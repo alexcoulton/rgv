@@ -29,9 +29,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    artifacts::{ArtifactError, ArtifactStore},
+    artifacts::{ArtifactError, ArtifactStore, TemporaryArtifact},
+    capture::{InlineCapture, effective_max_width, prepare_inline_png},
     config::RgvMcpArgs,
+    redaction::{inline_export_read_names, redact_message},
 };
+
+/// Oldest viewer automation schema this adapter can drive. Schema 6 removed and reshaped
+/// workspace-snapshot fields that earlier viewers emit, and a viewer rejects any batch stamped
+/// above its own version, so nothing below 6 is supported.
+pub(crate) const MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION: u32 = 6;
+/// Newest viewer automation schema this adapter was built against. A newer viewer may have
+/// changed response shapes this build cannot interpret.
+pub(crate) const MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION: u32 = AUTOMATION_SCHEMA_VERSION;
+/// Version stamped on every batch. A viewer accepts batches stamped at or below its own schema
+/// version, so the oldest supported version is accepted by every supported viewer.
+const BATCH_SCHEMA_VERSION: u32 = MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION;
+const _: () = assert!(
+    MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION <= MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION
+        && rgv_core::MINIMUM_AUTOMATION_SCHEMA_VERSION <= BATCH_SCHEMA_VERSION
+);
 
 const DEFAULT_SETTLE_TIMEOUT_MILLIS: u64 = 30_000;
 const MAXIMUM_MCP_BATCH_COMMANDS: usize = 100;
@@ -55,22 +72,20 @@ impl RgvMcpServer {
     /// a prerequisite for starting the stdio service.
     pub async fn viewer_is_compatible(&self) -> bool {
         self.control.status().await.is_ok_and(|status| {
-            status.schema_version == AUTOMATION_SCHEMA_VERSION
-                && status
-                    .control_schema_version
-                    .is_none_or(|version| version == AUTOMATION_SCHEMA_VERSION)
+            viewer_schema_compatibility(status.schema_version, status.control_schema_version)
+                .is_ok()
         })
     }
 
     async fn execute(&self, commands: Vec<AutomationCommand>) -> CallToolResult {
         let batch = AutomationBatch {
-            schema_version: AUTOMATION_SCHEMA_VERSION,
+            schema_version: BATCH_SCHEMA_VERSION,
             commands,
         };
         match self.control.run_batch(&batch).await {
             Ok(report) if report.succeeded => success_result(
                 "RGV completed the requested live-window operation",
-                json!({"report": public_report(&report)}),
+                json!({"report": public_report(&report, ReportOptions::default())}),
             ),
             Ok(report) => report_failure(&report),
             Err(error) => control_failure(&error),
@@ -84,7 +99,7 @@ impl RgvMcpServer {
         label: &str,
     ) -> Result<(T, AutomationRunReport), CallToolResult> {
         let batch = AutomationBatch {
-            schema_version: AUTOMATION_SCHEMA_VERSION,
+            schema_version: BATCH_SCHEMA_VERSION,
             commands,
         };
         let report = self
@@ -110,6 +125,129 @@ impl RgvMcpServer {
         })?;
         Ok((parsed, report))
     }
+
+    /// Runs `[wait_until_settled,] snapshot, describe_workspace` and returns the successful
+    /// report with the index of the snapshot result. The workspace result follows it.
+    async fn run_capture(
+        &self,
+        temporary: &TemporaryArtifact,
+        scope: AutomationSnapshotScope,
+        wait_until_settled: bool,
+        timeout_millis: u64,
+    ) -> Result<(AutomationRunReport, usize), CallToolResult> {
+        let mut commands = Vec::new();
+        if wait_until_settled {
+            commands.push(AutomationCommand::WaitUntilSettled { timeout_millis });
+        }
+        let snapshot_result_index = commands.len();
+        commands.push(AutomationCommand::Snapshot {
+            path: temporary.path().display().to_string(),
+            scope,
+            format: AutomationSnapshotFormat::Png,
+        });
+        commands.push(AutomationCommand::DescribeWorkspace);
+        match self
+            .control
+            .run_batch(&AutomationBatch {
+                schema_version: BATCH_SCHEMA_VERSION,
+                commands,
+            })
+            .await
+        {
+            Ok(report) if report.succeeded => Ok((report, snapshot_result_index)),
+            Ok(report) => Err(report_failure(&report)),
+            Err(error) => Err(control_failure(&error)),
+        }
+    }
+}
+
+/// Reads the temporary capture, checks it against the viewer's own metadata, and downscales it
+/// for inlining. Returns the prepared image and the snapshot command's result data.
+async fn inline_capture(
+    temporary: &TemporaryArtifact,
+    report: &AutomationRunReport,
+    snapshot_result_index: usize,
+    max_width: Option<u32>,
+    label: &str,
+) -> Result<(InlineCapture, Value), CallToolResult> {
+    let bytes = temporary
+        .read_capture()
+        .map_err(|error| artifact_failure(&error))?;
+    let Some((png_width, png_height)) = png_dimensions(&bytes) else {
+        return Err(adapter_failure(
+            "artifact_error",
+            &format!("RGV returned a malformed PNG {label}"),
+        ));
+    };
+    let metadata = report
+        .results
+        .get(snapshot_result_index)
+        .map(|result| &result.data)
+        .cloned()
+        .unwrap_or(Value::Null);
+    if metadata.get("width").and_then(Value::as_u64) != Some(u64::from(png_width))
+        || metadata.get("height").and_then(Value::as_u64) != Some(u64::from(png_height))
+    {
+        return Err(adapter_failure(
+            "invalid_response",
+            &format!("RGV {label} metadata did not match the PNG dimensions"),
+        ));
+    }
+    let max_width = effective_max_width(max_width);
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_inline_png(bytes, png_width, png_height, max_width)
+    })
+    .await;
+    match prepared {
+        Ok(Ok(capture)) => Ok((capture, metadata)),
+        Ok(Err(error)) => Err(adapter_failure("artifact_error", &error.to_string())),
+        Err(_) => Err(adapter_failure(
+            "artifact_error",
+            &format!("the PNG {label} could not be prepared for inlining"),
+        )),
+    }
+}
+
+/// Image fields shared by both capture tools. `width`/`height` describe the inlined PNG;
+/// `source_width`/`source_height` describe the viewer's capture before any downscale.
+fn capture_structure(capture: &InlineCapture) -> Value {
+    json!({
+        "mime_type": "image/png",
+        "bytes": capture.png.len(),
+        "width": capture.width,
+        "height": capture.height,
+        "source_width": capture.source_width,
+        "source_height": capture.source_height,
+        "downscaled": capture.downscaled(),
+    })
+}
+
+fn merge_object(target: &mut Value, addition: Value) {
+    if let (Some(target), Value::Object(addition)) = (target.as_object_mut(), addition) {
+        target.extend(addition);
+    }
+}
+
+/// Checks the schema versions a viewer reports against the range this adapter supports.
+fn viewer_schema_compatibility(
+    schema_version: u32,
+    control_schema_version: Option<u32>,
+) -> Result<(), String> {
+    let supported =
+        MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION..=MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION;
+    let unsupported = [Some(schema_version), control_schema_version]
+        .into_iter()
+        .flatten()
+        .find(|version| !supported.contains(version));
+    match unsupported {
+        None => Ok(()),
+        Some(version) => Err(format!(
+            "RGV reports automation schema {version}, but this rgv-mcp build supports schema \
+             versions {MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION} through \
+             {MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION}; use rgv-desktop and rgv-mcp builds from \
+             compatible releases"
+        )),
+    }
 }
 
 #[tool_router]
@@ -126,28 +264,26 @@ impl RgvMcpServer {
     )]
     async fn status(&self) -> CallToolResult {
         match self.control.status().await {
-            Ok(status)
-                if status.schema_version == AUTOMATION_SCHEMA_VERSION
-                    && status
-                        .control_schema_version
-                        .is_none_or(|version| version == AUTOMATION_SCHEMA_VERSION) =>
-            {
-                success_result(
-                    "The live RGV control service is reachable",
-                    json!({
-                        "connected": true,
-                        "compatible": true,
-                        "status": status,
-                    }),
-                )
+            Ok(status) => {
+                match viewer_schema_compatibility(
+                    status.schema_version,
+                    status.control_schema_version,
+                ) {
+                    Ok(()) => success_result(
+                        "The live RGV control service is reachable",
+                        json!({
+                            "connected": true,
+                            "compatible": true,
+                            "supported_schema_versions": {
+                                "minimum": MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION,
+                                "maximum": MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION,
+                            },
+                            "status": status,
+                        }),
+                    ),
+                    Err(message) => adapter_failure("unsupported_version", &message),
+                }
             }
-            Ok(status) => adapter_failure(
-                "unsupported_version",
-                &format!(
-                    "RGV uses control schema {}, but this adapter supports {}",
-                    status.schema_version, AUTOMATION_SCHEMA_VERSION
-                ),
-            ),
             Err(error) => control_failure(&error),
         }
     }
@@ -162,7 +298,7 @@ impl RgvMcpServer {
             open_world_hint = false
         )
     )]
-    async fn get_workspace(&self) -> CallToolResult {
+    async fn get_workspace(&self, Parameters(args): Parameters<WorkspaceArgs>) -> CallToolResult {
         match self
             .execute_with_data::<AutomationWorkspaceSnapshot>(
                 vec![AutomationCommand::DescribeWorkspace],
@@ -173,7 +309,7 @@ impl RgvMcpServer {
         {
             Ok((workspace, _)) => success_result(
                 "Described the live RGV workspace",
-                json!({"workspace": workspace}),
+                json!({"workspace": public_workspace(&workspace, args.include_telemetry)}),
             ),
             Err(error) => error,
         }
@@ -720,84 +856,60 @@ impl RgvMcpServer {
         )
     )]
     async fn capture_view(&self, Parameters(args): Parameters<CaptureArgs>) -> CallToolResult {
-        let path = self.artifacts.temporary_path("png");
-        let mut commands = Vec::new();
-        if args.wait_until_settled {
-            commands.push(AutomationCommand::WaitUntilSettled {
-                timeout_millis: args.timeout_millis,
-            });
-        }
-        commands.push(AutomationCommand::Snapshot {
-            path: path.display().to_string(),
-            scope: args.scope.into_core(),
-            format: AutomationSnapshotFormat::Png,
-        });
-        let snapshot_result_index = commands.len() - 1;
-        commands.push(AutomationCommand::DescribeWorkspace);
-        let report = match self
-            .control
-            .run_batch(&AutomationBatch {
-                schema_version: AUTOMATION_SCHEMA_VERSION,
-                commands,
-            })
+        // The guard removes the viewer-written PNG on every exit path below.
+        let temporary = self.artifacts.temporary("png");
+        let (report, snapshot_result_index) = match self
+            .run_capture(
+                &temporary,
+                args.scope.into_core(),
+                args.wait_until_settled,
+                args.timeout_millis,
+            )
             .await
         {
-            Ok(report) if report.succeeded => report,
-            Ok(report) => {
-                self.artifacts.discard_temporary(&path);
-                return report_failure(&report);
-            }
-            Err(error) => {
-                self.artifacts.discard_temporary(&path);
-                return control_failure(&error);
-            }
+            Ok(outcome) => outcome,
+            Err(failure) => return failure,
         };
-        let bytes = match self.artifacts.read_temporary_capture(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => return artifact_failure(&error),
-        };
-        let Some((png_width, png_height)) = png_dimensions(&bytes) else {
-            return adapter_failure("artifact_error", "RGV returned a malformed PNG capture");
-        };
-        let capture = report
-            .results
-            .get(snapshot_result_index)
-            .map(|result| &result.data)
-            .cloned()
-            .unwrap_or(Value::Null);
-        if capture.get("width").and_then(Value::as_u64) != Some(u64::from(png_width))
-            || capture.get("height").and_then(Value::as_u64) != Some(u64::from(png_height))
+        let (capture, metadata) = match inline_capture(
+            &temporary,
+            &report,
+            snapshot_result_index,
+            args.max_width,
+            "capture",
+        )
+        .await
         {
-            return adapter_failure(
-                "invalid_response",
-                "RGV capture metadata did not match the PNG dimensions",
-            );
-        }
+            Ok(outcome) => outcome,
+            Err(failure) => return failure,
+        };
         let workspace = report.results.last().and_then(|result| {
             serde_json::from_value::<AutomationWorkspaceSnapshot>(result.data.clone()).ok()
         });
-        let encoded = BASE64_STANDARD.encode(&bytes);
-        let structured = json!({
-            "mime_type": "image/png",
-            "bytes": bytes.len(),
-            "scope": args.scope,
-            "width": png_width,
-            "height": png_height,
-            "truncated": capture.get("truncated").and_then(Value::as_bool).unwrap_or(false),
-            "genome": workspace.as_ref().map(|workspace| &workspace.genome),
-            "application_instance_id": workspace.as_ref().map(|workspace| &workspace.application_instance_id),
-            "workspace_revision": workspace.as_ref().map(|workspace| workspace.workspace_revision),
-            "selection_id": workspace.as_ref().and_then(|workspace| workspace.selection.as_ref()).map(|selection| &selection.selection_id),
-            "evidence_revision": workspace.as_ref().and_then(|workspace| workspace.selection.as_ref()).map(|selection| selection.evidence_revision),
-            "panels": workspace.as_ref().map(|workspace| &workspace.panels),
-            "loci": workspace.as_ref().map(|workspace| {
-                workspace.panels.iter().map(|panel| panel.locus.as_str()).collect::<Vec<_>>()
-            }).unwrap_or_default(),
-            "report": public_report(&report),
-        });
+        let mut structured = capture_structure(&capture);
+        merge_object(
+            &mut structured,
+            json!({
+                "scope": args.scope,
+                "truncated": metadata.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+                "genome": workspace.as_ref().map(|workspace| &workspace.genome),
+                "application_instance_id": workspace.as_ref().map(|workspace| &workspace.application_instance_id),
+                "workspace_revision": workspace.as_ref().map(|workspace| workspace.workspace_revision),
+                "selection_id": workspace.as_ref().and_then(|workspace| workspace.selection.as_ref()).map(|selection| &selection.selection_id),
+                "evidence_revision": workspace.as_ref().and_then(|workspace| workspace.selection.as_ref()).map(|selection| selection.evidence_revision),
+                "panels": workspace.as_ref().map(|workspace| &workspace.panels),
+                "loci": workspace.as_ref().map(|workspace| {
+                    workspace.panels.iter().map(|panel| panel.locus.as_str()).collect::<Vec<_>>()
+                }).unwrap_or_default(),
+                "report": public_report(&report, ReportOptions {
+                    include_telemetry: args.include_telemetry,
+                    // The workspace is summarised once above, not inlined a second time.
+                    omit_data_at: Some(snapshot_result_index + 1),
+                }),
+            }),
+        );
         let mut result = CallToolResult::success(vec![
             ContentBlock::text("Captured the settled live RGV view"),
-            ContentBlock::image(encoded, "image/png"),
+            ContentBlock::image(BASE64_STANDARD.encode(&capture.png), "image/png"),
         ]);
         result.structured_content = Some(structured);
         result
@@ -817,43 +929,25 @@ impl RgvMcpServer {
         &self,
         Parameters(args): Parameters<CaptureWindowArgs>,
     ) -> CallToolResult {
-        let path = self.artifacts.temporary_path("png");
-        let mut commands = Vec::new();
-        if args.wait_until_settled {
-            commands.push(AutomationCommand::WaitUntilSettled {
-                timeout_millis: args.timeout_millis,
-            });
-        }
-        let snapshot_result_index = commands.len();
-        commands.push(AutomationCommand::Snapshot {
-            path: path.display().to_string(),
-            scope: AutomationSnapshotScope::NativeWindow,
-            format: AutomationSnapshotFormat::Png,
-        });
-        commands.push(AutomationCommand::DescribeWorkspace);
-        let report = match self
-            .control
-            .run_batch(&AutomationBatch {
-                schema_version: AUTOMATION_SCHEMA_VERSION,
-                commands,
-            })
+        // The guard removes the viewer-written PNG on every exit path below, including the
+        // protocol and process-identity rejections that follow the capture.
+        let temporary = self.artifacts.temporary("png");
+        let (report, snapshot_result_index) = match self
+            .run_capture(
+                &temporary,
+                AutomationSnapshotScope::NativeWindow,
+                args.wait_until_settled,
+                args.timeout_millis,
+            )
             .await
         {
-            Ok(report) if report.succeeded => report,
-            Ok(report) => {
-                self.artifacts.discard_temporary(&path);
-                return report_failure(&report);
-            }
-            Err(error) => {
-                self.artifacts.discard_temporary(&path);
-                return control_failure(&error);
-            }
+            Ok(outcome) => outcome,
+            Err(failure) => return failure,
         };
         let workspace = report.results.last().and_then(|result| {
             serde_json::from_value::<AutomationWorkspaceSnapshot>(result.data.clone()).ok()
         });
         let Some(workspace) = workspace else {
-            self.artifacts.discard_temporary(&path);
             return adapter_failure(
                 "invalid_response",
                 "RGV omitted the workspace associated with its window capture",
@@ -861,20 +955,12 @@ impl RgvMcpServer {
         };
         let status = match self.control.status().await {
             Ok(status) => status,
-            Err(error) => {
-                self.artifacts.discard_temporary(&path);
-                return control_failure(&error);
-            }
+            Err(error) => return control_failure(&error),
         };
-        if status.schema_version != AUTOMATION_SCHEMA_VERSION
-            || status
-                .control_schema_version
-                .is_some_and(|version| version != AUTOMATION_SCHEMA_VERSION)
+        if let Err(message) =
+            viewer_schema_compatibility(status.schema_version, status.control_schema_version)
         {
-            return adapter_failure(
-                "unsupported_version",
-                "RGV changed control protocol before native window capture",
-            );
+            return adapter_failure("unsupported_version", &message);
         }
         if status.process_id == 0
             || status.application_instance_id.is_empty()
@@ -885,54 +971,48 @@ impl RgvMcpServer {
                 "RGV process identity could not be bound to the authenticated workspace",
             );
         }
-        let bytes = match self.artifacts.read_temporary_capture(&path) {
-            Ok(bytes) => bytes,
-            Err(error) => return artifact_failure(&error),
-        };
-        let Some((png_width, png_height)) = png_dimensions(&bytes) else {
-            return adapter_failure("artifact_error", "RGV returned a malformed window PNG");
-        };
-        let capture = report
-            .results
-            .get(snapshot_result_index)
-            .map(|result| &result.data)
-            .cloned()
-            .unwrap_or(Value::Null);
-        if capture.get("width").and_then(Value::as_u64) != Some(u64::from(png_width))
-            || capture.get("height").and_then(Value::as_u64) != Some(u64::from(png_height))
+        let (capture, _) = match inline_capture(
+            &temporary,
+            &report,
+            snapshot_result_index,
+            args.max_width,
+            "window capture",
+        )
+        .await
         {
-            return adapter_failure(
-                "invalid_response",
-                "RGV window capture metadata did not match the PNG dimensions",
-            );
-        }
-        let encoded = BASE64_STANDARD.encode(&bytes);
+            Ok(outcome) => outcome,
+            Err(failure) => return failure,
+        };
         let loci = workspace
             .panels
             .iter()
             .map(|panel| panel.locus.as_str())
             .collect::<Vec<_>>();
-        let structured = json!({
-            "mime_type": "image/png",
-            "bytes": bytes.len(),
-            "capture_kind": "native_window_client_area",
-            "platform": std::env::consts::OS,
-            "width": png_width,
-            "height": png_height,
-            "process_id": status.process_id,
-            "includes_native_frame": false,
-            "foreground_activated": false,
-            "application_instance_id": &workspace.application_instance_id,
-            "workspace_revision": workspace.workspace_revision,
-            "selection_id": workspace.selection.as_ref().map(|selection| &selection.selection_id),
-            "evidence_revision": workspace.selection.as_ref().map(|selection| selection.evidence_revision),
-            "panels": &workspace.panels,
-            "loci": loci,
-            "report": public_report(&report),
-        });
+        let mut structured = capture_structure(&capture);
+        merge_object(
+            &mut structured,
+            json!({
+                "capture_kind": "native_window_client_area",
+                "platform": std::env::consts::OS,
+                "process_id": status.process_id,
+                "includes_native_frame": false,
+                "foreground_activated": false,
+                "application_instance_id": &workspace.application_instance_id,
+                "workspace_revision": workspace.workspace_revision,
+                "selection_id": workspace.selection.as_ref().map(|selection| &selection.selection_id),
+                "evidence_revision": workspace.selection.as_ref().map(|selection| selection.evidence_revision),
+                "panels": &workspace.panels,
+                "loci": loci,
+                "report": public_report(&report, ReportOptions {
+                    include_telemetry: args.include_telemetry,
+                    // The workspace is summarised once above, not inlined a second time.
+                    omit_data_at: Some(snapshot_result_index + 1),
+                }),
+            }),
+        );
         let mut result = CallToolResult::success(vec![
             ContentBlock::text("Captured the native RGV window client area without activating it"),
-            ContentBlock::image(encoded, "image/png"),
+            ContentBlock::image(BASE64_STANDARD.encode(&capture.png), "image/png"),
         ]);
         result.structured_content = Some(structured);
         result
@@ -966,7 +1046,7 @@ impl RgvMcpServer {
         let report = match self
             .control
             .run_batch(&AutomationBatch {
-                schema_version: AUTOMATION_SCHEMA_VERSION,
+                schema_version: BATCH_SCHEMA_VERSION,
                 commands,
             })
             .await
@@ -984,11 +1064,11 @@ impl RgvMcpServer {
             Ok(path) => path,
             Err(error) => return artifact_failure(&error),
         };
-        let inline_text = match self
+        let inline = match self
             .artifacts
             .read_durable_text(&path, MAXIMUM_INLINE_EXPORT_BYTES)
         {
-            Ok(value) => value,
+            Ok(value) => value.map(|text| inline_export_read_names(&text, args.include_read_names)),
             Err(error) => return artifact_failure(&error),
         };
         success_result(
@@ -997,8 +1077,12 @@ impl RgvMcpServer {
                 "kind": args.kind,
                 "path": relative,
                 "bytes": metadata.len(),
-                "inline_text": inline_text,
-                "report": public_report(&report),
+                "inline_text": inline.as_ref().map(|inline| &inline.text),
+                "inline_read_names": inline.as_ref().map(|inline| inline.handling),
+                "inline_distinct_read_names_replaced": inline
+                    .as_ref()
+                    .map(|inline| inline.distinct_read_names),
+                "report": public_report(&report, ReportOptions::default()),
             }),
         )
     }
@@ -1021,7 +1105,7 @@ impl RgvMcpServer {
         let report = match self
             .control
             .run_batch(&AutomationBatch {
-                schema_version: AUTOMATION_SCHEMA_VERSION,
+                schema_version: BATCH_SCHEMA_VERSION,
                 commands: vec![AutomationCommand::Save {
                     path: path.display().to_string(),
                 }],
@@ -1038,7 +1122,7 @@ impl RgvMcpServer {
         };
         success_result(
             "Saved the live RGV workspace",
-            json!({"path": relative, "report": public_report(&report)}),
+            json!({"path": relative, "report": public_report(&report, ReportOptions::default())}),
         )
     }
 
@@ -1106,14 +1190,20 @@ impl RgvMcpServer {
             );
         }
         let value = json!({
-            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "schema_version": BATCH_SCHEMA_VERSION,
             "commands": args.commands,
         });
-        let Ok(batch) = AutomationBatch::from_json(&value.to_string()) else {
-            return adapter_failure(
-                "invalid_batch",
-                "commands do not form a valid RGV automation batch",
-            );
+        let batch = match AutomationBatch::from_json(&value.to_string()) {
+            Ok(batch) => batch,
+            Err(error) => {
+                return adapter_failure(
+                    "invalid_batch",
+                    &format!(
+                        "commands do not form a valid RGV automation batch: {}",
+                        redact_message(&error.to_string())
+                    ),
+                );
+            }
         };
         if batch
             .commands
@@ -1136,7 +1226,10 @@ impl RgvMcpServer {
         match self.control.run_batch(&batch).await {
             Ok(report) if report.succeeded => success_result(
                 "RGV completed the advanced batch",
-                json!({"report": public_report(&report)}),
+                json!({"report": public_report(&report, ReportOptions {
+                    include_telemetry: args.include_telemetry,
+                    omit_data_at: None,
+                })}),
             ),
             Ok(report) => report_failure(&report),
             Err(error) => control_failure(&error),
@@ -1193,42 +1286,67 @@ fn adapter_failure(code: &str, message: &str) -> CallToolResult {
     result
 }
 
-fn control_failure(error: &ControlClientError) -> CallToolResult {
-    let (code, message) = match error {
+/// Maps a control-client error to its stable code and a diagnostic. Viewer- and
+/// validator-authored text is passed through after redaction; transport and decoding errors stay
+/// generic because their text can echo the control URL or response bytes.
+fn control_failure_parts(error: &ControlClientError) -> (String, String) {
+    match error {
         ControlClientError::Transport(_) => (
-            "unavailable",
+            "unavailable".to_owned(),
             "The configured RGV window is unavailable; start it with local control enabled and retry".to_owned(),
         ),
-        ControlClientError::Http { code, .. } => (
-            code.as_str(),
-            format!("RGV local control rejected the request ({code})"),
+        ControlClientError::Http { code, message, .. } => (
+            code.clone(),
+            with_detail(
+                &format!("RGV local control rejected the request ({code})"),
+                message,
+            ),
         ),
-        ControlClientError::InvalidBatch(_) => ("invalid_batch", "The generated RGV batch was invalid".to_owned()),
+        ControlClientError::InvalidBatch(reason) => (
+            "invalid_batch".to_owned(),
+            with_detail("The generated RGV batch was invalid", &reason.to_string()),
+        ),
         ControlClientError::Json(_) | ControlClientError::InvalidResponse(_) => (
-            "invalid_response",
+            "invalid_response".to_owned(),
             "RGV local control returned malformed JSON".to_owned(),
         ),
         ControlClientError::ResponseTooLarge => (
-            "response_too_large",
+            "response_too_large".to_owned(),
             "RGV local control exceeded the adapter response limit".to_owned(),
         ),
         ControlClientError::UnexpectedContentType => (
-            "invalid_response",
+            "invalid_response".to_owned(),
             "RGV local control returned an unexpected content type".to_owned(),
         ),
         ControlClientError::StateReobservationFailed => (
-            "state_reobservation_failed",
+            "state_reobservation_failed".to_owned(),
             "RGV state could not be re-observed after an interrupted mutation".to_owned(),
         ),
-    };
-    adapter_failure(code, &message)
+    }
+}
+
+/// Appends a redacted diagnostic to a fixed summary, or returns the summary alone when the
+/// diagnostic is empty.
+fn with_detail(summary: &str, detail: &str) -> String {
+    let detail = redact_message(detail.trim());
+    if detail.is_empty() {
+        summary.to_owned()
+    } else {
+        format!("{summary}: {detail}")
+    }
+}
+
+fn control_failure(error: &ControlClientError) -> CallToolResult {
+    let (code, message) = control_failure_parts(error);
+    adapter_failure(&code, &message)
 }
 
 fn artifact_failure(error: &ArtifactError) -> CallToolResult {
-    adapter_failure("artifact_error", &error.to_string())
+    adapter_failure("artifact_error", &redact_message(&error.to_string()))
 }
 
-fn report_failure(report: &AutomationRunReport) -> CallToolResult {
+/// The stable error code and redacted viewer diagnostic of the first failed command.
+fn report_failure_parts(report: &AutomationRunReport) -> (String, String) {
     let failed = report
         .results
         .iter()
@@ -1244,35 +1362,93 @@ fn report_failure(report: &AutomationRunReport) -> CallToolResult {
             });
     let message = failed.map_or_else(
         || "RGV did not complete the requested operation".to_owned(),
-        |result| format!("RGV command {} failed", result.command),
+        |result| {
+            with_detail(
+                &format!("RGV command {} failed", result.command),
+                &result.message,
+            )
+        },
     );
+    (code, message)
+}
+
+fn report_failure(report: &AutomationRunReport) -> CallToolResult {
+    let (code, message) = report_failure_parts(report);
     let mut result = CallToolResult::error(vec![ContentBlock::text(message.clone())]);
     result.structured_content = Some(json!({
         "error": {"code": code, "message": message},
-        "report": public_report(report),
+        "report": public_report(report, ReportOptions::default()),
     }));
     result
 }
 
-fn public_report(report: &AutomationRunReport) -> Value {
-    json!({
+#[derive(Clone, Copy, Debug, Default)]
+struct ReportOptions {
+    /// Include the run's frame, GPU, navigation, and environment telemetry.
+    include_telemetry: bool,
+    /// Result index whose `data` is replaced by a marker because the tool already reports the
+    /// same state in its own top-level fields.
+    omit_data_at: Option<usize>,
+}
+
+const OMITTED_DATA_MARKER: &str = "[reported once in this tool result's top-level fields]";
+
+fn public_report(report: &AutomationRunReport, options: ReportOptions) -> Value {
+    let mut public = json!({
         "schema_version": report.schema_version,
         "succeeded": report.succeeded,
-        "results": report.results.iter().map(|result| json!({
+        "results": report.results.iter().enumerate().map(|(index, result)| json!({
             "command_index": result.command_index,
             "command": result.command,
             "status": result.status,
             "error_code": result.error_code,
-            "message": match result.status {
-                AutomationCommandStatus::Succeeded => "Command succeeded",
-                AutomationCommandStatus::Failed => "Command failed",
-                AutomationCommandStatus::Skipped => "Command skipped",
+            // The viewer's own diagnostic, with filesystem locations and credentials removed.
+            "message": redact_message(&result.message),
+            "data": if options.omit_data_at == Some(index) {
+                Value::String(OMITTED_DATA_MARKER.to_owned())
+            } else {
+                public_data(&result.data)
             },
-            "data": public_data(&result.data),
             "elapsed_ms": result.elapsed_ms,
         })).collect::<Vec<_>>(),
-        "telemetry": report.telemetry,
-    })
+    });
+    if options.include_telemetry {
+        merge_object(&mut public, json!({"telemetry": report.telemetry}));
+    }
+    public
+}
+
+/// Prefix of the workspace-snapshot fields that carry alignment-scene cache accounting and
+/// diagnostic counters (`alignment_scene_diagnostics`, `alignment_scene_budget_bytes`, ...)
+/// rather than workspace state.
+const WORKSPACE_TELEMETRY_PREFIX: &str = "alignment_scene_";
+
+/// The workspace as returned to an MCP client: telemetry is opt-in, and free-text track
+/// failures and status lines have filesystem locations and credentials removed.
+fn public_workspace(workspace: &AutomationWorkspaceSnapshot, include_telemetry: bool) -> Value {
+    let mut value = serde_json::to_value(workspace).unwrap_or(Value::Null);
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    if !include_telemetry {
+        object.retain(|field, _| !field.starts_with(WORKSPACE_TELEMETRY_PREFIX));
+    }
+    let redact_in_place = |text: &mut Value| {
+        if let Value::String(message) = text {
+            *message = redact_message(message);
+        }
+    };
+    if let Some(Value::Array(status)) = object.get_mut("status") {
+        status.iter_mut().for_each(redact_in_place);
+    }
+    if let Some(Value::Array(tracks)) = object.get_mut("tracks") {
+        for track in tracks {
+            if let Some(failure) = track.get_mut("failure") {
+                redact_in_place(failure);
+            }
+        }
+    }
+    value
 }
 
 fn public_data(value: &Value) -> Value {
@@ -1312,12 +1488,29 @@ fn default_timeout() -> u64 {
     DEFAULT_SETTLE_TIMEOUT_MILLIS
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct WorkspaceArgs {
+    /// When true, include alignment-scene cache accounting and diagnostic counters (every
+    /// top-level `alignment_scene_*` field) in the workspace snapshot. Default false: they are
+    /// large and irrelevant to genomic interpretation.
+    #[serde(default)]
+    pub include_telemetry: bool,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NavigateArgs {
+    /// One to 16 locus strings; each becomes one panel, in order, replacing the current panel
+    /// arrangement. Coordinates are one-based and inclusive at both ends, e.g.
+    /// `chr1:1,000,001-1,100,000` (thousands separators optional).
     #[schemars(length(min = 1, max = 16))]
     pub loci: Vec<String>,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -1325,11 +1518,20 @@ pub struct NavigateArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ChangeViewportArgs {
+    /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+    /// identity, not a display index.
     #[schemars(range(min = 1))]
     pub panel_id: u64,
+    /// The pan, zoom, or fit to apply. Numeric positions are zero-based; intervals are half-open
+    /// `[start, end)`.
     pub operation: ToolViewportOperation,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -1338,20 +1540,36 @@ pub struct ChangeViewportArgs {
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum ToolViewportOperation {
+    /// Pan by a signed number of bases.
     PanBases {
+        /// Signed pan distance in bases (base pairs). Positive moves the view toward higher
+        /// coordinates, negative toward lower. Must not be zero; the view is clamped to the contig.
         delta: i64,
     },
+    /// Pan by a signed fraction of the visible span.
     PanFraction {
+        /// Signed pan distance as a fraction of the currently visible span (1.0 = one full view
+        /// width). Positive moves toward higher coordinates. Must not be zero; -100 to 100.
         #[schemars(range(min = -100.0, max = 100.0))]
         fraction: f64,
     },
+    /// Zoom in or out around an anchor.
     Zoom {
+        /// Magnification factor, 0.01 to 100: above 1 zooms in (the visible span is divided by the
+        /// factor), below 1 zooms out.
         #[schemars(range(min = 0.01, max = 100.0))]
         factor: f64,
+        /// Zero-based genomic position on the panel's current contig that keeps its screen position
+        /// while zooming. Omit to zoom around the viewport centre.
         anchor_position: Option<u64>,
     },
+    /// Show exactly one zero-based, half-open interval `[start, end)` of the panel's current
+    /// contig.
     FitInterval {
+        /// Zero-based inclusive start of the interval, in bases, on the panel's current contig.
         start: u64,
+        /// Zero-based exclusive end of the interval (half-open `[start, end)`); must be greater
+        /// than `start`. Equals the one-based inclusive end. Clamped to the contig length.
         end: u64,
     },
 }
@@ -1377,11 +1595,19 @@ impl ToolViewportOperation {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LoadTrackArgs {
+    /// Where to read the track from: a local file under the control root or an HTTP/HTTPS URL.
     pub source: ToolSource,
+    /// Track kind. Omit to let RGV infer it from the source.
     pub kind: Option<ToolTrackKind>,
+    /// Optional display name for the track.
     pub name: Option<String>,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -1390,8 +1616,17 @@ pub struct LoadTrackArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolSource {
-    Local { path: String },
-    Remote { url: String },
+    /// A file on the viewer's machine.
+    Local {
+        /// Local file path. A relative path is resolved against the viewer's `--control-root`;
+        /// any path that resolves outside that root is rejected.
+        path: String,
+    },
+    /// A remote file.
+    Remote {
+        /// HTTP or HTTPS URL of the remote file. It is never echoed back in tool results.
+        url: String,
+    },
 }
 
 impl ToolSource {
@@ -1437,10 +1672,17 @@ impl ToolTrackKind {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TrackIdArgs {
+    /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+    /// identity, not a display index.
     #[schemars(range(min = 1))]
     pub track_id: u64,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -1448,9 +1690,16 @@ pub struct TrackIdArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConfigureArgs {
+    /// The single typed setting to apply, selected by its `setting` discriminator. The report gives
+    /// `requested`, `effective`, `changed`, and `clamped`.
     pub change: ToolSetting,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -1476,13 +1725,21 @@ impl ToolTrackChannel {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolPresentationNode {
     Reference,
+    /// One track row in a presentation channel.
     Track {
+        /// Presentation channel (pane) that owns the target: `annotation` or `reads`.
         channel: ToolTrackChannel,
+        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         track_id: u64,
     },
+    /// One presentation group in a channel.
     Group {
+        /// Presentation channel (pane) that owns the target: `annotation` or `reads`.
         channel: ToolTrackChannel,
+        /// Positive presentation-group ID as reported in `presentation_groups` of the workspace
+        /// snapshot.
         #[schemars(range(min = 1))]
         group_id: u32,
     },
@@ -1509,13 +1766,24 @@ impl ToolPresentationNode {
 pub enum ToolAlignmentPredicateScope {
     #[default]
     Anywhere,
+    /// Restrict the predicate to one reference base.
     Position {
+        /// Contig (reference sequence) name exactly as the workspace reports it, e.g. `chr1`. An
+        /// unknown name matches nothing.
         contig: String,
+        /// Zero-based genomic position on `contig` (one less than the one-based coordinate shown in
+        /// a locus string).
         position: u64,
     },
+    /// Restrict the predicate to one zero-based, half-open reference interval `[start, end)`.
     Interval {
+        /// Contig (reference sequence) name exactly as the workspace reports it, e.g. `chr1`. An
+        /// unknown name matches nothing.
         contig: String,
+        /// Zero-based inclusive start on `contig`, in bases.
         start: u64,
+        /// Zero-based exclusive end on `contig` (half-open `[start, end)`); must be greater than
+        /// `start`.
         end: u64,
     },
 }
@@ -1615,8 +1883,11 @@ impl ToolAlignmentAuxComparison {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ToolAlignmentAuxValue {
+    /// Integer operand, compared numerically with integer tag values.
     Integer(i64),
+    /// Floating-point operand.
     Float(f64),
+    /// String operand, compared with string (`Z`) tag values.
     String(String),
 }
 
@@ -1633,44 +1904,87 @@ impl ToolAlignmentAuxValue {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "predicate", rename_all = "snake_case")]
 pub enum ToolAlignmentPredicate {
+    /// Keep records whose mapping quality (MAPQ) lies in an inclusive range. Records without a
+    /// mapping quality never match.
     MappingQuality {
+        /// Inclusive lower bound on MAPQ (0 to 255). Omit for no lower bound.
         minimum: Option<u8>,
+        /// Inclusive upper bound on MAPQ (0 to 255). Omit for no upper bound.
         maximum: Option<u8>,
     },
+    /// Keep records by the state of one SAM flag.
     Flag {
+        /// The SAM flag (or derived flag state) to test.
         flag: ToolAlignmentFlagPredicate,
+        /// Required flag state: true keeps records with the flag set, false keeps records with it
+        /// clear.
         expected: bool,
     },
+    /// Keep records whose absolute template length (|TLEN|) lies in an inclusive range.
     TemplateLength {
+        /// Inclusive lower bound on the absolute template length |TLEN|, in bases. Omit for no
+        /// lower bound.
         minimum: Option<u64>,
+        /// Inclusive upper bound on the absolute template length |TLEN|, in bases. Omit for no
+        /// upper bound.
         maximum: Option<u64>,
     },
+    /// Keep records whose mate maps to a named contig.
     MateContig {
+        /// Contig name of the mate, exactly as the workspace reports it. An unknown name matches
+        /// nothing.
         contig: String,
     },
+    /// Keep records by the presence or value of one SAM auxiliary tag.
     Auxiliary {
+        /// Two-character SAM auxiliary tag, e.g. `HP` or `NM` (a letter followed by a letter or
+        /// digit; case-sensitive).
         #[schemars(length(min = 2, max = 2))]
         #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
         tag: String,
+        /// How the tag is tested. `exists` needs no `value`; every other comparison is false for
+        /// records lacking the tag.
         comparison: ToolAlignmentAuxComparison,
+        /// Operand for the comparison. Required for every comparison except `exists`; without it
+        /// those comparisons match nothing.
         value: Option<ToolAlignmentAuxValue>,
     },
+    /// Keep records containing a CIGAR event of a given kind, optionally within a scope and length
+    /// range.
     CigarEvent {
+        /// The kind of CIGAR event to look for.
         event: ToolAlignmentCigarEventPredicate,
+        /// Where the event must occur. Defaults to `anywhere` in the record.
         #[serde(default)]
         scope: ToolAlignmentPredicateScope,
+        /// Inclusive lower bound on the event length, in bases. Omit for no lower bound.
         minimum_length: Option<u32>,
+        /// Inclusive upper bound on the event length, in bases. Omit for no upper bound.
         maximum_length: Option<u32>,
     },
+    /// Keep records whose aligned length lies in an inclusive range.
     AlignedLength {
+        /// Inclusive lower bound on the aligned length: the sum of CIGAR `M`, `=`, and `X`
+        /// operation lengths, in bases (not the reference span). Omit for no lower bound.
         minimum: Option<u64>,
+        /// Inclusive upper bound on the aligned length: the sum of CIGAR `M`, `=`, and `X`
+        /// operation lengths, in bases. Omit for no upper bound.
         maximum: Option<u64>,
     },
+    /// Keep records by their base substitutions relative to the reference. Requires a loaded
+    /// reference sequence.
     Substitution {
+        /// Where substitutions are counted. Defaults to `anywhere` in the record.
         #[serde(default)]
         scope: ToolAlignmentPredicateScope,
+        /// Single ASCII base letter the read must show at a substituted position, e.g. `T`. Omit to
+        /// count any substituted base.
         observed_base: Option<char>,
+        /// Inclusive lower bound on the number of matching substitutions within `scope`. Omit for
+        /// no lower bound.
         minimum_count: Option<u32>,
+        /// Inclusive upper bound on the number of matching substitutions within `scope`. Omit for
+        /// no upper bound.
         maximum_count: Option<u32>,
     },
 }
@@ -1740,178 +2054,267 @@ impl ToolAlignmentPredicate {
 #[serde(tag = "setting", rename_all = "snake_case")]
 pub enum ToolSetting {
     WindowSize {
+        /// Window client-area width in logical points (not physical pixels), 640 to 3840.
         #[schemars(range(min = 640, max = 3840))]
         width: u32,
+        /// Window client-area height in logical points (not physical pixels), 400 to 2160.
         #[schemars(range(min = 400, max = 2160))]
         height: u32,
     },
     InterfaceScalePercent {
+        /// Interface zoom in percent, 75 to 200; 100 is the unscaled interface.
         #[schemars(range(min = 75, max = 200))]
         value: u16,
     },
     PropertiesPanelExpanded {
+        /// True expands the Properties panel, false collapses it.
         value: bool,
     },
     PropertiesPanelWidth {
+        /// Properties panel width in logical points, 280 to 520.
         #[schemars(range(min = 280.0, max = 520.0))]
         value: f32,
     },
     PropertiesPanelResizeActive {
+        /// True marks a held Properties resize sash (a transient qualification signal); set it back
+        /// to false to release it and trigger the final refresh.
         value: bool,
     },
     ShowReference {
+        /// True shows the reference sequence lane, false hides it.
         value: bool,
     },
     ShowCoverage {
+        /// True shows alignment coverage, false hides it.
         value: bool,
     },
     ShowReads {
+        /// True shows individual reads, false hides them.
         value: bool,
     },
     ShowJunctions {
+        /// True shows splice-junction arcs, false hides them.
         value: bool,
     },
     ViewAsPairs {
+        /// True draws paired reads as linked templates, false draws each read separately.
         value: bool,
     },
     OverlappingMatePolicy {
+        /// How coverage counts bases where two mates of one template overlap.
         value: ToolOverlappingMatePolicy,
     },
     AlignmentColorMode {
+        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+        /// entries.
         #[schemars(length(min = 1, max = 1024))]
         track_ids: Vec<u64>,
+        /// The read colouring mode to apply to the listed tracks.
         value: ToolAlignmentColorMode,
     },
     AlignmentColorTag {
+        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+        /// entries.
         #[schemars(length(min = 1, max = 1024))]
         track_ids: Vec<u64>,
+        /// Two-character SAM auxiliary tag whose value colours each read, e.g. `HP` (a letter
+        /// followed by a letter or digit; case-sensitive).
         #[schemars(length(min = 2, max = 2))]
         #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
         tag: String,
     },
     AlignmentViewFilter {
+        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+        /// entries.
         #[schemars(length(min = 1, max = 1024))]
         track_ids: Vec<u64>,
+        /// Up to 64 predicates combined with logical AND; only records matching all of them remain
+        /// in the view, coverage, and exports. An empty list clears the view filter.
         #[schemars(length(max = 64))]
         predicates: Vec<ToolAlignmentPredicate>,
     },
     AlignmentHighlightFilter {
+        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+        /// entries.
         #[schemars(length(min = 1, max = 1024))]
         track_ids: Vec<u64>,
+        /// Up to 64 predicates combined with logical AND; matching records are highlighted but
+        /// nothing is removed. An empty list clears the highlight.
         #[schemars(length(max = 64))]
         predicates: Vec<ToolAlignmentPredicate>,
     },
     AlignmentDensity {
+        /// Read-row height multiplier, 0.25 to 4; 1.0 is the default row height and larger values
+        /// draw taller rows.
         #[schemars(range(min = 0.25, max = 4.0))]
         value: f32,
     },
     IncludeSecondary {
+        /// True includes secondary alignments (SAM flag 0x100), false excludes them.
         value: bool,
     },
     IncludeSupplementary {
+        /// True includes supplementary alignments (SAM flag 0x800), false excludes them.
         value: bool,
     },
     CoverageScaleTransform {
+        /// Vertical scale applied to coverage depth.
         value: ToolCoverageScaleTransform,
     },
     ReadBaseDisplayMode {
+        /// Which read bases are drawn: mismatches only, all bases, or none.
         value: ToolReadBaseDisplayMode,
     },
     ShadeReadBasesByQuality {
+        /// True shades read bases by their base quality, false draws them at full strength.
         value: bool,
     },
     ShowModifiedBases {
+        /// True draws base-modification (MM/ML) calls, false hides them.
         value: bool,
     },
     ModifiedBaseColorMode {
+        /// How base-modification calls are coloured.
         value: ToolModifiedBaseColorMode,
     },
     PresentationSectionExpanded {
+        /// The presentation section (pane) to expand or collapse: `annotation` or `reads`.
         channel: ToolTrackChannel,
+        /// True expands the section, false collapses it.
         value: bool,
     },
     PresentationNodeVisible {
+        /// The reference lane, track, or group to show or hide.
         target: ToolPresentationNode,
+        /// True shows the node, false hides it.
         value: bool,
     },
     PresentationNodeHeight {
+        /// The reference lane, track, or group to resize.
         target: ToolPresentationNode,
+        /// Preferred node height in logical points, 26 to 1200.
         #[schemars(range(min = 26.0, max = 1200.0))]
         value: f32,
     },
     PresentationGroupExpanded {
+        /// The group to expand or collapse (a `group` node).
         target: ToolPresentationNode,
+        /// True expands the group to show its members, false collapses it.
         value: bool,
     },
     PresentationGroupVisible {
+        /// The group to show or hide (a `group` node).
         target: ToolPresentationNode,
+        /// True shows the group, false hides it.
         value: bool,
     },
     PresentationCompositeVisible {
+        /// Presentation channel (pane) that owns the composite: `annotation` or `reads`.
         channel: ToolTrackChannel,
+        /// Positive composite ID as reported in `presentation_composites` of the workspace
+        /// snapshot.
         #[schemars(range(min = 1))]
         composite_id: u32,
+        /// True shows the composite, false hides it.
         value: bool,
     },
     PresentationGroup {
+        /// Presentation channel (pane) in which to create the group: `annotation` or `reads`.
         channel: ToolTrackChannel,
+        /// Positive stable track IDs (`tracks[].id`) to place in one new presentation group; 2 to
+        /// 1024 entries, all in `channel`.
         #[schemars(length(min = 2, max = 1024))]
         track_ids: Vec<u64>,
     },
     PresentationUngroup {
+        /// The group to dissolve (a `group` node).
         target: ToolPresentationNode,
     },
     ReadPaneHeight {
+        /// Height of the reads pane in logical points, 100 to 1200.
         #[schemars(range(min = 100.0, max = 1200.0))]
         value: f32,
     },
     TrackHeight {
+        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         track_id: u64,
+        /// Track height in logical points, 40 to 1200.
         #[schemars(range(min = 40.0, max = 1200.0))]
         value: f32,
     },
     TrackCollapsed {
+        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         track_id: u64,
+        /// True collapses the track, false expands it.
         value: bool,
     },
     TrackVisible {
+        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         track_id: u64,
+        /// True shows the track, false hides it.
         value: bool,
     },
     VerticalScrollPoints {
+        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         panel_id: u64,
+        /// Vertical scroll offset of the panel in logical points from the top (0 = top). Clamped to
+        /// the panel's `maximum_vertical_scroll_points`.
         #[schemars(range(min = 0.0))]
         value: f32,
     },
     AnnotationScrollPoints {
+        /// Positive stable panel ID whose scrollbar issues the request. The annotation camera is
+        /// workspace-wide, so the offset applies to every panel.
         #[schemars(range(min = 1))]
         panel_id: u64,
+        /// Vertical scroll offset of the workspace-wide annotation pane in logical points from the
+        /// top (0 = top). Clamped to `maximum_annotation_scroll_points`.
         #[schemars(range(min = 0.0))]
         value: f32,
     },
     ReadStackScrollPoints {
+        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         panel_id: u64,
+        /// Vertical scroll offset of this panel's read stack in logical points from the top (0 =
+        /// top). Clamped to the panel's `maximum_read_stack_scroll_points`.
         #[schemars(range(min = 0.0))]
         value: f32,
     },
     ReadPanelScrollPoints {
+        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         panel_id: u64,
+        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         track_id: u64,
+        /// Vertical scroll offset of this track's read panel in this genomic panel, in logical
+        /// points from the top (0 = top). Clamped to the maximum reported in `read_panel_states`.
         #[schemars(range(min = 0.0))]
         value: f32,
     },
     ReadPanelDensity {
+        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         panel_id: u64,
+        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         track_id: u64,
+        /// Read-row height multiplier for this track in this panel, 0.25 to 4; 1.0 is the default
+        /// row height and larger values draw taller rows.
         #[schemars(range(min = 0.25, max = 4.0))]
         value: f32,
     },
@@ -2206,18 +2609,31 @@ impl ToolAlignmentColorMode {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GroupArgs {
+    /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+    /// entries.
     #[schemars(length(min = 1, max = 1024))]
     pub track_ids: Vec<u64>,
+    /// Grouping mode. `tag` requires `tag`; `base` and `insertion` group by the evidence at
+    /// `anchor_position`; `none` removes grouping.
     pub mode: ToolGroupMode,
+    /// Order of the resulting groups: `natural` (default) or `reverse`.
     #[serde(default)]
     pub direction: ToolDirection,
+    /// Two-character SAM auxiliary tag to group by, e.g. `HP` (a letter followed by a letter or
+    /// digit). Required when `mode` is `tag`; ignored for every other mode.
     #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
     pub tag: Option<String>,
-    /// Zero-based fixed genomic position for base/insertion grouping. Defaults to the current
-    /// viewport centre when a position-aware mode is selected.
+    /// Zero-based genomic position on the active panel's contig used by `base` and `insertion`
+    /// grouping. Only valid with those modes; defaults to the centre of the active panel's
+    /// viewport.
     pub anchor_position: Option<u64>,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2273,18 +2689,29 @@ impl ToolGroupMode {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SortArgs {
+    /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+    /// entries.
     #[schemars(length(min = 1, max = 1024))]
     pub track_ids: Vec<u64>,
+    /// Sort key. `tag` requires `tag`; `base` sorts by the read base at `anchor_position`.
     pub mode: ToolSortMode,
+    /// Sort direction: `natural` (default) or `reverse`.
     #[serde(default)]
     pub direction: ToolDirection,
+    /// Two-character SAM auxiliary tag to sort by, e.g. `HP` (a letter followed by a letter or
+    /// digit). Required when `mode` is `tag`; ignored for every other mode.
     #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
     pub tag: Option<String>,
-    /// Zero-based fixed genomic position for base sorting. Defaults to the current viewport
-    /// centre when base sorting is selected.
+    /// Zero-based genomic position on the active panel's contig used by `base` sorting. Only valid
+    /// with that mode; defaults to the centre of the active panel's viewport.
     pub anchor_position: Option<u64>,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2365,11 +2792,20 @@ impl ToolDirection {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FilterArgs {
+    /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+    /// entries.
     #[schemars(length(min = 1, max = 1024))]
     pub track_ids: Vec<u64>,
+    /// RGV alignment-filter expression, validated by the viewer. An empty string clears the
+    /// alignment filter.
     pub expression: String,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2377,9 +2813,15 @@ pub struct FilterArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SelectArgs {
+    /// What to select: a track, a panel, or one genomic position on a track in a panel.
     pub selection: ToolSelection,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2388,20 +2830,36 @@ pub struct SelectArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "selection", rename_all = "snake_case")]
 pub enum ToolSelection {
+    /// Select a track.
     Track {
+        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         track_id: u64,
     },
+    /// Select a panel.
     Panel {
+        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         panel_id: u64,
     },
+    /// Select the evidence at one genomic position of a track in a panel.
     Position {
+        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         panel_id: u64,
+        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+        /// identity, not a display index.
         #[schemars(range(min = 1))]
         track_id: u64,
+        /// Zero-based genomic position on the panel's current contig (one less than the one-based
+        /// coordinate shown in a locus string).
         position: u64,
+        /// `exact_base` (default) selects evidence for exactly that base, which may require a
+        /// one-base query for alignment evidence; `visible_bin` selects the currently rendered
+        /// bin containing it.
         #[serde(default)]
         granularity: ToolSelectionGranularity,
     },
@@ -2450,15 +2908,23 @@ impl ToolSelectionGranularity {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct PanelArgs {
+    /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+    /// identity, not a display index.
     #[schemars(range(min = 1))]
     pub panel_id: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReviewNavigationArgs {
+    /// Which review item to open: a specific item or the next pending one.
     pub action: ToolReviewNavigation,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2467,7 +2933,9 @@ pub struct ReviewNavigationArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ToolReviewNavigation {
+    /// Navigate to one review item.
     Item {
+        /// Positive stable review-item ID as reported by `rgv_get_review_queue`.
         #[schemars(range(min = 1))]
         review_item_id: u64,
     },
@@ -2484,11 +2952,19 @@ impl ToolReviewNavigation {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct HistoryNavigationArgs {
+    /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+    /// identity, not a display index.
     #[schemars(range(min = 1))]
     pub panel_id: u64,
+    /// Move one step back or forward, or jump to an entry by index.
     pub action: ToolHistoryNavigation,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2499,7 +2975,12 @@ pub struct HistoryNavigationArgs {
 pub enum ToolHistoryNavigation {
     Back,
     Forward,
-    Index { index: usize },
+    /// Jump to one history entry.
+    Index {
+        /// Zero-based index of the history entry, as reported in `index` by
+        /// `rgv_get_navigation_history`.
+        index: usize,
+    },
 }
 impl ToolHistoryNavigation {
     fn into_core(self) -> AutomationHistoryNavigation {
@@ -2517,11 +2998,17 @@ fn default_alignment_results() -> usize {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindAlignmentsArgs {
+    /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
+    /// identity, not a display index.
     #[schemars(range(min = 1))]
     pub panel_id: u64,
+    /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
+    /// identity, not a display index.
     #[schemars(range(min = 1))]
     pub track_id: u64,
+    /// Which records to find within the track's currently settled query scope.
     pub selector: ToolAlignmentSelector,
+    /// Maximum number of hits to return, 1 to 128 (default 25).
     #[serde(default = "default_alignment_results")]
     #[schemars(range(min = 1, max = 128))]
     pub maximum_results: usize,
@@ -2530,21 +3017,44 @@ pub struct FindAlignmentsArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "selector", rename_all = "snake_case")]
 pub enum ToolAlignmentSelector {
+    /// Find records by exact read name.
     ExactReadName {
+        /// Exact, case-sensitive read name (QNAME). Treated as sensitive: matched only inside the
+        /// desktop process and never echoed in results.
         read_name: String,
     },
+    /// Find records covering one reference base.
     Position {
+        /// Zero-based genomic position on the panel's current contig; matches records whose aligned
+        /// span `[start, end)` contains it.
         position: u64,
     },
+    /// Find records overlapping a zero-based, half-open interval `[start, end)`.
     Interval {
+        /// Zero-based inclusive start on the panel's current contig, in bases.
         start: u64,
+        /// Zero-based exclusive end (half-open `[start, end)`); must be greater than `start`.
+        /// Records overlapping the interval by at least one base match.
         end: u64,
     },
+    /// Find records by alignment properties; every supplied property must match.
     Semantic {
+        /// Required alignment state: primary, secondary, or supplementary. Omit to accept any.
         alignment_state: Option<ToolAlignmentState>,
+        /// Required pair classification, case-insensitive, with no separators: `unpaired`,
+        /// `readunmapped`, `mateunmapped`, `matemissing`, `intercontig`, `discordantorientation`,
+        /// `discordanttemplatelengthshort`, `discordanttemplatelengthlong`, `proper`, or
+        /// `concordant` (the `pair_class` values returned in hits). Omit to accept any.
         pair_class: Option<String>,
+        /// True requires a mapped mate with a known position, false requires none. Omit to accept
+        /// either.
         has_mapped_mate: Option<bool>,
+        /// True requires a navigable supplementary (split-read) chain, false requires none. Omit to
+        /// accept either.
         has_supplementary_chain: Option<bool>,
+        /// True requires base-modification calls, false requires none. Fails with
+        /// `effective_state_unavailable` if modification evidence is not loaded. Omit to accept
+        /// either.
         has_modified_bases: Option<bool>,
     },
 }
@@ -2592,12 +3102,23 @@ impl ToolAlignmentState {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AlignmentHandleArgs {
+    /// Opaque alignment handle returned by `rgv_find_alignments`. It expires when the backing query
+    /// changes (`stale_handle`).
     pub handle: String,
+    /// If set, the call fails with `workspace_revision_conflict` and changes nothing unless the
+    /// viewer's current `workspace_revision` equals this value.
     pub expected_workspace_revision: Option<u64>,
+    /// Viewport change applied with the selection: `none` (default) leaves the view, `center` keeps
+    /// the span and centres the record, `fit` fits the record.
     #[serde(default)]
     pub reveal: ToolAlignmentReveal,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2623,13 +3144,26 @@ impl ToolAlignmentReveal {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RelatedNavigationArgs {
+    /// Which related record of the selected alignment to open: its mate or a supplementary-chain
+    /// segment.
     pub relationship: ToolAlignmentRelationship,
+    /// Zero-based index of the supplementary-chain segment, as reported in `segment_index` by
+    /// `rgv_get_related_alignments`. Required for `supplementary_segment`; must be omitted for
+    /// `mate`.
     pub segment_index: Option<usize>,
+    /// Where to show the related record: the `current_panel` (default) or a `new_panel`.
     #[serde(default)]
     pub destination: ToolNavigationDestination,
+    /// If set, the call fails with `workspace_revision_conflict` and changes nothing unless the
+    /// viewer's current `workspace_revision` equals this value.
     pub expected_workspace_revision: Option<u64>,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2668,10 +3202,26 @@ impl ToolNavigationDestination {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CaptureArgs {
+    /// What to capture: the visible workspace (default), the active panel's visible canvas, or the
+    /// active panel's complete unscrolled content.
     #[serde(default)]
     pub scope: ToolSnapshotScope,
+    /// Maximum width in pixels of the inlined PNG, 64 to 16384 (default 1600). A wider capture is
+    /// downscaled with its aspect ratio preserved; a narrower one is never enlarged. The result
+    /// reports both the inlined `width`/`height` and the original `source_width`/`source_height`.
+    #[serde(default)]
+    #[schemars(range(min = 64, max = 16_384))]
+    pub max_width: Option<u32>,
+    /// When true, include the run's frame, GPU, navigation, and environment performance telemetry
+    /// in the report. Default false: telemetry is large and irrelevant to genomic interpretation.
+    #[serde(default)]
+    pub include_telemetry: bool,
+    /// When true (the default), wait until all pending queries have settled before capturing, so it
+    /// reflects the final rendered state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2679,8 +3229,22 @@ pub struct CaptureArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CaptureWindowArgs {
+    /// Maximum width in pixels of the inlined PNG, 64 to 16384 (default 1600). A wider capture is
+    /// downscaled with its aspect ratio preserved; a narrower one is never enlarged. The result
+    /// reports both the inlined `width`/`height` and the original `source_width`/`source_height`.
+    #[serde(default)]
+    #[schemars(range(min = 64, max = 16_384))]
+    pub max_width: Option<u32>,
+    /// When true, include the run's frame, GPU, navigation, and environment performance telemetry
+    /// in the report. Default false: telemetry is large and irrelevant to genomic interpretation.
+    #[serde(default)]
+    pub include_telemetry: bool,
+    /// When true (the default), wait until all pending queries have settled before capturing, so it
+    /// reflects the final rendered state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2707,10 +3271,25 @@ impl ToolSnapshotScope {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExportArgs {
+    /// Destination file path relative to the control root, e.g. `exports/reads.tsv`. Absolute
+    /// paths, `..` components, and symbolic links are rejected.
     pub path: String,
+    /// Which evidence to export for the active panel's current interval. RGV's tabular exports
+    /// state their convention in a `# coordinates` header line (one-based `start`, one-based
+    /// inclusive `end`).
     pub kind: ToolExportKind,
+    /// When false (the default), read names in the inlined `inline_text` are replaced by
+    /// export-local pseudonyms (`read_1`, `read_2`, ...; segments of one template share a
+    /// pseudonym) and selected-evidence read identity is redacted. Set true to inline the original
+    /// read names. The file written under the control root always contains the original names.
+    #[serde(default)]
+    pub include_read_names: bool,
+    /// When true (the default), wait until all pending queries have settled before exporting, so it
+    /// reflects the final rendered state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true; a timeout does not roll back the operation.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2752,17 +3331,29 @@ impl ToolExportKind {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SaveArgs {
+    /// Destination project file path relative to the control root, e.g. `sessions/review.rgv.json`.
+    /// Absolute paths, `..` components, and symbolic links are rejected.
     pub path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct OpenWorkspaceArgs {
+    /// Project file path relative to the control root. Must be an existing regular file; absolute
+    /// paths, `..` components, and symbolic links are rejected.
     pub path: String,
+    /// Must be true: opening a project replaces the entire visible workspace.
     pub confirm_replace: bool,
+    /// What to do if the current workspace has unsaved changes: `reject` (default) fails with
+    /// `unsaved_changes`, `save_then_open` saves first, `discard` drops them.
     #[serde(default)]
     pub unsaved_changes: ToolUnsavedChangesPolicy,
+    /// When true (the default), wait after the operation until every query it triggered has
+    /// settled, so the returned report describes the final state. Set false only to observe
+    /// intermediate state.
     #[serde(default = "default_true")]
     pub wait_until_settled: bool,
+    /// Timeout in milliseconds, 100 to 600000 (default 30000), for opening the project and, when
+    /// `wait_until_settled` is true, for the settlement wait that follows.
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
@@ -2788,10 +3379,20 @@ impl ToolUnsavedChangesPolicy {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteBatchArgs {
+    /// One to 100 RGV automation command objects, executed in order; each has a `command`
+    /// discriminator (e.g. `{"command": "goto", "loci": ["chr1:101-200"]}`). Locus strings are
+    /// one-based inclusive; numeric `position`/`start`/`end` fields are zero-based, half-open.
+    /// `exit` is always rejected.
     #[schemars(length(min = 1, max = 100))]
     pub commands: Vec<Value>,
+    /// Must be true for a batch containing `new_workspace`, which discards the visible workspace.
+    /// Default false.
     #[serde(default)]
     pub allow_destructive: bool,
+    /// When true, include the run's frame, GPU, navigation, and environment performance telemetry
+    /// in the report. Default false: telemetry is large and irrelevant to genomic interpretation.
+    #[serde(default)]
+    pub include_telemetry: bool,
 }
 
 #[cfg(test)]
@@ -2842,6 +3443,585 @@ mod tests {
         header.extend_from_slice(&480_u32.to_be_bytes());
         assert_eq!(png_dimensions(&header), Some((640, 480)));
         assert_eq!(png_dimensions(b"not a png"), None);
+    }
+
+    fn failed_report(code: &str, message: &str) -> AutomationRunReport {
+        serde_json::from_value(json!({
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "succeeded": false,
+            "results": [
+                {"command_index": 0, "command": "load_track", "status": "failed",
+                 "error_code": code, "message": message},
+                {"command_index": 1, "command": "wait_until_settled", "status": "skipped",
+                 "message": "Skipped after an earlier failure"}
+            ],
+            "telemetry": {"run_elapsed_ms": 12.5, "navigation": [{"panel_id": 1}]}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn viewer_failure_diagnostics_pass_through_with_paths_redacted() {
+        let report = failed_report(
+            "resource_not_found",
+            "track source /Users/alice/cohort/NA12878.bam does not exist or is not a file",
+        );
+        let (code, message) = report_failure_parts(&report);
+        assert_eq!(code, "resource_not_found");
+        assert_eq!(
+            message,
+            "RGV command load_track failed: track source [path]/NA12878.bam does not exist or is not a file"
+        );
+        let failure = report_failure(&report);
+        assert_eq!(failure.is_error, Some(true));
+        let structured = failure.structured_content.unwrap();
+        assert_eq!(structured["error"]["code"], "resource_not_found");
+        assert_eq!(structured["error"]["message"], message.as_str());
+        assert_eq!(
+            structured["report"]["results"][0]["message"],
+            "track source [path]/NA12878.bam does not exist or is not a file"
+        );
+        assert_eq!(
+            structured["report"]["results"][1]["message"],
+            "Skipped after an earlier failure"
+        );
+        assert!(!structured.to_string().contains("alice"));
+        assert!(!structured.to_string().contains("Command failed"));
+    }
+
+    #[test]
+    fn viewer_failure_without_a_code_or_message_keeps_a_stable_fallback() {
+        let mut report = failed_report("timeout", "");
+        report.results[0].error_code = None;
+        assert_eq!(
+            report_failure_parts(&report),
+            (
+                "viewer_failed".to_owned(),
+                "RGV command load_track failed".to_owned()
+            )
+        );
+        report.results.clear();
+        assert_eq!(
+            report_failure_parts(&report),
+            (
+                "viewer_failed".to_owned(),
+                "RGV did not complete the requested operation".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn control_rejections_pass_the_viewer_message_through_without_secrets() {
+        let (code, message) = control_failure_parts(&ControlClientError::Http {
+            status: 400,
+            code: "invalid_batch".to_owned(),
+            message: "automation path /srv/other/reads.bam is outside the selected local-control root; Authorization: Bearer 0123456789abcdef0123456789abcdef".to_owned(),
+        });
+        assert_eq!(code, "invalid_batch");
+        assert!(message.starts_with("RGV local control rejected the request (invalid_batch): "));
+        assert!(message.contains("[path]/reads.bam is outside the selected local-control root"));
+        assert!(!message.contains("/srv/other"));
+        assert!(!message.contains("0123456789abcdef"));
+
+        let invalid = AutomationBatch {
+            schema_version: BATCH_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::WaitUntilSettled { timeout_millis: 1 }],
+        };
+        let (code, message) = control_failure_parts(&ControlClientError::InvalidBatch(
+            invalid.validate().unwrap_err(),
+        ));
+        assert_eq!(code, "invalid_batch");
+        assert!(message.contains("timeout_millis must be between 100 and 600000"));
+
+        let (code, message) = control_failure_parts(&ControlClientError::ResponseTooLarge);
+        assert_eq!(code, "response_too_large");
+        assert!(!message.is_empty());
+    }
+
+    #[test]
+    fn report_telemetry_is_opt_in_and_named_data_can_be_omitted() {
+        let report = failed_report("timeout", "settlement timed out");
+        let default = public_report(&report, ReportOptions::default());
+        assert!(default.get("telemetry").is_none());
+        assert_eq!(default["results"][0]["message"], "settlement timed out");
+        let with_telemetry = public_report(
+            &report,
+            ReportOptions {
+                include_telemetry: true,
+                omit_data_at: Some(1),
+            },
+        );
+        assert_eq!(with_telemetry["telemetry"]["run_elapsed_ms"], 12.5);
+        assert_eq!(with_telemetry["results"][1]["data"], OMITTED_DATA_MARKER);
+        assert_ne!(with_telemetry["results"][0]["data"], OMITTED_DATA_MARKER);
+    }
+
+    #[test]
+    fn viewer_schema_versions_outside_the_supported_range_are_rejected_clearly() {
+        let minimum = MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION;
+        let maximum = MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION;
+        for version in minimum..=maximum {
+            assert_eq!(viewer_schema_compatibility(version, None), Ok(()));
+            assert_eq!(viewer_schema_compatibility(version, Some(version)), Ok(()));
+        }
+        let too_old = viewer_schema_compatibility(minimum - 1, Some(minimum - 1)).unwrap_err();
+        assert!(too_old.contains(&format!("automation schema {}", minimum - 1)));
+        assert!(too_old.contains(&format!("{minimum} through {maximum}")));
+        let too_new = viewer_schema_compatibility(maximum + 1, None).unwrap_err();
+        assert!(too_new.contains(&format!("automation schema {}", maximum + 1)));
+        // The control schema is checked independently of the automation schema.
+        let control = viewer_schema_compatibility(maximum, Some(maximum + 1)).unwrap_err();
+        assert!(control.contains(&format!("automation schema {}", maximum + 1)));
+        assert!(viewer_schema_compatibility(0, None).is_err());
+        // Every supported viewer accepts the version stamped on generated batches.
+        assert!(
+            (rgv_core::MINIMUM_AUTOMATION_SCHEMA_VERSION..=minimum).contains(&BATCH_SCHEMA_VERSION)
+        );
+    }
+
+    fn workspace_fixture() -> Value {
+        json!({
+            "application_version": "0.1.0",
+            "schema_version": AUTOMATION_SCHEMA_VERSION,
+            "application_instance_id": "instance-a",
+            "workspace_revision": 7,
+            "genome": {
+                "name": "fixture",
+                "reference_configured": false,
+                "reference_ready": false
+            },
+            "settled": true,
+            "active_panel_id": 1,
+            "panels": [{
+                "id": 1, "locus": "chr1:101-200", "contig": "chr1", "start": 100, "end": 200,
+                "detail_level": "Bases", "vertical_scroll_points": 0.0
+            }],
+            "tracks": [{
+                "id": 3, "name": "tumour", "kind": "Alignment", "visible": true,
+                "collapsed": false, "height": 120.0, "lifecycle": "failed",
+                "failure": "could not open /Users/alice/tumour.bam.bai"
+            }],
+            "status": ["Could not start export: /Users/alice/out.tsv is read-only"],
+            "alignment_scene_budget_bytes": 4096,
+            "alignment_scene_diagnostics": {"camera_updates": 9, "scene_publications": 2},
+            "truncated": false
+        })
+    }
+
+    #[test]
+    fn workspace_telemetry_is_opt_in_and_free_text_is_redacted() {
+        let workspace: AutomationWorkspaceSnapshot =
+            serde_json::from_value(workspace_fixture()).unwrap();
+        let default = public_workspace(&workspace, false);
+        let telemetry_fields = |value: &Value| {
+            value
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|field| field.starts_with(WORKSPACE_TELEMETRY_PREFIX))
+                .count()
+        };
+        assert_eq!(telemetry_fields(&default), 0);
+        assert_eq!(default["panels"][0]["locus"], "chr1:101-200");
+        assert_eq!(default["workspace_revision"], 7);
+        assert_eq!(
+            default["tracks"][0]["failure"],
+            "could not open [path]/tumour.bam.bai"
+        );
+        assert_eq!(
+            default["status"][0],
+            "Could not start export: [path]/out.tsv is read-only"
+        );
+        let with_telemetry = public_workspace(&workspace, true);
+        assert!(telemetry_fields(&with_telemetry) >= 2);
+        assert_eq!(with_telemetry["alignment_scene_budget_bytes"], 4096);
+        assert_eq!(
+            with_telemetry["alignment_scene_diagnostics"]["camera_updates"],
+            9
+        );
+        assert!(!with_telemetry.to_string().contains("alice"));
+    }
+
+    /// A scripted stand-in for the viewer's control service. `respond` receives the request
+    /// path and parsed JSON body and returns the HTTP status and JSON response.
+    fn fake_viewer(
+        requests: usize,
+        mut respond: impl FnMut(&str, &Value) -> (u16, Value) + Send + 'static,
+    ) -> (std::net::SocketAddr, thread::JoinHandle<()>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let worker = thread::spawn(move || {
+            for _ in 0..requests {
+                let mut request = server.recv().unwrap();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let body = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let (status, response) = respond(request.url(), &body);
+                request
+                    .respond(
+                        Response::from_string(response.to_string())
+                            .with_status_code(status)
+                            .with_header(
+                                Header::from_bytes("Content-Type", "application/json").unwrap(),
+                            ),
+                    )
+                    .unwrap();
+            }
+        });
+        (address, worker)
+    }
+
+    fn test_server(address: std::net::SocketAddr, root: &Path) -> RgvMcpServer {
+        RgvMcpServer {
+            control: ControlClient::new(
+                reqwest::Url::parse(&format!("http://{address}")).unwrap(),
+                "protocol-test-secret-0123456789".to_owned(),
+            )
+            .unwrap(),
+            artifacts: ArtifactStore::new(root, Path::new("mcp-artifacts")).unwrap(),
+        }
+    }
+
+    fn temporary_artifact_count(root: &Path) -> usize {
+        std::fs::read_dir(root.join("mcp-artifacts"))
+            .unwrap()
+            .count()
+    }
+
+    fn test_png(width: u32, height: u32) -> Vec<u8> {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(width, height, image::Rgba([20, 40, 60, 255]))
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        encoded.into_inner()
+    }
+
+    /// Answers a capture batch the way the viewer does: writes the PNG to the requested path
+    /// and reports its dimensions followed by the workspace.
+    fn capture_response(body: &Value, reported_width: u32) -> (u16, Value) {
+        let commands = body["commands"].as_array().unwrap();
+        let mut results = Vec::new();
+        for (index, command) in commands.iter().enumerate() {
+            let name = command["command"].as_str().unwrap();
+            let data = match name {
+                "snapshot" => {
+                    std::fs::write(command["path"].as_str().unwrap(), test_png(400, 100)).unwrap();
+                    json!({"width": reported_width, "height": 100, "truncated": false})
+                }
+                "describe_workspace" => workspace_fixture(),
+                _ => Value::Null,
+            };
+            results.push(json!({
+                "command_index": index, "command": name, "status": "succeeded",
+                "message": "ok", "data": data
+            }));
+        }
+        (
+            200,
+            json!({
+                "schema_version": AUTOMATION_SCHEMA_VERSION,
+                "succeeded": true,
+                "results": results,
+                "telemetry": {"run_elapsed_ms": 5.0, "navigation": [{"panel_id": 1}]}
+            }),
+        )
+    }
+
+    fn status_response(schema_version: u32, instance: &str) -> (u16, Value) {
+        (
+            200,
+            json!({
+                "schema_version": schema_version,
+                "control_schema_version": schema_version,
+                "application_instance_id": instance,
+                "process_id": 4242,
+                "service": "rgv-local-control",
+                "authentication": "bearer"
+            }),
+        )
+    }
+
+    fn capture_args(max_width: Option<u32>, include_telemetry: bool) -> CaptureArgs {
+        CaptureArgs {
+            scope: ToolSnapshotScope::VisibleWorkspace,
+            max_width,
+            include_telemetry,
+            wait_until_settled: true,
+            timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_is_downscaled_deduplicated_and_its_temporary_file_removed() {
+        let (address, worker) = fake_viewer(2, |url, body| {
+            assert_eq!(url, "/v1/batches");
+            assert_eq!(body["schema_version"], BATCH_SCHEMA_VERSION);
+            capture_response(body, 400)
+        });
+        let root = tempfile::tempdir().unwrap();
+        let server = test_server(address, root.path());
+
+        let result = server
+            .capture_view(Parameters(capture_args(Some(100), false)))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.clone().unwrap();
+        assert_eq!(structured["width"], 100);
+        assert_eq!(structured["height"], 25);
+        assert_eq!(structured["source_width"], 400);
+        assert_eq!(structured["source_height"], 100);
+        assert_eq!(structured["downscaled"], true);
+        let image = serde_json::to_value(&result.content[1]).unwrap();
+        let png = BASE64_STANDARD
+            .decode(image["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(structured["bytes"], png.len());
+        assert_eq!(png_dimensions(&png), Some((100, 25)));
+        // The workspace appears once (panels/loci), not again inside the report, and
+        // telemetry is absent unless requested.
+        assert_eq!(structured["loci"][0], "chr1:101-200");
+        assert_eq!(structured["panels"][0]["id"], 1);
+        assert_eq!(
+            structured["report"]["results"][2]["command"],
+            "describe_workspace"
+        );
+        assert_eq!(
+            structured["report"]["results"][2]["data"],
+            OMITTED_DATA_MARKER
+        );
+        assert_eq!(structured["report"]["results"][1]["data"]["width"], 400);
+        assert!(structured["report"].get("telemetry").is_none());
+        assert_eq!(structured.to_string().matches("\"tracks\"").count(), 0);
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+
+        // The default bound never enlarges a narrower capture, and telemetry is opt-in.
+        let result = server
+            .capture_view(Parameters(capture_args(None, true)))
+            .await;
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["width"], 400);
+        assert_eq!(structured["downscaled"], false);
+        assert_eq!(structured["report"]["telemetry"]["run_elapsed_ms"], 5.0);
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_rejected_capture_discards_its_temporary_file() {
+        // 1: metadata disagrees with the PNG. 2-3: window capture bound to another process.
+        // 4-5: window capture from a viewer on an unsupported schema. 6: the viewer fails.
+        let mut call = 0;
+        let (address, worker) = fake_viewer(6, move |url, body| {
+            call += 1;
+            match (call, url) {
+                (1, "/v1/batches") => capture_response(body, 999),
+                (2 | 4, "/v1/batches") => capture_response(body, 400),
+                (3, "/v1/status") => status_response(AUTOMATION_SCHEMA_VERSION, "instance-b"),
+                (5, "/v1/status") => status_response(AUTOMATION_SCHEMA_VERSION + 1, "instance-a"),
+                (6, "/v1/batches") => {
+                    // The viewer may have written a partial file before failing.
+                    let path = body["commands"][0]["path"].as_str().unwrap();
+                    std::fs::write(path, b"partial").unwrap();
+                    (
+                        200,
+                        json!({
+                            "schema_version": AUTOMATION_SCHEMA_VERSION,
+                            "succeeded": false,
+                            "results": [{
+                                "command_index": 0, "command": "snapshot", "status": "failed",
+                                "error_code": "io",
+                                "message": format!("could not write {path}: disk full")
+                            }]
+                        }),
+                    )
+                }
+                other => panic!("unexpected request {other:?}"),
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let server = test_server(address, root.path());
+        let window_args = || CaptureWindowArgs {
+            max_width: None,
+            include_telemetry: false,
+            wait_until_settled: false,
+            timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
+        };
+        let code = |result: &CallToolResult| {
+            assert_eq!(result.is_error, Some(true));
+            result.structured_content.as_ref().unwrap()["error"]["code"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        let mismatch = server
+            .capture_view(Parameters(capture_args(None, false)))
+            .await;
+        assert_eq!(code(&mismatch), "invalid_response");
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+
+        let identity = server.capture_window(Parameters(window_args())).await;
+        assert_eq!(code(&identity), "application_identity_mismatch");
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+
+        let version = server.capture_window(Parameters(window_args())).await;
+        assert_eq!(code(&version), "unsupported_version");
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+
+        let mut args = capture_args(None, false);
+        args.wait_until_settled = false;
+        let failed = server.capture_view(Parameters(args)).await;
+        assert_eq!(code(&failed), "io");
+        let message = failed.structured_content.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            message.starts_with("RGV command snapshot failed: could not write [path]/rgv-mcp-")
+        );
+        assert!(message.ends_with(": disk full"));
+        assert!(!message.contains(&root.path().display().to_string()));
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_rejects_an_unsupported_viewer_schema_and_reports_the_range() {
+        let mut call = 0;
+        let (address, worker) = fake_viewer(3, move |url, _| {
+            assert_eq!(url, "/v1/status");
+            call += 1;
+            match call {
+                1 => status_response(AUTOMATION_SCHEMA_VERSION, "instance-a"),
+                2 => status_response(MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION - 1, "instance-a"),
+                _ => (
+                    401,
+                    json!({"error": {"code": "unauthorized", "message": "Bearer secret was rejected for /Users/alice/rgv.secret"}}),
+                ),
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let server = test_server(address, root.path());
+
+        let compatible = server.status().await;
+        assert_eq!(compatible.is_error, Some(false));
+        let structured = compatible.structured_content.unwrap();
+        assert_eq!(
+            structured["supported_schema_versions"]["minimum"],
+            MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION
+        );
+        assert_eq!(
+            structured["supported_schema_versions"]["maximum"],
+            MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION
+        );
+
+        let unsupported = server.status().await;
+        assert_eq!(unsupported.is_error, Some(true));
+        let error = &unsupported.structured_content.unwrap()["error"];
+        assert_eq!(error["code"], "unsupported_version");
+        assert!(error["message"].as_str().unwrap().contains(&format!(
+            "automation schema {}",
+            MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION - 1
+        )));
+
+        let rejected = server.status().await;
+        let error = &rejected.structured_content.unwrap()["error"];
+        assert_eq!(error["code"], "unauthorized");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("was rejected for [path]/rgv.secret"));
+        assert!(!message.contains("alice"));
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_inlines_pseudonymized_read_names_unless_explicitly_requested() {
+        const EXPORT: &str = "# RGV 0.1.0 alignment (filtered view) export v1\ntrack_id\ttrack_name\tcontig\tstart\tend\tread_name\tflags\n3\ttumour\tchr1\t101\t250\tPATIENT7_READ_A\t0x0063\n3\ttumour\tchr1\t140\t290\tPATIENT7_READ_B\t0x0093\n3\ttumour\tchr1\t400\t550\tPATIENT7_READ_A\t0x0800\n";
+        let (address, worker) = fake_viewer(2, |url, body| {
+            assert_eq!(url, "/v1/batches");
+            let command = &body["commands"][0];
+            assert_eq!(command["command"], "export");
+            std::fs::write(command["path"].as_str().unwrap(), EXPORT).unwrap();
+            (
+                200,
+                json!({
+                    "schema_version": AUTOMATION_SCHEMA_VERSION,
+                    "succeeded": true,
+                    "results": [{
+                        "command_index": 0, "command": "export", "status": "succeeded",
+                        "message": "Exported alignments", "data": {"records": 3}
+                    }]
+                }),
+            )
+        });
+        let root = tempfile::tempdir().unwrap();
+        let server = test_server(address, root.path());
+        let args = |include_read_names| ExportArgs {
+            path: "exports/reads.tsv".to_owned(),
+            kind: ToolExportKind::Alignments,
+            include_read_names,
+            wait_until_settled: false,
+            timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
+        };
+
+        let default = server.export(Parameters(args(false))).await;
+        assert_eq!(default.is_error, Some(false));
+        let structured = default.structured_content.unwrap();
+        let inline = structured["inline_text"].as_str().unwrap();
+        assert!(!structured.to_string().contains("PATIENT7"));
+        assert_eq!(inline.matches("\tread_1\t").count(), 2);
+        assert_eq!(inline.matches("\tread_2\t").count(), 1);
+        assert_eq!(structured["inline_read_names"], "pseudonymized");
+        assert_eq!(structured["inline_distinct_read_names_replaced"], 2);
+        assert_eq!(structured["bytes"], EXPORT.len());
+        // The durable artifact under the control root is the unmodified export.
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("exports/reads.tsv")).unwrap(),
+            EXPORT
+        );
+
+        let opted_in = server.export(Parameters(args(true))).await;
+        let structured = opted_in.structured_content.unwrap();
+        assert_eq!(structured["inline_text"], EXPORT);
+        assert_eq!(structured["inline_read_names"], "included");
+        worker.join().unwrap();
+    }
+
+    /// Collects `tool.path.to.property` for every schema property lacking a description.
+    /// Internally tagged enum discriminators (single-constant strings) are exempt.
+    fn undescribed_properties(schema: &Value, location: &str, missing: &mut Vec<String>) {
+        match schema {
+            Value::Object(object) => {
+                if let Some(Value::Object(properties)) = object.get("properties") {
+                    for (name, property) in properties {
+                        let discriminator = property.get("const").is_some()
+                            || property
+                                .get("enum")
+                                .and_then(Value::as_array)
+                                .is_some_and(|values| values.len() == 1);
+                        let described = property
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .is_some_and(|description| description.len() >= 12);
+                        // `ToolAlignmentAuxValue` is adjacently tagged over newtype variants;
+                        // its operand is described on each variant rather than on `value`.
+                        let variant_described = location.contains("ToolAlignmentAuxValue")
+                            && object.get("description").is_some();
+                        if !discriminator && !described && !variant_described {
+                            missing.push(format!("{location}.{name}"));
+                        }
+                    }
+                }
+                for (key, value) in object {
+                    undescribed_properties(value, &format!("{location}/{key}"), missing);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    undescribed_properties(value, location, missing);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2964,6 +4144,34 @@ mod tests {
         );
         assert!(tools.iter().all(|tool| tool.annotations.is_some()));
         assert!(tools.iter().all(|tool| tool.description.is_some()));
+        let mut undescribed = Vec::new();
+        for tool in &tools {
+            let schema = serde_json::to_value(tool.input_schema.as_ref()).unwrap();
+            undescribed_properties(&schema, &tool.name, &mut undescribed);
+        }
+        assert!(
+            undescribed.is_empty(),
+            "tool arguments without a schema description: {undescribed:#?}"
+        );
+        let schema_of = |name: &str| {
+            serde_json::to_string(
+                tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .unwrap()
+                    .input_schema
+                    .as_ref(),
+            )
+            .unwrap()
+        };
+        assert!(schema_of("rgv_navigate").contains("one-based and inclusive"));
+        assert!(schema_of("rgv_change_viewport").contains("Zero-based exclusive end"));
+        assert!(schema_of("rgv_select").contains("Zero-based genomic position"));
+        assert!(schema_of("rgv_find_alignments").contains("half-open"));
+        assert!(schema_of("rgv_capture_view").contains("max_width"));
+        assert!(schema_of("rgv_capture_window").contains("include_telemetry"));
+        assert!(schema_of("rgv_export").contains("include_read_names"));
+        assert!(schema_of("rgv_get_workspace").contains("include_telemetry"));
         let configure_input_schema = tools
             .iter()
             .find(|tool| tool.name == "rgv_configure")

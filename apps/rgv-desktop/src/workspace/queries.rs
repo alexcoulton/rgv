@@ -1271,6 +1271,7 @@ impl Viewer {
         self.poll_session_save_tasks();
         self.poll_export_tasks();
         self.poll_workspace_list_import_tasks();
+        self.poll_genome_tasks();
         self.retry_pending_queries();
         self.update_navigation_readiness();
         if self.reveal_due_alignment_checking_notices(now)
@@ -1491,11 +1492,15 @@ impl Viewer {
                             }
                         }
                         let default_annotation_count = self.assembly.default_annotation_count;
-                        self.assembly = load_assembly(
+                        let (assembly, cytoband_failure) = load_assembly_reporting(
                             &self.assembly_name,
                             dictionary.clone(),
                             self.cytoband_path.as_deref(),
                         );
+                        self.assembly = assembly;
+                        if let Some(failure) = cytoband_failure {
+                            self.report_error(failure);
+                        }
                         self.assembly.default_annotation_count = default_annotation_count;
                     }
                     self.update_landmark_resolution_from_dictionary(&dictionary);
@@ -2720,11 +2725,15 @@ impl Viewer {
                 }
             }
             let default_annotation_count = self.assembly.default_annotation_count;
-            self.assembly = load_assembly(
+            let (assembly, cytoband_failure) = load_assembly_reporting(
                 &self.assembly_name,
                 dictionary.clone(),
                 self.cytoband_path.as_deref(),
             );
+            self.assembly = assembly;
+            if let Some(failure) = cytoband_failure {
+                self.report_error(failure);
+            }
             self.assembly.default_annotation_count = default_annotation_count;
             self.assembly.reference_contig_count = self
                 .reference_dictionary
@@ -2891,36 +2900,46 @@ impl Viewer {
                         panel
                             .track_snapshot_generations
                             .insert(track.id, request.generation().get());
-                        if let Some(existing) = panel
+                        // Selections index into the lane's result. Re-resolve them against
+                        // the refreshed result by record identity instead of clearing them.
+                        let position = panel
                             .track_snapshots
-                            .iter_mut()
-                            .find(|snapshot| snapshot.id == track.id)
-                        {
-                            *existing = track;
-                        } else {
-                            panel.track_snapshots.push(track);
-                        }
-                        panel.selected_feature = panel
-                            .selected_feature
-                            .filter(|selection| selection.track_id != track_id);
-                        panel.selected_variant = panel
-                            .selected_variant
-                            .filter(|selection| selection.track_id != track_id);
-                        panel.selected_gwas = panel
-                            .selected_gwas
-                            .filter(|selection| selection.track_id != track_id);
-                        panel.selected_quantitative = panel
-                            .selected_quantitative
-                            .filter(|selection| selection.track_id != track_id);
-                        panel.selected_copy_number = panel
-                            .selected_copy_number
-                            .filter(|selection| selection.track_id != track_id);
-                        panel.selected_mutation = panel
-                            .selected_mutation
-                            .filter(|selection| selection.track_id != track_id);
-                        panel.selected_interaction = panel
-                            .selected_interaction
-                            .filter(|selection| selection.track_id != track_id);
+                            .iter()
+                            .position(|snapshot| snapshot.id == track_id);
+                        let (previous, position) = match position {
+                            Some(position) => (
+                                Some(std::mem::replace(
+                                    &mut panel.track_snapshots[position],
+                                    track,
+                                )),
+                                position,
+                            ),
+                            None => {
+                                panel.track_snapshots.push(track);
+                                (None, panel.track_snapshots.len() - 1)
+                            }
+                        };
+                        let selections =
+                            crate::inspection::stable_selection::reresolve_auxiliary_selections(
+                                crate::inspection::stable_selection::AuxiliarySelections {
+                                    feature: panel.selected_feature,
+                                    variant: panel.selected_variant,
+                                    gwas: panel.selected_gwas,
+                                    quantitative: panel.selected_quantitative,
+                                    copy_number: panel.selected_copy_number,
+                                    mutation: panel.selected_mutation,
+                                    interaction: panel.selected_interaction,
+                                },
+                                previous.as_ref(),
+                                &panel.track_snapshots[position],
+                            );
+                        panel.selected_feature = selections.feature;
+                        panel.selected_variant = selections.variant;
+                        panel.selected_gwas = selections.gwas;
+                        panel.selected_quantitative = selections.quantitative;
+                        panel.selected_copy_number = selections.copy_number;
+                        panel.selected_mutation = selections.mutation;
+                        panel.selected_interaction = selections.interaction;
                         self.mark_display_dirty("explicit display invalidation");
                         if is_active {
                             self.rebuild_genomic_display();
@@ -2990,11 +3009,15 @@ impl Viewer {
                                 }
                             }
                             self.mark_display_dirty("explicit display invalidation");
+                            // Logged for every panel; only the active panel's failure also
+                            // takes the status line.
+                            self.log_track_error(track, &message);
                             if is_active {
                                 self.data_status = message;
                             }
                         }
                     } else {
+                        self.log_track_error(track, &message);
                         self.data_status = message;
                     }
                 }

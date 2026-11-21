@@ -1,8 +1,9 @@
 use super::{
-    Event, IgvImportReportBuilder, IgvSessionImport, Reader, SessionAlignmentTrack,
-    SessionDocument, SessionError, SessionLocus, TrackConfig, TrackId, TrackKind, TrackSource,
-    classify_genomic_source,
+    Event, IgvImportReportBuilder, IgvLocusResolution, IgvSessionImport, Reader,
+    SessionAlignmentTrack, SessionDocument, SessionError, SessionLocus, TrackConfig, TrackId,
+    TrackKind, TrackSource, classify_genomic_source,
 };
+use crate::{Locus, LocusRange};
 
 impl SessionDocument {
     pub fn import_igv(xml: &str) -> Result<Self, SessionError> {
@@ -54,10 +55,7 @@ impl SessionDocument {
                         "Session" | "Global" => {
                             for (key, value) in attributes {
                                 match key.as_str() {
-                                    "locus" => {
-                                        locus = Some(parse_igv_locus(&value)?);
-                                        report.imported("Session.locus -> active RGV locus");
-                                    }
+                                    "locus" => locus = Some(value),
                                     "genome" => genome = Some(value),
                                     "version" => report.imported(
                                         "Session.version accepted as IGV compatibility metadata",
@@ -163,8 +161,9 @@ impl SessionDocument {
                 Err(error) => return Err(SessionError::Igv(error.to_string())),
             }
         }
-        let locus =
-            locus.ok_or_else(|| SessionError::Igv("IGV session has no locus".to_owned()))?;
+        // A locus RGV cannot place exactly must not fail the whole import:
+        // the sources and track state are still worth opening.
+        let (locus, locus_resolution) = import_igv_locus(locus.as_deref(), &mut report);
         let mut document = Self::new(locus);
         if let Some(genome) = genome {
             if infer_track_kind(&genome) == TrackKind::Reference {
@@ -181,6 +180,13 @@ impl SessionDocument {
         let resource_count = resources.len();
         for resource in resources {
             let source = source_from_string(resource.path.clone());
+            if let TrackSource::Remote { url } = &source
+                && !(url.starts_with("http://") || url.starts_with("https://"))
+            {
+                report.approximated(
+                    "Resource.path uses a remote scheme RGV cannot open yet; it was kept as a remote source instead of a local path",
+                );
+            }
             let kind = infer_track_kind(&resource.path);
             let default_name = resource
                 .path
@@ -286,6 +292,7 @@ impl SessionDocument {
         Ok(IgvSessionImport {
             document,
             report: report.finish(),
+            locus_resolution,
         })
     }
 }
@@ -329,35 +336,118 @@ fn apply_igv_common_track_state(
     }
 }
 
-fn parse_igv_locus(raw: &str) -> Result<SessionLocus, SessionError> {
-    let (contig, range) = raw
-        .split_once(':')
-        .ok_or_else(|| SessionError::Igv(format!("invalid IGV locus {raw}")))?;
-    let range = range.replace(',', "");
-    let (start, end) = range
-        .split_once('-')
-        .ok_or_else(|| SessionError::Igv(format!("invalid IGV locus {raw}")))?;
-    let start = start
-        .parse::<u64>()
-        .map_err(|_| SessionError::Igv(format!("invalid IGV locus {raw}")))?;
-    let end = end
-        .parse::<u64>()
-        .map_err(|_| SessionError::Igv(format!("invalid IGV locus {raw}")))?;
-    if start == 0 || start > end {
-        return Err(SessionError::Igv(format!("invalid IGV locus {raw}")));
+/// Bases shown on each side of a single-position IGV locus.
+const IGV_POSITION_FLANK: u64 = 20;
+
+/// Translates `Session.locus` into a session locus plus an account of how
+/// faithful that locus is. Never fails: an unplaceable locus yields a
+/// placeholder and a report notice.
+fn import_igv_locus(
+    raw: Option<&str>,
+    report: &mut IgvImportReportBuilder,
+) -> (SessionLocus, IgvLocusResolution) {
+    let unresolved = |requested: &str| {
+        (
+            SessionLocus {
+                contig: "All".to_owned(),
+                start: 0,
+                end: 1,
+            },
+            IgvLocusResolution::Unresolved {
+                requested: requested.to_owned(),
+            },
+        )
+    };
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        report.approximated("IGV session has no locus; RGV opens its default locus");
+        return unresolved("");
+    };
+    // IGV separates the loci of a multi-locus view with whitespace. A single
+    // `chr1 100 200` is one locus and is recognised by the canonical parser.
+    let tokens = raw.split_whitespace().collect::<Vec<_>>();
+    let coordinate_form = matches!(tokens.len(), 2 | 3)
+        && tokens[1..]
+            .iter()
+            .all(|token| crate::locus::is_coordinate(token));
+    let several = tokens.len() > 1 && !coordinate_form;
+    let candidate = Locus::parse(if several { tokens[0] } else { raw });
+    let Ok(locus) = candidate else {
+        report.ignored("Session.locus was not a valid locus; RGV opens its default locus");
+        return unresolved(raw);
+    };
+    if several {
+        report.approximated(
+            "Session.locus listed several loci; only the first was imported into the active panel",
+        );
     }
-    Ok(SessionLocus {
-        contig: contig.to_owned(),
-        start: start - 1,
-        end,
-    })
+    match locus.range {
+        LocusRange::Interval { start, end } => {
+            report.imported("Session.locus -> active RGV locus");
+            (
+                SessionLocus {
+                    contig: locus.contig,
+                    start,
+                    end,
+                },
+                IgvLocusResolution::Interval,
+            )
+        }
+        LocusRange::Position(position) => {
+            report.imported("Session.locus position -> active RGV locus window");
+            (
+                SessionLocus {
+                    contig: locus.contig,
+                    start: position.saturating_sub(IGV_POSITION_FLANK),
+                    end: position
+                        .saturating_add(1)
+                        .saturating_add(IGV_POSITION_FLANK),
+                },
+                IgvLocusResolution::Interval,
+            )
+        }
+        LocusRange::WholeContig if locus.contig.eq_ignore_ascii_case("all") => {
+            report.approximated(
+                "Session.locus was IGV's whole-genome view; RGV opens its default locus",
+            );
+            unresolved(raw)
+        }
+        LocusRange::WholeContig => {
+            report.approximated(
+                "Session.locus named a whole contig or a feature without coordinates; RGV resolves it after the reference is known",
+            );
+            (
+                SessionLocus {
+                    contig: locus.contig.clone(),
+                    start: 0,
+                    end: 1,
+                },
+                IgvLocusResolution::Named { name: locus.contig },
+            )
+        }
+    }
 }
 
+/// `http(s)` and the cloud/FTP schemes are remote; `file://` URLs become
+/// local paths. Anything else, including Windows drive paths, is local.
 fn source_from_string(value: String) -> TrackSource {
-    if value.starts_with("http://") || value.starts_with("https://") {
-        TrackSource::Remote { url: value }
-    } else {
-        TrackSource::Local { path: value }
+    let Some((scheme, _)) = value.split_once("://") else {
+        return TrackSource::Local { path: value };
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "file" => {
+            let path = url::Url::parse(&value)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+                .map_or_else(
+                    || value["file://".len()..].to_owned(),
+                    |path| path.display().to_string(),
+                );
+            TrackSource::Local { path }
+        }
+        "http" | "https" | "s3" | "gs" | "ftp" | "ftps" | "az" | "abfs" | "abfss" | "drs" => {
+            TrackSource::Remote { url: value }
+        }
+        _ => TrackSource::Local { path: value },
     }
 }
 

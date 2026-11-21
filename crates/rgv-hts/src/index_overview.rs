@@ -35,18 +35,17 @@ impl AlignmentIndexOverview {
                 index_density_bins(index, reference_sequence_id, contig.length())
             })
             .collect();
+        // One pass over the index: `nth` per contig would walk the reference list again for
+        // every contig, which is quadratic on assemblies with many scaffolds.
+        let mut references = index.reference_sequences();
         let mapped_record_counts = dictionary
             .iter()
-            .enumerate()
-            .map(|(reference_sequence_id, _)| {
-                index
-                    .reference_sequences()
-                    .nth(reference_sequence_id)
-                    .and_then(|reference| {
-                        reference
-                            .metadata()
-                            .map(|metadata| metadata.mapped_record_count())
-                    })
+            .map(|_| {
+                references.next().and_then(|reference| {
+                    reference
+                        .metadata()
+                        .map(|metadata| metadata.mapped_record_count())
+                })
             })
             .collect();
         Self {
@@ -141,10 +140,24 @@ fn index_density_bins(
     if contig_length == 0 {
         return densities;
     }
+    // An index answers a region query from its smallest-bin windows alone (`2^min_shift`
+    // bases): both the overlapping bins and the linear-index bound depend only on the first
+    // and last window touched. Overview bins of a short contig mostly share windows, so the
+    // previous answer is reused instead of asking the same question up to 256 times.
+    let window_shift = u32::from(index.min_shift());
+    let mut previous: Option<((u64, u64), u64)> = None;
     for (bin_index, density) in densities.iter_mut().enumerate() {
         let start = scaled_position(bin_index, contig_length);
         let end = scaled_position(bin_index + 1, contig_length);
         if end <= start {
+            continue;
+        }
+        let windows = (
+            start.checked_shr(window_shift).unwrap_or(0),
+            (end - 1).checked_shr(window_shift).unwrap_or(0),
+        );
+        if let Some((_, known)) = previous.filter(|(known, _)| *known == windows) {
+            *density = known;
             continue;
         }
         let Some(start) = usize::try_from(start.saturating_add(1))
@@ -165,6 +178,7 @@ fn index_density_bins(
         *density = chunks.iter().fold(0_u64, |total, chunk| {
             total.saturating_add(chunk_compressed_weight(*chunk))
         });
+        previous = Some((windows, *density));
     }
     densities
 }
@@ -213,6 +227,61 @@ mod tests {
             overview
                 .contig_mapped_record_count(ContigId::new(1))
                 .is_some()
+        );
+    }
+
+    /// The straightforward definition: one index query per overview bin.
+    fn density_bins_by_query(
+        index: &dyn BinningIndex,
+        reference_sequence_id: usize,
+        contig_length: u64,
+    ) -> Vec<u64> {
+        (0..ALIGNMENT_INDEX_OVERVIEW_BINS)
+            .map(|bin_index| {
+                let start = scaled_position(bin_index, contig_length);
+                let end = scaled_position(bin_index + 1, contig_length);
+                if end <= start {
+                    return 0;
+                }
+                let start = Position::try_from(usize::try_from(start + 1).unwrap()).unwrap();
+                let end = Position::try_from(usize::try_from(end).unwrap()).unwrap();
+                index
+                    .query(reference_sequence_id, (start..=end).into())
+                    .unwrap()
+                    .iter()
+                    .map(|chunk| chunk_compressed_weight(*chunk))
+                    .sum()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn window_reuse_gives_the_same_density_as_one_query_per_bin() {
+        let index_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam.bai");
+        if !index_path.exists() {
+            return;
+        }
+        let index = noodles_bam::bai::fs::read(index_path).unwrap();
+        let references = BinningIndex::reference_sequences(&index).count();
+        assert!(references > 0);
+        let mut populated = 0;
+        for reference_sequence_id in 0..references {
+            // Short contigs share windows between bins; long ones do not. Lengths that are not
+            // multiples of the window size exercise the boundary arithmetic.
+            for contig_length in [1, 255, 16_384, 100_003, 2_000_000, 250_000_000] {
+                let expected = density_bins_by_query(&index, reference_sequence_id, contig_length);
+                assert_eq!(
+                    index_density_bins(&index, reference_sequence_id, contig_length),
+                    expected,
+                    "reference {reference_sequence_id}, length {contig_length}"
+                );
+                populated += usize::from(expected.iter().any(|density| *density > 0));
+            }
+        }
+        assert!(
+            populated > 0,
+            "the fixture index should describe some alignments"
         );
     }
 

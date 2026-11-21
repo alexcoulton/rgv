@@ -16,6 +16,26 @@ members = [
     "crates/rgv-render",
     "tools/interaction-stress",
 ]
+# `benchmarks/alignment-io` is the only member that pulls the benchmark-only
+# backends (noodles 0.110 and rsomics-bamio). It stays a member so the lockfile
+# is unified, but a plain `cargo build`/`cargo test` at the root skips it. Use
+# `--workspace` or `-p rgv-alignment-bench` to include it.
+default-members = [
+    "apps/rgv-desktop",
+    "apps/rgv-mcp",
+    "benchmarks/interaction",
+    "benchmarks/comparison",
+    "benchmarks/remote-range",
+    "validation/runner",
+    "crates/rgv-alignment-scene",
+    "crates/rgv-control-client",
+    "crates/rgv-core",
+    "crates/rgv-engine",
+    "crates/rgv-hts",
+    "crates/rgv-layout",
+    "crates/rgv-render",
+    "tools/interaction-stress",
+]
 resolver = "2"
 exclude = ["fuzz"]
 
@@ -77,3 +97,16 @@ cast_precision_loss = "allow"
 cast_sign_loss = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+# The dev and test profiles are left at Cargo defaults so iteration stays fast.
+# `panic` is deliberately left at the default (`unwind`): the engine isolates
+# worker panics with `catch_unwind`, which `panic = "abort"` would defeat.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+# Distribution builds: `cargo build --profile dist` writes to `target/dist/`.
+[profile.dist]
+inherits = "release"
+lto = "fat"

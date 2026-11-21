@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::OnceLock};
 use rgv_core::{ContigId, GenomicInterval, OverlappingMatePolicy};
 
 use crate::reference::ReferenceSlice;
-use crate::{AlignmentFlags, ModificationSummary, TemplateId, template_id};
+use crate::{AlignmentFlags, CigarOp, CigarOpKind, ModificationSummary, TemplateId, template_id};
 
 /// Fixed-point scale used for base-quality-weighted allele support.
 pub const QUALITY_WEIGHT_SCALE: u64 = 1_000_000;
@@ -192,11 +192,220 @@ pub fn add_unmasked_range(
     overlap_end - overlap_start
 }
 
+/// Reference ranges that the later-arriving mate of an overlapping pair must not count again.
+///
+/// Unlike [`OverlapMask`], this follows what the earlier mate actually contributed: a deletion
+/// or `N` skip in the earlier mate does not hide the later mate's aligned bases from depth, and
+/// an earlier base that failed the base-quality threshold does not hide the later mate's base.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MateOverlapMask {
+    /// Positions where the earlier mate has an aligned base (`M`, `=`, `X`).
+    aligned: Vec<(u64, u64)>,
+    /// Positions the earlier mate spans with an aligned base or a deletion.
+    spanned: Vec<(u64, u64)>,
+    /// Positions where the earlier mate contributed an allele observation: a base passing the
+    /// caller's base-quality eligibility, or a deletion.
+    observed: Vec<(u64, u64)>,
+}
+
+impl MateOverlapMask {
+    /// Whether the later mate's aligned base at `position` is already counted in depth.
+    pub fn masks_depth(&self, position: u64) -> bool {
+        ranges_contain(&self.aligned, position)
+    }
+
+    /// Whether the later mate's base observation at `position` duplicates an earlier-mate
+    /// base or deletion observation.
+    pub fn masks_base(&self, position: u64) -> bool {
+        ranges_contain(&self.observed, position)
+    }
+
+    /// Whether an indel event of the later mate at `position` lies where the earlier mate
+    /// already describes the template (aligned base or deletion).
+    pub fn masks_indel(&self, position: u64) -> bool {
+        ranges_contain(&self.spanned, position)
+    }
+
+    /// Emits the parts of an aligned segment not already counted by the earlier mate and
+    /// returns the number of collapsed reference bases.
+    pub fn add_unmasked_depth_range(&self, start: u64, end: u64, add: impl FnMut(u64, u64)) -> u64 {
+        add_outside_ranges(&self.aligned, start, end, add, |_, _| {})
+    }
+
+    /// Emits the parts of a deletion not already described by the earlier mate and returns the
+    /// number of collapsed reference bases.
+    pub fn add_unmasked_deletion_range(
+        &self,
+        start: u64,
+        end: u64,
+        add: impl FnMut(u64, u64),
+    ) -> u64 {
+        add_outside_ranges(&self.spanned, start, end, add, |_, _| {})
+    }
+
+    /// Like [`Self::add_unmasked_depth_range`], additionally reporting each collapsed range.
+    pub fn split_depth_range(
+        &self,
+        start: u64,
+        end: u64,
+        add: impl FnMut(u64, u64),
+        collapsed: impl FnMut(u64, u64),
+    ) -> u64 {
+        add_outside_ranges(&self.aligned, start, end, add, collapsed)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.spanned.is_empty()
+    }
+
+    fn single_range(start: u64, end: u64) -> Self {
+        Self {
+            aligned: vec![(start, end)],
+            spanned: vec![(start, end)],
+            observed: vec![(start, end)],
+        }
+    }
+
+    /// Builds the earlier mate's contribution inside `window` from its CIGAR.
+    fn from_alignment(
+        alignment_start: u64,
+        window: (u64, u64),
+        cigar: impl IntoIterator<Item = CigarOp>,
+        mut base_is_observed: impl FnMut(usize) -> bool,
+    ) -> Self {
+        let mut mask = Self::default();
+        let mut reference_position = alignment_start;
+        let mut read_position = 0_usize;
+        for operation in cigar {
+            let length = u64::from(operation.len);
+            match operation.kind {
+                CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
+                    let end = reference_position.saturating_add(length);
+                    let clipped_start = reference_position.max(window.0);
+                    let clipped_end = end.min(window.1);
+                    if clipped_start < clipped_end {
+                        push_range(&mut mask.aligned, clipped_start, clipped_end);
+                        push_range(&mut mask.spanned, clipped_start, clipped_end);
+                        for position in clipped_start..clipped_end {
+                            let offset = usize::try_from(position - reference_position)
+                                .unwrap_or(usize::MAX);
+                            if base_is_observed(read_position.saturating_add(offset)) {
+                                push_range(&mut mask.observed, position, position + 1);
+                            }
+                        }
+                    }
+                    read_position = read_position.saturating_add(operation.len as usize);
+                    reference_position = end;
+                }
+                CigarOpKind::Deletion => {
+                    let end = reference_position.saturating_add(length);
+                    let clipped_start = reference_position.max(window.0);
+                    let clipped_end = end.min(window.1);
+                    if clipped_start < clipped_end {
+                        push_range(&mut mask.spanned, clipped_start, clipped_end);
+                        push_range(&mut mask.observed, clipped_start, clipped_end);
+                    }
+                    reference_position = end;
+                }
+                CigarOpKind::ReferenceSkip => {
+                    reference_position = reference_position.saturating_add(length);
+                }
+                CigarOpKind::Insertion | CigarOpKind::SoftClip => {
+                    read_position = read_position.saturating_add(operation.len as usize);
+                }
+                CigarOpKind::HardClip | CigarOpKind::Padding => {}
+            }
+            if reference_position >= window.1 {
+                break;
+            }
+        }
+        mask
+    }
+}
+
+fn push_range(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) {
+    if let Some((_, last_end)) = ranges.last_mut()
+        && *last_end >= start
+    {
+        *last_end = (*last_end).max(end);
+    } else {
+        ranges.push((start, end));
+    }
+}
+
+fn ranges_contain(ranges: &[(u64, u64)], position: u64) -> bool {
+    let index = ranges.partition_point(|(_, end)| *end <= position);
+    ranges
+        .get(index)
+        .is_some_and(|(start, _)| *start <= position)
+}
+
+/// Splits `[start, end)` against sorted disjoint `ranges`; returns the covered base count.
+fn add_outside_ranges(
+    ranges: &[(u64, u64)],
+    start: u64,
+    end: u64,
+    mut add: impl FnMut(u64, u64),
+    mut covered: impl FnMut(u64, u64),
+) -> u64 {
+    let mut cursor = start;
+    let mut total = 0_u64;
+    let first = ranges.partition_point(|(_, range_end)| *range_end <= start);
+    for (range_start, range_end) in &ranges[first..] {
+        if *range_start >= end {
+            break;
+        }
+        let overlap_start = (*range_start).max(cursor);
+        let overlap_end = (*range_end).min(end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        if cursor < overlap_start {
+            add(cursor, overlap_start);
+        }
+        covered(overlap_start, overlap_end);
+        total = total.saturating_add(overlap_end - overlap_start);
+        cursor = overlap_end;
+    }
+    if cursor < end {
+        add(cursor, end);
+    }
+    total
+}
+
+/// Identity and placement of one alignment as needed for mate-overlap collapsing.
+#[derive(Clone, Copy, Debug)]
+pub struct MateAlignment<'a> {
+    pub read_name: &'a [u8],
+    pub contig: ContigId,
+    pub start: u64,
+    pub end: u64,
+    pub flags: AlignmentFlags,
+    pub mate_contig: Option<ContigId>,
+    pub mate_start: Option<u64>,
+}
+
+struct PendingOverlap {
+    contig: ContigId,
+    mate_start: u64,
+    mask: MateOverlapMask,
+}
+
+/// Pending-entry count at which stale entries are first swept.
+const PENDING_SWEEP_FLOOR: usize = 4_096;
+
 pub struct OverlapCollapser {
     policy: OverlappingMatePolicy,
-    pending: HashMap<TemplateId, OverlapMask>,
+    pending: HashMap<TemplateId, PendingOverlap>,
     complete: bool,
     collapsed_mate_bases: u64,
+    /// Placement of the most recent record; used to prove coordinate order.
+    last_placement: Option<(ContigId, u64)>,
+    /// True while every record arrived in non-decreasing `(contig, start)` order.
+    coordinate_ordered: bool,
+    /// True once a sweep discarded entries on the strength of coordinate order.
+    swept_entries: bool,
+    next_sweep: usize,
 }
 
 impl OverlapCollapser {
@@ -206,9 +415,16 @@ impl OverlapCollapser {
             pending: HashMap::new(),
             complete: true,
             collapsed_mate_bases: 0,
+            last_placement: None,
+            coordinate_ordered: true,
+            swept_entries: false,
+            next_sweep: PENDING_SWEEP_FLOOR,
         }
     }
 
+    /// Legacy single-range mask: the later mate is masked over `[mate_start, earlier.end)`
+    /// regardless of the earlier mate's CIGAR or base qualities. Prefer
+    /// [`Self::mask_for_alignment`], which masks only what the earlier mate contributed.
     #[allow(clippy::too_many_arguments)]
     pub fn mask_for(
         &mut self,
@@ -220,41 +436,144 @@ impl OverlapCollapser {
         mate_contig: Option<ContigId>,
         mate_start: Option<u64>,
     ) -> Option<OverlapMask> {
-        if self.policy == OverlappingMatePolicy::CountBoth
-            || read_name.is_empty()
-            || !flags.is_paired()
-            || flags.is_unmapped()
-            || flags.is_mate_unmapped()
-            || flags.is_secondary()
-            || flags.is_supplementary()
-            || mate_contig != Some(contig)
-        {
-            return None;
-        }
-        let mate_start = mate_start?;
-        let identity = template_id(read_name);
+        let mate = MateAlignment {
+            read_name,
+            contig,
+            start,
+            end,
+            flags,
+            mate_contig,
+            mate_start,
+        };
+        let mate_start = self.eligible_mate_start(&mate)?;
+        self.note_placement(contig, start);
         if start == mate_start {
             return (!flags.is_first_in_template()).then_some(OverlapMask { start, end });
         }
-        let is_left = start < mate_start;
-        if is_left {
+        let identity = template_id(read_name);
+        if start < mate_start {
             if end > mate_start {
-                if self.pending.len() < MAX_PENDING_PAIR_OVERLAPS {
-                    self.pending.insert(
-                        identity,
-                        OverlapMask {
-                            start: mate_start,
-                            end,
-                        },
-                    );
-                } else {
-                    self.complete = false;
-                }
+                self.insert_pending(
+                    identity,
+                    contig,
+                    mate_start,
+                    MateOverlapMask::single_range(mate_start, end),
+                );
             }
             None
         } else {
-            self.pending.remove(&identity)
+            let pending = self.pending.remove(&identity)?;
+            let (start, _) = *pending.mask.spanned.first()?;
+            let (_, end) = *pending.mask.spanned.last()?;
+            Some(OverlapMask { start, end })
         }
+    }
+
+    /// Returns the ranges this alignment must not count because its mate, seen earlier, already
+    /// contributed them.
+    ///
+    /// `cigar` is this alignment's CIGAR and `base_is_observed(read_index)` reports whether the
+    /// aligned base at that `SEQ` index is counted as an allele observation (present and passing
+    /// the base-quality threshold). Pass `|_| true` when base observations are not collected.
+    /// When both mates start at the same position the first to arrive is counted in full.
+    pub fn mask_for_alignment(
+        &mut self,
+        mate: MateAlignment<'_>,
+        cigar: impl IntoIterator<Item = CigarOp>,
+        base_is_observed: impl FnMut(usize) -> bool,
+    ) -> Option<MateOverlapMask> {
+        let mate_start = self.eligible_mate_start(&mate)?;
+        self.note_placement(mate.contig, mate.start);
+        let identity = template_id(mate.read_name);
+        let arrives_second = mate.start > mate_start
+            || (mate.start == mate_start
+                && self.pending.get(&identity).is_some_and(|pending| {
+                    pending.contig == mate.contig && pending.mate_start == mate_start
+                }));
+        if arrives_second {
+            return self.pending.remove(&identity).map(|pending| pending.mask);
+        }
+        if mate.end > mate_start {
+            let mask = MateOverlapMask::from_alignment(
+                mate.start,
+                (mate_start, mate.end),
+                cigar,
+                base_is_observed,
+            );
+            if !mask.is_empty() {
+                self.insert_pending(identity, mate.contig, mate_start, mask);
+            }
+        }
+        None
+    }
+
+    fn eligible_mate_start(&self, mate: &MateAlignment<'_>) -> Option<u64> {
+        if self.policy == OverlappingMatePolicy::CountBoth
+            || mate.read_name.is_empty()
+            || !mate.flags.is_paired()
+            || mate.flags.is_unmapped()
+            || mate.flags.is_mate_unmapped()
+            || mate.flags.is_secondary()
+            || mate.flags.is_supplementary()
+            || mate.mate_contig != Some(mate.contig)
+        {
+            return None;
+        }
+        mate.mate_start
+    }
+
+    fn note_placement(&mut self, contig: ContigId, start: u64) {
+        let placement = (contig, start);
+        if self.last_placement.is_some_and(|last| placement < last) && self.coordinate_ordered {
+            self.coordinate_ordered = false;
+            // Entries were discarded assuming coordinate order; their mates may still arrive.
+            if self.swept_entries {
+                self.complete = false;
+            }
+        }
+        self.last_placement = Some(placement);
+    }
+
+    fn insert_pending(
+        &mut self,
+        identity: TemplateId,
+        contig: ContigId,
+        mate_start: u64,
+        mask: MateOverlapMask,
+    ) {
+        if self.pending.len() >= self.next_sweep.min(MAX_PENDING_PAIR_OVERLAPS) {
+            self.sweep_stale();
+        }
+        if self.pending.len() < MAX_PENDING_PAIR_OVERLAPS || self.pending.contains_key(&identity) {
+            self.pending.insert(
+                identity,
+                PendingOverlap {
+                    contig,
+                    mate_start,
+                    mask,
+                },
+            );
+        } else {
+            self.complete = false;
+        }
+    }
+
+    /// Drops entries whose mate can no longer arrive: in coordinate-ordered input a mate that
+    /// starts before the current record was either already consumed or never admitted
+    /// (filtered out, or outside the query).
+    fn sweep_stale(&mut self) {
+        let Some(current) = self.last_placement.filter(|_| self.coordinate_ordered) else {
+            return;
+        };
+        let before = self.pending.len();
+        self.pending
+            .retain(|_, pending| (pending.contig, pending.mate_start) >= current);
+        self.swept_entries |= self.pending.len() != before;
+        self.next_sweep = self
+            .pending
+            .len()
+            .saturating_mul(2)
+            .max(PENDING_SWEEP_FLOOR);
     }
 
     pub fn note_collapsed(&mut self, bases: u64) {
@@ -271,6 +590,11 @@ impl OverlapCollapser {
 
     pub const fn collapsed_mate_bases(&self) -> u64 {
         self.collapsed_mate_bases
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -435,6 +759,11 @@ impl PileupBuilder {
             depth_events_complete: true,
             depth_segments_omitted: 0,
         }
+    }
+
+    /// Base-quality threshold below which base observations are not counted.
+    pub const fn minimum_base_quality(&self) -> u8 {
+        self.minimum_base_quality
     }
 
     pub fn add_aligned_record(
@@ -694,6 +1023,23 @@ fn quality_weight(quality: u8) -> u64 {
     })[usize::from(quality)]
 }
 
+/// Whether the aligned base at `read_position` is counted as a base observation: the base is
+/// present and its quality is either missing or at least `minimum_base_quality`.
+///
+/// This is the eligibility rule [`aligned_observation`] and
+/// [`PileupBuilder::add_base_with_bisulfite_strand`] apply together.
+pub fn base_observation_is_counted(
+    base_count: usize,
+    qualities: &[u8],
+    read_position: usize,
+    minimum_base_quality: u8,
+) -> bool {
+    read_position < base_count
+        && qualities
+            .get(read_position)
+            .is_none_or(|quality| *quality == u8::MAX || *quality >= minimum_base_quality)
+}
+
 pub fn aligned_observation(
     bases: &[u8],
     qualities: &[u8],
@@ -715,6 +1061,285 @@ mod tests {
 
     fn interval() -> GenomicInterval {
         GenomicInterval::new(ContigId::new(0), 100, 104).unwrap()
+    }
+
+    const PAIRED_FIRST: u16 = 0x1 | 0x20 | 0x40;
+    const PAIRED_LAST_REVERSE: u16 = 0x1 | 0x10 | 0x80;
+
+    fn mate(name: &[u8], start: u64, end: u64, flags: u16, mate_start: u64) -> MateAlignment<'_> {
+        MateAlignment {
+            read_name: name,
+            contig: ContigId::new(0),
+            start,
+            end,
+            flags: AlignmentFlags::from_bits(flags),
+            mate_contig: Some(ContigId::new(0)),
+            mate_start: Some(mate_start),
+        }
+    }
+
+    fn op(kind: CigarOpKind, len: u32) -> CigarOp {
+        CigarOp { kind, len }
+    }
+
+    #[test]
+    fn mate_mask_follows_the_earlier_mates_cigar_and_base_quality() {
+        // Earlier mate: start 100, 4M2D4M -> bases at 100..104 and 106..110, deletion 104..106.
+        // Read index 4 (reference 106) fails base quality. Later mate: 102..112, all aligned.
+        let mut collapser = OverlapCollapser::new(OverlappingMatePolicy::CountOnce);
+        let qualities = [30_u8, 30, 30, 30, 5, 30, 30, 30];
+        let earlier = collapser.mask_for_alignment(
+            mate(b"pair", 100, 110, PAIRED_FIRST, 102),
+            [
+                op(CigarOpKind::Match, 4),
+                op(CigarOpKind::Deletion, 2),
+                op(CigarOpKind::Match, 4),
+            ],
+            |index| base_observation_is_counted(8, &qualities, index, 10),
+        );
+        assert_eq!(earlier, None);
+        let mask = collapser
+            .mask_for_alignment(
+                mate(b"pair", 102, 112, PAIRED_LAST_REVERSE, 100),
+                [op(CigarOpKind::Match, 10)],
+                |_| true,
+            )
+            .expect("the later mate receives the earlier mate's contribution");
+        assert_eq!(collapser.pending_len(), 0);
+
+        let depth_masked = (100..114)
+            .filter(|position| mask.masks_depth(*position))
+            .collect::<Vec<_>>();
+        assert_eq!(depth_masked, [102, 103, 106, 107, 108, 109]);
+        let base_masked = (100..114)
+            .filter(|position| mask.masks_base(*position))
+            .collect::<Vec<_>>();
+        // 104/105: the earlier mate's deletion is the template's observation there.
+        // 106: the earlier base failed quality, so the later mate's base must be counted.
+        assert_eq!(base_masked, [102, 103, 104, 105, 107, 108, 109]);
+        let indel_masked = (100..114)
+            .filter(|position| mask.masks_indel(*position))
+            .collect::<Vec<_>>();
+        assert_eq!(indel_masked, [102, 103, 104, 105, 106, 107, 108, 109]);
+
+        let mut kept = Vec::new();
+        let masked_bases = mask.add_unmasked_depth_range(102, 112, |start, end| {
+            kept.push((start, end));
+        });
+        assert_eq!(kept, [(104, 106), (110, 112)]);
+        assert_eq!(masked_bases, 6);
+        let mut kept = Vec::new();
+        let mut removed = Vec::new();
+        mask.split_depth_range(
+            100,
+            108,
+            |start, end| kept.push((start, end)),
+            |start, end| removed.push((start, end)),
+        );
+        assert_eq!(kept, [(100, 102), (104, 106)]);
+        assert_eq!(removed, [(102, 104), (106, 108)]);
+        let mut kept = Vec::new();
+        assert_eq!(
+            mask.add_unmasked_deletion_range(108, 113, |start, end| kept.push((start, end))),
+            2
+        );
+        assert_eq!(kept, [(110, 113)]);
+    }
+
+    #[test]
+    fn mate_mask_leaves_a_reference_skip_of_the_earlier_mate_uncollapsed() {
+        // Earlier mate: start 200, 3M4N3M -> bases at 200..203 and 207..210. Later mate: 203..208.
+        let mut collapser = OverlapCollapser::new(OverlappingMatePolicy::CountOnce);
+        assert_eq!(
+            collapser.mask_for_alignment(
+                mate(b"spliced", 200, 210, PAIRED_FIRST, 203),
+                [
+                    op(CigarOpKind::Match, 3),
+                    op(CigarOpKind::ReferenceSkip, 4),
+                    op(CigarOpKind::Match, 3),
+                ],
+                |_| true,
+            ),
+            None
+        );
+        let mask = collapser
+            .mask_for_alignment(
+                mate(b"spliced", 203, 208, PAIRED_LAST_REVERSE, 200),
+                [op(CigarOpKind::Match, 5)],
+                |_| true,
+            )
+            .unwrap();
+        let mut kept = Vec::new();
+        let masked_bases = mask.add_unmasked_depth_range(203, 208, |start, end| {
+            kept.push((start, end));
+        });
+        assert_eq!(kept, [(203, 207)]);
+        assert_eq!(masked_bases, 1);
+        assert!(!mask.masks_base(206) && mask.masks_base(207));
+    }
+
+    #[test]
+    fn mates_starting_together_count_the_first_arrival_in_full() {
+        let mut collapser = OverlapCollapser::new(OverlappingMatePolicy::CountOnce);
+        // The second-in-template record arrives first; nothing may be masked without proof that
+        // its mate was counted.
+        assert_eq!(
+            collapser.mask_for_alignment(
+                mate(b"same", 300, 304, PAIRED_LAST_REVERSE, 300),
+                [op(CigarOpKind::Match, 4)],
+                |_| true,
+            ),
+            None
+        );
+        let mask = collapser
+            .mask_for_alignment(
+                mate(b"same", 300, 306, PAIRED_FIRST, 300),
+                [op(CigarOpKind::Match, 6)],
+                |_| true,
+            )
+            .unwrap();
+        let mut kept = Vec::new();
+        assert_eq!(
+            mask.add_unmasked_depth_range(300, 306, |start, end| kept.push((start, end))),
+            4
+        );
+        assert_eq!(kept, [(304, 306)]);
+    }
+
+    #[test]
+    fn pending_overlaps_drain_when_the_later_mate_never_arrives() {
+        // Every earlier mate overlaps a later mate that is never offered (filtered out). In
+        // coordinate order those entries are provably dead once the scan passes the mate start.
+        let mut collapser = OverlapCollapser::new(OverlappingMatePolicy::CountOnce);
+        let total = MAX_PENDING_PAIR_OVERLAPS as u64 * 2 + 10;
+        for index in 0..total {
+            let name = format!("orphan-{index}");
+            let start = index * 10;
+            assert_eq!(
+                collapser.mask_for_alignment(
+                    mate(name.as_bytes(), start, start + 8, PAIRED_FIRST, start + 4),
+                    [op(CigarOpKind::Match, 8)],
+                    |_| true,
+                ),
+                None
+            );
+        }
+        assert!(collapser.complete());
+        assert!(collapser.pending_len() <= 2 * PENDING_SWEEP_FLOOR);
+
+        // A live pair is still collapsed after the sweeps.
+        let start = total * 10;
+        collapser.mask_for_alignment(
+            mate(b"live", start, start + 8, PAIRED_FIRST, start + 4),
+            [op(CigarOpKind::Match, 8)],
+            |_| true,
+        );
+        let mask = collapser
+            .mask_for_alignment(
+                mate(b"live", start + 4, start + 12, PAIRED_LAST_REVERSE, start),
+                [op(CigarOpKind::Match, 8)],
+                |_| true,
+            )
+            .unwrap();
+        assert!(mask.masks_depth(start + 4) && mask.masks_depth(start + 7));
+        assert!(!mask.masks_depth(start + 8));
+    }
+
+    #[test]
+    fn legacy_single_range_mask_also_drains_stale_entries() {
+        let mut collapser = OverlapCollapser::new(OverlappingMatePolicy::CountOnce);
+        let contig = ContigId::new(0);
+        let first = AlignmentFlags::from_bits(PAIRED_FIRST);
+        let last = AlignmentFlags::from_bits(PAIRED_LAST_REVERSE);
+        for index in 0..MAX_PENDING_PAIR_OVERLAPS as u64 + 10 {
+            let name = format!("orphan-{index}");
+            let start = index * 10;
+            assert_eq!(
+                collapser.mask_for(
+                    name.as_bytes(),
+                    contig,
+                    start,
+                    start + 8,
+                    first,
+                    Some(contig),
+                    Some(start + 4),
+                ),
+                None
+            );
+        }
+        assert!(collapser.complete());
+        let start = 5_000_000;
+        collapser.mask_for(
+            b"live",
+            contig,
+            start,
+            start + 8,
+            first,
+            Some(contig),
+            Some(start + 4),
+        );
+        assert_eq!(
+            collapser.mask_for(
+                b"live",
+                contig,
+                start + 4,
+                start + 12,
+                last,
+                Some(contig),
+                Some(start),
+            ),
+            Some(OverlapMask {
+                start: start + 4,
+                end: start + 8,
+            })
+        );
+    }
+
+    #[test]
+    fn unordered_input_never_passes_off_a_sweep_as_complete() {
+        let mut collapser = OverlapCollapser::new(OverlappingMatePolicy::CountOnce);
+        for index in 0..PENDING_SWEEP_FLOOR as u64 + 2 {
+            let name = format!("orphan-{index}");
+            let start = 1_000 + index * 10;
+            collapser.mask_for_alignment(
+                mate(name.as_bytes(), start, start + 8, PAIRED_FIRST, start + 4),
+                [op(CigarOpKind::Match, 8)],
+                |_| true,
+            );
+        }
+        assert!(collapser.complete());
+        // A record behind the scan position proves the input was not coordinate ordered, so
+        // the entries already swept may have been needed.
+        collapser.mask_for_alignment(
+            mate(b"behind", 10, 18, PAIRED_FIRST, 14),
+            [op(CigarOpKind::Match, 8)],
+            |_| true,
+        );
+        assert!(!collapser.complete());
+    }
+
+    #[test]
+    fn unordered_input_without_a_sweep_keeps_pending_overlaps() {
+        let mut collapser = OverlapCollapser::new(OverlappingMatePolicy::CountOnce);
+        collapser.mask_for_alignment(
+            mate(b"late-left", 500, 510, PAIRED_FIRST, 505),
+            [op(CigarOpKind::Match, 10)],
+            |_| true,
+        );
+        collapser.mask_for_alignment(
+            mate(b"other", 100, 110, PAIRED_FIRST, 400),
+            [op(CigarOpKind::Match, 10)],
+            |_| true,
+        );
+        let mask = collapser
+            .mask_for_alignment(
+                mate(b"late-left", 505, 515, PAIRED_LAST_REVERSE, 500),
+                [op(CigarOpKind::Match, 10)],
+                |_| true,
+            )
+            .unwrap();
+        assert!(mask.masks_depth(505) && mask.masks_depth(509) && !mask.masks_depth(510));
+        assert!(collapser.complete());
     }
 
     #[test]

@@ -1022,7 +1022,7 @@ fn quantitative_inspector_legacy_fields(
         (
             "Query provenance".to_owned(),
             format!(
-                "{} retained / {} examined · {} non-finite{}",
+                "{} retained / {} examined · {} non-finite{}{}",
                 provenance.records_retained,
                 provenance.records_examined,
                 provenance.non_finite_records,
@@ -1030,7 +1030,13 @@ fn quantitative_inspector_legacy_fields(
                     " · source record cap reached"
                 } else {
                     " · complete"
-                }
+                },
+                provenance
+                    .summary_reduction_bases
+                    .map(|bases| format!(
+                        " · values are means from the file's {bases}-base zoom summaries; zoom in for exact values"
+                    ))
+                    .unwrap_or_default()
             ),
         ),
     ];

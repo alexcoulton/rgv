@@ -94,8 +94,14 @@ impl SummaryPageKey {
         reference_revision: Option<ReferenceRevision>,
         annotation: Option<&JunctionAnnotationIndex>,
     ) -> Self {
-        let (dependency_first_tile, dependency_last_tile) =
+        let (mut dependency_first_tile, dependency_last_tile) =
             summary_page_dependency_span(root, tile, family);
+        if family == SummaryPageFamily::Junctions && !root.entering_junctions_for(tile).is_empty() {
+            // The first prepared tile also carries junctions which start left of it. A root
+            // prepared further left owns those in an earlier tile instead, so the two pages of
+            // this tile differ and must not share a cache identity.
+            dependency_first_tile = dependency_first_tile.min(tile.coordinate().saturating_sub(1));
+        }
         let junction_normalization_mapped_records = (family == SummaryPageFamily::Junctions)
             .then(|| {
                 root.junction_tiles()
@@ -594,7 +600,8 @@ fn maximum_primitives(
             .junction_tiles()
             .iter()
             .find(|summary| summary.tile() == key.tile)
-            .map_or(0, |summary| summary.summary().junctions.len()),
+            .map_or(0, |summary| summary.summary().junctions.len())
+            .saturating_add(root.entering_junctions_for(key.tile).len()),
         SummaryPageFamily::Modifications => root
             .modification_tiles()
             .iter()
@@ -703,8 +710,13 @@ fn emit_junctions(
         .iter()
         .find(|summary| summary.tile() == tile)
         .ok_or(SummarySemanticPageError::MissingCanonicalTile)?;
-    output.extend(summary.summary().junctions.iter().copied().map(|junction| {
-        debug_assert!(interval.contains(junction.start));
+    // Junctions entering the first prepared tile from the left have no owner page in this root.
+    // Their page-relative span is clipped to the tile start (offsets are unsigned); `evidence`
+    // keeps the true biological start for projection, labels and inspection.
+    let entering = root.entering_junctions_for(tile).iter().copied();
+    let owned = summary.summary().junctions.iter().copied();
+    output.extend(entering.chain(owned).map(|junction| {
+        debug_assert!(interval.contains(junction.start) || junction.start < interval.start());
         SummarySemanticPrimitive {
             start_offset: junction.start.saturating_sub(interval.start()),
             // Preserve the complete biological extent. Later tiles index this owner page rather
@@ -841,6 +853,7 @@ pub(crate) fn required_summary_page_keys(
         tile.summary()
             .junctions
             .iter()
+            .chain(root.entering_junctions_for(tile.tile()))
             .any(|junction| junction.start < interval.end() && junction.end > interval.start())
     }) {
         keys.push(SummaryPageKey::new_with_dependencies(
@@ -1198,6 +1211,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: crate::ReadSampling::Complete,
         };
         let atlas = AlignmentRowAtlas::build(
             RowAtlasRevision::new(RevisionFingerprint::new(90, 91)),
@@ -1545,14 +1559,25 @@ mod tests {
         reused: Option<&ExactSummaryRoot>,
         ledger: &AllocationLedger,
     ) -> Arc<ExactSummaryRoot> {
+        cross_tile_root_over(evidence, 0..tile_count, revision_seed, reused, ledger)
+    }
+
+    fn cross_tile_root_over(
+        evidence: &Arc<EvidenceRoot>,
+        tiles: std::ops::Range<u64>,
+        revision_seed: u64,
+        reused: Option<&ExactSummaryRoot>,
+        ledger: &AllocationLedger,
+    ) -> Arc<ExactSummaryRoot> {
         let contract = cross_tile_contract();
         assert!(reused.is_none_or(|root| root.contract() == contract));
-        let prepared = cross_tile_interval(tile_count);
+        let prepared =
+            GenomicInterval::new(ContigId::new(0), tiles.start * 100, tiles.end * 100).unwrap();
         let mut depth = Vec::new();
         let mut junctions = Vec::new();
         let mut pairs = Vec::new();
         let mut filters = Vec::new();
-        for coordinate in 0..tile_count {
+        for coordinate in tiles {
             let tile = cross_tile_tile(coordinate);
             let publication_revision = revision_seed.saturating_add(coordinate);
             depth.push(
@@ -1686,6 +1711,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: crate::ReadSampling::Complete,
         };
         AlignmentRowAtlas::build(
             RowAtlasRevision::new(RevisionFingerprint::new(97, 98)),
@@ -1842,6 +1868,74 @@ mod tests {
             false,
         );
         assert_eq!(cross_tile_junction_arcs(&frame).len(), 1);
+    }
+
+    #[test]
+    fn junction_starting_left_of_the_prepared_interval_still_produces_its_arc() {
+        let ledger = AllocationLedger::new(64 << 20, 0);
+        let evidence = cross_tile_evidence(&ledger);
+        // Prepared from tile 1: the tile owning the junction's start (90) is not in this root,
+        // but the read supporting it is resident in tile 1.
+        let summaries = cross_tile_root_over(&evidence, 1..3, 160, None, &ledger);
+        let prepared = GenomicInterval::new(ContigId::new(0), 100, 300).unwrap();
+        assert_eq!(summaries.prepared_interval(), prepared);
+        assert_eq!(
+            summaries
+                .junctions(prepared)
+                .unwrap()
+                .iter()
+                .map(|junction| (junction.start, junction.end, junction.depth))
+                .collect::<Vec<_>>(),
+            vec![(90, 210, 1)]
+        );
+        assert_eq!(summaries.junction_count(prepared).unwrap(), 1);
+        assert_eq!(summaries.expanded_junction_row(90, 210), Some(0));
+
+        let atlas = cross_tile_atlas(&evidence, &ledger);
+        let snapshot = cross_tile_snapshot(&evidence, &summaries, &atlas, prepared, &ledger);
+        let junction_pages = snapshot
+            .summary_pages()
+            .iter()
+            .filter(|page| page.key().family() == SummaryPageFamily::Junctions)
+            .collect::<Vec<_>>();
+        assert_eq!(junction_pages.len(), 2);
+        let carrier = junction_pages
+            .iter()
+            .find(|page| !page.primitives().is_empty())
+            .unwrap();
+        assert_eq!(carrier.key().tile(), cross_tile_tile(1));
+        assert_eq!(
+            junction_pages
+                .iter()
+                .map(|page| page.primitives().len())
+                .sum::<usize>(),
+            1
+        );
+        // The page span is clipped to its tile; the evidence keeps the biological extent.
+        let primitive = carrier.primitives()[0];
+        assert_eq!((primitive.start_offset, primitive.end_offset), (0, 110));
+        let SummarySemanticComponent::Junction(junction) = primitive.component else {
+            panic!("junction page holds a junction");
+        };
+        assert_eq!((junction.evidence.start, junction.evidence.end), (90, 210));
+        let frame =
+            cross_tile_junction_frame(&snapshot, prepared, rgv_core::SashimiCountMode::Raw, false);
+        assert_eq!(cross_tile_junction_arcs(&frame).len(), 1);
+
+        // A root which also prepared the owner tile draws the junction from there only, and the
+        // two versions of tile 1's page never share a cache identity.
+        let full = cross_tile_root(&evidence, 3, 180, &ledger);
+        assert!(full.entering_junctions().is_empty());
+        assert_eq!(full.junction_count(cross_tile_interval(3)).unwrap(), 1);
+        let family = SummaryPageFamily::Junctions;
+        assert_ne!(
+            SummaryPageKey::new(&summaries, cross_tile_tile(1), family),
+            SummaryPageKey::new(&full, cross_tile_tile(1), family)
+        );
+        assert_eq!(
+            SummaryPageKey::new(&summaries, cross_tile_tile(2), family),
+            SummaryPageKey::new(&full, cross_tile_tile(2), family)
+        );
     }
 
     #[test]
@@ -2368,6 +2462,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: crate::ReadSampling::Complete,
         };
         let atlas = AlignmentRowAtlas::build(
             RowAtlasRevision::new(RevisionFingerprint::new(20, 21)),
@@ -2846,6 +2941,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: crate::ReadSampling::Complete,
         };
         let atlas = AlignmentRowAtlas::build(
             RowAtlasRevision::new(RevisionFingerprint::new(30, 31)),
@@ -2952,6 +3048,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: crate::ReadSampling::Complete,
         };
         let atlas = AlignmentRowAtlas::build(
             RowAtlasRevision::new(RevisionFingerprint::new(40, 41)),

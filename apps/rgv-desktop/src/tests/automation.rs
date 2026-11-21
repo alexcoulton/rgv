@@ -72,7 +72,10 @@ fn automation_runner_rejects_a_completion_for_a_different_waiting_command() {
         commands: vec![AutomationCommand::Exit],
     };
     let mut runner = AutomationRunner::new(batch, PathBuf::from("report.json"));
-    runner.waiting = Some(AutomationWait::File { command_index: 4 });
+    runner.waiting = Some(AutomationWait::File {
+        command_index: 4,
+        deadline: Instant::now() + Duration::from_secs(60),
+    });
 
     assert!(!runner.finish_command(
         5,
@@ -81,8 +84,106 @@ fn automation_runner_rejects_a_completion_for_a_different_waiting_command() {
     assert!(runner.results.is_empty());
     assert!(matches!(
         runner.waiting,
-        Some(AutomationWait::File { command_index: 4 })
+        Some(AutomationWait::File {
+            command_index: 4,
+            ..
+        })
     ));
+}
+
+fn control_runner(
+    commands: Vec<AutomationCommand>,
+) -> (
+    AutomationRunner,
+    Arc<std::sync::atomic::AtomicBool>,
+    std::sync::mpsc::Receiver<AutomationRunReport>,
+) {
+    let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runner = AutomationRunner::for_control(ControlRequest {
+        batch: AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands,
+        },
+        reply,
+        cancelled: Arc::clone(&cancelled),
+    });
+    (runner, cancelled, receiver)
+}
+
+#[test]
+fn a_timed_out_control_batch_is_cancelled_instead_of_running_on() {
+    let (mut runner, cancelled, receiver) = control_runner(vec![
+        AutomationCommand::NewWorkspace,
+        AutomationCommand::NewWorkspace,
+        AutomationCommand::Exit,
+    ]);
+    assert!(!runner.cancel_if_requested(), "not cancelled until asked");
+    assert_eq!(runner.commands.len(), 3);
+
+    // The first command is waiting on a file worker when the HTTP request times out.
+    let (index, command) = runner.commands.pop_front().unwrap();
+    runner.begin_command(index, command.name(), Instant::now());
+    runner.waiting = Some(AutomationWait::File {
+        command_index: index,
+        deadline: Instant::now() + Duration::from_secs(60),
+    });
+    cancelled.store(true, std::sync::atomic::Ordering::Release);
+
+    assert!(runner.cancel_if_requested());
+    assert!(runner.finished);
+    assert!(runner.commands.is_empty(), "no further command will run");
+    assert!(runner.waiting.is_none());
+    assert_eq!(runner.results.len(), 3);
+    assert_eq!(runner.results[0].status, AutomationCommandStatus::Failed);
+    assert_eq!(
+        runner.results[0].error_code,
+        Some(AutomationErrorCode::Timeout)
+    );
+    assert!(
+        runner.results[1..]
+            .iter()
+            .all(|result| result.status == AutomationCommandStatus::Skipped)
+    );
+    assert!(
+        receiver.try_recv().is_err(),
+        "no report is sent to a client that already received its timeout"
+    );
+    assert!(!runner.cancel_if_requested(), "cancellation happens once");
+
+    // The file worker finishes afterwards: its completion is ignored.
+    assert!(!runner.finish_command(
+        index,
+        Ok(("late".to_owned(), serde_json::Value::Null))
+    ));
+    assert_eq!(runner.results.len(), 3);
+}
+
+#[test]
+fn a_cancelled_idle_control_batch_skips_every_remaining_command() {
+    let (mut runner, cancelled, _receiver) =
+        control_runner(vec![AutomationCommand::NewWorkspace, AutomationCommand::Exit]);
+    cancelled.store(true, std::sync::atomic::Ordering::Release);
+    assert!(runner.cancel_if_requested());
+    assert_eq!(runner.results.len(), 2);
+    assert!(
+        runner
+            .results
+            .iter()
+            .all(|result| result.status == AutomationCommandStatus::Skipped)
+    );
+    assert!(!runner.exit_after_report, "a skipped Exit does not exit");
+}
+
+#[test]
+fn file_batches_are_never_cancelled_by_the_control_flag() {
+    let batch = AutomationBatch {
+        schema_version: AUTOMATION_SCHEMA_VERSION,
+        commands: vec![AutomationCommand::Exit],
+    };
+    let mut runner = AutomationRunner::new(batch, PathBuf::from("report.json"));
+    assert!(!runner.cancel_if_requested());
+    assert_eq!(runner.commands.len(), 1);
 }
 
 #[test]

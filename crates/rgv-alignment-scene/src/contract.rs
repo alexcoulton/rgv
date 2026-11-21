@@ -403,6 +403,8 @@ pub struct LayoutContract {
     /// Stable template hash explicitly promoted to the top of its group. Promotion is a layout
     /// decision; hover and ordinary selection remain camera overlays and never rekey rows.
     pub promoted_template: Option<u64>,
+    /// Which eligible reads receive rows; never affects evidence or exact summaries.
+    pub sampling: crate::ReadSampling,
 }
 
 impl LayoutContract {
@@ -440,6 +442,10 @@ impl LayoutContract {
                 .to_le_bytes(),
         );
         hash.write(&self.promoted_template.unwrap_or(u64::MAX).to_le_bytes());
+        // Complete sampling adds nothing, preserving every fingerprint issued before sampling.
+        if self.sampling.is_downsampled() {
+            self.sampling.write_fingerprint(&mut hash);
+        }
         hash.finish()
     }
 }

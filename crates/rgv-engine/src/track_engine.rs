@@ -1,13 +1,14 @@
 use std::{
-    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
-    rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
-use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use rgv_core::{
     CopyNumberTrackSettings, GenerationClock, GenomicInterval, InteractionTrackSettings,
     PanelGeneration, TrackId, VariantTrackSettings,
@@ -15,15 +16,22 @@ use rgv_core::{
 use rgv_hts::{
     BigBedFeatureFormat, BigBedSource, BigWigSource, CopyNumberQuery, FeatureFormat, FeatureRecord,
     GwasQuery, InteractionFormat, InteractionQuery, LocalVariantSource, MAX_FEATURE_SEARCH_RESULTS,
-    MutationQuery, QuantitativeFormat, QuantitativeQuery, Strand, TdfSource, TextCopyNumberSource,
+    MutationQuery, QuantitativeFormat, QuantitativeQuery, TdfSource, TextCopyNumberSource,
     TextFeatureSource, TextGwasSource, TextInteractionSource, TextMutationSource,
     TextQuantitativeSource, VariantQuery,
 };
 
 use crate::{
     EngineQueueError,
-    mailbox::{CoalescingReceiver, CoalescingSender, bounded_coalescing},
+    mailbox::{
+        CoalescingReceiver, CoalescingSender, bounded_coalescing_to_ui, panic_message,
+        run_thread_root,
+    },
+    track_source::{SearchRequest, TdfChannel, TrackQuerySettings, TrackSource},
 };
+
+/// Most tracks queried at the same time for one viewport request.
+const MAXIMUM_PARALLEL_TRACK_QUERIES: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrackSpecKind {
@@ -177,74 +185,24 @@ enum TrackEngineRequest {
     },
 }
 
-enum OpenTrack {
-    Text {
-        id: TrackId,
-        name: String,
-        source: TextFeatureSource,
-    },
-    Variants {
-        id: TrackId,
-        name: String,
-        source: LocalVariantSource,
-    },
-    BigWig {
-        id: TrackId,
-        name: String,
-        source: BigWigSource,
-    },
-    TextQuantitative {
-        id: TrackId,
-        name: String,
-        source: TextQuantitativeSource,
-    },
-    Interactions {
-        id: TrackId,
-        name: String,
-        source: TextInteractionSource,
-    },
-    CopyNumber {
-        id: TrackId,
-        name: String,
-        source: TextCopyNumberSource,
-    },
-    Mutations {
-        id: TrackId,
-        name: String,
-        source: TextMutationSource,
-    },
-    Gwas {
-        id: TrackId,
-        name: String,
-        source: TextGwasSource,
-    },
-    Tdf {
-        id: TrackId,
-        name: String,
-        source: Rc<RefCell<TdfSource>>,
-        track_index: usize,
-    },
-    BigBed {
-        id: TrackId,
-        name: String,
-        source: BigBedSource,
-    },
+/// One opened auxiliary track. The file format is known only to its [`TrackSource`].
+struct OpenTrack {
+    id: TrackId,
+    name: String,
+    source: Box<dyn TrackSource>,
 }
 
 impl OpenTrack {
-    fn id(&self) -> TrackId {
-        match self {
-            Self::Text { id, .. }
-            | Self::Variants { id, .. }
-            | Self::BigWig { id, .. }
-            | Self::TextQuantitative { id, .. }
-            | Self::Interactions { id, .. }
-            | Self::CopyNumber { id, .. }
-            | Self::Mutations { id, .. }
-            | Self::Gwas { id, .. }
-            | Self::Tdf { id, .. }
-            | Self::BigBed { id, .. } => *id,
+    fn new(id: TrackId, name: String, source: impl TrackSource + 'static) -> Self {
+        Self {
+            id,
+            name,
+            source: Box::new(source),
         }
+    }
+
+    const fn id(&self) -> TrackId {
+        self.id
     }
 }
 
@@ -252,6 +210,9 @@ pub struct TrackEngine {
     input: Option<Sender<TrackEngineRequest>>,
     output: CoalescingReceiver<TrackEngineEvent>,
     worker: Option<JoinHandle<()>>,
+    /// Newest search generation the queue accepted. The actor abandons any search older than
+    /// this, before it starts and between tracks, instead of finishing an answer nobody wants.
+    latest_search: Arc<AtomicU64>,
 }
 
 impl TrackEngine {
@@ -270,15 +231,37 @@ impl TrackEngine {
         capacity: usize,
     ) -> Self {
         let (input_tx, input_rx) = bounded(capacity.max(1));
-        let (output_tx, output_rx) = bounded_coalescing(capacity.max(1));
+        let (output_tx, output_rx) = bounded_coalescing_to_ui(capacity.max(1));
+        let latest_search = Arc::new(AtomicU64::new(0));
+        let worker_latest_search = Arc::clone(&latest_search);
         let worker = thread::Builder::new()
             .name("rgv-track-actor".to_owned())
-            .spawn(move || worker_loop(specifications, &input_rx, &output_tx))
+            .spawn(move || {
+                // Query helpers publish lane results through the same sender.
+                let output = Arc::new(output_tx);
+                run_thread_root(
+                    || worker_loop(specifications, &input_rx, &output, &worker_latest_search),
+                    |message| {
+                        tracing::error!(message, "track actor panicked");
+                        send_event(
+                            &output,
+                            TrackEngineEvent::Error {
+                                request: None,
+                                track: None,
+                                message: format!(
+                                    "the track engine stopped after an internal error: {message}"
+                                ),
+                            },
+                        );
+                    },
+                );
+            })
             .expect("failed to spawn RGV track actor");
         Self {
             input: Some(input_tx),
             output: output_rx,
             worker: Some(worker),
+            latest_search,
         }
     }
 
@@ -472,7 +455,11 @@ impl TrackEngine {
                 limit: limit.min(MAX_FEATURE_SEARCH_RESULTS),
                 include_variant_ids,
             })
-            .map_err(map_send_error)
+            .map_err(map_send_error)?;
+        // Published only once the request is queued, and only ever raised: a search the queue
+        // refused cancels nothing, and a late store cannot cancel the search it belongs to.
+        self.latest_search.fetch_max(generation, Ordering::AcqRel);
+        Ok(())
     }
 
     pub fn try_adjacent_feature(
@@ -526,8 +513,10 @@ impl Drop for TrackEngine {
 fn worker_loop(
     specifications: Vec<(TrackSpec, BTreeMap<String, String>)>,
     input: &Receiver<TrackEngineRequest>,
-    output: &CoalescingSender<TrackEngineEvent>,
+    output: &Arc<CoalescingSender<TrackEngineEvent>>,
+    latest_search: &AtomicU64,
 ) {
+    let mut query_pool = None;
     let mut tracks = Vec::new();
     let mut tdf_sources = HashMap::new();
     let mut query_contig_aliases = HashMap::new();
@@ -614,28 +603,38 @@ fn worker_loop(
             } => query_tracks(
                 &mut tracks,
                 &query_contig_aliases,
-                output,
-                &clock,
-                request,
-                &contig,
-                interval,
+                &mut query_pool,
+                &Arc::new(TrackQueryContext {
+                    output: Arc::clone(output),
+                    clock,
+                    request,
+                    contig,
+                    interval,
+                    variant_settings,
+                    interaction_settings,
+                    copy_number_settings,
+                }),
                 track_ids.as_deref(),
-                &variant_settings,
-                &interaction_settings,
-                &copy_number_settings,
             ),
             TrackEngineRequest::Search {
                 generation,
                 query,
                 limit,
                 include_variant_ids,
-            } => send_event(
-                output,
-                TrackEngineEvent::SearchCompleted {
-                    generation,
-                    results: search_tracks(&mut tracks, query, limit, include_variant_ids),
-                },
-            ),
+            } => {
+                let superseded = || latest_search.load(Ordering::Acquire) > generation;
+                if let Some(results) =
+                    search_tracks(&mut tracks, query, limit, include_variant_ids, &superseded)
+                {
+                    send_event(
+                        output,
+                        TrackEngineEvent::SearchCompleted {
+                            generation,
+                            results,
+                        },
+                    );
+                }
+            }
             TrackEngineRequest::AdjacentFeature {
                 generation,
                 contig,
@@ -726,7 +725,7 @@ fn remove_tracks(
     let removed_set = removed.iter().copied().collect::<HashSet<_>>();
     tracks.retain(|track| !removed_set.contains(&track.id()));
     query_contig_aliases.retain(|id, _| !removed_set.contains(id));
-    tdf_sources.retain(|_, source| Rc::strong_count(source) > 1);
+    tdf_sources.retain(|_, source| Arc::strong_count(source) > 1);
     removed
 }
 
@@ -738,20 +737,15 @@ fn send_tdf_discovery(
     if specification.kind != TrackSpecKind::Tdf {
         return;
     }
-    let OpenTrack::Tdf {
-        source,
-        track_index,
-        ..
-    } = track
-    else {
+    let Some((track_names, selected_index)) = track.source.channels() else {
         return;
     };
     send_event(
         output,
         TrackEngineEvent::TdfChannelsDiscovered {
             id: specification.id,
-            track_names: source.borrow().metadata().track_names.clone(),
-            selected_index: *track_index,
+            track_names,
+            selected_index,
         },
     );
 }
@@ -767,33 +761,17 @@ fn adjacent_feature(
         .iter_mut()
         .filter_map(|track| {
             let query_contig = track_query_contig(query_contig_aliases, track.id(), contig);
-            let (id, name, record) = match track {
-                OpenTrack::Text { id, name, source } => {
-                    (*id, name.clone(), source.adjacent_feature(query_contig, position, forward)?)
+            let record = match track
+                .source
+                .adjacent_feature(query_contig, position, forward)
+            {
+                Ok(record) => record?,
+                Err(error) => {
+                    tracing::warn!(%error, track = %track.name, "feature navigation failed");
+                    return None;
                 }
-                OpenTrack::BigBed { id, name, source } => match source
-                    .adjacent_feature(query_contig, position, forward)
-                {
-                    Ok(Some(record)) => (*id, name.clone(), record),
-                    Ok(None) => return None,
-                    Err(error) => {
-                        tracing::warn!(%error, track = %name, "BigBed feature navigation failed");
-                        return None;
-                    }
-                },
-                OpenTrack::Gwas { id, name, source } => {
-                    let association =
-                        source.adjacent_association(query_contig, position, forward)?;
-                    (*id, name.clone(), gwas_feature_record(association))
-                }
-                OpenTrack::Variants { .. }
-                | OpenTrack::BigWig { .. }
-                | OpenTrack::Tdf { .. }
-                | OpenTrack::TextQuantitative { .. }
-                | OpenTrack::Interactions { .. }
-                | OpenTrack::CopyNumber { .. }
-                | OpenTrack::Mutations { .. } => return None,
             };
+            let (id, name) = (track.id, track.name.clone());
             Some(TrackSearchHit {
                 track_id: id,
                 track_name: name,
@@ -818,89 +796,53 @@ fn adjacent_feature(
     hits.into_iter().next()
 }
 
+/// Searches every track, or returns `None` as soon as `superseded` reports that a newer search
+/// was queued. The check runs before the first track and again around every track, so an
+/// abandoned query costs at most the one source scan already in progress.
 #[allow(clippy::too_many_lines)]
 fn search_tracks(
     tracks: &mut [OpenTrack],
     query: String,
     limit: usize,
     include_variant_ids: bool,
-) -> TrackSearchResults {
+    superseded: &dyn Fn() -> bool,
+) -> Option<TrackSearchResults> {
+    if superseded() {
+        return None;
+    }
     let normalized_query = query.trim().to_lowercase();
     let mut hits = Vec::new();
     let mut index_truncated = false;
     let mut scan_truncated = false;
+    let request = SearchRequest {
+        query: &query,
+        normalized: &normalized_query,
+        limit,
+        include_variant_ids,
+    };
     for track in tracks {
-        match track {
-            OpenTrack::Text { id, name, source } => {
-                let results = source.search(&normalized_query, limit);
-                index_truncated |= results.index_truncated;
-                scan_truncated |= results.scan_truncated;
-                hits.extend(results.hits.into_iter().map(|hit| TrackSearchHit {
-                    track_id: *id,
-                    track_name: name.clone(),
-                    matched_term: hit.matched_term,
-                    record: hit.record,
-                }));
-            }
-            OpenTrack::Variants { id, name, source } if include_variant_ids => {
-                match source.search_ids(&query, limit) {
-                    Ok(results) => {
-                        index_truncated |= results.index_truncated;
-                        scan_truncated |= results.scan_truncated;
-                        hits.extend(results.hits.into_iter().map(|hit| TrackSearchHit {
-                            track_id: *id,
-                            track_name: name.clone(),
-                            matched_term: hit.matched_id,
-                            record: FeatureRecord {
-                                contig: hit.contig,
-                                start: hit.start,
-                                end: hit.end,
-                                name: Some(hit.id),
-                                feature_type: Some("variant".to_owned()),
-                                score: None,
-                                strand: Strand::Unstranded,
-                                blocks: Vec::new(),
-                                coding_interval: None,
-                                peak: None,
-                                attributes: Vec::new(),
-                            },
-                        }));
-                    }
-                    Err(error) => tracing::warn!(%error, track = %name, "variant ID index failed"),
-                }
-            }
-            OpenTrack::Variants { .. }
-            | OpenTrack::BigWig { .. }
-            | OpenTrack::TextQuantitative { .. }
-            | OpenTrack::Interactions { .. }
-            | OpenTrack::CopyNumber { .. }
-            | OpenTrack::Mutations { .. }
-            | OpenTrack::Tdf { .. } => {}
-            OpenTrack::Gwas { id, name, source } => {
-                let results = source.search(&query, limit);
-                index_truncated |= results.index_truncated;
-                scan_truncated |= results.scan_truncated;
-                hits.extend(results.hits.into_iter().map(|hit| TrackSearchHit {
-                    track_id: *id,
-                    track_name: name.clone(),
-                    matched_term: hit.matched_term,
-                    record: gwas_feature_record(hit.record),
-                }));
-            }
-            OpenTrack::BigBed { id, name, source } => match source.search(&query, limit) {
-                Ok(results) => {
-                    index_truncated |= results.index_truncated;
-                    scan_truncated |= results.scan_truncated;
-                    hits.extend(results.hits.into_iter().map(|hit| TrackSearchHit {
-                        track_id: *id,
-                        track_name: name.clone(),
-                        matched_term: hit.matched_term,
-                        record: hit.record,
-                    }));
-                }
-                Err(error) => tracing::warn!(%error, track = %name, "BigBed feature search failed"),
-            },
+        if superseded() {
+            return None;
         }
+        match track.source.search(request) {
+            Ok(Some(results)) => {
+                index_truncated |= results.index_truncated;
+                scan_truncated |= results.scan_truncated;
+                hits.extend(results.hits.into_iter().map(|(matched_term, record)| {
+                    TrackSearchHit {
+                        track_id: track.id,
+                        track_name: track.name.clone(),
+                        matched_term,
+                        record,
+                    }
+                }));
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, track = %track.name, "feature search failed"),
+        }
+    }
+    if superseded() {
+        return None;
     }
     hits.sort_by(|left, right| {
         let left_exact = left.matched_term == normalized_query;
@@ -921,100 +863,291 @@ fn search_tracks(
             && left.record.name == right.record.name
     });
     hits.truncate(limit.min(MAX_FEATURE_SEARCH_RESULTS));
-    TrackSearchResults {
+    Some(TrackSearchResults {
         query,
         hits,
         index_truncated,
         scan_truncated,
         variant_ids_included: include_variant_ids,
-    }
+    })
 }
 
-fn gwas_feature_record(record: rgv_hts::GwasRecord) -> FeatureRecord {
-    FeatureRecord {
-        contig: record.contig,
-        start: record.position,
-        end: record.position.saturating_add(1),
-        name: Some(record.identifier),
-        feature_type: Some("GWAS association".to_owned()),
-        score: record
-            .minus_log10_p
-            .is_finite()
-            .then_some(record.minus_log10_p),
-        strand: Strand::Unstranded,
-        blocks: Vec::new(),
-        coding_interval: None,
-        peak: None,
-        attributes: record.fields,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn query_tracks(
-    tracks: &mut [OpenTrack],
-    query_contig_aliases: &HashMap<TrackId, BTreeMap<String, String>>,
-    output: &CoalescingSender<TrackEngineEvent>,
-    clock: &GenerationClock,
+/// Everything one viewport query shares across the tracks it reads.
+struct TrackQueryContext {
+    output: Arc<CoalescingSender<TrackEngineEvent>>,
+    clock: GenerationClock,
     request: PanelGeneration,
-    contig: &str,
+    contig: String,
     interval: GenomicInterval,
-    track_ids: Option<&[TrackId]>,
-    variant_settings: &[(TrackId, VariantTrackSettings)],
-    interaction_settings: &[(TrackId, InteractionTrackSettings)],
-    copy_number_settings: &[(TrackId, CopyNumberTrackSettings)],
-) {
-    if !clock.is_current(request.generation()) {
-        return;
+    variant_settings: Vec<(TrackId, VariantTrackSettings)>,
+    interaction_settings: Vec<(TrackId, InteractionTrackSettings)>,
+    copy_number_settings: Vec<(TrackId, CopyNumberTrackSettings)>,
+}
+
+impl TrackQueryContext {
+    fn is_current(&self) -> bool {
+        self.clock.is_current(self.request.generation())
     }
-    let selected = track_ids.map(|ids| ids.iter().copied().collect::<HashSet<_>>());
-    let mut completed = Vec::with_capacity(selected.as_ref().map_or(tracks.len(), HashSet::len));
-    for track in tracks {
-        if output.is_closed() || !clock.is_current(request.generation()) {
-            break;
+}
+
+struct TrackQueryJob {
+    index: usize,
+    track: OpenTrack,
+    query_contig: String,
+    context: Arc<TrackQueryContext>,
+}
+
+struct TrackQueryJobResult {
+    index: usize,
+    track: OpenTrack,
+    completed: Option<TrackId>,
+}
+
+/// Long-lived helper threads for querying independent tracks at the same time. They are started
+/// once, on the first query that has more than one track to read, and reused for every later
+/// query; the actor lends each helper one track and takes it back with the result.
+struct TrackQueryPool {
+    jobs: Option<Sender<TrackQueryJob>>,
+    finished: Receiver<TrackQueryJobResult>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl TrackQueryPool {
+    fn new(size: usize) -> Self {
+        let (jobs, job_rx) = unbounded::<TrackQueryJob>();
+        let (finished_tx, finished) = unbounded();
+        let workers = (0..size.max(1))
+            .filter_map(|ordinal| {
+                let job_rx = job_rx.clone();
+                let finished_tx = finished_tx.clone();
+                thread::Builder::new()
+                    .name(format!("rgv-track-query-{ordinal}"))
+                    .spawn(move || track_query_helper(&job_rx, &finished_tx))
+                    .inspect_err(|error| tracing::warn!(%error, "could not start a track query helper"))
+                    .ok()
+            })
+            .collect();
+        Self {
+            jobs: Some(jobs),
+            finished,
+            workers,
         }
-        if selected
-            .as_ref()
-            .is_some_and(|selected| !selected.contains(&track.id()))
-        {
-            continue;
-        }
-        let query_contig = track_query_contig(query_contig_aliases, track.id(), contig);
-        match query_track(
-            track,
-            query_contig,
-            interval.start(),
-            interval.end(),
-            variant_settings,
-            interaction_settings,
-            copy_number_settings,
-        ) {
-            Ok(snapshot) => {
-                completed.push(snapshot.id);
-                send_event(
-                    output,
-                    TrackEngineEvent::LaneCompleted {
-                        request,
-                        interval,
-                        track: snapshot,
-                    },
-                );
+    }
+
+    fn submit(&self, job: TrackQueryJob) -> Result<(), Box<TrackQueryJob>> {
+        match &self.jobs {
+            Some(jobs) if !self.workers.is_empty() => {
+                jobs.send(job).map_err(|error| Box::new(error.into_inner()))
             }
-            Err((id, message)) => send_event(
-                output,
+            _ => Err(Box::new(job)),
+        }
+    }
+}
+
+impl Drop for TrackQueryPool {
+    fn drop(&mut self) {
+        self.jobs.take();
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() {
+                tracing::warn!("track query helper panicked while shutting down");
+            }
+        }
+    }
+}
+
+/// Thread root of one query helper. A panic inside a source is contained per job: it becomes
+/// that lane's error event, and the borrowed track always travels back to the actor.
+fn track_query_helper(jobs: &Receiver<TrackQueryJob>, finished: &Sender<TrackQueryJobResult>) {
+    while let Ok(job) = jobs.recv() {
+        let TrackQueryJob {
+            index,
+            mut track,
+            query_contig,
+            context,
+        } = job;
+        let completed = query_one_contained(&mut track, &query_contig, &context);
+        // Release the shared event sender before the actor can observe this job as finished.
+        drop(context);
+        if finished
+            .send(TrackQueryJobResult {
+                index,
+                track,
+                completed,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn query_one_contained(
+    track: &mut OpenTrack,
+    query_contig: &str,
+    context: &TrackQueryContext,
+) -> Option<TrackId> {
+    let id = track.id();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        query_one(track, query_contig, context)
+    })) {
+        Ok(completed) => completed,
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            tracing::error!(message, track = %track.name, "track query panicked");
+            send_event(
+                &context.output,
                 TrackEngineEvent::Error {
-                    request: Some(request),
+                    request: Some(context.request),
+                    track: Some(id),
+                    message: format!("{}: internal error: {message}", track.name),
+                },
+            );
+            None
+        }
+    }
+}
+
+/// Queries one track for the request and publishes its lane. Both the start and the result are
+/// checked against the generation clock: a lane that became stale while its source was being
+/// read is dropped here rather than published for the UI to reject.
+fn query_one(
+    track: &mut OpenTrack,
+    query_contig: &str,
+    context: &TrackQueryContext,
+) -> Option<TrackId> {
+    if context.output.is_closed() || !context.is_current() {
+        return None;
+    }
+    let result = query_track(
+        track,
+        query_contig,
+        context.interval.start(),
+        context.interval.end(),
+        &context.variant_settings,
+        &context.interaction_settings,
+        &context.copy_number_settings,
+    );
+    if !context.is_current() {
+        return None;
+    }
+    match result {
+        Ok(snapshot) => {
+            let id = snapshot.id;
+            send_event(
+                &context.output,
+                TrackEngineEvent::LaneCompleted {
+                    request: context.request,
+                    interval: context.interval,
+                    track: snapshot,
+                },
+            );
+            Some(id)
+        }
+        Err((id, message)) => {
+            send_event(
+                &context.output,
+                TrackEngineEvent::Error {
+                    request: Some(context.request),
                     track: Some(id),
                     message,
                 },
-            ),
+            );
+            None
         }
     }
-    if clock.is_current(request.generation()) {
+}
+
+fn query_tracks(
+    tracks: &mut Vec<OpenTrack>,
+    query_contig_aliases: &HashMap<TrackId, BTreeMap<String, String>>,
+    pool: &mut Option<TrackQueryPool>,
+    context: &Arc<TrackQueryContext>,
+    track_ids: Option<&[TrackId]>,
+) {
+    if !context.is_current() {
+        return;
+    }
+    let selected = track_ids.map(|ids| ids.iter().copied().collect::<HashSet<_>>());
+    let wanted = tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, track)| {
+            selected
+                .as_ref()
+                .is_none_or(|selected| selected.contains(&track.id()))
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let parallelism = MAXIMUM_PARALLEL_TRACK_QUERIES
+        .min(thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get));
+    let mut completed = Vec::with_capacity(wanted.len());
+    if wanted.len().min(parallelism) <= 1 {
+        for index in wanted {
+            let track = &mut tracks[index];
+            let query_contig =
+                track_query_contig(query_contig_aliases, track.id(), &context.contig).to_owned();
+            if let Some(id) = query_one_contained(track, &query_contig, context) {
+                completed.push((index, id));
+            }
+        }
+    } else {
+        // Each source owns its reader, so tracks are independent: one slow file (a remote
+        // BigWig, a large indexed annotation) does not delay the lanes behind it. The helpers
+        // are persistent; no thread is created per query.
+        let pool = pool.get_or_insert_with(|| TrackQueryPool::new(parallelism));
+        let mut lent = std::mem::take(tracks)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let mut outstanding = 0_usize;
+        for index in wanted {
+            let track = lent[index]
+                .take()
+                .expect("each wanted track index is lent exactly once");
+            let query_contig =
+                track_query_contig(query_contig_aliases, track.id(), &context.contig).to_owned();
+            match pool.submit(TrackQueryJob {
+                index,
+                track,
+                query_contig,
+                context: Arc::clone(context),
+            }) {
+                Ok(()) => outstanding += 1,
+                Err(job) => {
+                    // No helper could be started: read this track on the actor itself.
+                    let TrackQueryJob {
+                        index,
+                        mut track,
+                        query_contig,
+                        ..
+                    } = *job;
+                    if let Some(id) = query_one_contained(&mut track, &query_contig, context) {
+                        completed.push((index, id));
+                    }
+                    lent[index] = Some(track);
+                }
+            }
+        }
+        for _ in 0..outstanding {
+            let Ok(result) = pool.finished.recv() else {
+                tracing::error!("track query helpers stopped; unreturned tracks were closed");
+                break;
+            };
+            if let Some(id) = result.completed {
+                completed.push((result.index, id));
+            }
+            lent[result.index] = Some(result.track);
+        }
+        *tracks = lent.into_iter().flatten().collect();
+    }
+    completed.sort_unstable_by_key(|(index, _)| *index);
+    let completed = completed.into_iter().map(|(_, id)| id).collect::<Vec<_>>();
+    if context.is_current() {
         send_event(
-            output,
+            &context.output,
             TrackEngineEvent::QueryCompleted {
-                request,
-                interval,
+                request: context.request,
+                interval: context.interval,
                 completed,
             },
         );
@@ -1032,7 +1165,7 @@ fn track_query_contig<'a>(
         .map_or(workspace_contig, String::as_str)
 }
 
-type TdfSourceCache = HashMap<PathBuf, Rc<RefCell<TdfSource>>>;
+type TdfSourceCache = HashMap<PathBuf, Arc<Mutex<TdfSource>>>;
 
 #[cfg(test)]
 fn open_track(specification: &TrackSpec) -> Result<OpenTrack, String> {
@@ -1066,17 +1199,17 @@ fn open_track_cached(
                 _ => unreachable!(),
             };
             TextFeatureSource::open(&specification.path, format)
-                .map(|source| OpenTrack::Text { id, name, source })
+                .map(|source| OpenTrack::new(id, name, source))
                 .map_err(|error| error.to_string())
         }
         TrackSpecKind::VcfOrBcf => LocalVariantSource::open(&specification.path)
-            .map(|source| OpenTrack::Variants { id, name, source })
+            .map(|source| OpenTrack::new(id, name, source))
             .map_err(|error| error.to_string()),
         TrackSpecKind::Gwas => TextGwasSource::open(&specification.path)
-            .map(|source| OpenTrack::Gwas { id, name, source })
+            .map(|source| OpenTrack::new(id, name, source))
             .map_err(|error| error.to_string()),
         TrackSpecKind::BigWig => BigWigSource::open(&specification.path)
-            .map(|source| OpenTrack::BigWig { id, name, source })
+            .map(|source| OpenTrack::new(id, name, source))
             .map_err(|error| error.to_string()),
         TrackSpecKind::Tdf | TrackSpecKind::TdfChannel { .. } => {
             open_tdf_track(specification, tdf_sources)
@@ -1088,7 +1221,7 @@ fn open_track_cached(
                 QuantitativeFormat::Wig
             };
             TextQuantitativeSource::open(&specification.path, format)
-                .map(|source| OpenTrack::TextQuantitative { id, name, source })
+                .map(|source| OpenTrack::new(id, name, source))
                 .map_err(|error| error.to_string())
         }
         TrackSpecKind::BedPe | TrackSpecKind::Interact => {
@@ -1098,14 +1231,14 @@ fn open_track_cached(
                 InteractionFormat::Interact
             };
             TextInteractionSource::open(&specification.path, format)
-                .map(|source| OpenTrack::Interactions { id, name, source })
+                .map(|source| OpenTrack::new(id, name, source))
                 .map_err(|error| error.to_string())
         }
         TrackSpecKind::Seg => TextCopyNumberSource::open(&specification.path)
-            .map(|source| OpenTrack::CopyNumber { id, name, source })
+            .map(|source| OpenTrack::new(id, name, source))
             .map_err(|error| error.to_string()),
         TrackSpecKind::MutationMaf => TextMutationSource::open(&specification.path)
-            .map(|source| OpenTrack::Mutations { id, name, source })
+            .map(|source| OpenTrack::new(id, name, source))
             .map_err(|error| error.to_string()),
         TrackSpecKind::BigBed | TrackSpecKind::BigGenePred | TrackSpecKind::BigNarrowPeak => {
             let format = match specification.kind {
@@ -1115,7 +1248,7 @@ fn open_track_cached(
                 _ => unreachable!(),
             };
             BigBedSource::open_with_format(&specification.path, format)
-                .map(|source| OpenTrack::BigBed { id, name, source })
+                .map(|source| OpenTrack::new(id, name, source))
                 .map_err(|error| error.to_string())
         }
     }
@@ -1126,34 +1259,40 @@ fn open_tdf_track(
     tdf_sources: &mut TdfSourceCache,
 ) -> Result<OpenTrack, String> {
     let source = if let Some(source) = tdf_sources.get(&specification.path) {
-        Rc::clone(source)
+        Arc::clone(source)
     } else {
-        let source = Rc::new(RefCell::new(
+        let source = Arc::new(Mutex::new(
             TdfSource::open(&specification.path).map_err(|error| error.to_string())?,
         ));
-        tdf_sources.insert(specification.path.clone(), Rc::clone(&source));
+        tdf_sources.insert(specification.path.clone(), Arc::clone(&source));
         source
     };
-    let track_index = match specification.kind {
-        TrackSpecKind::Tdf => source
-            .borrow()
-            .track_index_by_name(&specification.name)
-            .unwrap_or(0),
-        TrackSpecKind::TdfChannel { index } => index,
-        _ => unreachable!(),
+    let (track_index, channel_count) = {
+        let archive = source
+            .lock()
+            .map_err(|_| "the TDF reader failed in another query".to_owned())?;
+        let track_index = match specification.kind {
+            TrackSpecKind::Tdf => archive
+                .track_index_by_name(&specification.name)
+                .unwrap_or(0),
+            TrackSpecKind::TdfChannel { index } => index,
+            _ => unreachable!(),
+        };
+        (track_index, archive.metadata().track_names.len())
     };
-    let channel_count = source.borrow().metadata().track_names.len();
     if track_index >= channel_count {
         return Err(format!(
             "TDF channel index {track_index} is outside the {channel_count} embedded channels"
         ));
     }
-    Ok(OpenTrack::Tdf {
-        id: specification.id,
-        name: specification.name.clone(),
-        source,
-        track_index,
-    })
+    Ok(OpenTrack::new(
+        specification.id,
+        specification.name.clone(),
+        TdfChannel {
+            source,
+            track_index,
+        },
+    ))
 }
 
 fn query_track(
@@ -1165,104 +1304,28 @@ fn query_track(
     interaction_settings: &[(TrackId, InteractionTrackSettings)],
     copy_number_settings: &[(TrackId, CopyNumberTrackSettings)],
 ) -> Result<TrackSnapshot, (TrackId, String)> {
-    match track {
-        OpenTrack::Text { id, name, source } => source
-            .query(contig, start, end)
-            .map(|records| TrackSnapshot {
-                id: *id,
-                name: name.clone(),
-                data: TrackSnapshotData::Features(records),
-            })
-            .map_err(|error| (*id, error.to_string())),
-        OpenTrack::Variants { id, name, source } => {
-            let default_settings = VariantTrackSettings::default();
-            let settings = variant_settings
-                .iter()
-                .find(|(track_id, _)| track_id == id)
-                .map_or(&default_settings, |(_, settings)| settings);
-            source
-                .query_with_settings(contig, start, end, 100_000, settings)
-                .map(|records| TrackSnapshot {
-                    id: *id,
-                    name: name.clone(),
-                    data: TrackSnapshotData::Variants(Arc::new(records)),
-                })
-                .map_err(|error| (*id, error.to_string()))
-        }
-        OpenTrack::BigWig { id, name, source } => source
-            .query(contig, start, end)
-            .map(|query| TrackSnapshot {
-                id: *id,
-                name: name.clone(),
-                data: TrackSnapshotData::Quantitative(Arc::new(query)),
-            })
-            .map_err(|error| (*id, error.to_string())),
-        OpenTrack::TextQuantitative { id, name, source } => Ok(TrackSnapshot {
-            id: *id,
-            name: name.clone(),
-            data: TrackSnapshotData::Quantitative(Arc::new(source.query(contig, start, end))),
-        }),
-        OpenTrack::Tdf {
+    let id = track.id;
+    let settings = TrackQuerySettings {
+        variant: setting_for_track(variant_settings, id),
+        interaction: setting_for_track(interaction_settings, id),
+        copy_number: setting_for_track(copy_number_settings, id),
+    };
+    track
+        .source
+        .query(contig, start, end, settings)
+        .map(|data| TrackSnapshot {
             id,
-            name,
-            source,
-            track_index,
-        } => source
-            .borrow_mut()
-            .query_channel(*track_index, contig, start, end)
-            .map(|query| TrackSnapshot {
-                id: *id,
-                name: name.clone(),
-                data: TrackSnapshotData::Quantitative(Arc::new(query)),
-            })
-            .map_err(|error| (*id, error.to_string())),
-        OpenTrack::Interactions { id, name, source } => {
-            let default_settings = InteractionTrackSettings::default();
-            let settings = interaction_settings
-                .iter()
-                .find(|(track_id, _)| track_id == id)
-                .map_or(&default_settings, |(_, settings)| settings);
-            Ok(TrackSnapshot {
-                id: *id,
-                name: name.clone(),
-                data: TrackSnapshotData::Interactions(Arc::new(
-                    source.query(contig, start, end, settings),
-                )),
-            })
-        }
-        OpenTrack::CopyNumber { id, name, source } => {
-            let default_settings = CopyNumberTrackSettings::default();
-            let settings = copy_number_settings
-                .iter()
-                .find(|(track_id, _)| track_id == id)
-                .map_or(&default_settings, |(_, settings)| settings);
-            Ok(TrackSnapshot {
-                id: *id,
-                name: name.clone(),
-                data: TrackSnapshotData::CopyNumber(Arc::new(
-                    source.query(contig, start, end, settings),
-                )),
-            })
-        }
-        OpenTrack::Mutations { id, name, source } => Ok(TrackSnapshot {
-            id: *id,
-            name: name.clone(),
-            data: TrackSnapshotData::Mutations(Arc::new(source.query(contig, start, end))),
-        }),
-        OpenTrack::Gwas { id, name, source } => Ok(TrackSnapshot {
-            id: *id,
-            name: name.clone(),
-            data: TrackSnapshotData::Gwas(Arc::new(source.query(contig, start, end))),
-        }),
-        OpenTrack::BigBed { id, name, source } => source
-            .query(contig, start, end)
-            .map(|records| TrackSnapshot {
-                id: *id,
-                name: name.clone(),
-                data: TrackSnapshotData::Features(records),
-            })
-            .map_err(|error| (*id, error.to_string())),
-    }
+            name: track.name.clone(),
+            data,
+        })
+        .map_err(|message| (id, message))
+}
+
+fn setting_for_track<T>(settings: &[(TrackId, T)], id: TrackId) -> Option<&T> {
+    settings
+        .iter()
+        .find(|(track, _)| *track == id)
+        .map(|(_, settings)| settings)
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1297,6 +1360,7 @@ mod tests {
     use rgv_core::{ContigId, GenomicInterval, PanelId, ViewportGeneration};
 
     use super::*;
+    use crate::mailbox::bounded_coalescing;
 
     fn tdf_fixture() -> Vec<u8> {
         fn string(bytes: &mut Vec<u8>, value: &str) {
@@ -1469,6 +1533,281 @@ mod tests {
         assert_eq!(receiver.try_receive().unwrap(), None);
     }
 
+    fn test_query_context(
+        output: CoalescingSender<TrackEngineEvent>,
+        clock: &GenerationClock,
+        request: PanelGeneration,
+        interval: GenomicInterval,
+    ) -> Arc<TrackQueryContext> {
+        Arc::new(TrackQueryContext {
+            output: Arc::new(output),
+            clock: clock.clone(),
+            request,
+            contig: "chr1".to_owned(),
+            interval,
+            variant_settings: Vec::new(),
+            interaction_settings: Vec::new(),
+            copy_number_settings: Vec::new(),
+        })
+    }
+
+    /// A source whose behaviour a test scripts: it can advance the generation clock while it is
+    /// being read, panic, or record that it was searched.
+    #[derive(Default)]
+    struct ScriptedSource {
+        advance_during_query: Option<GenerationClock>,
+        panic_in_query: bool,
+        searches: Option<Arc<AtomicU64>>,
+        supersede_on_search: Option<Arc<AtomicU64>>,
+    }
+
+    impl TrackSource for ScriptedSource {
+        fn query(
+            &mut self,
+            _contig: &str,
+            _start: u64,
+            _end: u64,
+            _settings: TrackQuerySettings<'_>,
+        ) -> Result<TrackSnapshotData, String> {
+            assert!(!self.panic_in_query, "scripted source failure");
+            if let Some(clock) = &self.advance_during_query {
+                clock.advance();
+            }
+            Ok(TrackSnapshotData::Features(Vec::new()))
+        }
+
+        fn search(
+            &mut self,
+            _request: SearchRequest<'_>,
+        ) -> Result<Option<crate::track_source::SourceSearch>, String> {
+            if let Some(searches) = &self.searches {
+                searches.fetch_add(1, Ordering::AcqRel);
+            }
+            if let Some(latest) = &self.supersede_on_search {
+                latest.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(Some(crate::track_source::SourceSearch::default()))
+        }
+    }
+
+    fn drain(receiver: &CoalescingReceiver<TrackEngineEvent>) -> Vec<TrackEngineEvent> {
+        std::iter::from_fn(|| receiver.try_receive().unwrap()).collect()
+    }
+
+    #[test]
+    fn a_lane_that_became_stale_while_its_source_was_read_is_not_published() {
+        let (output, receiver) = bounded_coalescing(8);
+        let clock = GenerationClock::default();
+        let request = PanelGeneration::new(PanelId::new(1), clock.current());
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap();
+        let context = test_query_context(output, &clock, request, interval);
+        let mut tracks = vec![OpenTrack::new(
+            TrackId::new(1),
+            "navigated away".to_owned(),
+            ScriptedSource {
+                advance_during_query: Some(clock.clone()),
+                ..ScriptedSource::default()
+            },
+        )];
+
+        query_tracks(&mut tracks, &HashMap::new(), &mut None, &context, None);
+
+        assert_eq!(
+            drain(&receiver),
+            Vec::new(),
+            "neither the stale lane nor its settlement marker may be published"
+        );
+    }
+
+    #[test]
+    fn a_panicking_source_becomes_that_lanes_error_and_spares_the_others() {
+        let (output, receiver) = bounded_coalescing(8);
+        let clock = GenerationClock::default();
+        let request = PanelGeneration::new(PanelId::new(1), clock.current());
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap();
+        let context = test_query_context(output, &clock, request, interval);
+        let mut tracks = vec![
+            OpenTrack::new(
+                TrackId::new(1),
+                "broken".to_owned(),
+                ScriptedSource {
+                    panic_in_query: true,
+                    ..ScriptedSource::default()
+                },
+            ),
+            OpenTrack::new(
+                TrackId::new(2),
+                "healthy".to_owned(),
+                ScriptedSource::default(),
+            ),
+        ];
+        let mut pool = None;
+
+        query_tracks(&mut tracks, &HashMap::new(), &mut pool, &context, None);
+
+        assert_eq!(tracks.len(), 2, "the panicking track is still returned");
+        let events = drain(&receiver);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TrackEngineEvent::Error {
+                request: Some(failed),
+                track: Some(track),
+                message,
+            } if *failed == request
+                && *track == TrackId::new(1)
+                && message.contains("scripted source failure")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TrackEngineEvent::LaneCompleted { track, .. } if track.id == TrackId::new(2)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TrackEngineEvent::QueryCompleted { completed, .. }
+                if completed == &[TrackId::new(2)]
+        )));
+    }
+
+    #[test]
+    fn a_superseded_search_stops_before_and_between_tracks() {
+        let searches = Arc::new(AtomicU64::new(0));
+        let latest = Arc::new(AtomicU64::new(1));
+        let scripted = |supersede: bool| ScriptedSource {
+            searches: Some(Arc::clone(&searches)),
+            supersede_on_search: supersede.then(|| Arc::clone(&latest)),
+            ..ScriptedSource::default()
+        };
+        let mut tracks = vec![
+            OpenTrack::new(TrackId::new(1), "first".to_owned(), scripted(true)),
+            OpenTrack::new(TrackId::new(2), "second".to_owned(), scripted(false)),
+        ];
+        let superseded = |generation: u64| {
+            let latest = Arc::clone(&latest);
+            move || latest.load(Ordering::Acquire) > generation
+        };
+
+        // A newer search is queued while the first track is being scanned: the second track is
+        // never read and no result is produced.
+        assert!(search_tracks(&mut tracks, "gene".to_owned(), 10, false, &superseded(1)).is_none());
+        assert_eq!(searches.load(Ordering::Acquire), 1);
+
+        // Already superseded on arrival: nothing is read at all.
+        assert!(search_tracks(&mut tracks, "gene".to_owned(), 10, false, &superseded(1)).is_none());
+        assert_eq!(searches.load(Ordering::Acquire), 1);
+
+        // The current search runs to completion.
+        tracks.remove(0);
+        let current = latest.load(Ordering::Acquire);
+        assert!(
+            search_tracks(&mut tracks, "gene".to_owned(), 10, false, &superseded(current))
+                .is_some()
+        );
+        assert_eq!(searches.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn the_engine_answers_only_the_newest_queued_search() {
+        let engine = TrackEngine::spawn(Vec::new(), 8);
+        // Both are queued before the actor can have finished the first; whichever it reaches,
+        // only generation 2 may ever be answered.
+        engine.try_search(1, "a".to_owned(), 10, false).unwrap();
+        engine.try_search(2, "b".to_owned(), 10, false).unwrap();
+        let answered = loop {
+            match engine
+                .output
+                .receive_timeout(std::time::Duration::from_secs(30))
+                .unwrap()
+            {
+                Some(TrackEngineEvent::SearchCompleted { generation, .. }) => {
+                    if generation == 2 {
+                        break generation;
+                    }
+                    // Generation 1 may legitimately finish before generation 2 is queued.
+                    assert_eq!(generation, 1);
+                }
+                Some(TrackEngineEvent::Ready { .. }) | None => {}
+                Some(other) => panic!("unexpected track event {other:?}"),
+            }
+        };
+        assert_eq!(answered, 2);
+        assert_eq!(engine.latest_search.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn many_tracks_are_queried_concurrently_and_reported_in_track_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut tracks = Vec::new();
+        for index in 0..12_u64 {
+            let path = directory.path().join(format!("features-{index}.bed"));
+            std::fs::write(
+                &path,
+                format!("chr1\t{}\t{}\tfeature{index}\n", 100 + index, 200),
+            )
+            .unwrap();
+            tracks.push(
+                open_track(&TrackSpec {
+                    id: TrackId::new(index + 1),
+                    name: format!("track {index}"),
+                    path,
+                    kind: TrackSpecKind::Bed,
+                })
+                .unwrap(),
+            );
+        }
+        let (output, receiver) = bounded_coalescing(64);
+        let clock = GenerationClock::default();
+        let request = PanelGeneration::new(PanelId::new(1), clock.current());
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap();
+        let context = test_query_context(output, &clock, request, interval);
+        let mut pool = None;
+
+        for _ in 0..2 {
+            // The second pass reuses the helpers the first one started.
+            query_tracks(
+                &mut tracks,
+                &HashMap::new(),
+                &mut pool,
+                &context,
+                Some(&(2..=11).map(TrackId::new).collect::<Vec<_>>()),
+            );
+            if let Some(pool) = &pool {
+                assert!(pool.workers.len() <= MAXIMUM_PARALLEL_TRACK_QUERIES);
+            }
+            assert_eq!(
+                tracks.iter().map(OpenTrack::id).collect::<Vec<_>>(),
+                (1..=12).map(TrackId::new).collect::<Vec<_>>(),
+                "every lent track is returned to its original position"
+            );
+        }
+
+        let mut lanes = Vec::new();
+        let mut completed = None;
+        while let Some(event) = receiver.try_receive().unwrap() {
+            match event {
+                TrackEngineEvent::LaneCompleted { track, .. } => {
+                    let TrackSnapshotData::Features(records) = &track.data else {
+                        panic!("a BED track returned the wrong snapshot type");
+                    };
+                    assert_eq!(
+                        records[0].name.as_deref(),
+                        Some(format!("feature{}", track.id.get() - 1).as_str())
+                    );
+                    lanes.push(track.id);
+                }
+                TrackEngineEvent::QueryCompleted { completed: ids, .. } => completed = Some(ids),
+                other => panic!("unexpected track event {other:?}"),
+            }
+        }
+        lanes.sort_unstable();
+        let expected = (2..=11).map(TrackId::new).collect::<Vec<_>>();
+        assert_eq!(lanes, expected, "only the selected tracks are queried");
+        assert_eq!(
+            completed,
+            Some(expected),
+            "completion lists tracks in order"
+        );
+    }
+
     #[test]
     fn feature_search_merges_tracks_with_exact_matches_before_prefixes() {
         let directory = tempfile::tempdir().unwrap();
@@ -1501,7 +1840,7 @@ mod tests {
             .unwrap(),
         ];
 
-        let results = search_tracks(&mut tracks, "BRCA".to_owned(), 10, false);
+        let results = search_tracks(&mut tracks, "BRCA".to_owned(), 10, false, &|| false).unwrap();
 
         assert_eq!(results.hits.len(), 2);
         assert_eq!(results.hits[0].record.name.as_deref(), Some("BRCA"));
@@ -1709,7 +2048,8 @@ mod tests {
         assert_eq!(broad[0].peak.unwrap().summit, None);
         assert_eq!(psl[0].blocks, [(100, 130), (140, 190)]);
 
-        let search = search_tracks(&mut tracks, "query-1".to_owned(), 10, false);
+        let search =
+            search_tracks(&mut tracks, "query-1".to_owned(), 10, false, &|| false).unwrap();
         assert_eq!(search.hits[0].track_id, TrackId::new(13));
         assert_eq!(
             adjacent_feature(&mut tracks, &HashMap::new(), "chr1", 0, true)
@@ -1744,7 +2084,8 @@ mod tests {
         assert_eq!(query.records[0].identifier, "rs-first");
         assert!((query.records[0].minus_log10_p - 9.0).abs() < 1e-5);
 
-        let search = search_tracks(&mut tracks, "RS-FIR".to_owned(), 10, false);
+        let search =
+            search_tracks(&mut tracks, "RS-FIR".to_owned(), 10, false, &|| false).unwrap();
         assert_eq!(search.hits.len(), 1);
         assert_eq!(search.hits[0].record.name.as_deref(), Some("rs-first"));
         assert_eq!(search.hits[0].record.start, 100);
@@ -1798,20 +2139,9 @@ mod tests {
         let mut cache = TdfSourceCache::new();
         let mut parent = open_track_cached(&parent_specification, &mut cache).unwrap();
         let mut channel = open_track_cached(&channel_specification, &mut cache).unwrap();
-        let (
-            OpenTrack::Tdf {
-                source: parent_source,
-                ..
-            },
-            OpenTrack::Tdf {
-                source: channel_source,
-                ..
-            },
-        ) = (&parent, &channel)
-        else {
-            panic!("expected two TDF tracks");
-        };
-        assert!(Rc::ptr_eq(parent_source, channel_source));
+        // Both channels read through the one archive opened for the file.
+        assert_eq!(cache.len(), 1);
+        assert_eq!(Arc::strong_count(cache.values().next().unwrap()), 3);
 
         let second = query_track(&mut channel, "chr1", 100, 120, &[], &[], &[]).unwrap();
         let TrackSnapshotData::Quantitative(second) = second.data else {

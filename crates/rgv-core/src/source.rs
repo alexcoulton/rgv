@@ -76,13 +76,22 @@ impl GenomicSourceFormat {
         )
     }
 
-    /// Whether the current desktop I/O stack can open this format remotely.
+    /// Whether the current desktop I/O stack can open this format remotely. Text annotation
+    /// formats are downloaded whole; the others are read by range request.
     pub const fn supports_remote(self) -> bool {
         matches!(
             self,
             Self::Bam
                 | Self::Cram
                 | Self::Fasta
+                | Self::Bed
+                | Self::Gff3
+                | Self::Gtf
+                | Self::GenePred
+                | Self::RefFlat
+                | Self::NarrowPeak
+                | Self::BroadPeak
+                | Self::Psl
                 | Self::Vcf
                 | Self::Bcf
                 | Self::BigWig
@@ -185,7 +194,7 @@ pub fn classify_genomic_source(value: &str) -> Option<ClassifiedGenomicSource> {
     let format = match (effective, extension.as_str(), inner_extension.as_deref()) {
         ("bam", _, _) => GenomicSourceFormat::Bam,
         ("cram", _, _) => GenomicSourceFormat::Cram,
-        ("fa" | "fasta" | "fna", _, _) => GenomicSourceFormat::Fasta,
+        ("fa" | "fasta" | "fna" | "2bit", _, _) => GenomicSourceFormat::Fasta,
         ("bed", _, _) => GenomicSourceFormat::Bed,
         ("gff" | "gff3", _, _) => GenomicSourceFormat::Gff3,
         ("gtf", _, _) => GenomicSourceFormat::Gtf,
@@ -320,7 +329,8 @@ mod tests {
             GenomicSourceFormat::Bam.companion_index_suffixes(),
             &[".bai", ".csi"]
         );
-        assert!(!GenomicSourceFormat::Bed.supports_remote());
+        assert!(GenomicSourceFormat::Bed.supports_remote());
+        assert!(!GenomicSourceFormat::BedGraph.supports_remote());
         assert!(!GenomicSourceFormat::BigWig.requires_companion_index());
     }
 

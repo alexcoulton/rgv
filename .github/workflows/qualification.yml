@@ -21,9 +21,9 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
       - name: Verify immutable inputs exist
         env:
           CORPUS_MANIFEST: ${{ inputs.corpus_manifest }}

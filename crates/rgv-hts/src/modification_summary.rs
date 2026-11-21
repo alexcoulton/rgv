@@ -175,18 +175,27 @@ impl ModificationSummaryBuilder {
             SequenceData::Present { bases, .. } => Some(bases.as_slice()),
             SequenceData::NotLoaded | SequenceData::Missing => None,
         };
-        self.add_record_parts(
+        let mn = record
+            .auxiliary_fields
+            .iter()
+            .find(|field| field.tag == *b"MN")
+            .map(|field| &field.value);
+        self.add_record_parts_checked(
             record.start,
             &record.cigar,
             record.flags,
             sequence,
             mm,
             ml,
+            mn,
             haplotype,
         );
     }
 
     /// Adds one packed record without materialising its sequence, CIGAR, or auxiliary fields.
+    ///
+    /// The `MN` tag is not consulted, so every hard-clipped record is treated as unresolvable.
+    /// Prefer [`Self::add_record_parts_checked`].
     #[allow(clippy::too_many_arguments)]
     pub fn add_record_parts(
         &mut self,
@@ -196,6 +205,33 @@ impl ModificationSummaryBuilder {
         sequence: Option<&[u8]>,
         mm: Option<&AuxValue>,
         ml: Option<&AuxValue>,
+        haplotype: Option<&AuxValue>,
+    ) {
+        self.add_record_parts_checked(
+            alignment_start,
+            cigar,
+            flags,
+            sequence,
+            mm,
+            ml,
+            None,
+            haplotype,
+        );
+    }
+
+    /// Adds one packed record, using `MN` (when present) and hard clipping to decide whether the
+    /// `MM` coordinates still describe the stored sequence. Unresolvable records are counted as
+    /// unavailable instead of contributing misplaced calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_record_parts_checked(
+        &mut self,
+        alignment_start: u64,
+        cigar: &[CigarOp],
+        flags: AlignmentFlags,
+        sequence: Option<&[u8]>,
+        mm: Option<&AuxValue>,
+        ml: Option<&AuxValue>,
+        mn: Option<&AuxValue>,
         haplotype: Option<&AuxValue>,
     ) {
         let Some(mm) = mm else {
@@ -210,6 +246,11 @@ impl ModificationSummaryBuilder {
                 self.provenance.unavailable_records.saturating_add(1);
             return;
         };
+        if !mm_resolvable(bases.len(), cigar, mn) {
+            self.provenance.unavailable_records =
+                self.provenance.unavailable_records.saturating_add(1);
+            return;
+        }
         let Ok(calls) = decode_modified_bases_parts(bases, flags, mm, ml) else {
             self.provenance.malformed_records = self.provenance.malformed_records.saturating_add(1);
             return;
@@ -385,6 +426,13 @@ fn reference_position_for_sequencer_position(
     None
 }
 
+fn mm_resolvable(sequence_length: usize, cigar: &[CigarOp], mn: Option<&AuxValue>) -> bool {
+    let hard_clipped = cigar
+        .iter()
+        .any(|operation| operation.kind == CigarOpKind::HardClip);
+    crate::modified_bases_resolvable(sequence_length, mn, hard_clipped)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
@@ -485,6 +533,47 @@ mod tests {
         assert_eq!(summary.series[0].bins[1].canonical_observations, 1);
         assert_eq!(summary.series[0].bins[2].canonical_observations, 1);
         assert_eq!(summary.series[0].bins[3].canonical_observations, 0);
+    }
+
+    #[test]
+    fn unresolvable_mm_is_reported_unavailable_instead_of_being_misplaced() {
+        let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
+        let hard_clipped = |mn: Option<u64>| {
+            // 5H4M: MM written for the unclipped nine-base read would index the wrong bases.
+            let mut record = record("C+m,1;", Some(vec![128]), 0);
+            record.cigar.insert(
+                0,
+                CigarOp {
+                    kind: CigarOpKind::HardClip,
+                    len: 5,
+                },
+            );
+            if let Some(length) = mn {
+                record.auxiliary_fields.push(AuxField {
+                    tag: *b"MN",
+                    value: AuxValue::Unsigned(length),
+                });
+            }
+            record
+        };
+        for unresolvable in [hard_clipped(None), hard_clipped(Some(9))] {
+            let mut builder = ModificationSummaryBuilder::new(interval, 4);
+            builder.add_record(&unresolvable);
+            let summary = builder.finish(1, true);
+            assert!(summary.series.is_empty());
+            assert_eq!(summary.provenance.records_with_modification_tags, 1);
+            assert_eq!(summary.provenance.unavailable_records, 1);
+            assert_eq!(summary.provenance.malformed_records, 0);
+            assert_eq!(summary.provenance.decoded_calls, 0);
+        }
+        // MN equal to the stored four bases proves MM was rewritten for the clipped record.
+        // ACCC with `C+m,1`: the second C, read index 2, reference 102 (hard clips consume
+        // neither read nor reference).
+        let mut builder = ModificationSummaryBuilder::new(interval, 4);
+        builder.add_record(&hard_clipped(Some(4)));
+        let summary = builder.finish(1, true);
+        assert_eq!(summary.series[0].bins[2].modified_calls, 1);
+        assert_eq!(summary.provenance.unavailable_records, 0);
     }
 
     #[test]

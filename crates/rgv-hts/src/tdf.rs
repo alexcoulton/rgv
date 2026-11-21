@@ -61,10 +61,10 @@ enum RandomAccess {
 }
 
 impl RandomAccess {
-    fn open(path: &Path) -> Result<Self, TrackError> {
+    fn open(path: &Path, remote: HttpRangeConfig) -> Result<Self, TrackError> {
         let raw = path.to_string_lossy();
         if raw.starts_with("http://") || raw.starts_with("https://") {
-            let reader = HttpRangeReader::open(&raw, HttpRangeConfig::default())
+            let reader = HttpRangeReader::open(&raw, remote)
                 .map_err(|error| TrackError::Backend(error.to_string()))?;
             Ok(Self::Remote(Box::new(reader)))
         } else {
@@ -123,12 +123,22 @@ impl TdfSource {
         Self::open_with_track_name(path, None)
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn open_with_track_name(
         path: impl AsRef<Path>,
         preferred_track_name: Option<&str>,
     ) -> Result<Self, TrackError> {
-        let mut reader = RandomAccess::open(path.as_ref())?;
+        Self::open_with_remote_config(path, preferred_track_name, HttpRangeConfig::default())
+    }
+
+    /// Opens a TDF; a remote URL is read with `remote` (authentication, timeouts, retries and
+    /// cache geometry) instead of the anonymous defaults. `remote` is unused for a file.
+    #[allow(clippy::too_many_lines)]
+    pub fn open_with_remote_config(
+        path: impl AsRef<Path>,
+        preferred_track_name: Option<&str>,
+        remote: HttpRangeConfig,
+    ) -> Result<Self, TrackError> {
+        let mut reader = RandomAccess::open(path.as_ref(), remote)?;
         if reader.length() < FIXED_HEADER_BYTES as u64 {
             return Err(TrackError::InvalidSchema(
                 "TDF source is shorter than its fixed header".to_owned(),
@@ -249,6 +259,29 @@ impl TdfSource {
         }
         source.selected_track = track_index;
         Ok(source)
+    }
+
+    /// Installs (or clears) the check that abandons remote reads once the view has moved on.
+    /// No effect on a local file.
+    pub fn set_remote_cancellation(&mut self, cancellation: Option<crate::RemoteCancellation>) {
+        if let RandomAccess::Remote(reader) = &mut self.reader {
+            reader.set_cancellation(cancellation);
+        }
+    }
+
+    /// Bounds the requests and bytes spent from now on; `None` lifts the bound.
+    pub fn set_remote_transfer_budget(&mut self, budget: Option<crate::RemoteTransferBudget>) {
+        if let RandomAccess::Remote(reader) = &mut self.reader {
+            reader.set_transfer_budget(budget);
+        }
+    }
+
+    /// Transfer statistics of a remote source; `None` for a local file.
+    pub fn remote_io_stats(&self) -> Option<crate::RemoteIoStats> {
+        match &self.reader {
+            RandomAccess::Local { .. } => None,
+            RandomAccess::Remote(reader) => Some(reader.stats()),
+        }
     }
 
     pub const fn metadata(&self) -> &TdfMetadata {
@@ -851,6 +884,11 @@ mod tests {
 
     impl RangeServer {
         fn start(data: Vec<u8>) -> Self {
+            Self::start_requiring(data, None)
+        }
+
+        /// Serves ranges only to requests carrying `authorization`, when one is required.
+        fn start_requiring(data: Vec<u8>, authorization: Option<&'static str>) -> Self {
             let server = Server::http("127.0.0.1:0").unwrap();
             let address = server.server_addr().to_ip().unwrap();
             let stop = Arc::new(AtomicBool::new(false));
@@ -864,6 +902,14 @@ mod tests {
                         continue;
                     };
                     worker_requests.fetch_add(1, Ordering::Relaxed);
+                    if authorization.is_some_and(|expected| {
+                        !request.headers().iter().any(|header| {
+                            header.field.equiv("Authorization") && header.value.as_str() == expected
+                        })
+                    }) {
+                        request.respond(Response::empty(StatusCode(401))).unwrap();
+                        continue;
+                    }
                     let range = request
                         .headers()
                         .iter()
@@ -1045,6 +1091,44 @@ mod tests {
         let query = source.query("chr1", 100, 130).unwrap();
         assert_eq!(query.records.len(), 2);
         assert!(server.requests.load(Ordering::Relaxed) >= 2);
+    }
+
+    #[test]
+    fn remote_tdf_honours_authentication_cancellation_and_budgets() {
+        let server = RangeServer::start_requiring(build_tdf(true), Some("Bearer tdf-secret"));
+        // The anonymous default is refused by the server.
+        assert!(TdfSource::open(Path::new(&server.url)).is_err());
+        let mut source = TdfSource::open_with_remote_config(
+            Path::new(&server.url),
+            None,
+            HttpRangeConfig {
+                authentication: crate::RemoteAuthentication::Bearer("tdf-secret".to_owned()),
+                // One 64-byte block is cached at a time, so every query below must fetch.
+                chunk_size: std::num::NonZeroUsize::new(64).unwrap(),
+                maximum_cache_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+                maximum_retries: 0,
+                ..HttpRangeConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(source.remote_io_stats().unwrap().requests >= 2);
+
+        let cancellation: crate::RemoteCancellation = Arc::new(|| false);
+        source.set_remote_cancellation(Some(cancellation));
+        let cancelled = source.query("chr1", 100, 130).unwrap_err();
+        assert!(cancelled.to_string().contains("cancelled"));
+        assert_eq!(source.remote_io_stats().unwrap().cancellations, 1);
+
+        source.set_remote_cancellation(None);
+        source.set_remote_transfer_budget(Some(crate::RemoteTransferBudget {
+            maximum_requests: 0,
+            maximum_response_bytes: 0,
+        }));
+        let over_budget = source.query("chr1", 100, 130).unwrap_err();
+        assert!(over_budget.to_string().contains("budget"));
+
+        source.set_remote_transfer_budget(None);
+        assert_eq!(source.query("chr1", 100, 130).unwrap().records.len(), 2);
     }
 
     #[test]

@@ -151,6 +151,7 @@ pub(crate) fn write_support_files(suite_root: &Path) -> Result<()> {
         name: "RGV portable manual genome".to_owned(),
         assembly_identity: None,
         reference: local_source("../../variants.fa"),
+        reference_index: None,
         cytobands: Some(local_source("../data/tracks/cytobands.txt")),
         contig_aliases: BTreeMap::from([("variants".to_owned(), "chrVariants".to_owned())]),
         default_annotations: vec![GenomeAnnotation {

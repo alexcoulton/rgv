@@ -2,6 +2,7 @@ pub(super) mod alignment_management;
 pub(super) mod alignment_navigation;
 pub(super) mod alignments;
 pub(super) mod context_lanes;
+pub(super) mod genomes;
 pub(super) mod landmarks;
 pub(super) mod lists;
 pub(super) mod navigation;

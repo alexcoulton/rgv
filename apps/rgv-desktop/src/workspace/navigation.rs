@@ -16,7 +16,7 @@ pub(crate) fn resolve_initial_locus(
             .context("alignment header has no reference sequences")?;
         (first.name(), None)
     };
-    let contig_id = resolve_contig_alias(dictionary, aliases, name)?
+    let contig_id = resolve_typed_contig(dictionary, aliases, name)?
         .with_context(|| format!("alignment header has no contig named {name}"))?;
     let contig = dictionary
         .get(contig_id)
@@ -26,25 +26,77 @@ pub(crate) fn resolve_initial_locus(
     }
 
     let (start, end) = if let Some(range) = range {
-        let range = range.replace(',', "");
-        let (start, end) = range
-            .split_once('-')
-            .with_context(|| format!("locus must use name:start-end, got {range}"))?;
-        let one_based_start: u64 = start
-            .parse()
-            .with_context(|| format!("invalid locus start {start}"))?;
-        let one_based_end: u64 = end
-            .parse()
-            .with_context(|| format!("invalid locus end {end}"))?;
-        if one_based_start == 0 || one_based_end < one_based_start {
-            anyhow::bail!("locus coordinates must be one-based and forward");
-        }
-        (one_based_start - 1, one_based_end)
+        parse_locus_range(range)?
+    } else if requested.is_some() {
+        // A bare contig name shows the whole contig, as IGV does.
+        (0, contig.length())
     } else {
         (0, contig.length().min(100_000))
     };
     let interval = GenomicInterval::bounded(contig_id, start, end, contig.length())?;
     Ok((interval, contig.name().to_owned(), contig.length()))
+}
+
+/// Bases shown on each side of a single-position locus such as `chr1:12345`.
+const SINGLE_POSITION_FLANK: u64 = 20;
+
+/// Parses the coordinate part of a locus into a zero-based half-open range. Accepts
+/// `start-end` and a single one-based position, which is centred in a small window.
+fn parse_locus_range(range: &str) -> Result<(u64, u64)> {
+    let range = range.replace(',', "");
+    let range = range.trim();
+    if let Some((start, end)) = range.split_once('-') {
+        let one_based_start: u64 = start
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid locus start {start}"))?;
+        let one_based_end: u64 = end
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid locus end {end}"))?;
+        if one_based_start == 0 || one_based_end < one_based_start {
+            anyhow::bail!("locus coordinates must be one-based and forward");
+        }
+        return Ok((one_based_start - 1, one_based_end));
+    }
+    let position: u64 = range
+        .parse()
+        .with_context(|| format!("locus must use name:start-end or name:position, got {range}"))?;
+    if position == 0 {
+        anyhow::bail!("locus coordinates must be one-based and forward");
+    }
+    Ok((
+        (position - 1).saturating_sub(SINGLE_POSITION_FLANK),
+        position.saturating_add(SINGLE_POSITION_FLANK),
+    ))
+}
+
+/// Resolves a contig name typed by the user. Explicit aliases win; otherwise the common `chr`
+/// prefix and mitochondrial spellings are tried, so `1`, `chr1`, `MT` and `chrM` all work
+/// against either naming convention.
+pub(crate) fn resolve_typed_contig(
+    dictionary: &ReferenceDictionary,
+    aliases: &ContigAliases,
+    name: &str,
+) -> Result<Option<ContigId>> {
+    if let Some(contig) = resolve_contig_alias(dictionary, aliases, name)? {
+        return Ok(Some(contig));
+    }
+    let mut candidates = Vec::with_capacity(3);
+    if let Some(stripped) = name.strip_prefix("chr") {
+        candidates.push(stripped.to_owned());
+        if stripped == "M" {
+            candidates.push("MT".to_owned());
+        }
+    } else {
+        candidates.push(format!("chr{name}"));
+        if name == "MT" {
+            candidates.push("chrM".to_owned());
+        }
+    }
+    Ok(candidates
+        .iter()
+        .find_map(|candidate| dictionary.id_by_name(candidate)))
 }
 
 pub(crate) fn parse_contig_aliases(values: &[String]) -> Result<ContigAliases> {
@@ -100,24 +152,10 @@ pub(crate) fn standalone_locus(locus: &str) -> Result<(GenomicInterval, String, 
     let (name, range) = locus
         .split_once(':')
         .with_context(|| format!("standalone track locus must use name:start-end, got {locus}"))?;
-    let range = range.replace(',', "");
-    let (start, end) = range
-        .split_once('-')
-        .with_context(|| format!("standalone track locus must use name:start-end, got {locus}"))?;
-    let one_based_start: u64 = start
-        .parse()
-        .with_context(|| format!("invalid locus start {start}"))?;
-    let one_based_end: u64 = end
-        .parse()
-        .with_context(|| format!("invalid locus end {end}"))?;
-    if one_based_start == 0 || one_based_end < one_based_start {
-        anyhow::bail!("locus coordinates must be one-based and forward");
-    }
-    let contig_length = one_based_end
-        .saturating_mul(2)
-        .max(one_based_end.saturating_add(1_000_000));
+    let (start, end) = parse_locus_range(range)?;
+    let contig_length = end.saturating_mul(2).max(end.saturating_add(1_000_000));
     Ok((
-        GenomicInterval::new(ContigId::new(0), one_based_start - 1, one_based_end)?,
+        GenomicInterval::new(ContigId::new(0), start, end)?,
         name.to_owned(),
         contig_length,
     ))

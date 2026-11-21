@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     io::Cursor,
     path::Path,
     sync::{
@@ -1039,8 +1040,62 @@ fn gtf_names_are_decoded() {
 }
 
 #[test]
+fn tabix_indexed_annotations_are_read_on_demand() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/indexed.gtf.gz");
+    let source = TextFeatureSource::open(&path, FeatureFormat::Gtf).unwrap();
+    assert!(source.is_indexed());
+    let mut contigs = source.contigs().collect::<Vec<_>>();
+    contigs.sort_unstable();
+    assert_eq!(contigs, ["chr1", "chr2"]);
+
+    // One-based inclusive GTF rows become zero-based half-open records.
+    let first = source.query("chr1", 0, 6_000).unwrap();
+    assert_eq!(
+        first
+            .iter()
+            .map(|record| (record.start, record.end, record.feature_type.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1_000, 1_200, Some("exon")),
+            (1_000, 5_000, Some("gene")),
+            (1_000, 5_000, Some("transcript")),
+            (4_800, 5_000, Some("exon")),
+        ]
+    );
+    // Overlap is exact: a query touching only the gap between the exons returns the spans.
+    assert_eq!(source.query("chr1", 2_000, 2_001).unwrap().len(), 2);
+    assert!(source.query("chr1", 5_000, 6_000).unwrap().is_empty());
+    assert!(source.query("chr3", 0, 1_000).unwrap().is_empty());
+    assert_eq!(
+        source.query("chr1", 1_000_000, 1_001_000).unwrap().len(),
+        10
+    );
+
+    let next = source.adjacent_feature("chr1", 5_000, true).unwrap();
+    assert_eq!((next.start, next.end), (200_000, 200_500));
+    let previous = source.adjacent_feature("chr1", 200_000, false).unwrap();
+    assert_eq!((previous.start, previous.end), (4_800, 5_000));
+    assert!(source.adjacent_feature("chr1", 1_000, false).is_none());
+
+    // Name search keeps the widest feature carrying each term: the gene, not an exon.
+    let hits = source.search("alpha", 10);
+    assert!(!hits.index_truncated);
+    assert_eq!(hits.hits.len(), 1);
+    assert_eq!(
+        (hits.hits[0].record.start, hits.hits[0].record.end),
+        (1_000, 5_000)
+    );
+    // 111 terms share this prefix; results stay within the search-result cap.
+    assert_eq!(source.search("bulk29", 1_000).hits.len(), 100);
+    assert_eq!(source.search("bulk299", 1_000).hits.len(), 11);
+    assert!(source.search("no-such-gene", 10).hits.is_empty());
+}
+
+#[test]
 fn nested_features_do_not_break_overlap_queries() {
     let source = TextFeatureSource {
+        malformed_lines: 0,
+        first_malformed_line: None,
         features: HashMap::from([(
             "chr1".to_owned(),
             FeatureIndex {
@@ -1077,6 +1132,7 @@ fn nested_features_do_not_break_overlap_queries() {
         )]),
         search_terms: BTreeMap::default(),
         search_index_truncated: false,
+        indexed: None,
     };
     let records = source.query("chr1", 500, 600).unwrap();
     assert_eq!(records.len(), 1);
@@ -1472,7 +1528,80 @@ fn quantitative_query_cap_and_non_finite_provenance_are_exact() {
             records_retained: 2,
             non_finite_records: 1,
             records_truncated: true,
+            summary_reduction_bases: None,
         }
+    );
+}
+
+#[test]
+fn bigwig_wide_queries_use_zoom_summaries_and_narrow_queries_stay_exact() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dense.bw");
+    let mut chromosome_sizes = HashMap::new();
+    chromosome_sizes.insert("chr1".to_owned(), 4_000_000);
+    // 40,000 adjacent 100-base intervals alternating between 1 and 3: the mean is exactly 2.
+    let mut bedgraph = String::new();
+    for index in 0..40_000_u32 {
+        let value = if index % 2 == 0 { 1 } else { 3 };
+        writeln!(
+            bedgraph,
+            "chr1\t{}\t{}\t{value}",
+            index * 100,
+            (index + 1) * 100
+        )
+        .unwrap();
+    }
+    let writer = bigtools::BigWigWrite::create_file(&path, chromosome_sizes).unwrap();
+    let data = BedParserStreamingIterator::from_bedgraph_file(Cursor::new(bedgraph), false);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    writer.write(data, runtime).unwrap();
+
+    let mut source = BigWigSource::open(&path).unwrap();
+
+    let narrow = source.query("chr1", 1_000, 1_400).unwrap();
+    assert_eq!(narrow.provenance.summary_reduction_bases, None);
+    assert_eq!(
+        narrow
+            .records
+            .iter()
+            .map(|record| (record.start, record.end, record.value))
+            .collect::<Vec<_>>(),
+        vec![
+            (1_000, 1_100, 1.0),
+            (1_100, 1_200, 3.0),
+            (1_200, 1_300, 1.0),
+            (1_300, 1_400, 3.0),
+        ]
+    );
+
+    let wide = source.query("chr1", 0, 4_000_000).unwrap();
+    let reduction = wide
+        .provenance
+        .summary_reduction_bases
+        .expect("a whole-contig query reads a precomputed zoom level");
+    assert!(
+        reduction > 100,
+        "reduction {reduction} should aggregate raw intervals"
+    );
+    assert!(!wide.provenance.records_truncated);
+    assert!(wide.records.len() < 40_000);
+    assert!(wide.records.len() >= 1_000);
+    assert!(wide.records.last().unwrap().end > 3_900_000);
+    let (weighted, bases) = wide.records.iter().fold((0.0_f64, 0_u64), |state, record| {
+        let length = record.end - record.start;
+        (
+            state.0 + f64::from(record.value) * length as f64,
+            state.1 + length,
+        )
+    });
+    assert!((weighted / bases as f64 - 2.0).abs() < 0.01);
+    assert!(
+        wide.records
+            .iter()
+            .all(|record| (1.0..=3.0).contains(&record.value))
     );
 }
 
@@ -1566,4 +1695,359 @@ fn gzip_gwas_opens_through_the_production_path() {
     assert_eq!(query.records.len(), 1);
     assert_eq!(query.records[0].identifier, "rs7");
     assert!((query.records[0].minus_log10_p - 3.0).abs() < 1e-5);
+}
+
+#[test]
+fn remote_text_annotations_are_downloaded_and_read_like_local_files() {
+    let data = b"chr1\t100\t200\tfirst\nchr1\t300\t450\tsecond\nchr2\t10\t20\tthird\n".to_vec();
+    let server = Server::http("127.0.0.1:0").unwrap();
+    let address = server.server_addr().to_ip().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let body = data.clone();
+    let worker = thread::spawn(move || {
+        while !worker_stop.load(Ordering::Relaxed) {
+            let Some(request) = server.recv_timeout(Duration::from_millis(20)).unwrap() else {
+                continue;
+            };
+            let range = request
+                .headers()
+                .iter()
+                .find(|header| header.field.equiv("Range"))
+                .and_then(|header| {
+                    let value = header.value.as_str().strip_prefix("bytes=")?;
+                    let (start, end) = value.split_once('-')?;
+                    let start = start.parse::<usize>().ok()?;
+                    let end = end
+                        .parse::<usize>()
+                        .map_or(body.len() - 1, |end| end.min(body.len() - 1));
+                    (start <= end).then_some((start, end))
+                })
+                .unwrap_or((0, body.len() - 1));
+            let response = Response::from_data(body[range.0..=range.1].to_vec())
+                .with_status_code(StatusCode(206))
+                .with_header(
+                    HttpHeader::from_bytes(
+                        "Content-Range",
+                        format!("bytes {}-{}/{}", range.0, range.1, body.len()),
+                    )
+                    .unwrap(),
+                )
+                .with_header(HttpHeader::from_bytes("ETag", "\"remote-bed\"").unwrap());
+            request.respond(response).unwrap();
+        }
+    });
+
+    let url = format!("http://{address}/peaks/regions.bed?token=ignored");
+    let source = TextFeatureSource::open(&url, FeatureFormat::Bed);
+    stop.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    let source = source.unwrap();
+    let mut contigs = source.contigs().collect::<Vec<_>>();
+    contigs.sort_unstable();
+    assert_eq!(contigs, ["chr1", "chr2"]);
+    let features = source.query("chr1", 150, 320).unwrap();
+    assert_eq!(features.len(), 2);
+}
+
+#[test]
+fn bed_accepts_space_separated_columns_and_empty_thick_intervals() {
+    let spaced = parse_bed("chr1 100   200 tx 42 -").unwrap();
+    assert_eq!((spaced.start, spaced.end), (100, 200));
+    assert_eq!(spaced.name.as_deref(), Some("tx"));
+    assert_eq!(spaced.strand, Strand::Reverse);
+    // Tabs win when present, so a name may contain spaces.
+    let tabbed = parse_bed("chr1\t100\t200\tmy feature").unwrap();
+    assert_eq!(tabbed.name.as_deref(), Some("my feature"));
+
+    // thickStart == thickEnd means "no thick part" wherever it is written.
+    for thick in ["0\t0", "200\t200", "100\t100", "150\t150"] {
+        let record = parse_bed(&format!("chr1\t100\t200\ttx\t0\t+\t{thick}")).unwrap();
+        assert_eq!(record.coding_interval, None, "thick {thick}");
+    }
+    let record = parse_bed("chr1\t100\t200\ttx\t0\t+\t120\t180").unwrap();
+    assert_eq!(record.coding_interval, Some((120, 180)));
+    // A non-empty thick interval outside the feature is still wrong.
+    assert!(parse_bed("chr1\t100\t200\ttx\t0\t+\t50\t180").is_err());
+}
+
+#[test]
+fn gff3_attributes_are_percent_decoded_after_splitting() {
+    let record = parse_gff(
+        "chr1\tsrc\tgene\t11\t50\t.\t+\t.\tID=g%3B1;Name=A%2CB%3DC%20d;Note=50%25 done%;bad=%zz",
+        false,
+    )
+    .unwrap();
+    let value = |key: &str| attribute_value(&record.attributes, &[key]);
+    // The escaped `;`, `,`, `=` and space are data, not separators.
+    assert_eq!(value("ID").as_deref(), Some("g;1"));
+    assert_eq!(value("Name").as_deref(), Some("A,B=C d"));
+    assert_eq!(record.name.as_deref(), Some("A,B=C d"));
+    // Truncated and non-hex escapes are kept verbatim.
+    assert_eq!(value("Note").as_deref(), Some("50% done%"));
+    assert_eq!(value("bad").as_deref(), Some("%zz"));
+    assert_eq!(record.attributes.len(), 4);
+
+    // GTF has no percent-escaping.
+    let gtf = parse_gff("chr1\tsrc\tgene\t11\t50\t.\t+\t.\tgene_id \"g%3B1\";", true).unwrap();
+    assert_eq!(
+        attribute_value(&gtf.attributes, &["gene_id"]).as_deref(),
+        Some("g%3B1")
+    );
+}
+
+#[test]
+fn gff3_reading_stops_at_the_embedded_fasta_section() {
+    let source = TextFeatureSource::from_reader(
+        Cursor::new(
+            "##gff-version 3\n\
+             chr1\tsrc\tgene\t11\t50\t.\t+\t.\tID=g1\n\
+             ##FASTA\n\
+             >chr1\n\
+             ACGTACGTACGT\n\
+             chr1\tnot\ta\tfeature\n",
+        ),
+        FeatureFormat::Gff3,
+    )
+    .unwrap();
+    assert_eq!(source.query("chr1", 0, 1_000).unwrap().len(), 1);
+    assert_eq!(source.malformed_line_count(), 0);
+
+    // The directive is optional: a bare FASTA header also ends the annotation.
+    let bare = TextFeatureSource::from_reader(
+        Cursor::new("chr1\tsrc\tgene\t11\t50\t.\t+\t.\tID=g1\n>chr1\nACGT\n"),
+        FeatureFormat::Gff3,
+    )
+    .unwrap();
+    assert_eq!(bare.query("chr1", 0, 1_000).unwrap().len(), 1);
+    assert_eq!(bare.malformed_line_count(), 0);
+}
+
+#[test]
+fn one_malformed_feature_line_is_skipped_and_counted() {
+    let source = TextFeatureSource::from_reader(
+        Cursor::new(
+            "chr1\t10\t20\tfirst\n\
+             chr1\tnot-a-number\t30\tbroken\n\
+             chr1\t40\t50\tsecond\n\
+             chr1\t70\t60\tbackwards\n",
+        ),
+        FeatureFormat::Bed,
+    )
+    .unwrap();
+    let names = source
+        .query("chr1", 0, 1_000)
+        .unwrap()
+        .into_iter()
+        .map(|record| record.name.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["first", "second"]);
+    assert_eq!(source.malformed_line_count(), 2);
+    let (line, message) = source.first_malformed_line().unwrap();
+    assert_eq!(line, 2);
+    assert!(message.contains("BED start"));
+
+    // A file with no parseable line at all is the wrong format and still fails loudly.
+    assert!(matches!(
+        TextFeatureSource::from_reader(
+            Cursor::new("this is not\na feature file\n"),
+            FeatureFormat::Gff3,
+        ),
+        Err(TrackError::MalformedLine { line: 1, .. })
+    ));
+}
+
+/// Serves byte ranges of `data` only to requests carrying `Authorization: Bearer track-secret`.
+struct AuthenticatedRangeServer {
+    url: String,
+    stop: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl AuthenticatedRangeServer {
+    fn start(data: Vec<u8>, name: &str) -> Self {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                let Some(request) = server.recv_timeout(Duration::from_millis(20)).unwrap() else {
+                    continue;
+                };
+                if !request.headers().iter().any(|header| {
+                    header.field.equiv("Authorization")
+                        && header.value.as_str() == "Bearer track-secret"
+                }) {
+                    request.respond(Response::empty(StatusCode(401))).unwrap();
+                    continue;
+                }
+                let (start, end) = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("Range"))
+                    .and_then(|header| {
+                        let (start, end) = header
+                            .value
+                            .as_str()
+                            .strip_prefix("bytes=")?
+                            .split_once('-')?;
+                        let end = end.parse::<usize>().ok()?.min(data.len() - 1);
+                        Some((start.parse::<usize>().ok()?, end))
+                    })
+                    .unwrap();
+                let response = Response::from_data(data[start..=end].to_vec())
+                    .with_status_code(StatusCode(206))
+                    .with_header(
+                        HttpHeader::from_bytes(
+                            "Content-Range",
+                            format!("bytes {start}-{end}/{}", data.len()),
+                        )
+                        .unwrap(),
+                    )
+                    .with_header(HttpHeader::from_bytes("ETag", "\"authenticated\"").unwrap());
+                request.respond(response).unwrap();
+            }
+        });
+        Self {
+            url: format!("http://{address}/{name}"),
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn config() -> HttpRangeConfig {
+        HttpRangeConfig {
+            authentication: crate::RemoteAuthentication::Bearer("track-secret".to_owned()),
+            // One small block is cached at a time, so distinct regions need distinct requests.
+            chunk_size: std::num::NonZeroUsize::new(4_096).unwrap(),
+            maximum_cache_bytes: std::num::NonZeroUsize::new(4_096).unwrap(),
+            maximum_retries: 0,
+            ..HttpRangeConfig::default()
+        }
+    }
+}
+
+impl Drop for AuthenticatedRangeServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn remote_bigwig_honours_authentication_cancellation_and_budgets() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("remote.bw");
+    let mut chromosome_sizes = HashMap::new();
+    chromosome_sizes.insert("chr1".to_owned(), 4_000_000);
+    let mut bedgraph = String::new();
+    for index in 0..20_000_u32 {
+        writeln!(
+            bedgraph,
+            "chr1\t{}\t{}\t{}",
+            index * 100,
+            (index + 1) * 100,
+            index % 7
+        )
+        .unwrap();
+    }
+    let writer = bigtools::BigWigWrite::create_file(&path, chromosome_sizes).unwrap();
+    let data = BedParserStreamingIterator::from_bedgraph_file(Cursor::new(bedgraph), false);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    writer.write(data, runtime).unwrap();
+    let mut local = BigWigSource::open(&path).unwrap();
+    assert_eq!(local.remote_io_stats(), None);
+    let expected = local.query("chr1", 1_000, 1_400).unwrap().records;
+    assert_eq!(expected.len(), 4);
+
+    let server = AuthenticatedRangeServer::start(std::fs::read(&path).unwrap(), "remote.bw");
+    // The anonymous default is refused by the server.
+    assert!(BigWigSource::open(&server.url).is_err());
+    let mut source =
+        BigWigSource::open_with_remote_config(&server.url, AuthenticatedRangeServer::config())
+            .unwrap();
+    assert_eq!(
+        source.query("chr1", 1_000, 1_400).unwrap().records,
+        expected
+    );
+    let opened = source.remote_io_stats().unwrap();
+    assert!(opened.requests >= 2);
+
+    let cancellation: crate::RemoteCancellation = Arc::new(|| false);
+    source.set_remote_cancellation(Some(cancellation));
+    assert!(source.query("chr1", 1_900_000, 1_900_400).is_err());
+    assert_eq!(source.remote_io_stats().unwrap().cancellations, 1);
+    assert_eq!(source.remote_io_stats().unwrap().requests, opened.requests);
+
+    source.set_remote_cancellation(None);
+    source.set_remote_transfer_budget(Some(RemoteTransferBudget {
+        maximum_requests: 0,
+        maximum_response_bytes: 0,
+    }));
+    assert!(source.query("chr1", 1_900_000, 1_900_400).is_err());
+    assert_eq!(source.remote_io_stats().unwrap().requests, opened.requests);
+
+    source.set_remote_transfer_budget(None);
+    assert_eq!(
+        source.query("chr1", 1_900_000, 1_900_400).unwrap().records,
+        local.query("chr1", 1_900_000, 1_900_400).unwrap().records
+    );
+}
+
+#[test]
+fn remote_bigbed_and_text_annotations_use_the_supplied_remote_config() {
+    let directory = tempfile::tempdir().unwrap();
+    let bed = "chr1\t100\t200\tfirst\nchr1\t300\t450\tsecond\n";
+    let path = directory.path().join("remote.bb");
+    let mut chromosome_sizes = HashMap::new();
+    chromosome_sizes.insert("chr1".to_owned(), 10_000);
+    let writer = BigBedWrite::create_file(&path, chromosome_sizes).unwrap();
+    let data = BedParserStreamingIterator::from_bed_file(Cursor::new(bed.to_owned()), false);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+    writer.write(data, runtime).unwrap();
+
+    let server = AuthenticatedRangeServer::start(std::fs::read(&path).unwrap(), "remote.bb");
+    assert!(BigBedSource::open(&server.url).is_err());
+    let mut source = BigBedSource::open_with_format_and_remote_config(
+        &server.url,
+        BigBedFeatureFormat::Bed,
+        AuthenticatedRangeServer::config(),
+    )
+    .unwrap();
+    let names = |records: Vec<FeatureRecord>| {
+        records
+            .into_iter()
+            .map(|record| record.name.unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(source.query("chr1", 0, 1_000).unwrap()),
+        ["first", "second"]
+    );
+    assert!(source.remote_io_stats().unwrap().requests >= 2);
+    let cancellation: crate::RemoteCancellation = Arc::new(|| false);
+    source.set_remote_cancellation(Some(cancellation));
+    assert!(source.query("chr1", 0, 1_000).is_err());
+
+    let text = AuthenticatedRangeServer::start(bed.as_bytes().to_vec(), "authenticated-hts10.bed");
+    assert!(TextFeatureSource::open(&text.url, FeatureFormat::Bed).is_err());
+    let source = TextFeatureSource::open_with_remote_config(
+        &text.url,
+        FeatureFormat::Bed,
+        &AuthenticatedRangeServer::config(),
+    )
+    .unwrap();
+    assert_eq!(
+        names(source.query("chr1", 0, 1_000).unwrap()),
+        ["first", "second"]
+    );
 }

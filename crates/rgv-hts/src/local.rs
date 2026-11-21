@@ -26,7 +26,8 @@ use crate::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
     pileup::{
-        OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, aligned_observation,
+        MateAlignment, MateOverlapMask, OverlapCollapser, PileupBuilder, aligned_observation,
+        base_observation_is_counted,
     },
     source_revision::{LocalSourceGuard, local_source_stamp},
 };
@@ -531,21 +532,29 @@ pub fn derive_alignment_query_with_summary_index_and_phase(
             let overlap_collapser = overlap_collapser
                 .as_mut()
                 .expect("unindexed overlap collapser exists");
-            let overlap_mask = overlap_collapser.mask_for(
-                record.read_name(),
-                record.contig(),
-                record.start(),
-                record.end(),
-                record.flags(),
-                record.mate_contig(),
-                record.mate_start(),
+            let overlap_mask = overlap_collapser.mask_for_alignment(
+                MateAlignment {
+                    read_name: record.read_name(),
+                    contig: record.contig(),
+                    start: record.start(),
+                    end: record.end(),
+                    flags: record.flags(),
+                    mate_contig: record.mate_contig(),
+                    mate_start: record.mate_start(),
+                },
+                record.cigar().iter().copied(),
+                view_base_observation_filter(
+                    record,
+                    options.collect_alleles,
+                    options.minimum_base_quality,
+                ),
             );
             let collapsed = add_record_view_pileup(
                 record,
                 pileup.as_mut().expect("unindexed pileup builder exists"),
                 &mut junctions,
                 options.collect_alleles,
-                overlap_mask,
+                overlap_mask.as_ref(),
             )?;
             overlap_collapser.note_collapsed(collapsed);
             if let Some(modifications) = &mut modifications
@@ -620,12 +629,34 @@ fn duration_micros(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
+/// Reports which `SEQ` indices of a packed record are counted as base observations, mirroring
+/// the eligibility applied by [`add_record_view_pileup`].
+fn view_base_observation_filter(
+    record: AlignmentRecordView<'_>,
+    collect_alleles: bool,
+    minimum_base_quality: u8,
+) -> impl FnMut(usize) -> bool {
+    let (base_count, qualities) = match record.sequence() {
+        SequenceView::Present { bases, qualities } => (bases.len(), qualities.unwrap_or(&[])),
+        SequenceView::NotLoaded | SequenceView::Missing => (0, &[][..]),
+    };
+    move |read_position| {
+        !collect_alleles
+            || base_observation_is_counted(
+                base_count,
+                qualities,
+                read_position,
+                minimum_base_quality,
+            )
+    }
+}
+
 fn add_record_view_pileup(
     record: AlignmentRecordView<'_>,
     pileup: &mut PileupBuilder,
     junctions: &mut JunctionSummaryBuilder,
     collect_alleles: bool,
-    overlap_mask: Option<OverlapMask>,
+    overlap_mask: Option<&MateOverlapMask>,
 ) -> Result<u64, AlignmentError> {
     let mut reference_position = record.start();
     let mut read_position = 0_usize;
@@ -644,16 +675,16 @@ fn add_record_view_pileup(
             CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
                 record_junctions.add_aligned(operation.len);
                 let end = reference_position.saturating_add(u64::from(operation.len));
-                collapsed_bases = collapsed_bases.saturating_add(add_unmasked_range(
+                collapsed_bases = collapsed_bases.saturating_add(unmasked_depth_range(
+                    overlap_mask,
                     reference_position,
                     end,
-                    overlap_mask,
                     |start, end| aligned_segments.push((start, end)),
                 ));
                 if collect_alleles {
                     for offset in 0..operation.len as usize {
                         let position = reference_position.saturating_add(offset as u64);
-                        if overlap_mask.is_some_and(|mask| mask.contains(position)) {
+                        if overlap_mask.is_some_and(|mask| mask.masks_base(position)) {
                             continue;
                         }
                         let sequence_index = read_position.saturating_add(offset);
@@ -676,10 +707,10 @@ fn add_record_view_pileup(
             }
             CigarOpKind::Deletion => {
                 let end = reference_position.saturating_add(u64::from(operation.len));
-                collapsed_bases = collapsed_bases.saturating_add(add_unmasked_range(
+                collapsed_bases = collapsed_bases.saturating_add(unmasked_deletion_range(
+                    overlap_mask,
                     reference_position,
                     end,
-                    overlap_mask,
                     |start, end| pileup.add_deletion(start, end, reverse),
                 ));
                 reference_position = end;
@@ -690,7 +721,7 @@ fn add_record_view_pileup(
                 reference_position = end;
             }
             CigarOpKind::Insertion => {
-                if !overlap_mask.is_some_and(|mask| mask.contains(reference_position)) {
+                if !overlap_mask.is_some_and(|mask| mask.masks_indel(reference_position)) {
                     pileup.add_insertion(reference_position, reverse);
                 }
                 read_position = read_position.saturating_add(operation.len as usize);
@@ -1298,8 +1329,10 @@ impl AlignmentSource for LocalAlignmentSource {
                 break;
             }
             let flags = AlignmentFlags::from_bits(record.flags());
+            // One CIGAR view per record: span, mate-overlap, pileup and normalization share it.
+            let cigar_view = record.cigar();
             let record_span = u64::try_from(record.pos()).ok().and_then(|start| {
-                u64::try_from(record.cigar().end_pos())
+                u64::try_from(cigar_view.end_pos())
                     .ok()
                     .filter(|end| *end > start)
                     .map(|end| (start, end))
@@ -1352,25 +1385,43 @@ impl AlignmentSource for LocalAlignmentSource {
                 record.insert_size(),
             );
             let record_start = u64::try_from(record.pos()).unwrap_or_default();
-            let record_end = u64::try_from(record.cigar().end_pos()).unwrap_or(record_start);
-            let overlap_mask = overlap_collapser.mask_for(
-                record.qname(),
-                ContigId::new(u32::try_from(record.tid()).unwrap_or_default()),
-                record_start,
-                record_end,
-                flags,
-                u32::try_from(record.mtid()).ok().map(ContigId::new),
-                u64::try_from(record.mpos()).ok(),
-            );
+            let record_end = u64::try_from(cigar_view.end_pos()).unwrap_or(record_start);
+            let overlap_mask = {
+                let base_count = record.seq_len();
+                let qualities = record.qual();
+                overlap_collapser.mask_for_alignment(
+                    MateAlignment {
+                        read_name: record.qname(),
+                        contig: ContigId::new(u32::try_from(record.tid()).unwrap_or_default()),
+                        start: record_start,
+                        end: record_end,
+                        flags,
+                        mate_contig: u32::try_from(record.mtid()).ok().map(ContigId::new),
+                        mate_start: u64::try_from(record.mpos()).ok(),
+                    },
+                    cigar_view.iter().map(htslib_cigar_op),
+                    |read_position| {
+                        !options.collect_alleles
+                            || base_observation_is_counted(
+                                base_count,
+                                qualities,
+                                read_position,
+                                options.minimum_base_quality,
+                            )
+                    },
+                )
+            };
             overlap_collapser.note_collapsed(add_record_pileup(
                 &record,
+                &cigar_view,
                 &mut pileup,
                 &mut junctions,
                 options.collect_alleles,
-                overlap_mask,
+                overlap_mask.as_ref(),
             ));
             let normalized_for_modifications = if let Some(builder) = &mut modifications {
-                let normalized = normalize_record(&record, QueryDetail::Full, &[])?;
+                let normalized =
+                    normalize_record_with_cigar(&record, &cigar_view, QueryDetail::Full, &[])?;
                 builder.add_record(&normalized);
                 Some(normalized)
             } else {
@@ -1384,9 +1435,12 @@ impl AlignmentSource for LocalAlignmentSource {
                     // The summary already paid the cost to normalize the full
                     // record, so do not discard its sequence/tags.
                     Some(normalized) => normalized,
-                    None => {
-                        normalize_record(&record, options.detail, &options.retained_auxiliary_tags)?
-                    }
+                    None => normalize_record_with_cigar(
+                        &record,
+                        &cigar_view,
+                        options.detail,
+                        &options.retained_auxiliary_tags,
+                    )?,
                 };
                 retained.push((normalized, source_position));
             }
@@ -1452,8 +1506,10 @@ fn process_positioned_bam_record(
     source_position: crate::AlignmentSourcePosition,
 ) -> Result<(), AlignmentError> {
     let flags = AlignmentFlags::from_bits(record.flags());
+    // One CIGAR view per record, shared by the span and the normalized record.
+    let cigar_view = record.cigar();
     let record_span = u64::try_from(record.pos()).ok().and_then(|start| {
-        u64::try_from(record.cigar().end_pos())
+        u64::try_from(cigar_view.end_pos())
             .ok()
             .filter(|end| *end > start)
             .map(|end| (start, end))
@@ -1512,8 +1568,9 @@ fn process_positioned_bam_record(
     } else {
         state.options.detail
     };
-    let normalized = normalize_record(
+    let normalized = normalize_record_with_cigar(
         &record,
+        &cigar_view,
         detail,
         if state.options.collect_modifications {
             &[]
@@ -1529,7 +1586,7 @@ fn process_positioned_bam_record(
     Ok(())
 }
 
-fn finalize_positioned_stream_stats(stats: &mut QueryStats) {
+pub(crate) fn finalize_positioned_stream_stats(stats: &mut QueryStats) {
     let limit = stats.complete_read_limit;
     if stats.complete_read_records_eligible > limit {
         stats.records_emitted = 0;
@@ -1560,12 +1617,62 @@ fn cancelled_query(
     }
 }
 
+fn unmasked_depth_range(
+    mask: Option<&MateOverlapMask>,
+    start: u64,
+    end: u64,
+    mut add: impl FnMut(u64, u64),
+) -> u64 {
+    if let Some(mask) = mask {
+        mask.add_unmasked_depth_range(start, end, add)
+    } else {
+        add(start, end);
+        0
+    }
+}
+
+fn unmasked_deletion_range(
+    mask: Option<&MateOverlapMask>,
+    start: u64,
+    end: u64,
+    mut add: impl FnMut(u64, u64),
+) -> u64 {
+    if let Some(mask) = mask {
+        mask.add_unmasked_deletion_range(start, end, add)
+    } else {
+        add(start, end);
+        0
+    }
+}
+
+// By reference because it maps over `CigarStringView::iter`, which yields references.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn htslib_cigar_op(operation: &rust_htslib::bam::record::Cigar) -> CigarOp {
+    use rust_htslib::bam::record::Cigar;
+
+    CigarOp {
+        kind: match operation {
+            Cigar::Match(_) => CigarOpKind::Match,
+            Cigar::Ins(_) => CigarOpKind::Insertion,
+            Cigar::Del(_) => CigarOpKind::Deletion,
+            Cigar::RefSkip(_) => CigarOpKind::ReferenceSkip,
+            Cigar::SoftClip(_) => CigarOpKind::SoftClip,
+            Cigar::HardClip(_) => CigarOpKind::HardClip,
+            Cigar::Pad(_) => CigarOpKind::Padding,
+            Cigar::Equal(_) => CigarOpKind::SequenceMatch,
+            Cigar::Diff(_) => CigarOpKind::SequenceMismatch,
+        },
+        len: operation.len(),
+    }
+}
+
 fn add_record_pileup(
     record: &bam::Record,
+    cigar: &rust_htslib::bam::record::CigarStringView,
     pileup: &mut PileupBuilder,
     junctions: &mut JunctionSummaryBuilder,
     collect_alleles: bool,
-    overlap_mask: Option<OverlapMask>,
+    overlap_mask: Option<&MateOverlapMask>,
 ) -> u64 {
     use rust_htslib::bam::record::Cigar;
 
@@ -1573,7 +1680,10 @@ fn add_record_pileup(
         return 0;
     };
     let mut read_position = 0_usize;
-    let sequence = record.seq().as_bytes();
+    // Bases are decoded one at a time and only when alleles are collected; depth-only queries
+    // never touch the packed sequence.
+    let sequence = record.seq();
+    let sequence_length = sequence.len();
     let qualities = record.qual();
     let flags = AlignmentFlags::from_bits(record.flags());
     let reverse = flags.is_reverse();
@@ -1582,29 +1692,32 @@ fn add_record_pileup(
     let mut collapsed_bases = 0_u64;
     let mut aligned_segments = Vec::new();
     let mut record_junctions = RecordJunctionCollector::default();
-    for operation in &record.cigar() {
+    for operation in cigar {
         match operation {
             Cigar::Match(len) | Cigar::Equal(len) | Cigar::Diff(len) => {
                 record_junctions.add_aligned(*len);
                 let end = reference_position.saturating_add(u64::from(*len));
-                collapsed_bases = collapsed_bases.saturating_add(add_unmasked_range(
+                collapsed_bases = collapsed_bases.saturating_add(unmasked_depth_range(
+                    overlap_mask,
                     reference_position,
                     end,
-                    overlap_mask,
                     |start, end| aligned_segments.push((start, end)),
                 ));
                 if collect_alleles {
                     for offset in 0..*len as usize {
                         let position = reference_position.saturating_add(offset as u64);
-                        if overlap_mask.is_some_and(|mask| mask.contains(position)) {
+                        if overlap_mask.is_some_and(|mask| mask.masks_base(position)) {
                             continue;
                         }
                         let sequence_index = read_position.saturating_add(offset);
-                        let Some((base, quality)) =
-                            aligned_observation(&sequence, qualities, sequence_index)
-                        else {
+                        if sequence_index >= sequence_length {
                             continue;
-                        };
+                        }
+                        let base = sequence[sequence_index];
+                        let quality = qualities
+                            .get(sequence_index)
+                            .copied()
+                            .filter(|quality| *quality != u8::MAX);
                         pileup.add_base_with_bisulfite_strand(
                             position,
                             base,
@@ -1619,10 +1732,10 @@ fn add_record_pileup(
             }
             Cigar::Del(len) => {
                 let end = reference_position.saturating_add(u64::from(*len));
-                collapsed_bases = collapsed_bases.saturating_add(add_unmasked_range(
+                collapsed_bases = collapsed_bases.saturating_add(unmasked_deletion_range(
+                    overlap_mask,
                     reference_position,
                     end,
-                    overlap_mask,
                     |start, end| pileup.add_deletion(start, end, reverse),
                 ));
                 reference_position = end;
@@ -1633,7 +1746,7 @@ fn add_record_pileup(
                 reference_position = end;
             }
             Cigar::Ins(len) => {
-                if !overlap_mask.is_some_and(|mask| mask.contains(reference_position)) {
+                if !overlap_mask.is_some_and(|mask| mask.masks_indel(reference_position)) {
                     pileup.add_insertion(reference_position, reverse);
                 }
                 read_position = read_position.saturating_add(*len as usize);
@@ -1668,35 +1781,26 @@ fn htslib_junction_strand(record: &bam::Record) -> JunctionStrandInput {
     }
 }
 
+#[cfg(test)]
 fn normalize_record(
     record: &bam::Record,
     detail: QueryDetail,
     retained_auxiliary_tags: &[[u8; 2]],
 ) -> Result<AlignmentRecord, AlignmentError> {
-    use rust_htslib::bam::record::Cigar;
+    normalize_record_with_cigar(record, &record.cigar(), detail, retained_auxiliary_tags)
+}
 
+fn normalize_record_with_cigar(
+    record: &bam::Record,
+    cigar_view: &rust_htslib::bam::record::CigarStringView,
+    detail: QueryDetail,
+    retained_auxiliary_tags: &[[u8; 2]],
+) -> Result<AlignmentRecord, AlignmentError> {
     let tid = u32::try_from(record.tid()).map_err(|_| AlignmentError::UnmappedRecord)?;
     let start = u64::try_from(record.pos()).map_err(|_| AlignmentError::UnmappedRecord)?;
-    let cigar_view = record.cigar();
     let end =
         u64::try_from(cigar_view.end_pos()).map_err(|_| AlignmentError::CoordinateOverflow)?;
-    let cigar = cigar_view
-        .iter()
-        .map(|operation| CigarOp {
-            kind: match operation {
-                Cigar::Match(_) => CigarOpKind::Match,
-                Cigar::Ins(_) => CigarOpKind::Insertion,
-                Cigar::Del(_) => CigarOpKind::Deletion,
-                Cigar::RefSkip(_) => CigarOpKind::ReferenceSkip,
-                Cigar::SoftClip(_) => CigarOpKind::SoftClip,
-                Cigar::HardClip(_) => CigarOpKind::HardClip,
-                Cigar::Pad(_) => CigarOpKind::Padding,
-                Cigar::Equal(_) => CigarOpKind::SequenceMatch,
-                Cigar::Diff(_) => CigarOpKind::SequenceMismatch,
-            },
-            len: operation.len(),
-        })
-        .collect();
+    let cigar = cigar_view.iter().map(htslib_cigar_op).collect();
     let sequence = if detail == QueryDetail::Layout {
         SequenceData::NotLoaded
     } else if record.seq_len() == 0 {
@@ -1936,6 +2040,285 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Two overlapping pairs with hand-computed pileups.
+    ///
+    /// Pair `del`: first mate at 100 with `4M2D4M` (bases `A` at 100..104 and 106..110,
+    /// deletion 104..106; the base at 106 has quality 5), second mate at 102 with `10M`
+    /// (bases `C` at 102..112).
+    /// Pair `skip`: first mate at 200 with `3M4N3M` (bases `G` at 200..203 and 207..210),
+    /// second mate at 203 with `5M` (bases `T` at 203..208).
+    fn write_overlapping_mate_fixture(path: &Path) {
+        use rust_htslib::bam::{
+            Format, Header, Record, Writer,
+            header::HeaderRecord,
+            record::{Cigar, CigarString},
+        };
+        type Mate<'a> = (&'a [u8], i64, Vec<Cigar>, &'a [u8], &'a [u8], u16, i64);
+
+        let mut header = Header::new();
+        header.push_record(
+            HeaderRecord::new(b"HD")
+                .push_tag(b"VN", "1.6")
+                .push_tag(b"SO", "coordinate"),
+        );
+        header.push_record(
+            HeaderRecord::new(b"SQ")
+                .push_tag(b"SN", "chr1")
+                .push_tag(b"LN", 1_000),
+        );
+        let mut writer = Writer::from_path(path, &header, Format::Bam).unwrap();
+        let first = 0x1 | 0x20 | 0x40;
+        let second = 0x1 | 0x10 | 0x80;
+        let records: [Mate<'_>; 4] = [
+            (
+                b"del",
+                100,
+                vec![Cigar::Match(4), Cigar::Del(2), Cigar::Match(4)],
+                b"AAAAAAAA",
+                &[30, 30, 30, 30, 5, 30, 30, 30],
+                first,
+                102,
+            ),
+            (
+                b"del",
+                102,
+                vec![Cigar::Match(10)],
+                b"CCCCCCCCCC",
+                &[30; 10],
+                second,
+                100,
+            ),
+            (
+                b"skip",
+                200,
+                vec![Cigar::Match(3), Cigar::RefSkip(4), Cigar::Match(3)],
+                b"GGGGGG",
+                &[30; 6],
+                first,
+                203,
+            ),
+            (
+                b"skip",
+                203,
+                vec![Cigar::Match(5)],
+                b"TTTTT",
+                &[30; 5],
+                second,
+                200,
+            ),
+        ];
+        for (name, position, cigar, sequence, qualities, flags, mate_position) in records {
+            let mut record = Record::new();
+            record.set(name, Some(&CigarString(cigar)), sequence, qualities);
+            record.set_tid(0);
+            record.set_pos(position);
+            record.set_mapq(60);
+            record.set_flags(flags);
+            record.set_mtid(0);
+            record.set_mpos(mate_position);
+            writer.write(&record).unwrap();
+        }
+        drop(writer);
+        let index = PathBuf::from(format!("{}.bai", path.display()));
+        bam::index::build(path, Some(&index), bam::index::Type::Bai, 1).unwrap();
+    }
+
+    fn overlapping_mate_pileup(
+        path: &Path,
+        policy: OverlappingMatePolicy,
+        collect_alleles: bool,
+    ) -> crate::PileupSummary {
+        let mut source =
+            LocalAlignmentSource::open(path, &AlignmentOpenOptions::default()).unwrap();
+        source
+            .query(
+                GenomicInterval::new(ContigId::new(0), 95, 215).unwrap(),
+                QueryOptions {
+                    coverage_bins: NonZeroUsize::new(120).unwrap(),
+                    collect_alleles,
+                    minimum_base_quality: 10,
+                    overlapping_mate_policy: policy,
+                    ..QueryOptions::default()
+                },
+                &|| true,
+            )
+            .unwrap()
+            .pileup
+    }
+
+    #[test]
+    fn count_once_masks_only_what_the_earlier_mate_contributed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overlapping-mates.bam");
+        write_overlapping_mate_fixture(&path);
+        let pileup = overlapping_mate_pileup(&path, OverlappingMatePolicy::CountOnce, true);
+        let bin = |position: u64| pileup.bins[usize::try_from(position - 95).unwrap()];
+        let depth = |range: std::ops::Range<u64>| range.map(|p| bin(p).depth).collect::<Vec<_>>();
+
+        // Pair `del`: every template position 100..112 has exactly one aligned base. 104/105
+        // are aligned only in the second mate (the first has a deletion there).
+        assert_eq!(
+            depth(98..114),
+            [0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]
+        );
+        for position in [100, 101, 102, 103, 107, 108, 109] {
+            assert_eq!((bin(position).alleles.a, bin(position).alleles.c), (1, 0));
+            assert_eq!(bin(position).alleles.deletion, 0);
+        }
+        // The first mate's deletion is the template's single observation at 104/105.
+        for position in [104, 105] {
+            assert_eq!(bin(position).alleles.deletion, 1);
+            assert_eq!(bin(position).alleles.base_observations(), 0);
+        }
+        // The first mate's base at 106 fails quality, so the second mate's `C` is counted.
+        assert_eq!((bin(106).alleles.a, bin(106).alleles.c), (0, 1));
+        assert_eq!(bin(106).reverse_alleles.c, 1);
+        for position in [110, 111] {
+            assert_eq!((bin(position).alleles.a, bin(position).alleles.c), (0, 1));
+        }
+        // Pair `skip`: the second mate fills the first mate's `N` gap 203..207.
+        assert_eq!(depth(199..211), [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]);
+        for position in [200, 201, 202, 207, 208, 209] {
+            assert_eq!((bin(position).alleles.g, bin(position).alleles.t), (1, 0));
+        }
+        for position in [203, 204, 205, 206] {
+            assert_eq!((bin(position).alleles.g, bin(position).alleles.t), (0, 1));
+        }
+        // Collapsed aligned bases: 102,103,106..110 of `del` and 207 of `skip`.
+        assert_eq!(pileup.provenance.collapsed_mate_bases, 7);
+        assert!(pileup.provenance.overlap_collapse_complete);
+
+        let both = overlapping_mate_pileup(&path, OverlappingMatePolicy::CountBoth, true);
+        let bin = |position: u64| both.bins[usize::try_from(position - 95).unwrap()];
+        assert_eq!(
+            (100..112).map(|p| bin(p).depth).collect::<Vec<_>>(),
+            [1, 1, 2, 2, 1, 1, 2, 2, 2, 2, 1, 1]
+        );
+        assert_eq!((bin(104).alleles.deletion, bin(104).alleles.c), (1, 1));
+        assert_eq!(both.provenance.collapsed_mate_bases, 0);
+    }
+
+    #[test]
+    fn resident_derivations_collapse_overlapping_mates_like_a_direct_query() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overlapping-mates.bam");
+        write_overlapping_mate_fixture(&path);
+        let interval = GenomicInterval::new(ContigId::new(0), 95, 215).unwrap();
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        for collect_alleles in [true, false] {
+            let options = QueryOptions {
+                detail: QueryDetail::Full,
+                coverage_bins: NonZeroUsize::new(120).unwrap(),
+                collect_alleles,
+                minimum_base_quality: 10,
+                ..QueryOptions::default()
+            };
+            let direct = source.query(interval, options.clone(), &|| true).unwrap();
+            assert_eq!(direct.pileup.provenance.collapsed_mate_bases, 7);
+            let overlap = AlignmentOverlapIndex::new(&direct.batch);
+            // The packed-record path applies the same CIGAR- and quality-aware mask.
+            let derived =
+                derive_alignment_query(&direct, &overlap, interval, &options, None, &|| true)
+                    .unwrap();
+            assert_eq!(derived.pileup, direct.pileup, "alleles: {collect_alleles}");
+            if !collect_alleles {
+                // So does the precomputed depth/indel summary index.
+                let summaries = crate::AlignmentSummaryIndex::build(
+                    &direct.batch,
+                    interval,
+                    options.overlapping_mate_policy,
+                )
+                .unwrap();
+                let indexed = derive_alignment_query_with_summary_index_and_phase(
+                    &direct,
+                    &overlap,
+                    Some(&summaries),
+                    interval,
+                    &options,
+                    None,
+                    &|| true,
+                    &mut |_| {},
+                )
+                .unwrap()
+                .0;
+                assert_eq!(indexed.pileup, direct.pileup);
+            }
+        }
+    }
+
+    #[test]
+    fn depth_only_queries_match_allele_queries_without_decoding_bases() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overlapping-mates.bam");
+        write_overlapping_mate_fixture(&path);
+        let with_alleles = overlapping_mate_pileup(&path, OverlappingMatePolicy::CountOnce, true);
+        let depth_only = overlapping_mate_pileup(&path, OverlappingMatePolicy::CountOnce, false);
+        assert!(!depth_only.provenance.allele_observations_available);
+        for (depth_only, with_alleles) in depth_only.bins.iter().zip(&with_alleles.bins) {
+            assert_eq!(depth_only.depth, with_alleles.depth);
+            assert_eq!(depth_only.forward_depth, with_alleles.forward_depth);
+            assert_eq!(depth_only.alleles.deletion, with_alleles.alleles.deletion);
+            assert_eq!(depth_only.alleles.base_observations(), 0);
+        }
+        assert_eq!(depth_only.provenance.collapsed_mate_bases, 7);
+    }
+
+    /// Mirrors `fuzz/fuzz_targets/alignment_file.rs`: the seed is an uncompressed BAM payload
+    /// which the harness BGZF-frames and indexes. If this stops decoding a record, the fuzz
+    /// target has stopped reaching record decode.
+    #[test]
+    fn alignment_fuzz_seed_reaches_record_decode_once_framed_and_indexed() {
+        use std::io::Write as _;
+
+        let seed = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/seeds/alignment_file/one-record.bam-payload");
+        if !seed.exists() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("framed.bam");
+        // Without an index the open is refused before any record is read.
+        let mut writer = rust_htslib::bgzf::Writer::from_path(&path).unwrap();
+        writer.write_all(&fs::read(seed).unwrap()).unwrap();
+        drop(writer);
+        assert!(LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).is_err());
+
+        bam::index::build(&path, None, bam::index::Type::Bai, 1).unwrap();
+        let mut source =
+            LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+        let query = source
+            .query(
+                GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap(),
+                QueryOptions {
+                    detail: QueryDetail::Full,
+                    collect_alleles: true,
+                    collect_modifications: true,
+                    ..QueryOptions::default()
+                },
+                &|| true,
+            )
+            .unwrap();
+        assert_eq!(query.batch.len(), 1);
+        let record = query.batch.materialize_record(0).unwrap();
+        assert_eq!((record.start, record.end), (100, 108));
+        assert_eq!(
+            record.sequence,
+            SequenceData::Present {
+                bases: b"ACGTACGT".to_vec(),
+                qualities: Some(vec![30; 8]),
+            }
+        );
+        // `C+m,0;` with ML 200: the first C of ACGTACGT, read index 1, reference 101.
+        let calls = crate::decode_modified_bases(&record).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (calls[0].sequencer_position, calls[0].probability),
+            (1, Some(200))
+        );
+        assert_eq!(query.pileup.modifications.provenance.decoded_calls, 1);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # ADR 0004: remote backends and byte accountability
 
-Status: accepted for beta.
+Status: accepted for beta; amended 20 November 2026 (local CRAM backend, see Decision).
 
 ## Context
 
@@ -17,8 +17,17 @@ seekable reader that the pure-Rust `bigtools` library can consume.
   decoding uses an explicitly supplied local or remote indexed FASTA; its per-query decoded
   reference footprint is capped and released after the query. Both formats share normalized
   alignment, pileup, junction, pair, filtering, sampling, and generation-routing code.
-- Keep local BAM and CRAM behind `rust-htslib`, retaining its mature local codec behavior while
-  making remote traffic fully observable in the pure-Rust path.
+- Keep local BAM behind `rust-htslib`, retaining its mature local codec behavior while making
+  remote traffic fully observable in the pure-Rust path.
+- **Amended 20 November 2026.** The original decision also kept local CRAM behind `rust-htslib`.
+  That is no longer what the code does: `ProductionAlignmentSource::open` in
+  `crates/rgv-hts/src/remote_alignment.rs` routes a local `.cram` path to
+  `LocalCramAlignmentSource`, which uses the `noodles` indexed CRAM reader and the same positioned
+  container/slice decoder as remote CRAM. Only local BAM (and any other local non-CRAM path) goes
+  through `rust-htslib`. The doc comment on `ProductionAlignmentSource` still says "Local files
+  and CRAM use `HTSlib`" and is stale. RGV therefore ships two production alignment decoders;
+  converging on one is tracked as HTS-15 / OPS-10 in
+  `audits/COMPREHENSIVE_REVIEW_2026-11-20.md`.
 - Keep all callers behind RGV source traits so backend selection does not affect layout or
   rendering.
 - Use RGV's `HttpRangeReader` for BigWig and BigBed. It performs bounded chunk coalescing, maintains

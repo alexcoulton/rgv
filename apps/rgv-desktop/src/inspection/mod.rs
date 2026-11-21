@@ -6,4 +6,5 @@ pub(crate) mod navigation;
 pub(crate) mod read;
 pub(crate) mod rna;
 pub(crate) mod selection;
+pub(crate) mod stable_selection;
 pub(crate) mod variant;

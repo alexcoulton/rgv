@@ -685,6 +685,11 @@ fn pick_captured_scene(
         })
 }
 
+/// Smallest extent, in points, any projected alignment shape may have along either axis. One
+/// point is at least one physical pixel at every window scale factor. Keep in lockstep with
+/// `project_instance` in `rgv-render`'s `alignment_scene.wgsl`.
+const MINIMUM_PRIMITIVE_EXTENT: f64 = 1.0;
+
 fn project_primitive(
     primitive: AlignmentSemanticPrimitive,
     page_start: u64,
@@ -693,47 +698,54 @@ fn project_primitive(
     text: Option<Arc<str>>,
     interaction: AlignmentInteractionToken,
 ) -> Option<CpuProjectedPrimitive> {
+    // Mirror of `project_instance` in `alignment_scene.wgsl`: project the unclipped genomic span,
+    // apply the minimum-size policy, then clip to the pane exactly as the GPU scissor does. Every
+    // shape keeps at least one point (>= one physical pixel) in both axes, so sub-pixel
+    // mismatches do not shimmer and rows do not vanish when they are shorter than a pixel.
     let genomic_start = page_start.saturating_add(primitive.start_offset);
     let genomic_end = page_start.saturating_add(primitive.end_offset);
-    let clipped_start = genomic_start.max(camera.interval().start());
-    let clipped_end = genomic_end.min(camera.interval().end());
-    if clipped_start >= clipped_end {
+    if genomic_start >= genomic_end {
         return None;
     }
-    let mut x = camera.x_for_position(clipped_start);
-    let mut width = camera.x_for_position(clipped_end) - x;
+    let mut x = camera.x_for_position(genomic_start);
+    let mut width = camera.x_for_position(genomic_end) - x;
     let row_top = camera.clip.y
         + (f64::from(global_row) - camera.row_scroll) * camera.row_height
         + (camera.row_height - camera.read_height) * 0.5;
+    let body_height = camera.read_height.max(MINIMUM_PRIMITIVE_EXTENT);
     let (shape, y, height) = match primitive.geometry {
-        AlignmentGeometryToken::EventLine => (
-            CpuPrimitiveShape::EventLine,
-            row_top + camera.read_height * 0.45,
-            (camera.read_height * 0.1).max(1.0),
-        ),
+        AlignmentGeometryToken::EventLine => {
+            width = width.max(MINIMUM_PRIMITIVE_EXTENT);
+            (
+                CpuPrimitiveShape::EventLine,
+                row_top + camera.read_height * 0.45,
+                (camera.read_height * 0.1).max(MINIMUM_PRIMITIVE_EXTENT),
+            )
+        }
         AlignmentGeometryToken::PointMarker => {
             let marker_width = width.max(1.5);
             x -= (marker_width - width) * 0.5;
             width = marker_width;
-            (CpuPrimitiveShape::PointMarker, row_top, camera.read_height)
+            (CpuPrimitiveShape::PointMarker, row_top, body_height)
         }
         AlignmentGeometryToken::DirectionalTerminalLeft => {
-            width = width.max(1.0);
+            width = width.max(MINIMUM_PRIMITIVE_EXTENT);
             (
                 CpuPrimitiveShape::DirectionTerminalLeft,
                 row_top,
-                camera.read_height,
+                body_height,
             )
         }
         AlignmentGeometryToken::DirectionalTerminalRight => {
-            width = width.max(1.0);
+            width = width.max(MINIMUM_PRIMITIVE_EXTENT);
             (
                 CpuPrimitiveShape::DirectionTerminalRight,
                 row_top,
-                camera.read_height,
+                body_height,
             )
         }
         AlignmentGeometryToken::Rectangle => {
+            width = width.max(MINIMUM_PRIMITIVE_EXTENT);
             let shape = match primitive.component {
                 AlignmentComponent::Label { .. } => CpuPrimitiveShape::TextLabel,
                 AlignmentComponent::Base { .. }
@@ -743,7 +755,7 @@ fn project_primitive(
                 | AlignmentComponent::SbxTailBase { .. } => CpuPrimitiveShape::BaseCell,
                 _ => CpuPrimitiveShape::ReadBody,
             };
-            (shape, row_top, camera.read_height)
+            (shape, row_top, body_height)
         }
     };
     let clip_right = camera.clip.x + camera.clip.width;
@@ -943,4 +955,165 @@ pub enum CpuInteractionError {
         frame: SceneRevision,
         scene: SceneRevision,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use rgv_core::ContigId;
+    use rgv_hts::AlignmentSourcePosition;
+
+    use super::*;
+    use crate::{
+        AlignmentBodyColorToken, AlignmentSourceRevision, RevisionFingerprint, SourceFingerprint,
+    };
+
+    const GEOMETRIES: [AlignmentGeometryToken; 5] = [
+        AlignmentGeometryToken::Rectangle,
+        AlignmentGeometryToken::EventLine,
+        AlignmentGeometryToken::PointMarker,
+        AlignmentGeometryToken::DirectionalTerminalLeft,
+        AlignmentGeometryToken::DirectionalTerminalRight,
+    ];
+
+    fn primitive(
+        start_offset: u64,
+        end_offset: u64,
+        geometry: AlignmentGeometryToken,
+    ) -> AlignmentSemanticPrimitive {
+        AlignmentSemanticPrimitive {
+            start_offset,
+            end_offset,
+            row_offset: 0,
+            handle: AlignmentHandle::new(
+                AlignmentSourceRevision::new(
+                    SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+                    RevisionFingerprint::new(3, 4),
+                ),
+                AlignmentSourcePosition::bam_virtual_offset(100),
+            ),
+            component: AlignmentComponent::ReadSpan,
+            geometry,
+            style: AlignmentStyleToken {
+                flags: 0,
+                mapping_quality: None,
+                operation: None,
+                body: AlignmentBodyColorToken::Neutral,
+            },
+            draw_order: 0,
+        }
+    }
+
+    fn camera(bases: u64, row_height: f64, read_height: f64) -> AlignmentCamera {
+        AlignmentCamera::new(
+            GenomicInterval::new(ContigId::new(0), 1_000, 1_000 + bases).unwrap(),
+            0.0,
+            row_height,
+            read_height,
+            CpuClipRect {
+                x: 10.0,
+                y: 20.0,
+                width: 100.0,
+                height: 50.0,
+            },
+        )
+        .unwrap()
+    }
+
+    fn project(
+        primitive: AlignmentSemanticPrimitive,
+        row: u32,
+        camera: AlignmentCamera,
+    ) -> Option<CpuProjectedPrimitive> {
+        project_primitive(
+            primitive,
+            1_000,
+            row,
+            camera,
+            None,
+            AlignmentInteractionToken::default(),
+        )
+    }
+
+    #[test]
+    fn cpu_projection_gives_every_shape_at_least_one_point_in_both_axes() {
+        // 1,000 bases per point and rows a quarter of a point tall: a single mismatch is a
+        // thousandth of a point wide and every read is shorter than a pixel.
+        let camera = camera(100_000, 0.25, 0.2);
+        for geometry in GEOMETRIES {
+            let projected = project(primitive(50_000, 50_001, geometry), 8, camera)
+                .unwrap_or_else(|| panic!("{geometry:?} vanished below one point"));
+            assert!(
+                projected.width >= 1.0 - 1.0e-9,
+                "{geometry:?} is {} points wide",
+                projected.width
+            );
+            assert!(
+                projected.height >= 1.0 - 1.0e-9,
+                "{geometry:?} is {} points tall",
+                projected.height
+            );
+        }
+        let marker = project(
+            primitive(50_000, 50_001, AlignmentGeometryToken::PointMarker),
+            8,
+            camera,
+        )
+        .unwrap();
+        assert!((marker.width - 1.5).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn cpu_projection_minimum_size_does_not_move_the_start_edge_or_inflate_large_shapes() {
+        let zoomed_out = camera(100_000, 0.25, 0.2);
+        let tiny = project(
+            primitive(50_000, 50_001, AlignmentGeometryToken::Rectangle),
+            8,
+            zoomed_out,
+        )
+        .unwrap();
+        assert!((tiny.x - (10.0 + 50_000.0 / 1_000.0)).abs() < 1.0e-9);
+        assert!((tiny.y - (20.0 + 8.0 * 0.25 + 0.025)).abs() < 1.0e-9);
+
+        // One base per point, nine-point reads: nothing is rounded up.
+        let detailed = camera(100, 12.0, 9.0);
+        let body = project(
+            primitive(20, 60, AlignmentGeometryToken::Rectangle),
+            1,
+            detailed,
+        )
+        .unwrap();
+        assert!((body.x - 30.0).abs() < 1.0e-9);
+        assert!((body.width - 40.0).abs() < 1.0e-9);
+        assert!((body.height - 9.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn cpu_projection_clips_to_the_pane_after_applying_the_minimum_size() {
+        let detailed = camera(100, 12.0, 9.0);
+        // Starts 30 bases left of the pane and ends 20 bases inside it.
+        let projected = project_primitive(
+            primitive(0, 50, AlignmentGeometryToken::Rectangle),
+            970,
+            0,
+            detailed,
+            None,
+            AlignmentInteractionToken::default(),
+        )
+        .unwrap();
+        assert!((projected.x - 10.0).abs() < 1.0e-9);
+        assert!((projected.width - 20.0).abs() < 1.0e-9);
+
+        // Wholly outside the pane: the minimum size never drags it into view.
+        let outside = project_primitive(
+            primitive(0, 5, AlignmentGeometryToken::Rectangle),
+            900,
+            0,
+            detailed,
+            None,
+            AlignmentInteractionToken::default(),
+        );
+        assert!(outside.is_none());
+        let empty = project(primitive(7, 7, AlignmentGeometryToken::Rectangle), 0, detailed);
+        assert!(empty.is_none());
+    }
 }

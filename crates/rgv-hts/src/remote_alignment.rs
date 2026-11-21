@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::{self, Cursor, Read as _, SeekFrom},
     sync::{
         Arc, Mutex,
@@ -39,13 +39,21 @@ use crate::{
         JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
     pileup::{
-        OverlapCollapser, OverlapMask, PileupBuilder, add_unmasked_range, aligned_observation,
+        MateAlignment, MateOverlapMask, OverlapCollapser, PileupBuilder, aligned_observation,
+        base_observation_is_counted,
     },
     read_remote_object_bounded, remote_url_with_extension,
     source_revision::{LocalSourceGuard, digest_bytes, local_source_stamp, remote_source_stamp},
 };
 
-type NoodlesReader = bam::io::IndexedReader<noodles::bgzf::io::Reader<HttpRangeReader>>;
+mod positioned_stream;
+
+use positioned_stream::NoodlesPositionedStream;
+
+/// Remote BAM stream and its index. They are kept apart (instead of in a noodles
+/// `IndexedReader`, which boxes the index as a non-`Send` trait object) so the source can be
+/// moved onto its worker thread.
+type NoodlesReader = noodles::bgzf::io::Reader<HttpRangeReader>;
 type NoodlesCramReader = cram::io::IndexedReader<HttpRangeReader>;
 const MAX_REMOTE_ALIGNMENT_INDEX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_REMOTE_CRAM_REFERENCE_BASES: usize = 512 * 1024 * 1024;
@@ -176,6 +184,142 @@ impl ProductionAlignmentSource {
         }
     }
 
+    /// Immutable parsed SAM header metadata retained for scene-backed inspection.
+    #[must_use]
+    pub fn header_metadata(&self) -> &Arc<AlignmentHeaderMetadata> {
+        match self {
+            Self::Htslib(source) => source.header_metadata(),
+            Self::LocalCram(source) => &source.metadata,
+            Self::RemoteBam(source) => &source.metadata,
+            Self::RemoteCram(source) => &source.metadata,
+        }
+    }
+
+    /// Exact mapped-record total when the index provides it in constant time.
+    #[must_use]
+    pub fn normalization_mapped_records(&self) -> Option<u64> {
+        match self {
+            Self::Htslib(source) => source.normalization_mapped_records(),
+            Self::RemoteBam(source) => source.normalization_mapped_records,
+            Self::LocalCram(_) | Self::RemoteCram(_) => None,
+        }
+    }
+
+    /// Whether decoding needs a reference sequence supplied at open time.
+    #[must_use]
+    pub const fn is_cram(&self) -> bool {
+        matches!(self, Self::LocalCram(_) | Self::RemoteCram(_))
+    }
+
+    /// Installs or clears the cancellation probe consulted by remote range requests.
+    pub fn set_remote_cancellation(&mut self, cancellation: Option<RemoteCancellation>) {
+        match self {
+            Self::Htslib(_) | Self::LocalCram(_) => {}
+            Self::RemoteBam(source) => source.set_cancellation(cancellation),
+            Self::RemoteCram(source) => source.set_cancellation(cancellation),
+        }
+    }
+
+    /// Starts a resumable positioned acquisition; see
+    /// [`LocalAlignmentSource::begin_positioned_stream_with_admission`]. Calling this again
+    /// retargets by discarding only the unfinished transaction state.
+    pub fn begin_positioned_stream_with_admission(
+        &mut self,
+        interval: GenomicInterval,
+        admission_interval: GenomicInterval,
+        options: QueryOptions,
+    ) -> Result<(), AlignmentError> {
+        match self {
+            Self::Htslib(source) => {
+                source.begin_positioned_stream_with_admission(interval, admission_interval, options)
+            }
+            Self::LocalCram(source) => {
+                source.positioned_stream = None;
+                if !source.source_guard.validate()? {
+                    return Err(AlignmentError::SourceChanged);
+                }
+                if source.dictionary.get(interval.contig()).is_none() {
+                    return Err(AlignmentError::UnknownContig(interval.contig().get()));
+                }
+                // Each transaction has its own reference budget; slices fetch only their span.
+                source.reference_query_bases.store(0, Ordering::Relaxed);
+                source.reader.reference_sequence_repository().clear();
+                source.positioned_stream = Some(NoodlesPositionedStream::begin_cram(
+                    &source.reader,
+                    interval,
+                    admission_interval,
+                    options,
+                )?);
+                Ok(())
+            }
+            Self::RemoteCram(source) => {
+                source.positioned_stream = None;
+                if source.dictionary.get(interval.contig()).is_none() {
+                    return Err(AlignmentError::UnknownContig(interval.contig().get()));
+                }
+                // Each transaction has its own reference budget; slices fetch only their span.
+                source.reference_query_bases.store(0, Ordering::Relaxed);
+                source.reader.reference_sequence_repository().clear();
+                source.positioned_stream = Some(NoodlesPositionedStream::begin_cram(
+                    &source.reader,
+                    interval,
+                    admission_interval,
+                    options,
+                )?);
+                Ok(())
+            }
+            Self::RemoteBam(source) => {
+                source.positioned_stream = None;
+                let region = remote_bam_region(&source.dictionary, interval)?;
+                source.positioned_stream = Some(NoodlesPositionedStream::begin_bam(
+                    &source.index,
+                    interval,
+                    admission_interval,
+                    options,
+                    &region,
+                )?);
+                Ok(())
+            }
+        }
+    }
+
+    /// Abandons the unfinished positioned transaction without invalidating returned blocks.
+    pub fn cancel_positioned_stream(&mut self) {
+        match self {
+            Self::Htslib(source) => source.cancel_positioned_stream(),
+            Self::LocalCram(source) => source.positioned_stream = None,
+            Self::RemoteBam(source) => source.positioned_stream = None,
+            Self::RemoteCram(source) => source.positioned_stream = None,
+        }
+    }
+
+    /// Performs at most one physical owner unit of source work.
+    pub fn next_positioned_stream_checkpoint(
+        &mut self,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<crate::PositionedAlignmentStreamCheckpoint, AlignmentError> {
+        match self {
+            Self::Htslib(source) => source.next_positioned_stream_checkpoint(keep_going),
+            Self::LocalCram(source) => positioned_stream::next_cram_checkpoint(
+                &mut source.positioned_stream,
+                &mut source.reader,
+                &source.header,
+                &source.reference_slice_span,
+            ),
+            Self::RemoteCram(source) => positioned_stream::next_cram_checkpoint(
+                &mut source.positioned_stream,
+                &mut source.reader,
+                &source.header,
+                &source.reference_slice_span,
+            ),
+            Self::RemoteBam(source) => positioned_stream::next_bam_checkpoint(
+                &mut source.positioned_stream,
+                &mut source.reader,
+                &source.header,
+            ),
+        }
+    }
+
     pub fn query_with_cancellation(
         &mut self,
         interval: GenomicInterval,
@@ -195,6 +339,31 @@ impl ProductionAlignmentSource {
             }
         }
     }
+}
+
+impl From<LocalAlignmentSource> for ProductionAlignmentSource {
+    fn from(source: LocalAlignmentSource) -> Self {
+        Self::Htslib(source)
+    }
+}
+
+fn remote_bam_region(
+    dictionary: &ReferenceDictionary,
+    interval: GenomicInterval,
+) -> Result<Region, AlignmentError> {
+    let contig = dictionary
+        .get(interval.contig())
+        .ok_or(AlignmentError::UnknownContig(interval.contig().get()))?;
+    let start = Position::try_from(
+        usize::try_from(interval.start().saturating_add(1))
+            .map_err(|_| AlignmentError::CoordinateOverflow)?,
+    )
+    .map_err(|_| AlignmentError::CoordinateOverflow)?;
+    let end = Position::try_from(
+        usize::try_from(interval.end()).map_err(|_| AlignmentError::CoordinateOverflow)?,
+    )
+    .map_err(|_| AlignmentError::CoordinateOverflow)?;
+    Ok(Region::new(contig.name(), start..=end))
 }
 
 impl AlignmentSource for ProductionAlignmentSource {
@@ -238,8 +407,10 @@ pub struct LocalCramAlignmentSource {
     dictionary: ReferenceDictionary,
     metadata: Arc<AlignmentHeaderMetadata>,
     reference_query_bases: Arc<AtomicUsize>,
+    reference_slice_span: CramSliceSpan,
     source_stamp: AlignmentSourceStamp,
     source_guard: LocalSourceGuard,
+    positioned_stream: Option<NoodlesPositionedStream>,
 }
 
 impl LocalCramAlignmentSource {
@@ -257,20 +428,24 @@ impl LocalCramAlignmentSource {
                     &FastaOpenOptions {
                         remote_index_url: options.remote_reference_index_url.clone(),
                         remote_range: options.remote_range.clone(),
+                        ..FastaOpenOptions::default()
                     },
                 )
                 .map(|reference| Arc::new(Mutex::new(reference)))
             })
             .transpose()?;
         let reference_query_bases = Arc::new(AtomicUsize::new(0));
-        let repository = reference
-            .as_ref()
-            .map_or_else(fasta::Repository::default, |reference| {
-                fasta::Repository::new(CramReferenceAdapter {
-                    reference: Arc::clone(reference),
-                    query_bases: Arc::clone(&reference_query_bases),
-                })
-            });
+        let reference_slice_span = CramSliceSpan::default();
+        let repository =
+            reference
+                .as_ref()
+                .map_or_else(missing_cram_reference_repository, |reference| {
+                    fasta::Repository::new(CramReferenceAdapter {
+                        reference: Arc::clone(reference),
+                        query_bases: Arc::clone(&reference_query_bases),
+                        slice_span: Arc::clone(&reference_slice_span),
+                    })
+                });
         let mut builder = cram::io::indexed_reader::Builder::default()
             .set_reference_sequence_repository(repository);
         if let Some(index_path) = &options.index_path {
@@ -323,8 +498,10 @@ impl LocalCramAlignmentSource {
             dictionary,
             metadata,
             reference_query_bases,
+            reference_slice_span,
             source_stamp,
             source_guard,
+            positioned_stream: None,
         })
     }
 }
@@ -356,7 +533,12 @@ impl AlignmentSource for LocalCramAlignmentSource {
         self.reference_query_bases.store(0, Ordering::Relaxed);
         self.reader.reference_sequence_repository().clear();
         let result = {
-            let records = positioned_cram_records(&mut self.reader, &self.header, interval)?;
+            let records = positioned_cram_records(
+                &mut self.reader,
+                &self.header,
+                interval,
+                &self.reference_slice_span,
+            )?;
             query_positioned_noodles_records(
                 records,
                 &self.header,
@@ -375,6 +557,7 @@ impl AlignmentSource for LocalCramAlignmentSource {
 /// Indexed remote BAM source backed by RGV's observable, bounded HTTP range cache.
 pub struct RemoteBamAlignmentSource {
     reader: NoodlesReader,
+    index: RemoteIndex,
     header: noodles::sam::Header,
     dictionary: ReferenceDictionary,
     metadata: Arc<AlignmentHeaderMetadata>,
@@ -382,6 +565,7 @@ pub struct RemoteBamAlignmentSource {
     normalization_mapped_records: Option<u64>,
     index_overview: Option<crate::AlignmentIndexOverview>,
     source_stamp: AlignmentSourceStamp,
+    positioned_stream: Option<NoodlesPositionedStream>,
 }
 
 impl RemoteBamAlignmentSource {
@@ -394,11 +578,8 @@ impl RemoteBamAlignmentSource {
             options.remote_range.clone(),
         )?;
         let normalization_mapped_records = remote_index_mapped_records(&index);
-        let mut reader = match index {
-            RemoteIndex::Bai(index) => bam::io::IndexedReader::new(source, index),
-            RemoteIndex::Csi(index) => bam::io::IndexedReader::new(source, index),
-        };
-        let header = reader.read_header()?;
+        let mut reader = noodles::bgzf::io::Reader::new(source);
+        let header = bam::io::Reader::from(&mut reader).read_header()?;
         let metadata = Arc::new(alignment_header_metadata_from_noodles(&header));
         let dictionary = ReferenceDictionary::from_contigs(
             header
@@ -412,10 +593,14 @@ impl RemoteBamAlignmentSource {
                 })
                 .collect::<Vec<_>>(),
         );
-        let index_overview = Some(crate::AlignmentIndexOverview::from_binning_index(
-            reader.index(),
-            &dictionary,
-        ));
+        let index_overview = Some(match &index {
+            RemoteIndex::Bai(index) => {
+                crate::AlignmentIndexOverview::from_binning_index(index, &dictionary)
+            }
+            RemoteIndex::Csi(index) => {
+                crate::AlignmentIndexOverview::from_binning_index(index, &dictionary)
+            }
+        });
         let source_stamp = options.source_stamp_override.unwrap_or_else(|| {
             remote_source_stamp(
                 url,
@@ -428,6 +613,7 @@ impl RemoteBamAlignmentSource {
         });
         Ok(Self {
             reader,
+            index,
             header,
             dictionary,
             metadata,
@@ -435,22 +621,20 @@ impl RemoteBamAlignmentSource {
             normalization_mapped_records,
             index_overview,
             source_stamp,
+            positioned_stream: None,
         })
     }
 
     pub fn remote_io_stats(&self) -> RemoteIoStats {
-        combine_stats(self.index_stats, self.reader.get_ref().get_ref().stats())
+        combine_stats(self.index_stats, self.reader.get_ref().stats())
     }
 
     fn set_cancellation(&mut self, cancellation: Option<RemoteCancellation>) {
-        self.reader
-            .get_mut()
-            .get_mut()
-            .set_cancellation(cancellation);
+        self.reader.get_mut().set_cancellation(cancellation);
     }
 
     fn set_transfer_budget(&mut self, budget: Option<RemoteTransferBudget>) {
-        self.reader.get_mut().get_mut().set_transfer_budget(budget);
+        self.reader.get_mut().set_transfer_budget(budget);
     }
 }
 
@@ -463,7 +647,9 @@ pub struct RemoteCramAlignmentSource {
     index_stats: RemoteIoStats,
     reference: Option<Arc<Mutex<FastaReference>>>,
     reference_query_bases: Arc<AtomicUsize>,
+    reference_slice_span: CramSliceSpan,
     source_stamp: AlignmentSourceStamp,
+    positioned_stream: Option<NoodlesPositionedStream>,
 }
 
 impl RemoteCramAlignmentSource {
@@ -485,20 +671,24 @@ impl RemoteCramAlignmentSource {
                     &FastaOpenOptions {
                         remote_index_url: options.remote_reference_index_url.clone(),
                         remote_range: options.remote_range.clone(),
+                        ..FastaOpenOptions::default()
                     },
                 )
                 .map(|reference| Arc::new(Mutex::new(reference)))
             })
             .transpose()?;
         let reference_query_bases = Arc::new(AtomicUsize::new(0));
-        let repository = reference
-            .as_ref()
-            .map_or_else(fasta::Repository::default, |reference| {
-                fasta::Repository::new(CramReferenceAdapter {
-                    reference: Arc::clone(reference),
-                    query_bases: Arc::clone(&reference_query_bases),
-                })
-            });
+        let reference_slice_span = CramSliceSpan::default();
+        let repository =
+            reference
+                .as_ref()
+                .map_or_else(missing_cram_reference_repository, |reference| {
+                    fasta::Repository::new(CramReferenceAdapter {
+                        reference: Arc::clone(reference),
+                        query_bases: Arc::clone(&reference_query_bases),
+                        slice_span: Arc::clone(&reference_slice_span),
+                    })
+                });
         let mut reader = cram::io::indexed_reader::Builder::default()
             .set_index(index)
             .set_reference_sequence_repository(repository)
@@ -535,7 +725,9 @@ impl RemoteCramAlignmentSource {
             index_stats,
             reference,
             reference_query_bases,
+            reference_slice_span,
             source_stamp,
+            positioned_stream: None,
         })
     }
 
@@ -599,14 +791,74 @@ fn split_remote_transfer_budget(
     )
 }
 
+/// Zero-based half-open reference span needed by the CRAM slice about to be decoded, shared
+/// between the decoder loop and the reference adapter. `None` means the whole sequence.
+type CramSliceSpan = Arc<CramSliceReference>;
+
+/// Decoder/adapter rendezvous for the slice being decoded.
+#[derive(Default)]
+struct CramSliceReference {
+    span: Mutex<Option<(u64, u64)>>,
+    /// Set by the adapter when it could not supply reference bases (fetch failure, budget,
+    /// absent contig). Such a failure says nothing about the slice's span, so it must not be
+    /// answered by fetching the whole sequence.
+    reference_unavailable: std::sync::atomic::AtomicBool,
+}
+
+impl CramSliceReference {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Option<(u64, u64)>>> {
+        self.span.lock()
+    }
+}
+
+/// Whether a slice that failed to decode against its indexed span should be decoded once more
+/// against the whole reference sequence. Only a decode failure can mean the index understated
+/// the span; when the reference itself was unavailable a wider fetch would repeat the same
+/// failure at many times the cost.
+const fn retry_slice_against_whole_sequence(
+    attempted_span: bool,
+    reference_unavailable: bool,
+) -> bool {
+    attempted_span && !reference_unavailable
+}
+
 struct CramReferenceAdapter {
     reference: Arc<Mutex<FastaReference>>,
     query_bases: Arc<AtomicUsize>,
+    slice_span: CramSliceSpan,
+}
+
+/// Stands in when no reference was supplied. A reference-compressed slice then fails with an
+/// actionable error; without an adapter the CRAM decoder would panic on the missing sequence.
+/// Slices which embed their reference, or need none, never consult the repository.
+struct MissingCramReferenceAdapter;
+
+impl fasta::repository::Adapter for MissingCramReferenceAdapter {
+    fn get(&mut self, name: &[u8]) -> Option<io::Result<fasta::Record>> {
+        Some(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "this CRAM is compressed against reference sequence '{}'; load the matching \
+                 reference FASTA to display it",
+                String::from_utf8_lossy(name)
+            ),
+        )))
+    }
+}
+
+fn missing_cram_reference_repository() -> fasta::Repository {
+    fasta::Repository::new(MissingCramReferenceAdapter)
 }
 
 impl fasta::repository::Adapter for CramReferenceAdapter {
     fn get(&mut self, name: &[u8]) -> Option<io::Result<fasta::Record>> {
-        Some(self.get_inner(name))
+        let result = self.get_inner(name);
+        if result.is_err() {
+            self.slice_span
+                .reference_unavailable
+                .store(true, Ordering::Relaxed);
+        }
+        Some(result)
     }
 }
 
@@ -631,10 +883,22 @@ impl CramReferenceAdapter {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid FASTA contig ID"))?;
         let length = usize::try_from(contig.length())
             .map_err(|_| io::Error::other("CRAM reference contig length exceeds this platform"))?;
+        // A single-reference slice needs only its own span. The decoder addresses the sequence
+        // by absolute position, so the span is placed in a zero-filled buffer which the allocator
+        // maps lazily: only the fetched span is ever resident or transferred.
+        let span = self
+            .slice_span
+            .lock()
+            .map_err(|_| io::Error::other("CRAM reference span lock was poisoned"))?
+            .map(|(start, end)| (start.min(contig.length()), end.min(contig.length())))
+            .filter(|(start, end)| start < end);
+        let (fetch_start, fetch_end) = span.unwrap_or((0, contig.length()));
+        let fetched = usize::try_from(fetch_end - fetch_start)
+            .map_err(|_| io::Error::other("CRAM reference span exceeds this platform"))?;
         self.query_bases
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |loaded| {
                 loaded
-                    .checked_add(length)
+                    .checked_add(fetched)
                     .filter(|total| *total <= MAX_REMOTE_CRAM_REFERENCE_BASES)
             })
             .map_err(|_| {
@@ -642,15 +906,24 @@ impl CramReferenceAdapter {
                     "CRAM query reference budget exceeded {MAX_REMOTE_CRAM_REFERENCE_BASES} bases"
                 ))
             })?;
-        let bases = if length == 0 {
+        let bases = if fetched == 0 {
             Vec::new()
         } else {
-            let interval = GenomicInterval::new(contig_id, 0, contig.length())
+            let interval = GenomicInterval::new(contig_id, fetch_start, fetch_end)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             match reference.fetch(interval) {
-                Ok(bases) => bases,
+                Ok(bases) if span.is_none() => bases,
+                Ok(bases) => {
+                    let start = usize::try_from(fetch_start).map_err(|_| {
+                        io::Error::other("CRAM reference span exceeds this platform")
+                    })?;
+                    let mut padded = vec![0_u8; start.saturating_add(bases.len()).min(length)];
+                    let copied = padded.len() - start;
+                    padded[start..].copy_from_slice(&bases[..copied]);
+                    padded
+                }
                 Err(error) => {
-                    self.query_bases.fetch_sub(length, Ordering::Relaxed);
+                    self.query_bases.fetch_sub(fetched, Ordering::Relaxed);
                     return Err(io::Error::other(error));
                 }
             }
@@ -694,7 +967,13 @@ impl AlignmentSource for RemoteBamAlignmentSource {
         )
         .map_err(|_| AlignmentError::CoordinateOverflow)?;
         let region = Region::new(contig.name(), start..=end);
-        let records = positioned_bam_records(&mut self.reader, &self.header, interval, &region)?;
+        let records = positioned_bam_records(
+            &mut self.reader,
+            &self.index,
+            &self.header,
+            interval,
+            &region,
+        )?;
         query_positioned_noodles_records(
             records,
             &self.header,
@@ -707,45 +986,99 @@ impl AlignmentSource for RemoteBamAlignmentSource {
     }
 }
 
-fn positioned_bam_records(
-    reader: &mut NoodlesReader,
-    header: &sam::Header,
+/// Streams the records of one indexed BAM region that intersect `interval`, one at a time.
+///
+/// Nothing is buffered: the consumer applies filters, the record limit and cancellation as each
+/// record arrives, so a dense region costs one record of memory instead of every record in it.
+struct PositionedBamRecords<'a> {
+    reader: bam::io::Reader<&'a mut NoodlesReader>,
+    header: &'a sam::Header,
     interval: GenomicInterval,
-    region: &Region,
-) -> Result<Vec<io::Result<(bam::Record, Option<crate::AlignmentSourcePosition>)>>, AlignmentError>
-{
-    use noodles::bgzf::io::Seek as _;
+    chunks: std::vec::IntoIter<noodles::csi::binning_index::index::reference_sequence::bin::Chunk>,
+    /// End of the index chunk being read; `None` before the next chunk is entered.
+    chunk_end: Option<noodles::bgzf::VirtualPosition>,
+    /// Virtual offset just past the last record read. Chunks are visited in file order, so a
+    /// record ending at or before it was already produced by an overlapping chunk.
+    high_water: u64,
+    scratch: bam::Record,
+    finished: bool,
+}
 
-    let reference_sequence_id =
-        usize::try_from(interval.contig().get()).map_err(|_| AlignmentError::CoordinateOverflow)?;
-    let chunks = reader
-        .index()
-        .query(reference_sequence_id, region.interval())?;
-    let bgzf_reader = reader.get_mut();
-    let mut positioned = Vec::new();
-    let mut seen = BTreeSet::new();
-    for chunk in chunks {
-        bgzf_reader.seek_to_virtual_position(chunk.start())?;
-        let mut direct_reader = bam::io::Reader::from(&mut *bgzf_reader);
-        let mut record = bam::Record::default();
-        while direct_reader.get_ref().virtual_position() < chunk.end() {
-            if direct_reader.read_record(&mut record)? == 0 {
-                break;
-            }
-            let end_position = u64::from(direct_reader.get_ref().virtual_position());
-            if !seen.insert(end_position) || !noodles_record_intersects(&record, header, interval)?
+impl PositionedBamRecords<'_> {
+    fn next_record(
+        &mut self,
+    ) -> Result<Option<(bam::Record, Option<crate::AlignmentSourcePosition>)>, AlignmentError> {
+        use noodles::bgzf::io::Seek as _;
+
+        loop {
+            let Some(chunk_end) = self.chunk_end else {
+                let Some(chunk) = self.chunks.next() else {
+                    return Ok(None);
+                };
+                self.reader
+                    .get_mut()
+                    .seek_to_virtual_position(chunk.start())?;
+                self.chunk_end = Some(chunk.end());
+                continue;
+            };
+            if self.reader.get_ref().virtual_position() >= chunk_end
+                || self.reader.read_record(&mut self.scratch)? == 0
             {
+                self.chunk_end = None;
                 continue;
             }
-            positioned.push(Ok((
-                record.clone(),
+            let end_position = u64::from(self.reader.get_ref().virtual_position());
+            if end_position <= self.high_water {
+                continue;
+            }
+            self.high_water = end_position;
+            if !noodles_record_intersects(&self.scratch, self.header, self.interval)? {
+                continue;
+            }
+            return Ok(Some((
+                std::mem::take(&mut self.scratch),
                 Some(crate::AlignmentSourcePosition::bam_virtual_offset(
                     end_position,
                 )),
             )));
         }
     }
-    Ok(positioned)
+}
+
+impl Iterator for PositionedBamRecords<'_> {
+    type Item = Result<(bam::Record, Option<crate::AlignmentSourcePosition>), AlignmentError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let next = self.next_record().transpose();
+        self.finished = !matches!(next, Some(Ok(_)));
+        next
+    }
+}
+
+fn positioned_bam_records<'a>(
+    reader: &'a mut NoodlesReader,
+    index: &RemoteIndex,
+    header: &'a sam::Header,
+    interval: GenomicInterval,
+    region: &Region,
+) -> Result<PositionedBamRecords<'a>, AlignmentError> {
+    let reference_sequence_id =
+        usize::try_from(interval.contig().get()).map_err(|_| AlignmentError::CoordinateOverflow)?;
+    let mut chunks = index.query(reference_sequence_id, region.interval())?;
+    chunks.sort_by_key(|chunk| (chunk.start(), chunk.end()));
+    Ok(PositionedBamRecords {
+        reader: bam::io::Reader::from(reader),
+        header,
+        interval,
+        chunks: chunks.into_iter(),
+        chunk_end: None,
+        high_water: 0,
+        scratch: bam::Record::default(),
+        finished: false,
+    })
 }
 
 impl AlignmentSource for RemoteCramAlignmentSource {
@@ -774,7 +1107,12 @@ impl AlignmentSource for RemoteCramAlignmentSource {
         self.reference_query_bases.store(0, Ordering::Relaxed);
         self.reader.reference_sequence_repository().clear();
         let result = {
-            let records = positioned_cram_records(&mut self.reader, &self.header, interval)?;
+            let records = positioned_cram_records(
+                &mut self.reader,
+                &self.header,
+                interval,
+                &self.reference_slice_span,
+            )?;
             query_positioned_noodles_records(
                 records,
                 &self.header,
@@ -790,27 +1128,22 @@ impl AlignmentSource for RemoteCramAlignmentSource {
     }
 }
 
-/// Reads exact CRAM slices selected by CRAI and retains a physical record address which is stable
-/// across independent genomic query boundaries.
-fn positioned_cram_records<R>(
-    reader: &mut cram::io::IndexedReader<R>,
-    header: &sam::Header,
+/// Slices of one container selected for decoding, by landmark, each with the zero-based
+/// half-open reference span CRAI records for it. The span is `None` when the slice holds more
+/// than one reference sequence or the index gives no usable span.
+type SelectedCramSlices = BTreeMap<u64, Option<(u64, u64)>>;
+
+/// Containers and slices which CRAI says can intersect `interval`, in file order.
+fn select_cram_containers<R>(
+    reader: &cram::io::IndexedReader<R>,
     interval: GenomicInterval,
-) -> Result<
-    Vec<
-        io::Result<(
-            sam::alignment::RecordBuf,
-            Option<crate::AlignmentSourcePosition>,
-        )>,
-    >,
-    AlignmentError,
->
+) -> Result<BTreeMap<u64, SelectedCramSlices>, AlignmentError>
 where
-    R: io::Read + io::Seek,
+    R: io::Read,
 {
     let reference_sequence_id =
         usize::try_from(interval.contig().get()).map_err(|_| AlignmentError::CoordinateOverflow)?;
-    let mut selected = BTreeMap::<u64, BTreeSet<u64>>::new();
+    let mut selected = BTreeMap::<u64, SelectedCramSlices>::new();
     for index_record in reader.index() {
         if index_record.reference_sequence_id() != Some(reference_sequence_id) {
             continue;
@@ -826,66 +1159,228 @@ where
             selected
                 .entry(index_record.offset())
                 .or_default()
-                .insert(index_record.landmark());
+                .insert(index_record.landmark(), Some((start, end)));
         }
     }
+    // A slice listed under any other reference (or with several spans) is multi-reference.
+    for index_record in reader.index() {
+        let Some(span) = selected
+            .get_mut(&index_record.offset())
+            .and_then(|slices| slices.get_mut(&index_record.landmark()))
+        else {
+            continue;
+        };
+        let record_span = index_record.alignment_start().and_then(|start| {
+            let start = u64::try_from(start.get()).ok()?.saturating_sub(1);
+            Some((
+                start,
+                start.saturating_add(index_record.alignment_span() as u64),
+            ))
+        });
+        if index_record.reference_sequence_id() != Some(reference_sequence_id)
+            || record_span != *span
+        {
+            *span = None;
+        }
+    }
+    Ok(selected)
+}
 
+/// Decodes the selected slices of one CRAM container and visits every record intersecting
+/// `interval` with a physical address which is stable across independent query boundaries.
+fn visit_cram_container_records<R, F>(
+    reader: &mut cram::io::IndexedReader<R>,
+    header: &sam::Header,
+    interval: GenomicInterval,
+    container_offset: u64,
+    selected_slices: &SelectedCramSlices,
+    slice_span: &CramSliceSpan,
+    mut visit: F,
+) -> Result<(), AlignmentError>
+where
+    R: io::Read + io::Seek,
+    F: FnMut(
+        sam::alignment::RecordBuf,
+        crate::AlignmentSourcePosition,
+    ) -> Result<(), AlignmentError>,
+{
     let repository = reader.reference_sequence_repository().clone();
     let raw_reader = reader.get_mut();
-    let mut positioned = Vec::new();
-    for (container_offset, selected_landmarks) in selected {
-        raw_reader.seek(SeekFrom::Start(container_offset))?;
-        let mut direct_reader = cram::io::reader::Builder::default()
-            .set_reference_sequence_repository(repository.clone())
-            .build_from_reader(&mut *raw_reader);
-        let mut container = cram::io::reader::Container::default();
-        if direct_reader.read_container(&mut container)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "CRAI points beyond the CRAM container stream",
-            )
-            .into());
-        }
-        let compression_header = container.compression_header()?;
-        let landmarks = container.header().landmarks().to_vec();
-        for (slice_index, result) in container.slices().enumerate() {
-            let slice = result?;
-            let landmark = u64::try_from(
-                *landmarks
-                    .get(slice_index)
-                    .ok_or_else(|| io::Error::other("CRAM slice has no container landmark"))?,
-            )
-            .map_err(|_| AlignmentError::CoordinateOverflow)?;
-            if !selected_landmarks.contains(&landmark) {
-                continue;
-            }
-            let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
-            let records = slice.records(
-                repository.clone(),
-                header,
-                &compression_header,
-                &core_data_src,
-                &external_data_srcs,
-            )?;
-            for (record_index, record) in records.iter().enumerate() {
-                let record_index =
-                    u32::try_from(record_index).map_err(|_| AlignmentError::CoordinateOverflow)?;
-                let record = sam::alignment::RecordBuf::try_from_alignment_record(header, record)?;
-                if !noodles_record_intersects(&record, header, interval)? {
-                    continue;
+    raw_reader.seek(SeekFrom::Start(container_offset))?;
+    let mut direct_reader = cram::io::reader::Builder::default()
+        .set_reference_sequence_repository(repository.clone())
+        .build_from_reader(&mut *raw_reader);
+    let mut container = cram::io::reader::Container::default();
+    if direct_reader.read_container(&mut container)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "CRAI points beyond the CRAM container stream",
+        )
+        .into());
+    }
+    let compression_header = container.compression_header()?;
+    let landmarks = container.header().landmarks().to_vec();
+    let set_span = |span: Option<(u64, u64)>| -> Result<(), AlignmentError> {
+        *slice_span
+            .lock()
+            .map_err(|_| io::Error::other("CRAM reference span lock was poisoned"))? = span;
+        // The repository caches by name; a cached span must not serve another slice.
+        repository.clear();
+        Ok(())
+    };
+    for (slice_index, result) in container.slices().enumerate() {
+        let slice = result?;
+        let landmark = u64::try_from(
+            *landmarks
+                .get(slice_index)
+                .ok_or_else(|| io::Error::other("CRAM slice has no container landmark"))?,
+        )
+        .map_err(|_| AlignmentError::CoordinateOverflow)?;
+        let Some(span) = selected_slices.get(&landmark) else {
+            continue;
+        };
+        let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
+        // Decode against the slice's own reference span. If the index understated that span the
+        // decoder's checksum or bounds check fails, and the slice is decoded once more against
+        // the whole sequence.
+        let mut decoded = Vec::new();
+        let mut attempt = *span;
+        loop {
+            set_span(attempt)?;
+            slice_span
+                .reference_unavailable
+                .store(false, Ordering::Relaxed);
+            let outcome = (|| -> Result<(), AlignmentError> {
+                let records = slice.records(
+                    repository.clone(),
+                    header,
+                    &compression_header,
+                    &core_data_src,
+                    &external_data_srcs,
+                )?;
+                for (record_index, record) in records.iter().enumerate() {
+                    // Test placement on the lazy CRAM record: most records of a slice lie
+                    // outside a narrow query and never need an owned copy.
+                    if !noodles_record_intersects(record, header, interval)? {
+                        continue;
+                    }
+                    let record_index = u32::try_from(record_index)
+                        .map_err(|_| AlignmentError::CoordinateOverflow)?;
+                    let record =
+                        sam::alignment::RecordBuf::try_from_alignment_record(header, record)?;
+                    decoded.push((record, record_index));
                 }
-                positioned.push(Ok((
-                    record,
-                    Some(crate::AlignmentSourcePosition::cram_record(
-                        container_offset,
-                        landmark,
-                        record_index,
-                    )),
-                )));
+                Ok(())
+            })();
+            match outcome {
+                Ok(()) => break,
+                Err(_)
+                    if retry_slice_against_whole_sequence(
+                        attempt.is_some(),
+                        slice_span.reference_unavailable.load(Ordering::Relaxed),
+                    ) =>
+                {
+                    decoded.clear();
+                    attempt = None;
+                }
+                Err(error) => {
+                    set_span(None)?;
+                    return Err(error);
+                }
             }
+        }
+        set_span(None)?;
+        for (record, record_index) in decoded {
+            visit(
+                record,
+                crate::AlignmentSourcePosition::cram_record(
+                    container_offset,
+                    landmark,
+                    record_index,
+                ),
+            )?;
         }
     }
-    Ok(positioned)
+    Ok(())
+}
+
+/// Streams records of the CRAM slices CRAI selects for `interval`, decoding one container at
+/// a time. Each record keeps a physical address which is stable across independent genomic
+/// query boundaries. At most one container's intersecting records are held at once.
+struct PositionedCramRecords<'a, R> {
+    reader: &'a mut cram::io::IndexedReader<R>,
+    header: &'a sam::Header,
+    interval: GenomicInterval,
+    slice_span: &'a CramSliceSpan,
+    containers: std::collections::btree_map::IntoIter<u64, SelectedCramSlices>,
+    decoded: std::vec::IntoIter<(sam::alignment::RecordBuf, crate::AlignmentSourcePosition)>,
+    finished: bool,
+}
+
+impl<R> Iterator for PositionedCramRecords<'_, R>
+where
+    R: io::Read + io::Seek,
+{
+    type Item = Result<
+        (
+            sam::alignment::RecordBuf,
+            Option<crate::AlignmentSourcePosition>,
+        ),
+        AlignmentError,
+    >;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some((record, position)) = self.decoded.next() {
+                return Some(Ok((record, Some(position))));
+            }
+            if self.finished {
+                return None;
+            }
+            let Some((container_offset, selected_slices)) = self.containers.next() else {
+                self.finished = true;
+                return None;
+            };
+            let mut decoded = Vec::new();
+            if let Err(error) = visit_cram_container_records(
+                self.reader,
+                self.header,
+                self.interval,
+                container_offset,
+                &selected_slices,
+                self.slice_span,
+                |record, position| {
+                    decoded.push((record, position));
+                    Ok(())
+                },
+            ) {
+                self.finished = true;
+                return Some(Err(error));
+            }
+            self.decoded = decoded.into_iter();
+        }
+    }
+}
+
+fn positioned_cram_records<'a, R>(
+    reader: &'a mut cram::io::IndexedReader<R>,
+    header: &'a sam::Header,
+    interval: GenomicInterval,
+    slice_span: &'a CramSliceSpan,
+) -> Result<PositionedCramRecords<'a, R>, AlignmentError>
+where
+    R: io::Read + io::Seek,
+{
+    let containers = select_cram_containers(reader, interval)?.into_iter();
+    Ok(PositionedCramRecords {
+        reader,
+        header,
+        interval,
+        slice_span,
+        containers,
+        decoded: Vec::new().into_iter(),
+        finished: false,
+    })
 }
 
 fn noodles_record_intersects<R>(
@@ -924,7 +1419,7 @@ fn query_positioned_noodles_records<R, I>(
 ) -> Result<AlignmentQuery, AlignmentError>
 where
     R: sam::alignment::Record,
-    I: IntoIterator<Item = io::Result<(R, Option<crate::AlignmentSourcePosition>)>>,
+    I: IntoIterator<Item = Result<(R, Option<crate::AlignmentSourcePosition>), AlignmentError>>,
 {
     let mut pileup = PileupBuilder::new(
         interval,
@@ -1052,21 +1547,47 @@ where
             .transpose()?
             .map_or(0, |position| position.get() as u64 - 1);
         let record_end = record_reference_end(&record, record_start)?;
-        let overlap_mask = overlap_collapser.mask_for(
-            record.name().map_or(&[][..], AsRef::<[u8]>::as_ref),
-            record_contig,
-            record_start,
-            record_end,
-            flags,
-            mate_contig,
-            mate_start,
+        let observations = options
+            .collect_alleles
+            .then(|| -> io::Result<_> {
+                Ok((
+                    record.sequence().iter().collect::<Vec<_>>(),
+                    record
+                        .quality_scores()
+                        .iter()
+                        .collect::<io::Result<Vec<_>>>()?,
+                ))
+            })
+            .transpose()?;
+        let mate_cigar = mate_overlap_cigar(&record, record_start, mate_start)?;
+        let overlap_mask = overlap_collapser.mask_for_alignment(
+            MateAlignment {
+                read_name: record.name().map_or(&[][..], AsRef::<[u8]>::as_ref),
+                contig: record_contig,
+                start: record_start,
+                end: record_end,
+                flags,
+                mate_contig,
+                mate_start,
+            },
+            mate_cigar,
+            |read_position| {
+                observations.as_ref().is_none_or(|(bases, qualities)| {
+                    base_observation_is_counted(
+                        bases.len(),
+                        qualities,
+                        read_position,
+                        options.minimum_base_quality,
+                    )
+                })
+            },
         );
         overlap_collapser.note_collapsed(add_pileup(
             &record,
             &mut pileup,
             &mut junctions,
-            options.collect_alleles,
-            overlap_mask,
+            observations.as_ref(),
+            overlap_mask.as_ref(),
         )?);
         let normalized_for_modifications = if let Some(builder) = &mut modifications {
             let normalized = normalize_record(&record, header, QueryDetail::Full, &[])?;
@@ -1151,6 +1672,19 @@ where
 enum RemoteIndex {
     Bai(bam::bai::Index),
     Csi(noodles::csi::Index),
+}
+
+impl RemoteIndex {
+    fn query(
+        &self,
+        reference_sequence_id: usize,
+        interval: noodles::core::region::Interval,
+    ) -> io::Result<Vec<noodles::csi::binning_index::index::reference_sequence::bin::Chunk>> {
+        match self {
+            Self::Bai(index) => index.query(reference_sequence_id, interval),
+            Self::Csi(index) => index.query(reference_sequence_id, interval),
+        }
+    }
 }
 
 fn remote_index_mapped_records(index: &RemoteIndex) -> Option<u64> {
@@ -1493,12 +2027,50 @@ fn eligibility(
     Ok(Eligibility::Eligible)
 }
 
+/// Decodes the CIGAR for mate-overlap bookkeeping, but only for a record that can be the
+/// earlier mate of a pair (it starts at or before its mate); later mates only consume a mask.
+fn mate_overlap_cigar(
+    record: &dyn sam::alignment::Record,
+    record_start: u64,
+    mate_start: Option<u64>,
+) -> Result<Vec<CigarOp>, AlignmentError> {
+    if mate_start.is_none_or(|mate_start| record_start > mate_start) {
+        return Ok(Vec::new());
+    }
+    record
+        .cigar()
+        .iter()
+        .map(|result| {
+            let operation = result?;
+            Ok(CigarOp {
+                kind: cigar_op_kind(operation.kind()),
+                len: u32::try_from(operation.len())
+                    .map_err(|_| AlignmentError::CoordinateOverflow)?,
+            })
+        })
+        .collect()
+}
+
+const fn cigar_op_kind(kind: Kind) -> CigarOpKind {
+    match kind {
+        Kind::Match => CigarOpKind::Match,
+        Kind::Insertion => CigarOpKind::Insertion,
+        Kind::Deletion => CigarOpKind::Deletion,
+        Kind::Skip => CigarOpKind::ReferenceSkip,
+        Kind::SoftClip => CigarOpKind::SoftClip,
+        Kind::HardClip => CigarOpKind::HardClip,
+        Kind::Pad => CigarOpKind::Padding,
+        Kind::SequenceMatch => CigarOpKind::SequenceMatch,
+        Kind::SequenceMismatch => CigarOpKind::SequenceMismatch,
+    }
+}
+
 fn add_pileup(
     record: &dyn sam::alignment::Record,
     pileup: &mut PileupBuilder,
     junctions: &mut JunctionSummaryBuilder,
-    collect_alleles: bool,
-    overlap_mask: Option<OverlapMask>,
+    observations: Option<&(Vec<u8>, Vec<u8>)>,
+    overlap_mask: Option<&MateOverlapMask>,
 ) -> Result<u64, AlignmentError> {
     let Some(start) = record.alignment_start().transpose()? else {
         return Ok(0);
@@ -1506,15 +2078,6 @@ fn add_pileup(
     let mut reference_position =
         u64::try_from(start.get() - 1).map_err(|_| AlignmentError::CoordinateOverflow)?;
     let mut read_position = 0_usize;
-    let sequence = collect_alleles.then(|| record.sequence().iter().collect::<Vec<_>>());
-    let qualities = collect_alleles
-        .then(|| {
-            record
-                .quality_scores()
-                .iter()
-                .collect::<io::Result<Vec<_>>>()
-        })
-        .transpose()?;
     let flags = AlignmentFlags::from_bits(record.flags()?.bits());
     let reverse = flags.is_reverse();
     let bisulfite_reverse = bisulfite_strand_is_reverse(flags);
@@ -1532,16 +2095,18 @@ fn add_pileup(
             Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
                 record_junctions.add_aligned(u32::try_from(length).unwrap_or(u32::MAX));
                 let end = reference_position.saturating_add(length as u64);
-                collapsed_bases = collapsed_bases.saturating_add(add_unmasked_range(
-                    reference_position,
-                    end,
-                    overlap_mask,
-                    |start, end| aligned_segments.push((start, end)),
-                ));
-                if let (Some(sequence), Some(qualities)) = (&sequence, &qualities) {
+                let mut add_segment = |start, end| aligned_segments.push((start, end));
+                collapsed_bases =
+                    collapsed_bases.saturating_add(if let Some(mask) = overlap_mask {
+                        mask.add_unmasked_depth_range(reference_position, end, add_segment)
+                    } else {
+                        add_segment(reference_position, end);
+                        0
+                    });
+                if let Some((sequence, qualities)) = observations {
                     for offset in 0..length {
                         let position = reference_position.saturating_add(offset as u64);
-                        if overlap_mask.is_some_and(|mask| mask.contains(position)) {
+                        if overlap_mask.is_some_and(|mask| mask.masks_base(position)) {
                             continue;
                         }
                         let sequence_index = read_position.saturating_add(offset);
@@ -1564,12 +2129,14 @@ fn add_pileup(
             }
             Kind::Deletion => {
                 let end = reference_position.saturating_add(length as u64);
-                collapsed_bases = collapsed_bases.saturating_add(add_unmasked_range(
-                    reference_position,
-                    end,
-                    overlap_mask,
-                    |start, end| pileup.add_deletion(start, end, reverse),
-                ));
+                let mut add_deletion = |start, end| pileup.add_deletion(start, end, reverse);
+                collapsed_bases =
+                    collapsed_bases.saturating_add(if let Some(mask) = overlap_mask {
+                        mask.add_unmasked_deletion_range(reference_position, end, add_deletion)
+                    } else {
+                        add_deletion(reference_position, end);
+                        0
+                    });
                 reference_position = end;
             }
             Kind::Skip => {
@@ -1578,7 +2145,7 @@ fn add_pileup(
                 reference_position = end;
             }
             Kind::Insertion => {
-                if !overlap_mask.is_some_and(|mask| mask.contains(reference_position)) {
+                if !overlap_mask.is_some_and(|mask| mask.masks_indel(reference_position)) {
                     pileup.add_insertion(reference_position, reverse);
                 }
                 read_position = read_position.saturating_add(length);
@@ -1827,6 +2394,7 @@ fn normalize_array(array: Array<'_>) -> Result<AuxValue, AlignmentError> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         fs::{self, File},
         num::NonZero,
         path::Path,
@@ -2265,6 +2833,396 @@ mod tests {
             Err(AlignmentError::InvalidCramIndex(message))
                 if message.contains("six fields")
         ));
+    }
+
+    /// Drains a positioned stream and checks its physical-ownership invariants.
+    fn drain_positioned_stream(
+        source: &mut ProductionAlignmentSource,
+        interval: GenomicInterval,
+        options: QueryOptions,
+    ) -> (
+        Vec<(crate::AlignmentSourcePosition, AlignmentRecord)>,
+        QueryStats,
+        usize,
+    ) {
+        source
+            .begin_positioned_stream_with_admission(interval, interval, options)
+            .unwrap();
+        let mut records = Vec::new();
+        let mut owners = BTreeSet::new();
+        let mut positions = BTreeSet::new();
+        loop {
+            match source.next_positioned_stream_checkpoint(&|| true).unwrap() {
+                crate::PositionedAlignmentStreamCheckpoint::Block(block) => {
+                    let Some(first) = block.records.first() else {
+                        continue;
+                    };
+                    let owner = owner_of(first.source_position);
+                    assert!(owners.insert(owner), "one owner chunk was returned twice");
+                    for positioned in block.records {
+                        assert_eq!(owner_of(positioned.source_position), owner);
+                        assert!(positions.insert(positioned.source_position));
+                        records.push((positioned.source_position, positioned.record));
+                    }
+                }
+                crate::PositionedAlignmentStreamCheckpoint::Complete(completion) => {
+                    assert_eq!(completion.interval, interval);
+                    return (records, completion.stats, owners.len());
+                }
+                crate::PositionedAlignmentStreamCheckpoint::Cancelled(_) => {
+                    panic!("an uncancelled stream reported cancellation")
+                }
+            }
+        }
+    }
+
+    fn owner_of(position: crate::AlignmentSourcePosition) -> (u64, u64) {
+        match position {
+            crate::AlignmentSourcePosition::BamVirtualOffset(offset) => (offset >> 16, 0),
+            crate::AlignmentSourcePosition::CramRecord {
+                container_offset,
+                slice_landmark,
+                ..
+            } => (container_offset, slice_landmark),
+        }
+    }
+
+    fn assert_stream_matches_query(
+        source: &mut ProductionAlignmentSource,
+        interval: GenomicInterval,
+        options: &QueryOptions,
+    ) -> usize {
+        let query = source.query(interval, options.clone(), &|| true).unwrap();
+        let (mut streamed, stats, owners) =
+            drain_positioned_stream(source, interval, options.clone());
+        assert_eq!(stats.records_seen, query.stats.records_seen);
+        assert_eq!(stats.records_eligible, query.stats.records_eligible);
+        assert_eq!(stats.records_emitted, query.stats.records_emitted);
+        assert_eq!(stats.individual_reads, query.stats.individual_reads);
+        assert_eq!(streamed.len(), query.batch.len());
+        streamed.sort_by_key(|(position, _)| *position);
+        let mut expected = (0..query.batch.len())
+            .map(|index| {
+                (
+                    query.batch.source_position(index).unwrap(),
+                    query.batch.materialize_record(index).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by_key(|(position, _)| *position);
+        assert_eq!(streamed, expected);
+        owners
+    }
+
+    #[test]
+    fn remote_bam_positioned_stream_matches_the_one_shot_query() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        let index_path = Path::new(&format!("{}.bai", path.display())).to_path_buf();
+        if !path.exists() || !index_path.exists() {
+            return;
+        }
+        let Some(fixture) =
+            BamFixture::start(fs::read(&path).unwrap(), fs::read(index_path).unwrap())
+        else {
+            return;
+        };
+        let options = AlignmentOpenOptions {
+            remote_index_url: Some(fixture.index_url.clone()),
+            ..AlignmentOpenOptions::default()
+        };
+        let mut source = ProductionAlignmentSource::open(&fixture.bam_url, &options).unwrap();
+        assert!(matches!(source, ProductionAlignmentSource::RemoteBam(_)));
+        let query_options = QueryOptions {
+            detail: QueryDetail::Full,
+            ..QueryOptions::default()
+        };
+        let broad = GenomicInterval::new(ContigId::new(1), 0, 2_000_000).unwrap();
+        let owners = assert_stream_matches_query(&mut source, broad, &query_options);
+        assert!(owners > 1, "the fixture should span several BGZF blocks");
+
+        // A record keeps one physical identity whichever window acquires it.
+        let narrow = GenomicInterval::new(ContigId::new(1), 400_000, 600_000).unwrap();
+        assert_stream_matches_query(&mut source, narrow, &query_options);
+        let (broad_records, _, _) =
+            drain_positioned_stream(&mut source, broad, query_options.clone());
+        let (narrow_records, _, _) = drain_positioned_stream(&mut source, narrow, query_options);
+        assert!(!narrow_records.is_empty());
+        for narrow_record in &narrow_records {
+            assert!(broad_records.contains(narrow_record));
+        }
+
+        // Retargeting abandons the unfinished transaction without corrupting the next one.
+        source
+            .begin_positioned_stream_with_admission(broad, broad, QueryOptions::default())
+            .unwrap();
+        let _ = source.next_positioned_stream_checkpoint(&|| true).unwrap();
+        source.cancel_positioned_stream();
+        assert!(matches!(
+            source.next_positioned_stream_checkpoint(&|| true),
+            Err(AlignmentError::NoActivePositionedStream)
+        ));
+    }
+
+    #[test]
+    fn remote_bam_positioned_stream_refuses_dense_targets_without_retaining_records() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        let index_path = Path::new(&format!("{}.bai", path.display())).to_path_buf();
+        if !path.exists() || !index_path.exists() {
+            return;
+        }
+        let Some(fixture) =
+            BamFixture::start(fs::read(&path).unwrap(), fs::read(index_path).unwrap())
+        else {
+            return;
+        };
+        let options = AlignmentOpenOptions {
+            remote_index_url: Some(fixture.index_url.clone()),
+            ..AlignmentOpenOptions::default()
+        };
+        let mut source = ProductionAlignmentSource::open(&fixture.bam_url, &options).unwrap();
+        let interval = GenomicInterval::new(ContigId::new(1), 0, 2_000_000).unwrap();
+        let (records, stats, _) = drain_positioned_stream(
+            &mut source,
+            interval,
+            QueryOptions {
+                max_records: std::num::NonZeroUsize::new(10).unwrap(),
+                ..QueryOptions::default()
+            },
+        );
+        assert_eq!(records.len(), 10);
+        assert_eq!(stats.records_emitted, 0);
+        assert!(stats.complete_read_records_eligible > 10);
+        assert_eq!(
+            stats.individual_reads,
+            crate::IndividualReadStatus::TooDense { limit: 10 }
+        );
+    }
+
+    #[test]
+    fn reference_compressed_cram_without_a_reference_fails_with_an_actionable_error() {
+        let cram = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmark-data/manual-suite/data/alignments/reference-dependent.cram");
+        if !cram.exists() {
+            return;
+        }
+        let mut source =
+            ProductionAlignmentSource::open(&cram, &AlignmentOpenOptions::default()).unwrap();
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 100_000).unwrap();
+        let error = source
+            .query(interval, QueryOptions::default(), &|| true)
+            .unwrap_err();
+        assert!(error.to_string().contains("load the matching"), "{error}");
+        source
+            .begin_positioned_stream_with_admission(interval, interval, QueryOptions::default())
+            .unwrap();
+        let error = source
+            .next_positioned_stream_checkpoint(&|| true)
+            .unwrap_err();
+        assert!(error.to_string().contains("load the matching"), "{error}");
+    }
+
+    #[test]
+    fn cram_slices_decode_against_their_own_reference_span_and_match_htslib() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/manual-suite");
+        let cram = root.join("data/alignments/reference-dependent.cram");
+        let reference = root.join("data/references/manual.fa");
+        if !cram.exists() || !reference.exists() {
+            return;
+        }
+        let options = AlignmentOpenOptions {
+            reference_path: Some(reference),
+            ..AlignmentOpenOptions::default()
+        };
+        let query_options = QueryOptions {
+            detail: QueryDetail::Full,
+            ..QueryOptions::default()
+        };
+        let mut source = LocalCramAlignmentSource::open(&cram, &options).unwrap();
+        let mut oracle = LocalAlignmentSource::open(&cram, &options).unwrap();
+        let mut compared = 0;
+        for (index, contig) in source.reference_dictionary().clone().iter().enumerate() {
+            let interval =
+                GenomicInterval::new(ContigId::new(index as u32), 0, contig.length()).unwrap();
+            let decoded = source
+                .query(interval, query_options.clone(), &|| true)
+                .unwrap();
+            if decoded.batch.is_empty() {
+                continue;
+            }
+            // Only the slices' spans were read from the reference, never the whole sequence.
+            let loaded = source.reference_query_bases.load(Ordering::Relaxed);
+            assert!(loaded > 0, "the fixture is reference-compressed");
+            assert!(
+                (loaded as u64) < contig.length(),
+                "loaded {loaded} reference bases of a {}-base sequence",
+                contig.length()
+            );
+            let expected = oracle
+                .query(interval, query_options.clone(), &|| true)
+                .unwrap();
+            assert_eq!(decoded.batch.len(), expected.batch.len());
+            let key = |record: &AlignmentRecord| {
+                (
+                    record.start,
+                    record.end,
+                    record.read_name.clone(),
+                    record.flags.bits(),
+                )
+            };
+            let mut ours = (0..decoded.batch.len())
+                .map(|index| decoded.batch.materialize_record(index).unwrap())
+                .collect::<Vec<_>>();
+            let mut theirs = (0..expected.batch.len())
+                .map(|index| expected.batch.materialize_record(index).unwrap())
+                .collect::<Vec<_>>();
+            ours.sort_by_key(key);
+            theirs.sort_by_key(key);
+            for (ours, theirs) in ours.iter().zip(&theirs) {
+                assert_eq!(key(ours), key(theirs));
+                assert_eq!(ours.cigar, theirs.cigar);
+                assert_eq!(ours.sequence, theirs.sequence, "bases and qualities");
+                compared += 1;
+            }
+        }
+        assert!(compared > 0);
+    }
+
+    #[test]
+    fn local_cram_positioned_stream_matches_the_one_shot_query() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/manual-suite");
+        let cram = root.join("data/alignments/reference-dependent.cram");
+        let reference = root.join("data/references/manual.fa");
+        if !cram.exists() || !reference.exists() {
+            return;
+        }
+        let options = AlignmentOpenOptions {
+            reference_path: Some(reference),
+            ..AlignmentOpenOptions::default()
+        };
+        let mut source = ProductionAlignmentSource::open(&cram, &options).unwrap();
+        assert!(matches!(source, ProductionAlignmentSource::LocalCram(_)));
+        assert!(source.is_cram());
+        let query_options = QueryOptions {
+            detail: QueryDetail::Full,
+            ..QueryOptions::default()
+        };
+        let mut total = 0;
+        for (index, contig) in source.reference_dictionary().clone().iter().enumerate() {
+            let interval =
+                GenomicInterval::new(ContigId::new(index as u32), 0, contig.length()).unwrap();
+            let before = source
+                .query(interval, query_options.clone(), &|| true)
+                .unwrap()
+                .batch
+                .len();
+            assert_stream_matches_query(&mut source, interval, &query_options);
+            total += before;
+        }
+        assert!(total > 0, "the CRAM fixture should contain mapped records");
+    }
+
+    #[test]
+    fn remote_bam_query_stops_fetching_once_cancelled_mid_stream() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        let index_path = Path::new(&format!("{}.bai", path.display())).to_path_buf();
+        if !path.exists() || !index_path.exists() {
+            return;
+        }
+        let Some(fixture) =
+            BamFixture::start(fs::read(&path).unwrap(), fs::read(index_path).unwrap())
+        else {
+            return;
+        };
+        // Small uncoalesced ranges make the bytes transferred track the records read.
+        let options = AlignmentOpenOptions {
+            remote_index_url: Some(fixture.index_url.clone()),
+            remote_range: HttpRangeConfig {
+                chunk_size: std::num::NonZeroUsize::new(64 * 1024).unwrap(),
+                minimum_coalesced_chunks: std::num::NonZeroUsize::MIN,
+                maximum_coalesced_chunks: std::num::NonZeroUsize::MIN,
+                ..HttpRangeConfig::default()
+            },
+            ..AlignmentOpenOptions::default()
+        };
+        let interval = GenomicInterval::new(ContigId::new(1), 0, 2_000_000).unwrap();
+        let query_options = QueryOptions {
+            cancellation_chunk: std::num::NonZeroUsize::new(8).unwrap(),
+            ..QueryOptions::default()
+        };
+        let transferred = |keep_going: &dyn Fn() -> bool| {
+            let mut source = RemoteBamAlignmentSource::open(&fixture.bam_url, &options).unwrap();
+            let opened = source.remote_io_stats().response_bytes;
+            let query = source
+                .query(interval, query_options.clone(), keep_going)
+                .unwrap();
+            (query, source.remote_io_stats().response_bytes - opened)
+        };
+
+        let (complete, complete_bytes) = transferred(&|| true);
+        assert_eq!(complete.stats.records_seen, 2_000);
+        assert!(!complete.stats.cancelled);
+        assert!(
+            complete_bytes > 8 * 64 * 1024,
+            "the region must span many ranges for this test to mean anything ({complete_bytes})"
+        );
+
+        // Proceed at the entry check and the first two record checkpoints, then cancel.
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let (cancelled, cancelled_bytes) =
+            transferred(&|| checks.fetch_add(1, Ordering::Relaxed) < 3);
+        assert!(cancelled.stats.cancelled);
+        assert!(cancelled.batch.is_empty());
+        // The records were never fetched, rather than fetched and then discarded.
+        assert!(
+            cancelled_bytes * 4 < complete_bytes,
+            "cancelled query transferred {cancelled_bytes} of {complete_bytes} bytes"
+        );
+    }
+
+    #[test]
+    fn unavailable_cram_reference_never_escalates_to_a_whole_sequence_fetch() {
+        use fasta::repository::Adapter as _;
+
+        // Only a decode failure against an indexed span justifies decoding once more against
+        // the whole sequence.
+        assert!(retry_slice_against_whole_sequence(true, false));
+        assert!(!retry_slice_against_whole_sequence(true, true));
+        assert!(!retry_slice_against_whole_sequence(false, false));
+        assert!(!retry_slice_against_whole_sequence(false, true));
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genome.2bit");
+        fs::write(
+            &path,
+            crate::two_bit::tests::encode_two_bit(&[("chrA", "ACGTACGTACGTACGT")], false),
+        )
+        .unwrap();
+        let slice_span = CramSliceSpan::default();
+        let query_bases = Arc::new(AtomicUsize::new(0));
+        let mut adapter = CramReferenceAdapter {
+            reference: Arc::new(Mutex::new(FastaReference::open(&path).unwrap())),
+            query_bases: Arc::clone(&query_bases),
+            slice_span: Arc::clone(&slice_span),
+        };
+        let unavailable = || slice_span.reference_unavailable.load(Ordering::Relaxed);
+
+        // A served span leaves the flag clear: a later decode error is about the slice.
+        *slice_span.lock().unwrap() = Some((4, 12));
+        let record = adapter.get(b"chrA").unwrap().unwrap();
+        assert_eq!(&record.sequence().as_ref()[4..], b"ACGTACGT");
+        assert_eq!(query_bases.load(Ordering::Relaxed), 8);
+        assert!(!unavailable());
+
+        // A contig the reference lacks, and an exhausted base budget, are reference failures.
+        assert!(adapter.get(b"chrMissing").unwrap().is_err());
+        assert!(unavailable());
+        slice_span
+            .reference_unavailable
+            .store(false, Ordering::Relaxed);
+        query_bases.store(MAX_REMOTE_CRAM_REFERENCE_BASES, Ordering::Relaxed);
+        let error = adapter.get(b"chrA").unwrap().unwrap_err();
+        assert!(error.to_string().contains("reference budget exceeded"));
+        assert!(unavailable());
     }
 
     #[test]

@@ -7,8 +7,15 @@ on:
 permissions:
   contents: read
 
+# The Rust toolchain is pinned in rust-toolchain.toml. Jobs install exactly that
+# toolchain instead of floating `stable`, so a new compiler or Clippy release
+# cannot turn the build red without a deliberate bump.
+
 jobs:
-  check:
+  # Plain compile and test per platform. Kept separate from `lint` so a Clippy
+  # or formatting failure can never hide a platform build break (and vice versa).
+  build-test:
+    name: build and test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -16,22 +23,48 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --yes libfontconfig1-dev libxkbcommon-dev libwayland-dev
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+      - name: Test package staging, SBOM, provenance, and manifests
+        run: python -m unittest discover -s packaging/tests -v
+
+  lint:
+    name: fmt and clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes libfontconfig1-dev libxkbcommon-dev libwayland-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
-      - name: Test package staging, SBOM, provenance, and manifests
-        run: python -m unittest discover -s packaging/tests -v
+
+  linux-gates:
+    name: fuzz-target compile and remote range budgets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install Linux native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libfontconfig1-dev libxkbcommon-dev libwayland-dev
       - name: Compile fuzz targets
-        if: runner.os == 'Linux'
         run: cargo check --manifest-path fuzz/Cargo.toml --locked
       - name: Enforce remote range request and byte budgets
-        if: runner.os == 'Linux'
         run: |
           cargo run --locked --release -p rgv-alignment-bench -- generate
           cargo run --locked --release -p rgv-remote-range-bench -- --latency-ms 5

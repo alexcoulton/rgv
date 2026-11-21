@@ -28,7 +28,10 @@ pub const MUTATION_HEADER_HEIGHT: f32 = 24.0;
 pub const MAX_RENDERED_MUTATIONS: usize = 32_768;
 pub const MAX_MUTATION_LABELS: usize = 2_048;
 pub const MAX_RENDERED_GWAS_POINTS: usize = 250_000;
-const INTERACTION_ARC_SEGMENTS: usize = 24;
+/// How far beyond either viewport edge, in viewport widths, an interaction
+/// arc endpoint may be placed before it is clamped.
+const INTERACTION_ARC_OFFSCREEN_MARGIN_VIEWPORTS: f64 = 4.0;
+const MINIMUM_INTERACTION_ARC_HEIGHT: f32 = 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TrackLayoutOptions {
@@ -195,42 +198,29 @@ pub fn layout_features_with_label_widths(
         FeatureDisplayMode::Squished => options.maximum_rows.saturating_mul(2).max(1),
         FeatureDisplayMode::Expanded => options.maximum_rows.max(1),
     };
-    let mut row_ends = vec![0_u64; row_count];
-    let row_height = options.height / row_ends.len() as f32;
-    let mut placed = Vec::new();
-    let mut hidden = 0;
-    for (index, feature) in features.iter().enumerate() {
-        if feature.end <= viewport.interval().start() || feature.start >= viewport.interval().end()
-        {
-            continue;
-        }
-        let row = if options.feature_display_mode == FeatureDisplayMode::Collapsed {
-            0
-        } else {
-            let Some(row) = row_ends.iter().position(|end| *end <= feature.start) else {
-                hidden += 1;
-                continue;
-            };
-            row
-        };
-        row_ends[row] = row_ends[row].max(feature.end);
-        placed.push(PlacedFeature {
-            record_index: index,
-            row,
-        });
-    }
+    let row_height = options.height / row_count as f32;
+    let (placed, overflow) = pack_feature_rows(
+        features,
+        viewport,
+        row_count,
+        options.feature_display_mode == FeatureDisplayMode::Collapsed,
+    );
+    let hidden = overflow.len();
 
     let viewport_width = viewport.pixel_width() as f32;
     let mut candidates = Vec::new();
     for placement in &placed {
         let feature = &features[placement.record_index];
         let selected = options.selected_record == Some(placement.record_index);
-        let labelable_gene_model = feature.feature_type.as_deref().is_some_and(|feature_type| {
+        // Untyped records (BED, bigBed, peaks) are whole features and are
+        // labelled by name. Typed records are labelled only at gene or
+        // transcript level, so exons and CDS parts do not repeat the label.
+        let labelable = feature.feature_type.as_deref().is_none_or(|feature_type| {
             ["gene", "transcript", "mrna", "primary_transcript"]
                 .iter()
                 .any(|candidate| feature_type.eq_ignore_ascii_case(candidate))
         });
-        if !labelable_gene_model || (row_height < 16.0 && !selected) {
+        if !labelable || (row_height < 16.0 && !selected) {
             continue;
         }
         let Some(label) = feature.display_label().filter(|label| !label.is_empty()) else {
@@ -303,9 +293,7 @@ pub fn layout_features_with_label_widths(
         let selected = options.selected_record == Some(index);
         let label_band = if row_has_label[row] { 10.0 } else { 0.0 };
         let y = row_top + label_band + 2.0;
-        let object_id = options
-            .object_id_base
-            .saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
+        let object_id = crate::record_object_id(options.object_id_base, index);
         add_feature(
             &mut display,
             feature,
@@ -326,6 +314,7 @@ pub fn layout_features_with_label_widths(
             color: Rgba::new(0.16, 0.18, 0.22, 0.96),
         });
     }
+    add_feature_overflow_indicator(&mut display, features, &overflow, viewport, options);
     let primitive_count = display.rectangles.len();
     (
         display,
@@ -337,6 +326,108 @@ pub fn layout_features_with_label_widths(
             ..TrackLayoutStats::default()
         },
     )
+}
+
+/// Minimum horizontal gap, in pixels, between two features sharing a row.
+const FEATURE_ROW_PADDING_PIXELS: f64 = 2.0;
+/// Height of the strip that marks where features did not fit in any row.
+const FEATURE_OVERFLOW_INDICATOR_HEIGHT: f32 = 2.0;
+const MAX_FEATURE_OVERFLOW_INDICATORS: usize = 1_024;
+
+/// Assigns every viewport-intersecting feature a row, returning the placed
+/// features in input order and the indices of those that fit in no row.
+///
+/// Rows are packed over *all* supplied records in genomic order, not just the
+/// visible ones in input order: a feature's row then depends on the loaded
+/// neighbourhood rather than on which features happen to intersect the
+/// viewport, so features keep their rows while panning, and unsorted input
+/// packs as tightly as sorted input. Features on one row are separated by at
+/// least [`FEATURE_ROW_PADDING_PIXELS`] so abutting features stay distinct.
+fn pack_feature_rows(
+    features: &[FeatureRecord],
+    viewport: Viewport,
+    row_count: usize,
+    collapsed: bool,
+) -> (Vec<PlacedFeature>, Vec<usize>) {
+    let interval = viewport.interval();
+    let visible =
+        |feature: &FeatureRecord| feature.end > interval.start() && feature.start < interval.end();
+    if collapsed {
+        let placed = features
+            .iter()
+            .enumerate()
+            .filter(|(_, feature)| visible(feature))
+            .map(|(record_index, _)| PlacedFeature {
+                record_index,
+                row: 0,
+            })
+            .collect();
+        return (placed, Vec::new());
+    }
+    let padding = (viewport.bases_per_pixel() * FEATURE_ROW_PADDING_PIXELS).ceil() as u64;
+    let mut order = (0..features.len()).collect::<Vec<_>>();
+    order.sort_by_key(|index| (features[*index].start, features[*index].end, *index));
+    // Exclusive end of the last feature on each row, including its padding.
+    let mut row_ends = vec![0_u64; row_count];
+    let mut placed = Vec::new();
+    let mut overflow = Vec::new();
+    for index in order {
+        let feature = &features[index];
+        let row = row_ends.iter().position(|end| *end <= feature.start);
+        if let Some(row) = row {
+            row_ends[row] = row_ends[row].max(feature.end.saturating_add(padding));
+        }
+        if !visible(feature) {
+            continue;
+        }
+        match row {
+            Some(row) => placed.push(PlacedFeature {
+                record_index: index,
+                row,
+            }),
+            None => overflow.push(index),
+        }
+    }
+    // Draw order (and therefore overlap and marker budgets) follows the input.
+    placed.sort_by_key(|placement| placement.record_index);
+    overflow.sort_unstable();
+    (placed, overflow)
+}
+
+/// Marks the extent of features that fit in no row with a strip along the
+/// bottom edge of the track, so a dense region is visibly incomplete instead
+/// of silently missing records. The strip is not pickable.
+fn add_feature_overflow_indicator(
+    display: &mut DisplayList,
+    features: &[FeatureRecord],
+    overflow: &[usize],
+    viewport: Viewport,
+    options: TrackLayoutOptions,
+) {
+    let mut spans = overflow
+        .iter()
+        .map(|index| clipped_geometry(features[*index].start, features[*index].end, viewport))
+        .map(|(x, width)| (x, x + width.max(2.0)))
+        .collect::<Vec<_>>();
+    spans.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut merged = Vec::<(f32, f32)>::new();
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 + 1.0 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    for (start, end) in merged.into_iter().take(MAX_FEATURE_OVERFLOW_INDICATORS) {
+        display.rectangles.push(RectPrimitive {
+            x: start,
+            y: options.top + options.height - FEATURE_OVERFLOW_INDICATOR_HEIGHT,
+            width: end - start,
+            height: FEATURE_OVERFLOW_INDICATOR_HEIGHT,
+            color: Rgba::new(0.80, 0.33, 0.20, 0.85),
+            object_id: crate::NO_OBJECT_ID,
+            shape: RectShape::Rectangle,
+        });
+    }
 }
 
 pub fn layout_variants(
@@ -353,11 +444,13 @@ pub fn layout_variants(
         {
             continue;
         }
-        let x = viewport.pixel_at_genomic(variant.start) as f32;
-        let right = viewport.pixel_at_genomic(variant.end) as f32;
-        let object_id = options
-            .object_id_base
-            .saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
+        // Geometry is clipped to the viewport before the cast to `f32`: a
+        // long variant whose start lies far off-screen would otherwise lose
+        // pixel precision or overflow the renderer's coordinate range.
+        let start_visible = variant.start >= viewport.interval().start();
+        let (x, span_width) = clipped_geometry(variant.start, variant.end, viewport);
+        let right = x + span_width;
+        let object_id = crate::record_object_id(options.object_id_base, index);
         let color = match settings.color_mode {
             VariantColorMode::Type => variant_color(
                 variant
@@ -371,46 +464,53 @@ pub fn layout_variants(
             display.rectangles.push(RectPrimitive {
                 x: x - 6.0,
                 y: options.top,
-                width: 12.0,
+                width: if start_visible {
+                    12.0
+                } else {
+                    span_width + 6.0
+                },
                 height: 12.0,
                 color: Rgba::new(0.10, 0.28, 0.62, 0.24),
                 object_id,
                 shape: Default::default(),
             });
         }
-        display.rectangles.push(RectPrimitive {
-            x: x - 1.0,
-            y: options.top + 5.0,
-            width: 2.0,
-            height: (options.height - 12.0).max(2.0),
-            color: with_alpha(color, 0.72),
-            object_id,
-            shape: Default::default(),
-        });
-        display.rectangles.push(RectPrimitive {
-            x: x - 4.0,
-            y: options.top + 1.0,
-            width: 8.0,
-            height: 8.0,
-            color,
-            object_id,
-            shape: variant
-                .breakends
-                .first()
-                .map(|partner| breakend_shape(partner.local_join_after_position))
-                .or_else(|| {
-                    variant
-                        .breakpoint_orientations
-                        .first()
-                        .map(|orientation| breakend_shape(orientation.local_join_after_position))
-                })
-                .unwrap_or(RectShape::Rectangle),
-        });
+        // The stem and head mark the variant's start position; when that is
+        // off-screen only the clipped span below remains.
+        if start_visible {
+            display.rectangles.push(RectPrimitive {
+                x: x - 1.0,
+                y: options.top + 5.0,
+                width: 2.0,
+                height: (options.height - 12.0).max(2.0),
+                color: with_alpha(color, 0.72),
+                object_id,
+                shape: Default::default(),
+            });
+            display.rectangles.push(RectPrimitive {
+                x: x - 4.0,
+                y: options.top + 1.0,
+                width: 8.0,
+                height: 8.0,
+                color,
+                object_id,
+                shape: variant
+                    .breakends
+                    .first()
+                    .map(|partner| breakend_shape(partner.local_join_after_position))
+                    .or_else(|| {
+                        variant.breakpoint_orientations.first().map(|orientation| {
+                            breakend_shape(orientation.local_join_after_position)
+                        })
+                    })
+                    .unwrap_or(RectShape::Rectangle),
+            });
+        }
         if variant.breakends.is_empty() {
             display.rectangles.push(RectPrimitive {
                 x,
                 y: baseline,
-                width: (right - x).max(2.0),
+                width: span_width.max(2.0),
                 height: 3.0,
                 color,
                 object_id,
@@ -625,9 +725,7 @@ pub fn layout_gwas(
             options.height,
             settings.maximum_score,
         );
-        let object_id = options
-            .object_id_base
-            .saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
+        let object_id = crate::record_object_id(options.object_id_base, index);
         if options.selected_record == Some(index) {
             let halo = point_size + 8.0;
             display.rectangles.push(RectPrimitive {
@@ -742,21 +840,48 @@ pub fn layout_interactions(
     settings: &InteractionTrackSettings,
 ) -> (DisplayList, TrackLayoutStats) {
     let mut display = DisplayList::default();
+    let interval = viewport.interval();
+    let passes_score = |record: &InteractionRecord| {
+        settings
+            .minimum_score
+            .is_none_or(|minimum| record.score.is_some_and(|score| score >= minimum))
+    };
+    // Exactly the records the loop below draws. The render cap must count
+    // these, not the input prefix: a query returns every contig's records in
+    // file order, so capping first starved everything after the first
+    // `MAX_RENDERED_INTERACTIONS` records regardless of what was on screen.
+    let drawable = |record: &InteractionRecord| {
+        let source_here = record.source.contig == contig;
+        let target_here = record.target.contig == contig;
+        if source_here && target_here {
+            let source = endpoint_center(record.source.start, record.source.end);
+            let target = endpoint_center(record.target.start, record.target.end);
+            source.max(target) >= interval.start() && source.min(target) < interval.end()
+        } else if source_here || target_here {
+            let local = if source_here {
+                &record.source
+            } else {
+                &record.target
+            };
+            local.end > interval.start() && local.start < interval.end()
+        } else {
+            false
+        }
+    };
+    // The automatic scale stays a property of the loaded records so arc
+    // heights do not rescale while panning.
+    let automatic_maximum = interactions
+        .iter()
+        .filter(|record| passes_score(record))
+        .map(interaction_magnitude)
+        .fold(0.0_f32, f32::max)
+        .max(1.0);
     let eligible = interactions
         .iter()
         .enumerate()
-        .filter(|(_, record)| {
-            settings
-                .minimum_score
-                .is_none_or(|minimum| record.score.is_some_and(|score| score >= minimum))
-        })
+        .filter(|(_, record)| passes_score(record) && drawable(record))
         .take(MAX_RENDERED_INTERACTIONS)
         .collect::<Vec<_>>();
-    let automatic_maximum = eligible
-        .iter()
-        .map(|(_, record)| interaction_magnitude(record))
-        .fold(0.0_f32, f32::max)
-        .max(1.0);
     let scale_maximum = settings
         .fixed_maximum_score
         .unwrap_or(automatic_maximum)
@@ -764,15 +889,14 @@ pub fn layout_interactions(
     let baseline = options.top + options.height - 5.0;
     let mut rendered = 0_usize;
     let mut labels = 0_usize;
+    let eligible_count = eligible.len();
     for (index, record) in eligible {
         let source_here = record.source.contig == contig;
         let target_here = record.target.contig == contig;
         if !source_here && !target_here {
             continue;
         }
-        let object_id = options
-            .object_id_base
-            .saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
+        let object_id = crate::record_object_id(options.object_id_base, index);
         let color = record
             .color
             .map_or(Rgba::new(0.48, 0.30, 0.76, 0.86), rgba_from_bytes);
@@ -796,8 +920,18 @@ pub fn layout_interactions(
             if right < viewport.interval().start() || left >= viewport.interval().end() {
                 continue;
             }
-            let left_x = viewport.pixel_at_genomic(left) as f32;
-            let right_x = viewport.pixel_at_genomic(right) as f32;
+            // Endpoints far outside the viewport are pulled in to a bounded
+            // margin before the cast to `f32`, so a megabase-scale arc viewed
+            // at base resolution keeps finite, precise geometry.
+            let pixel_width = viewport.pixel_width();
+            let margin = pixel_width * INTERACTION_ARC_OFFSCREEN_MARGIN_VIEWPORTS;
+            let bounded_x = |position: u64| {
+                viewport
+                    .pixel_at_genomic(position)
+                    .clamp(-margin, pixel_width + margin) as f32
+            };
+            let left_x = bounded_x(left);
+            let right_x = bounded_x(right);
             match settings.display_mode {
                 InteractionDisplayMode::Arcs => add_interaction_arc(
                     &mut display,
@@ -936,6 +1070,7 @@ pub fn layout_interactions(
         rendered = rendered.saturating_add(1);
     }
     let primitive_count = display.rectangles.len();
+    debug_assert_eq!(rendered, eligible_count);
     (
         display,
         TrackLayoutStats {
@@ -948,6 +1083,8 @@ pub fn layout_interactions(
     )
 }
 
+/// One smooth arc primitive whose endpoints meet `baseline`, replacing a
+/// polyline of axis-aligned rectangles that rendered as stair-steps.
 fn add_interaction_arc(
     display: &mut DisplayList,
     left: f32,
@@ -957,25 +1094,16 @@ fn add_interaction_arc(
     color: Rgba,
     object_id: u32,
 ) {
-    let width = (right - left).max(1.0);
-    let mut previous = (left, baseline);
-    for segment in 1..=INTERACTION_ARC_SEGMENTS {
-        let fraction = segment as f32 / INTERACTION_ARC_SEGMENTS as f32;
-        let point = (
-            left + width * fraction,
-            baseline - height * 4.0 * fraction * (1.0 - fraction),
-        );
-        display.rectangles.push(RectPrimitive {
-            x: previous.0.min(point.0),
-            y: previous.1.min(point.1),
-            width: (point.0 - previous.0).abs().max(1.0),
-            height: (point.1 - previous.1).abs().max(1.5),
-            color,
-            object_id,
-            shape: Default::default(),
-        });
-        previous = point;
-    }
+    let height = height.max(MINIMUM_INTERACTION_ARC_HEIGHT);
+    display.rectangles.push(RectPrimitive {
+        x: left,
+        y: baseline - height,
+        width: (right - left).max(1.0),
+        height,
+        color,
+        object_id,
+        shape: RectShape::JunctionArcUp,
+    });
 }
 
 fn add_interaction_endpoint(
@@ -1126,7 +1254,7 @@ pub fn layout_quantitative(
     settings: &QuantitativeTrackSettings,
     shared_range: Option<QuantitativeRange>,
 ) -> (DisplayList, TrackLayoutStats) {
-    let windows = quantitative_windows(records, viewport, settings.window_function);
+    let (windows, aggregated) = quantitative_windows(records, viewport, settings.window_function);
     let non_finite_records = records
         .iter()
         .filter(|record| !record.value.is_finite())
@@ -1150,7 +1278,7 @@ pub fn layout_quantitative(
                 input_records: records.len(),
                 hidden_records: records.len(),
                 non_finite_records,
-                aggregated: settings.window_function != QuantitativeWindowFunction::Raw,
+                aggregated,
                 ..TrackLayoutStats::default()
             },
         );
@@ -1197,9 +1325,7 @@ pub fn layout_quantitative(
         let x = viewport.pixel_at_genomic(window.start) as f32;
         let right = viewport.pixel_at_genomic(window.end) as f32;
         let width = (right - x).max(1.0);
-        let object_id = options
-            .object_id_base
-            .saturating_add(u32::try_from(window.identity).unwrap_or(u32::MAX));
+        let object_id = crate::record_object_id(options.object_id_base, window.identity);
         let Some(value) = window.value else {
             missing = missing.saturating_add(1);
             match settings.missing_mode {
@@ -1345,7 +1471,7 @@ pub fn layout_quantitative(
             quantitative_maximum: Some(range.maximum),
             missing_windows: missing,
             non_finite_records,
-            aggregated: settings.window_function != QuantitativeWindowFunction::Raw,
+            aggregated,
         },
     )
 }
@@ -1357,7 +1483,7 @@ pub fn quantitative_data_range(
     settings: &QuantitativeTrackSettings,
 ) -> Option<QuantitativeRange> {
     range_for_windows(
-        &quantitative_windows(records, viewport, settings.window_function),
+        &quantitative_windows(records, viewport, settings.window_function).0,
         settings.baseline,
     )
 }
@@ -1425,9 +1551,7 @@ pub fn layout_mutations(
         let y = rows_top + record.sample_index as f32 * row_height + 2.0;
         let height = (row_height - 4.0).max(4.0);
         let color = mutation_color(record, settings.color_mode);
-        let object_id = options
-            .object_id_base
-            .saturating_add(u32::try_from(record_index).unwrap_or(u32::MAX));
+        let object_id = crate::record_object_id(options.object_id_base, record_index);
         if options.selected_record == Some(record_index) {
             display.rectangles.push(RectPrimitive {
                 x: x - 2.0,
@@ -1700,9 +1824,7 @@ pub fn layout_copy_number(
         let intensity = ((segment.value - baseline).abs()
             / (edge - baseline).abs().max(f32::EPSILON))
         .clamp(0.08, 1.0);
-        let object_id = options
-            .object_id_base
-            .saturating_add(u32::try_from(segment_index).unwrap_or(u32::MAX));
+        let object_id = crate::record_object_id(options.object_id_base, segment_index);
         display.rectangles.push(RectPrimitive {
             x,
             y,
@@ -1919,26 +2041,68 @@ struct QuantitativeWindow {
     identity: usize,
 }
 
-fn quantitative_windows(
+/// How one aggregation window reduces the records that overlap it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuantitativeReduction {
+    Minimum,
+    Mean,
+    Maximum,
+    /// Whichever of the minimum and maximum is further from zero: keeps the
+    /// peaks and troughs a one-rectangle-per-record plot would have shown.
+    Extreme,
+}
+
+/// One window per visible record, or `None` when that exceeds the raw budget.
+fn raw_quantitative_windows(
     records: &[QuantitativeRecord],
     viewport: Viewport,
-    function: QuantitativeWindowFunction,
-) -> Vec<QuantitativeWindow> {
+) -> Option<Vec<QuantitativeWindow>> {
     let interval = viewport.interval();
-    if function == QuantitativeWindowFunction::Raw {
-        return records
+    let visible = || {
+        records
             .iter()
             .enumerate()
             .filter(|(_, record)| record.end > interval.start() && record.start < interval.end())
-            .take(MAX_RAW_QUANTITATIVE_RECORDS)
+    };
+    if visible().nth(MAX_RAW_QUANTITATIVE_RECORDS).is_some() {
+        return None;
+    }
+    Some(
+        visible()
             .map(|(identity, record)| QuantitativeWindow {
                 start: record.start.max(interval.start()),
                 end: record.end.min(interval.end()),
                 value: record.value.is_finite().then_some(record.value),
                 identity,
             })
-            .collect();
-    }
+            .collect(),
+    )
+}
+
+/// Builds the plotted windows and reports whether they aggregate records.
+///
+/// Raw mode plots one window per record while that fits the render budget.
+/// Beyond [`MAX_RAW_QUANTITATIVE_RECORDS`] visible records it used to plot
+/// only the first records and leave the rest of the viewport blank; it now
+/// falls back to extreme-preserving per-pixel windows across the whole
+/// viewport (many records then share each pixel in any case).
+fn quantitative_windows(
+    records: &[QuantitativeRecord],
+    viewport: Viewport,
+    function: QuantitativeWindowFunction,
+) -> (Vec<QuantitativeWindow>, bool) {
+    let interval = viewport.interval();
+    let reduction = match function {
+        QuantitativeWindowFunction::Raw => {
+            if let Some(windows) = raw_quantitative_windows(records, viewport) {
+                return (windows, false);
+            }
+            QuantitativeReduction::Extreme
+        }
+        QuantitativeWindowFunction::Minimum => QuantitativeReduction::Minimum,
+        QuantitativeWindowFunction::Mean => QuantitativeReduction::Mean,
+        QuantitativeWindowFunction::Maximum => QuantitativeReduction::Maximum,
+    };
 
     let bin_count = usize::try_from(interval.len())
         .unwrap_or(usize::MAX)
@@ -1987,7 +2151,7 @@ fn quantitative_windows(
             accumulator.weight = accumulator.weight.saturating_add(overlap);
         }
     }
-    accumulators
+    let windows = accumulators
         .into_iter()
         .enumerate()
         .map(|(identity, accumulator)| {
@@ -1996,13 +2160,19 @@ fn quantitative_windows(
             let end = interval.start()
                 + u64::try_from((span_128 * (identity + 1) as u128) / bin_count as u128)
                     .unwrap_or(span);
-            let value = accumulator.present.then(|| match function {
-                QuantitativeWindowFunction::Minimum => accumulator.minimum,
-                QuantitativeWindowFunction::Mean => {
+            let value = accumulator.present.then(|| match reduction {
+                QuantitativeReduction::Minimum => accumulator.minimum,
+                QuantitativeReduction::Mean => {
                     (accumulator.weighted_sum / accumulator.weight.max(1) as f64) as f32
                 }
-                QuantitativeWindowFunction::Maximum => accumulator.maximum,
-                QuantitativeWindowFunction::Raw => unreachable!(),
+                QuantitativeReduction::Maximum => accumulator.maximum,
+                QuantitativeReduction::Extreme => {
+                    if accumulator.minimum.abs() > accumulator.maximum.abs() {
+                        accumulator.minimum
+                    } else {
+                        accumulator.maximum
+                    }
+                }
             });
             QuantitativeWindow {
                 start,
@@ -2011,7 +2181,8 @@ fn quantitative_windows(
                 identity,
             }
         })
-        .collect()
+        .collect();
+    (windows, true)
 }
 
 fn range_for_windows(windows: &[QuantitativeWindow], baseline: f32) -> Option<QuantitativeRange> {

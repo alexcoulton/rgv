@@ -4,8 +4,10 @@ mod automation;
 mod coordinates;
 mod generation;
 mod genome;
+mod igv_genome;
 mod interaction_stress;
 mod landmarks;
+mod locus;
 mod lod;
 mod navigation;
 mod panel;
@@ -49,8 +51,8 @@ pub use automation::{
     MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS,
 };
 pub use coordinates::{
-    Contig, ContigAliasError, ContigAliases, ContigId, GenomicInterval, IntervalError,
-    ReferenceDictionary, resolve_contig_alias,
+    Contig, ContigAliasError, ContigAliases, ContigId, DuplicateContigError, GenomicInterval,
+    IntervalError, ReferenceDictionary, resolve_contig_alias,
 };
 pub use generation::{GenerationClock, ViewportGeneration};
 pub use genome::{
@@ -59,6 +61,10 @@ pub use genome::{
     GenomeAssemblyIdentity, GenomeAssetProvenance, GenomeConfiguration, GenomeConfigurationError,
     MAXIMUM_DEFAULT_ANNOTATIONS, MAXIMUM_GENOME_ASSET_PROVENANCE, ReferenceTranslationFrame,
     parse_ucsc_cytobands, parse_ucsc_cytobands_with_aliases,
+};
+pub use igv_genome::{
+    IGV_HOSTED_GENOME_LIST_URL, IgvGenomeDescription, IgvGenomeError, IgvGenomeListEntry,
+    IgvGenomeTrack, parse_igv_alias_table, parse_igv_genome_list,
 };
 pub use interaction_stress::{
     INTERACTION_RECORDING_SCHEMA_NAME, INTERACTION_RECORDING_SCHEMA_VERSION,
@@ -86,8 +92,9 @@ pub use landmarks::{
     LandmarkSearchIndexError, MAXIMUM_LANDMARK_ASSETS, MAXIMUM_LANDMARK_BUNDLES, dictionary_sha256,
     parse_landmark_aliases, parse_landmark_search_index,
 };
+pub use locus::{Locus, LocusError, LocusRange, ResolvedLocus, resolve_contig_name};
 pub use lod::{DetailLevel, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, RenderBudget};
-pub use navigation::NavigationHistory;
+pub use navigation::{NamedNavigationHistory, NavigationEntry, NavigationHistory};
 pub use panel::{PanelGeneration, PanelId, PanelTrackId};
 pub use sample_metadata::{
     MAXIMUM_SAMPLE_KEY_BYTES, MAXIMUM_SAMPLE_METADATA_BYTES, MAXIMUM_SAMPLE_METADATA_CELLS,
@@ -97,19 +104,20 @@ pub use sample_metadata::{
 pub use session::{
     AlignmentAuxComparison, AlignmentAuxFilterValue, AlignmentCigarEventPredicate,
     AlignmentColorMode, AlignmentFlagPredicate, AlignmentGroupMode, AlignmentOrderDirection,
-    AlignmentPredicateExpression, AlignmentPredicateScope, AlignmentSortMode,
-    AlignmentViewPredicate, BisulfiteContext, CoverageScaleTransform, IgvImportReport,
-    IgvSessionImport, InspectorActivation, JunctionDisplayMode, MAXIMUM_ALIGNMENT_TRACKS,
-    MAXIMUM_CONTIG_ALIASES, MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS,
-    MAXIMUM_REVIEW_NOTE_BYTES, MAXIMUM_VIEW_PANELS, ModifiedBaseColorMode, OverlappingMatePolicy,
+    AlignmentPredicateExpression, AlignmentPredicateScope, AlignmentReadSampling,
+    AlignmentSortMode, AlignmentViewPredicate, BisulfiteContext, CoverageScaleTransform,
+    IgvImportReport, IgvLocusResolution, IgvSessionImport, InspectorActivation,
+    JunctionDisplayMode, MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_CONTIG_ALIASES,
+    MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS, MAXIMUM_REVIEW_NOTE_BYTES,
+    MAXIMUM_SESSION_TRACKS, MAXIMUM_VIEW_PANELS, ModifiedBaseColorMode, OverlappingMatePolicy,
     PresentationNodeId, ReadBaseDisplayMode, ReadStackingMode, ReadStackingTransitionReason,
-    RegionOfInterest, ReviewItem, ReviewStatus, SESSION_SCHEMA_VERSION, SashimiCountMode,
-    SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode, SessionAlignmentTrack,
-    SessionDocument, SessionError, SessionFilters, SessionLocus, SessionPaneTrackState,
-    SessionPresentationComposite, SessionPresentationGroup, SessionReadPanelState,
-    SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackChannel, TrackIntent,
-    TrackIntentError, UltimaDisplayOptions, UltimaQualityMode, UnresolvedSessionSource,
-    WorkspacePresentation,
+    RegionOfInterest, ReviewItem, ReviewStatus, SESSION_SCHEMA_MINOR_VERSION,
+    SESSION_SCHEMA_VERSION, SashimiCountMode, SashimiScaleMode, SbxDisplayOptions,
+    SbxSimplexTailMode, SessionAlignmentTrack, SessionDocument, SessionError, SessionFilters,
+    SessionLocus, SessionPaneTrackState, SessionPresentationComposite, SessionPresentationGroup,
+    SessionReadPanelState, SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackChannel,
+    TrackIntent, TrackIntentError, UltimaDisplayOptions, UltimaQualityMode,
+    UnresolvedSessionSource, WorkspacePresentation,
 };
 pub use settings::{
     DEFAULT_AUTOSAVE_INTERVAL_SECONDS, DEFAULT_AUTOSAVE_RETENTION, DEFAULT_CACHE_BUDGET_MIB,
@@ -118,7 +126,7 @@ pub use settings::{
     MAXIMUM_INTERFACE_SCALE_PERCENT, MAXIMUM_READ_BROWSING_BUFFER_PERCENT,
     MINIMUM_AUTOSAVE_INTERVAL_SECONDS, MINIMUM_AUTOSAVE_RETENTION, MINIMUM_CACHE_BUDGET_MIB,
     MINIMUM_INTERFACE_SCALE_PERCENT, MINIMUM_READ_BROWSING_BUFFER_PERCENT, SETTINGS_SCHEMA_VERSION,
-    SettingsError,
+    SettingsError, SettingsRecovery,
 };
 pub use source::{
     ClassifiedGenomicSource, GenomicSourceFormat, classify_genomic_source,

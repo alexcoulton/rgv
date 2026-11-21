@@ -680,6 +680,16 @@ pub fn project_alignment_summary_junction_instance(
     } else {
         baseline - height
     };
+    // The visible span above only decides whether the arc is drawn. Its geometry is the
+    // junction's full, unclamped span: the shader parameterises the parabola over that span and
+    // lets the clipped quad cut it, so an off-screen end stays off-screen instead of landing on
+    // the viewport edge. These bounds may therefore extend beyond the camera clip.
+    let (x, width) = projected_horizontal_unclamped(
+        instance.start_offset,
+        instance.end_offset,
+        page_start,
+        camera,
+    );
     Some(AlignmentSummaryGpuProjectedJunction {
         bounds: AlignmentSummaryGpuProjectedBounds {
             x,
@@ -691,6 +701,32 @@ pub fn project_alignment_summary_junction_instance(
         expanded_row: row,
         stroke_width: (1.0 + height * 0.075).clamp(1.25, 4.5),
     })
+}
+
+/// Projects a span without clamping it to the camera clip. The width keeps the shader's
+/// one-point minimum.
+fn projected_horizontal_unclamped(
+    start_offset: [f32; 2],
+    end_offset: [f32; 2],
+    page_start: u64,
+    camera: CpuSummaryCamera,
+) -> (f64, f64) {
+    let start_offset = f64::from(start_offset[0]) + f64::from(start_offset[1]);
+    let end_offset = f64::from(end_offset[0]) + f64::from(end_offset[1]);
+    let clip = camera.clip();
+    let x = clip.x
+        + (page_start as f64 + start_offset - camera.exact_start()) / camera.bases_per_pixel();
+    let right =
+        clip.x + (page_start as f64 + end_offset - camera.exact_start()) / camera.bases_per_pixel();
+    (x, (right - x).max(1.0))
+}
+
+/// Distance from an arc's flat edge (the top of an upward arc, the bottom of a downward one) to
+/// its centre line at arc parameter `fraction`; the fragment stage's `curve_y`.
+fn junction_arc_curve_offset(fraction: f64, height: f64, stroke_width: f64) -> f64 {
+    let inner_height = (height - stroke_width).max(0.0);
+    let centred = fraction.clamp(0.0, 1.0) - 0.5;
+    stroke_width * 0.5 + inner_height * 4.0 * centred * centred
 }
 
 fn projected_horizontal(
@@ -5093,6 +5129,22 @@ impl AlignmentSummaryGpuRenderer {
         pass: &mut wgpu::RenderPass<'pass>,
         frame: &'pass AlignmentSummaryGpuFrame,
     ) -> Result<(), AlignmentSummaryGpuRenderError> {
+        self.render_within(pass, frame, [u32::MAX; 2])
+    }
+
+    /// Replays `frame` like [`Self::render`], but first intersects every captured scissor with a
+    /// render target of `target_size` physical pixels. A frame is captured against one target
+    /// size and may be replayed after a resize or into a differently sized capture texture; a
+    /// scissor outside the attachment is a wgpu validation error, so draws whose scissor falls
+    /// wholly outside the target are skipped and the rest are clipped.
+    // Same error type as `render`, which this supersedes.
+    #[allow(clippy::result_large_err)]
+    pub fn render_within<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        frame: &'pass AlignmentSummaryGpuFrame,
+        target_size: [u32; 2],
+    ) -> Result<(), AlignmentSummaryGpuRenderError> {
         if frame.device_generation != self.device_generation {
             return Err(AlignmentSummaryGpuRenderError::DeviceGenerationMismatch {
                 frame: frame.device_generation,
@@ -5120,12 +5172,18 @@ impl AlignmentSummaryGpuRenderer {
                     return Err(AlignmentSummaryGpuRenderError::UnsupportedFamily(family));
                 }
             });
-            pass.set_scissor_rect(
-                draw.scissor.x,
-                draw.scissor.y,
-                draw.scissor.width,
-                draw.scissor.height,
-            );
+            let Some([x, y, width, height]) = crate::clamp_scissor_to_target(
+                [
+                    draw.scissor.x,
+                    draw.scissor.y,
+                    draw.scissor.width,
+                    draw.scissor.height,
+                ],
+                target_size,
+            ) else {
+                continue;
+            };
+            pass.set_scissor_rect(x, y, width, height);
             pass.set_bind_group(0, bind_group, &[draw.uniform_offset]);
             if let Some(buffer) = &page.buffer
                 && page.instance_count > 0
@@ -5148,12 +5206,18 @@ impl AlignmentSummaryGpuRenderer {
             pass.set_pipeline(&self.overlay_pipeline);
             pass.set_vertex_buffer(0, overlay.slice(..));
             for draw in frame.overlay_draws.iter() {
-                pass.set_scissor_rect(
-                    draw.scissor.x,
-                    draw.scissor.y,
-                    draw.scissor.width,
-                    draw.scissor.height,
-                );
+                let Some([x, y, width, height]) = crate::clamp_scissor_to_target(
+                    [
+                        draw.scissor.x,
+                        draw.scissor.y,
+                        draw.scissor.width,
+                        draw.scissor.height,
+                    ],
+                    target_size,
+                ) else {
+                    continue;
+                };
+                pass.set_scissor_rect(x, y, width, height);
                 pass.set_bind_group(0, bind_group, &[draw.uniform_offset]);
                 pass.draw(0..6, draw.range.clone());
             }
@@ -5245,9 +5309,11 @@ impl AlignmentSummaryGpuRenderer {
                     ) else {
                         continue;
                     };
+                    // Arc bounds are unclamped and can start millions of points off-screen, so
+                    // express them relative to the pointer before narrowing to `f32`.
                     let rectangle = RectPrimitive {
-                        x: projected.bounds.x as f32,
-                        y: projected.bounds.y as f32,
+                        x: (projected.bounds.x - x) as f32,
+                        y: (projected.bounds.y - y) as f32,
                         width: projected.bounds.width as f32,
                         height: projected.bounds.height as f32,
                         color: Rgba::new(0.0, 0.0, 0.0, 1.0),
@@ -5259,8 +5325,7 @@ impl AlignmentSummaryGpuRenderer {
                         },
                     };
                     let Some(distance) =
-                        junction_arc_distance_to_point(rectangle, x as f32, y as f32)
-                            .map(f64::from)
+                        junction_arc_distance_to_point(rectangle, 0.0, 0.0).map(f64::from)
                     else {
                         continue;
                     };
@@ -5373,16 +5438,29 @@ impl AlignmentSummaryGpuRenderer {
                     JunctionDisplayMode::Expanded => draw.junction_row_count.max(1),
                 };
                 let band_height = draw.camera.clip().height / f64::from(row_count);
-                if projected.bounds.width < 30.0 || band_height < 28.0 {
+                // Arc bounds are unclamped; a label is anchored to the part of the arc that is
+                // on screen and follows the curve there, so a junction whose apex is off-screen
+                // still gets a visible label next to its visible stroke.
+                let clip = draw.camera.clip();
+                let visible_left = projected.bounds.x.max(clip.x);
+                let visible_right =
+                    (projected.bounds.x + projected.bounds.width).min(clip.x + clip.width);
+                let visible_width = visible_right - visible_left;
+                if visible_width < 30.0 || band_height < 28.0 {
                     continue;
                 }
-                let band_top =
-                    draw.camera.clip().y + f64::from(projected.expanded_row) * band_height;
+                let band_top = clip.y + f64::from(projected.expanded_row) * band_height;
                 let band_bottom = band_top + band_height;
+                let x = (visible_left + visible_right) * 0.5;
+                let curve_offset = junction_arc_curve_offset(
+                    (x - projected.bounds.x) / projected.bounds.width,
+                    projected.bounds.height,
+                    projected.stroke_width,
+                );
                 let apex = if component == AlignmentSummaryJunctionComponentToken::Negative {
-                    projected.bounds.y + projected.bounds.height - projected.stroke_width * 0.5
+                    projected.bounds.y + projected.bounds.height - curve_offset
                 } else {
-                    projected.bounds.y + projected.stroke_width * 0.5
+                    projected.bounds.y + curve_offset
                 };
                 let y = (if component == AlignmentSummaryJunctionComponentToken::Negative {
                     apex + 7.0
@@ -5390,14 +5468,13 @@ impl AlignmentSummaryGpuRenderer {
                     apex - 7.0
                 })
                 .clamp(band_top + 5.5, band_bottom - 5.5);
-                let x = projected.bounds.x + projected.bounds.width * 0.5;
                 let text = junction_count_label(
                     evidence,
                     draw.junction_count_mode,
                     f64::from(draw.junction_normalization),
                 );
                 let label_width =
-                    ((text.chars().count() as f64) * 6.2 + 2.0).clamp(10.0, projected.bounds.width);
+                    ((text.chars().count() as f64) * 6.2 + 2.0).clamp(10.0, visible_width);
                 let bounds = [
                     x - label_width * 0.5,
                     y - 5.5,
@@ -5426,6 +5503,40 @@ impl AlignmentSummaryGpuRenderer {
             }
         }
         labels
+    }
+
+    /// Rebuilds this renderer for a replacement GPU device, for example after the previous device
+    /// was lost. Every pipeline is recreated against `device` and `target_format`, every
+    /// device-derived page and frame buffer is dropped (releasing its ledger charge), and the
+    /// device generation advances so frames, leases and plans captured against the old device
+    /// are rejected instead of being replayed. Semantic scenes are untouched and are simply
+    /// admitted again.
+    pub fn rebuild_for_device(&mut self, device: &wgpu::Device, target_format: wgpu::TextureFormat) {
+        self.discard_device_resources();
+        let mut rebuilt = Self::new(device, target_format);
+        rebuilt.device_generation = self.device_generation;
+        rebuilt.revision = self.revision;
+        for (rebuilt, previous) in [
+            (
+                &rebuilt.content_manifest_builds,
+                &self.content_manifest_builds,
+            ),
+            (
+                &rebuilt.content_manifest_pages_enumerated,
+                &self.content_manifest_pages_enumerated,
+            ),
+            (
+                &rebuilt.prefetch_authority_keys_inspected,
+                &self.prefetch_authority_keys_inspected,
+            ),
+            (
+                &rebuilt.reclaim_authority_keys_inspected,
+                &self.reclaim_authority_keys_inspected,
+            ),
+        ] {
+            rebuilt.store(previous.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        *self = rebuilt;
     }
 
     /// Drops every device-derived allocation while preserving all scene-owned semantic pages.
@@ -6228,11 +6339,9 @@ fn write_packed_page(
 fn summary_gpu_buffer_capacity<T>(
     count: usize,
 ) -> Result<usize, AlignmentSummaryGpuPageAdmissionError> {
-    if count == 0 {
-        return Ok(0);
-    }
-    next_summary_capacity(count)?
-        .checked_mul(size_of::<T>())
+    // Immutable summary pages are allocated (and charged to the ledger) at their exact size; see
+    // `exact_immutable_buffer_bytes`.
+    crate::alignment_scene::exact_immutable_buffer_bytes(count, size_of::<T>())
         .ok_or(AlignmentSummaryGpuPageAdmissionError::CapacityOverflow)
 }
 
@@ -7788,6 +7897,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: rgv_alignment_scene::ReadSampling::Complete,
         };
         let atlas = AlignmentRowAtlas::build(
             RowAtlasRevision::new(RevisionFingerprint::new(20, 21)),
@@ -8633,6 +8743,125 @@ mod tests {
             assert_near(gpu.bounds.width, cpu.width);
             assert_near(gpu.bounds.height, cpu.height);
         }
+    }
+
+    #[test]
+    fn junction_arcs_keep_their_unclamped_span_when_an_end_is_off_screen() {
+        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+        let scene = test_snapshot_with_summary_tile_bases(&ledger, NonZeroU64::new(10).unwrap());
+        let mut options = sashimi_options(
+            JunctionDisplayMode::Collapsed,
+            AlignmentSashimiScalePolicy::Fixed(1.0),
+        );
+        options.projection.scale_maximum = Some(1.0);
+        options.projection.show_labels = false;
+
+        let mut packed = Vec::new();
+        for page in scene
+            .summary_pages()
+            .iter()
+            .filter(|page| page.key().family() == SummaryPageFamily::Junctions)
+        {
+            let PackedAlignmentSummaryPage::Junctions {
+                instances,
+                metadata,
+            } = PackedAlignmentSummaryPage::from_request(
+                AlignmentSummaryGpuPageRequest::junctions(page),
+            )
+            .unwrap()
+            else {
+                unreachable!();
+            };
+            for entry in metadata.entries() {
+                packed.push((entry.evidence(), page.interval().start(), instances.clone()));
+            }
+        }
+        let (evidence, page_start, instances) = packed.pop().unwrap();
+        let junction_bases = evidence.end - evidence.start;
+        assert!(junction_bases >= 2);
+
+        // The camera ends one base into the junction, so its right end is off-screen.
+        let prepared = scene.prepared_interval();
+        let cut = evidence.start + 1;
+        assert!(prepared.start() < cut);
+        let camera =
+            camera(GenomicInterval::new(prepared.contig(), prepared.start(), cut).unwrap());
+        let clip = camera.clip();
+        let points_per_base = 1.0 / camera.bases_per_pixel();
+        let expected_x =
+            clip.x + (evidence.start as f64 - camera.exact_start()) * points_per_base;
+        let expected_width = (evidence.end - evidence.start) as f64 * points_per_base;
+
+        let gpu = instances
+            .iter()
+            .filter_map(|instance| {
+                project_alignment_summary_junction_instance(
+                    *instance,
+                    page_start,
+                    camera,
+                    1.0,
+                    1.0,
+                    1,
+                    options.projection.minimum_depth,
+                    options.projection.minimum_flank,
+                    options.projection.display_mode,
+                )
+            })
+            .filter(|projected| {
+                projected.component != AlignmentSummaryJunctionComponentToken::Annotation
+            })
+            .collect::<Vec<_>>();
+        assert!(!gpu.is_empty());
+        for projected in &gpu {
+            assert_near(projected.bounds.x, expected_x);
+            assert_near(projected.bounds.width, expected_width);
+            // The far end is beyond the pane rather than snapped to its edge: the pane edge
+            // cuts the arc one base into its span, still on the rising flank.
+            assert!(projected.bounds.x + projected.bounds.width > clip.x + clip.width + 1.0);
+            assert_near(
+                (clip.x + clip.width - projected.bounds.x) / projected.bounds.width,
+                1.0 / junction_bases as f64,
+            );
+        }
+
+        let cpu = CpuSummaryProjector::project(
+            &scene,
+            1,
+            camera,
+            &CpuSummaryProjectionOptions::Junctions(options.projection),
+        )
+        .unwrap();
+        let cpu = cpu
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(
+                    primitive.component,
+                    CpuSummaryProjectedComponent::Junction { evidence: candidate, .. }
+                        if candidate == evidence
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cpu.len(), gpu.len());
+        for primitive in cpu {
+            assert_near(primitive.x, expected_x);
+            assert_near(primitive.width, expected_width);
+            assert!(gpu.iter().any(|projected| {
+                (projected.bounds.y - primitive.y).abs() < 1.0e-4
+                    && (projected.bounds.height - primitive.height).abs() < 1.0e-4
+            }));
+        }
+    }
+
+    #[test]
+    fn junction_arc_curve_offset_follows_the_fragment_parabola() {
+        // Height 20, stroke 2: the centre line runs from the flat edge + 1 at the apex to the
+        // baseline - 1 at either end.
+        assert_near(junction_arc_curve_offset(0.5, 20.0, 2.0), 1.0);
+        assert_near(junction_arc_curve_offset(0.0, 20.0, 2.0), 19.0);
+        assert_near(junction_arc_curve_offset(1.0, 20.0, 2.0), 19.0);
+        assert_near(junction_arc_curve_offset(0.25, 20.0, 2.0), 1.0 + 18.0 * 0.25);
+        assert_near(junction_arc_curve_offset(7.0, 20.0, 2.0), 19.0);
     }
 
     #[test]

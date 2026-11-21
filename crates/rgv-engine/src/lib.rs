@@ -6,9 +6,9 @@ mod cache;
 mod local_bam_source;
 mod mailbox;
 mod reference_engine;
-mod scheduler;
 mod source_actor;
 mod track_engine;
+mod track_source;
 
 pub use alignment_scene_coordinator::{
     AlignmentCoordinatorEviction, AlignmentCoordinatorFrame, AlignmentCoordinatorPressure,
@@ -16,7 +16,7 @@ pub use alignment_scene_coordinator::{
     AlignmentPresentationPump, AlignmentReferenceAuthority, AlignmentReferenceInstallOutcome,
     AlignmentReferenceRequirement, AlignmentSceneBuildContract, AlignmentSceneCoordinator,
     AlignmentSceneCoordinatorConfigError, AlignmentSceneCoordinatorError,
-    AlignmentSceneCoordinatorTelemetry, AlignmentSceneOwnerPressure,
+    AlignmentSceneCoordinatorTelemetry, AlignmentSceneOwnerFailure, AlignmentSceneOwnerPressure,
     AlignmentSceneOwnerPublication, AlignmentSceneOwnerRefusal, AlignmentSceneOwnerRetry,
     AlignmentSceneOwnerWorkState, AlignmentScenePreparationPolicy, AlignmentSceneSourceCoordinator,
     AlignmentSceneSourcePump, AlignmentVerticalResidency,
@@ -28,18 +28,15 @@ pub use alignment_scene_engine::{
     AlignmentSceneResourcePressureDisposition, AlignmentSceneSourceMetadata,
     LocalAlignmentSceneEngineConfig,
 };
-pub use cache::{
-    AlignmentTileKey, CacheBudgets, CacheInsertError, CacheStats, CoverageTileKey, GpuTileKey,
-    LayoutTileKey, SourceFingerprint, WeightedLruCache,
-};
+pub use cache::SourceFingerprint;
 pub use local_bam_source::{
     LocalBamCanonicalBackend, LocalBamCanonicalBackendError, LocalBamSourceControl,
 };
-pub use mailbox::EngineQueueError;
+pub use mailbox::{EngineQueueError, set_ui_waker};
 pub use reference_engine::{
-    MAX_REFERENCE_QUERY_BASES, ReferenceEngine, ReferenceEngineEvent, ReferenceQueryIdentity,
+    MAX_REFERENCE_QUERY_BASES, MAX_REFERENCE_SLICE_BASES, ReferenceEngine, ReferenceEngineEvent,
+    ReferenceQueryIdentity,
 };
-pub use scheduler::{CompletedWork, Scheduler, SchedulerError, WorkItem};
 pub use source_actor::{
     AlignmentSourceActor, AlignmentSourceActorAction, AlignmentSourceActorError,
     AlignmentSourceActorEvent, AlignmentSourceActorSchedule, AlignmentSourceIntent,

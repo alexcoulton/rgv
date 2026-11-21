@@ -1,9 +1,26 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use thiserror::Error;
+
+type UiWaker = Arc<dyn Fn() + Send + Sync>;
+
+static UI_WAKER: OnceLock<UiWaker> = OnceLock::new();
+
+/// Registers the callback engines use to wake the application's event loop whenever a worker
+/// publishes a result, so the UI does not have to poll for it. Only the first registration in
+/// a process takes effect; returns whether this call was that one.
+pub fn set_ui_waker(waker: impl Fn() + Send + Sync + 'static) -> bool {
+    UI_WAKER.set(Arc::new(waker)).is_ok()
+}
+
+fn wake_ui() {
+    if let Some(waker) = UI_WAKER.get() {
+        waker();
+    }
+}
 
 /// Non-blocking scheduling failure shared by the bounded source, reference, and contextual-lane
 /// actors. This is deliberately independent of any particular data engine.
@@ -26,10 +43,14 @@ struct MailboxState<T> {
     next_sequence: u128,
     sender_open: bool,
     receiver_open: bool,
+    /// Set by a [`MailboxWaker`]; the next blocking receive returns early and clears it.
+    woken: bool,
 }
 
 struct MailboxInner<T> {
     control_capacity: usize,
+    /// Whether the receiver is the UI thread, which is woken on every send.
+    wakes_ui: bool,
     state: Mutex<MailboxState<T>>,
     has_data: Condvar,
     has_control_capacity: Condvar,
@@ -55,14 +76,30 @@ pub(crate) enum TryMailboxSendError<T> {
 pub(crate) fn bounded_coalescing<T>(
     control_capacity: usize,
 ) -> (CoalescingSender<T>, CoalescingReceiver<T>) {
+    mailbox(control_capacity, false)
+}
+
+/// A worker-to-UI mailbox: every send also wakes the application's event loop.
+pub(crate) fn bounded_coalescing_to_ui<T>(
+    control_capacity: usize,
+) -> (CoalescingSender<T>, CoalescingReceiver<T>) {
+    mailbox(control_capacity, true)
+}
+
+fn mailbox<T>(
+    control_capacity: usize,
+    wakes_ui: bool,
+) -> (CoalescingSender<T>, CoalescingReceiver<T>) {
     let inner = Arc::new(MailboxInner {
         control_capacity: control_capacity.max(1),
+        wakes_ui,
         state: Mutex::new(MailboxState {
             controls: VecDeque::new(),
             latest: VecDeque::new(),
             next_sequence: 0,
             sender_open: true,
             receiver_open: true,
+            woken: false,
         }),
         has_data: Condvar::new(),
         has_control_capacity: Condvar::new(),
@@ -98,6 +135,10 @@ impl<T> CoalescingSender<T> {
         let stamped = stamp(&mut state, value);
         state.controls.push_back(stamped);
         self.inner.has_data.notify_one();
+        drop(state);
+        if self.inner.wakes_ui {
+            wake_ui();
+        }
         Ok(())
     }
 
@@ -119,6 +160,10 @@ impl<T> CoalescingSender<T> {
         let stamped = stamp(&mut state, value);
         state.controls.push_back(stamped);
         self.inner.has_data.notify_one();
+        drop(state);
+        if self.inner.wakes_ui {
+            wake_ui();
+        }
         Ok(())
     }
 
@@ -169,6 +214,10 @@ impl<T> CoalescingSender<T> {
         let stamped = stamp(&mut state, value);
         state.latest.push_back((key, stamped));
         self.inner.has_data.notify_one();
+        drop(state);
+        if self.inner.wakes_ui {
+            wake_ui();
+        }
         Ok(())
     }
 }
@@ -209,6 +258,11 @@ impl<T> CoalescingReceiver<T> {
             if !state.sender_open {
                 return Err(MailboxDisconnected);
             }
+            if std::mem::take(&mut state.woken) {
+                // Work became runnable outside the mailbox (for example a decoder finished a
+                // unit). Return so the owner re-evaluates instead of sleeping out the timeout.
+                return Ok(None);
+            }
             let remaining = timeout.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 return Ok(None);
@@ -228,9 +282,60 @@ impl<T> CoalescingReceiver<T> {
     /// Closes the consumer side before worker joins so a producer waiting on
     /// bounded control capacity can terminate cleanly.
     pub(crate) fn close(&self) {
-        let mut state = self.inner.state.lock().expect("mailbox mutex poisoned");
-        state.receiver_open = false;
-        self.inner.has_control_capacity.notify_all();
+        close_receiver(&self.inner);
+    }
+}
+
+impl<T: Send + 'static> CoalescingReceiver<T> {
+    /// A handle another thread uses to end this receiver's current (or next) blocking wait
+    /// without enqueueing a value. It keeps neither side of the mailbox open.
+    pub(crate) fn waker(&self) -> MailboxWaker {
+        let inner = Arc::clone(&self.inner);
+        Arc::new(move || {
+            // A poisoned mailbox already belongs to a panicking owner; there is nobody to wake.
+            if let Ok(mut state) = inner.state.lock() {
+                state.woken = true;
+                inner.has_data.notify_all();
+            }
+        })
+    }
+}
+
+/// Dropping the consumer is a disconnection: without this a worker that exited (or panicked)
+/// would leave its senders succeeding forever into a mailbox nobody reads.
+impl<T> Drop for CoalescingReceiver<T> {
+    fn drop(&mut self) {
+        close_receiver(&self.inner);
+    }
+}
+
+fn close_receiver<T>(inner: &MailboxInner<T>) {
+    // Runs during unwinding too, so a poisoned mutex must not turn into a double panic.
+    let mut state = inner
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.receiver_open = false;
+    inner.has_control_capacity.notify_all();
+}
+
+/// Ends a blocking mailbox receive from another thread. See [`CoalescingReceiver::waker`].
+pub(crate) type MailboxWaker = Arc<dyn Fn() + Send + Sync>;
+
+/// Best-effort text of a caught panic payload, for a terminal error event.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "panic payload was not a string".to_owned())
+}
+
+/// Runs one thread's whole body. A panic never unwinds out of the thread silently: it is
+/// handed to `on_panic` as text so the owner can publish a terminal error event.
+pub(crate) fn run_thread_root(body: impl FnOnce(), on_panic: impl FnOnce(String)) {
+    if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        on_panic(panic_message(payload.as_ref()));
     }
 }
 
@@ -350,6 +455,79 @@ mod tests {
             sender.try_send_control(3),
             Err(TryMailboxSendError::Disconnected(3))
         );
+    }
+
+    #[test]
+    fn dropping_the_receiver_disconnects_every_send_form() {
+        let (sender, receiver) = bounded_coalescing(1);
+        sender.try_send_control(1).unwrap();
+        drop(receiver);
+
+        assert!(sender.is_closed());
+        assert_eq!(
+            sender.try_send_control(2),
+            Err(TryMailboxSendError::Disconnected(2))
+        );
+        assert_eq!(sender.send_control(3), Err(3));
+        assert_eq!(sender.send_latest_for(0, 4), Err(4));
+        assert_eq!(sender.send_latest_system(0, 5), Err(5));
+    }
+
+    #[test]
+    fn dropping_the_receiver_unblocks_a_full_control_queue() {
+        let (sender, receiver) = bounded_coalescing(1);
+        sender.send_control(1).unwrap();
+        let blocked = thread::spawn(move || sender.send_control(2));
+
+        drop(receiver);
+
+        assert_eq!(blocked.join().unwrap(), Err(2));
+    }
+
+    #[test]
+    fn a_waker_ends_a_blocking_receive_without_a_value() {
+        let (sender, receiver) = bounded_coalescing::<u8>(1);
+        let waker = receiver.waker();
+        // Signalled before the wait starts: the wake must not be lost.
+        waker();
+        let started = Instant::now();
+        assert_eq!(
+            receiver.receive_timeout(Duration::from_secs(30)).unwrap(),
+            None
+        );
+        // Signalled from another thread while (or before) this thread waits.
+        let remote = thread::spawn(move || waker());
+        assert_eq!(
+            receiver.receive_timeout(Duration::from_secs(30)).unwrap(),
+            None
+        );
+        remote.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(20));
+        // The wake is consumed; values and disconnection behave as before.
+        sender.send_control(7).unwrap();
+        assert_eq!(
+            receiver.receive_timeout(Duration::from_secs(30)).unwrap(),
+            Some(7)
+        );
+        drop(sender);
+        assert_eq!(receiver.try_receive(), Err(MailboxDisconnected));
+    }
+
+    #[test]
+    fn a_thread_root_reports_the_panic_message() {
+        let reported = Mutex::new(None);
+        run_thread_root(
+            || panic!("decoder exploded at block {}", 7),
+            |message| *reported.lock().unwrap() = Some(message),
+        );
+        assert_eq!(
+            reported.into_inner().unwrap().as_deref(),
+            Some("decoder exploded at block 7")
+        );
+
+        let mut completed = false;
+        run_thread_root(|| completed = true, |_| unreachable!());
+        assert!(completed);
     }
 
     #[test]

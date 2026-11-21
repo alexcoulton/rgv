@@ -72,11 +72,23 @@ impl AutomationBatch {
     }
 
     /// Resolves local paths against an explicitly selected control root and
-    /// rejects lexical attempts to access paths outside it.
+    /// rejects every path, read or written, that lies outside it.
+    ///
+    /// Containment is decided on the real filesystem location: `..` segments
+    /// are folded lexically and then symbolic links in the deepest existing
+    /// ancestor are resolved, so neither `../x` nor a link inside the root
+    /// that points elsewhere can reach outside. A not-yet-existing output is
+    /// judged by its nearest existing directory; a dangling link is refused.
+    /// The stored paths remain the lexical ones under the root as given.
     pub fn resolve_paths_within(&mut self, root: impl AsRef<Path>) -> Result<(), AutomationError> {
         let root = normalize_automation_path(&std::path::absolute(root)?);
+        let real_root = real_automation_path(&root)?;
+        let roots = ControlRoot {
+            lexical: &root,
+            real: &real_root,
+        };
         for command in &mut self.commands {
-            command.resolve_paths_within(&root)?;
+            command.resolve_paths_within(&roots)?;
         }
         Ok(())
     }
@@ -528,19 +540,22 @@ impl AutomationCommand {
         }
     }
 
-    fn resolve_paths_within(&mut self, root: &Path) -> Result<(), AutomationError> {
+    fn resolve_paths_within(&mut self, root: &ControlRoot<'_>) -> Result<(), AutomationError> {
         let resolve = |value: &mut String| -> Result<(), AutomationError> {
             let path = Path::new(value);
+            let outside = || AutomationError::PathOutsideControlRoot(path.display().to_string());
             let candidate = if path.is_relative() {
-                root.join(path)
+                root.lexical.join(path)
             } else {
                 path.to_owned()
             };
             let resolved = normalize_automation_path(&candidate);
-            if !resolved.starts_with(root) {
-                return Err(AutomationError::PathOutsideControlRoot(
-                    path.display().to_string(),
-                ));
+            // A lexical prefix test is defeated by a symbolic link inside the
+            // root (and wrongly refuses the root's own real spelling), so the
+            // real location is what must lie inside the real root.
+            let real = real_automation_path(&resolved).map_err(|_| outside())?;
+            if !real.starts_with(root.real) {
+                return Err(outside());
             }
             *value = resolved.display().to_string();
             Ok(())
@@ -1929,6 +1944,44 @@ pub struct AutomationAlignmentSearchResult {
     pub truncated: bool,
 }
 
+/// A control root as the caller named it and as the filesystem resolves it.
+struct ControlRoot<'a> {
+    lexical: &'a Path,
+    real: &'a Path,
+}
+
+/// Resolves symbolic links in the deepest existing ancestor of an absolute,
+/// lexically normalized path and re-appends the components that do not exist
+/// yet. A dangling symbolic link is an error rather than a "missing" name,
+/// because creating the file would follow the link to wherever it points.
+fn real_automation_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(mut real) => {
+                for component in missing.iter().rev() {
+                    real.push(component);
+                }
+                return Ok(real);
+            }
+            Err(error) => {
+                if ancestor
+                    .symlink_metadata()
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                {
+                    return Err(error);
+                }
+                let (Some(name), Some(parent)) = (ancestor.file_name(), ancestor.parent()) else {
+                    return Err(error);
+                };
+                missing.push(name.to_os_string());
+                ancestor = parent;
+            }
+        }
+    }
+}
+
 fn normalize_automation_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -3113,6 +3166,85 @@ mod tests {
             absolute.resolve_paths_within(&root),
             Err(AutomationError::PathOutsideControlRoot(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_control_paths_cannot_escape_the_root_through_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("allowed");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(root.join("inner")).unwrap();
+        std::fs::write(outside.join("private.bam"), b"secret").unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        symlink(outside.join("private.bam"), root.join("linked.bam")).unwrap();
+        symlink(outside.join("not-yet.json"), root.join("dangling.json")).unwrap();
+        symlink(root.join("inner"), root.join("inside-link")).unwrap();
+        let through_link = directory.path().join("root-link");
+        symlink(&root, &through_link).unwrap();
+
+        let read = |path: &str| AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::LoadTrack {
+                source: TrackSource::Local {
+                    path: path.to_owned(),
+                },
+                kind: Some(TrackKind::Alignment),
+                name: None,
+            }],
+        };
+        let write = |path: &str| AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Save {
+                path: path.to_owned(),
+            }],
+        };
+
+        // Reads and writes through a link that leaves the root are refused,
+        // including outputs that do not exist yet and dangling links.
+        for mut escaping in [
+            read("escape/private.bam"),
+            read("linked.bam"),
+            write("escape/new/project.json"),
+            write("escape/../escape/project.json"),
+            write("dangling.json"),
+            write("linked.bam"),
+        ] {
+            assert!(
+                matches!(
+                    escaping.resolve_paths_within(&root),
+                    Err(AutomationError::PathOutsideControlRoot(_))
+                ),
+                "{:?}",
+                escaping.commands[0]
+            );
+        }
+
+        // Links that stay inside the root, missing outputs, and a root that is
+        // itself reached through a link all remain usable.
+        for mut contained in [
+            write("inside-link/project.json"),
+            write("new/deeper/project.json"),
+            read("inner/missing.bam"),
+        ] {
+            contained.resolve_paths_within(&root).unwrap();
+            contained.resolve_paths_within(&through_link).unwrap();
+        }
+        let mut stored = write("inside-link/project.json");
+        stored.resolve_paths_within(&through_link).unwrap();
+        assert!(matches!(
+            &stored.commands[0],
+            AutomationCommand::Save { path }
+                if Path::new(path) == through_link.join("inside-link/project.json")
+        ));
+        let mut absolute = write(&root.join("inner/absolute.json").display().to_string());
+        absolute.resolve_paths_within(&through_link).unwrap();
+        let mut escaping = read(&outside.join("private.bam").display().to_string());
+        assert!(escaping.resolve_paths_within(&through_link).is_err());
     }
 
     #[test]

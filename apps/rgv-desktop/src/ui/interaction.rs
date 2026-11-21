@@ -8,6 +8,26 @@ fn pointer_targets_unobstructed_canvas(
     canvas_contains_pointer && canvas_layer.is_some() && canvas_layer == layer_under_pointer
 }
 
+/// Hover feedback is hit-tested only where a click would land on the canvas: not while egui
+/// owns the pointer, not during a drag, and not underneath a floating window or popup.
+const fn hover_hit_testing_allowed(
+    egui_consumed: bool,
+    dragging: bool,
+    over_unobstructed_canvas: bool,
+) -> bool {
+    !egui_consumed && !dragging && over_unobstructed_canvas
+}
+
+/// The read stack scrolled by the keyboard: the selected alignment track, else the one under
+/// the pointer, else the primary alignment.
+fn keyboard_scroll_track(
+    selected: Option<TrackId>,
+    under_pointer: Option<TrackId>,
+    primary: TrackId,
+) -> TrackId {
+    selected.or(under_pointer).unwrap_or(primary)
+}
+
 impl Viewer {
     /// One-way compatibility projection for display/layout code that still
     /// consumes the compact canvas view. The immutable workspace snapshot is
@@ -38,7 +58,14 @@ impl Viewer {
         } else {
             self.last_cursor = None;
         }
-        let hovered_scene = (!consumed && !self.dragging && self.cursor_in_genomic_canvas())
+        // The same unobstructed test clicks use: a window floating over the canvas must not let
+        // hover highlight, or hover-select, the reads underneath it.
+        let hover_allowed = hover_hit_testing_allowed(
+            consumed,
+            self.dragging,
+            self.cursor_over_unobstructed_genomic_canvas(),
+        );
+        let hovered_scene = hover_allowed
             .then(|| self.alignment_scene_hit_at_cursor())
             .flatten();
         if hovered_scene != self.panels.active().hovered_alignment_hit {
@@ -49,7 +76,7 @@ impl Viewer {
             self.window.request_redraw();
         }
         let cursor_in_genomic_canvas = self.cursor_in_genomic_canvas();
-        let should_hit_test_junction_arc = !consumed && !self.dragging && cursor_in_genomic_canvas;
+        let should_hit_test_junction_arc = hover_allowed;
         let junction_hit_started = self.diagnostics_open.then(Instant::now);
         let junction_hit = if should_hit_test_junction_arc {
             self.junction_arc_hit_test_at_cursor()
@@ -113,10 +140,7 @@ impl Viewer {
             }
             self.window.request_redraw();
         }
-        if self.inspector_activation_at_cursor() == InspectorActivation::Hover
-            && !consumed
-            && !self.dragging
-        {
+        if hover_allowed && self.inspector_activation_at_cursor() == InspectorActivation::Hover {
             let target = self.hover_inspector_target_at_cursor();
             if target != self.panels.active().hover_inspector_target {
                 self.panels.active_mut().hover_inspector_target = target;
@@ -149,12 +173,9 @@ impl Viewer {
             .map(HoverInspectorTarget::Read)
     }
 
-    pub(crate) fn zoom(&mut self, delta: MouseScrollDelta) {
-        let amount = match delta {
-            MouseScrollDelta::LineDelta(_, y) => f64::from(y),
-            MouseScrollDelta::PixelDelta(position) => position.y * 0.02,
-        };
-        let factor = 0.85_f64.powf(amount);
+    /// Zooms the active panel around the cursor. One step of a continuous gesture: the history
+    /// entry is recorded once, when the gesture settles.
+    pub(crate) fn zoom_at_cursor(&mut self, factor: f64) {
         let panel_rect = self.active_panel_rect();
         let anchor_points =
             self.cursor.x / self.window.scale_factor() - f64::from(panel_rect.left());
@@ -164,16 +185,12 @@ impl Viewer {
             self.panels.active_mut().contig_length,
         ) {
             self.panels.active_mut().viewport = viewport;
-            self.panels
-                .active_mut()
-                .navigation_history
-                .visit(viewport.interval());
             self.viewport_gesture_changed();
         }
     }
 
-    pub(crate) fn scroll_tracks(&mut self, delta: MouseScrollDelta) {
-        let points = wheel_primary_axis(delta);
+    /// Scrolls the track stack under the cursor by logical points.
+    pub(crate) fn scroll_tracks_points(&mut self, points: f32) {
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
         let annotation_clip_bottom = self
             .panels
@@ -190,10 +207,16 @@ impl Viewer {
         }
     }
 
-    /// Backward-compatible primary-track entry point used by automation and
-    /// older tests. Pointer interaction calls `scroll_read_panel_by` directly.
-    pub(crate) fn scroll_tracks_by(&mut self, points: f32) {
-        self.scroll_read_panel_by(self.primary_alignment_track_id(), points);
+    /// Up/Down/PageUp/PageDown scroll the read stack the user is working in, not always the
+    /// primary alignment.
+    fn keyboard_scroll_reads(&mut self, points: f32) {
+        let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
+        let track_id = keyboard_scroll_track(
+            self.panels.active().selected_alignment_track,
+            self.read_panel_at_screen_y(cursor_y),
+            self.primary_alignment_track_id(),
+        );
+        self.scroll_read_panel_by(track_id, points);
     }
 
     pub(crate) fn scroll_read_panel_by(&mut self, track_id: TrackId, points: f32) {
@@ -359,6 +382,9 @@ impl Viewer {
                     });
                 }
                 (true, "l") => self.pending_command = Some(UiCommand::FocusLocus),
+                // IGV's feature-jump shortcuts.
+                (true, "f") => self.request_adjacent_feature(true),
+                (true, "b") => self.request_adjacent_feature(false),
                 (true, "d") => {
                     self.diagnostics_open = ui::toggled_diagnostics(self.diagnostics_open);
                 }
@@ -373,10 +399,10 @@ impl Viewer {
             },
             Key::Named(NamedKey::ArrowLeft) => self.keyboard_pan(-0.1),
             Key::Named(NamedKey::ArrowRight) => self.keyboard_pan(0.1),
-            Key::Named(NamedKey::ArrowUp) => self.scroll_tracks_by(-80.0),
-            Key::Named(NamedKey::ArrowDown) => self.scroll_tracks_by(80.0),
-            Key::Named(NamedKey::PageUp) => self.scroll_tracks_by(-self.canvas_page_height()),
-            Key::Named(NamedKey::PageDown) => self.scroll_tracks_by(self.canvas_page_height()),
+            Key::Named(NamedKey::ArrowUp) => self.keyboard_scroll_reads(-80.0),
+            Key::Named(NamedKey::ArrowDown) => self.keyboard_scroll_reads(80.0),
+            Key::Named(NamedKey::PageUp) => self.keyboard_scroll_reads(-self.canvas_page_height()),
+            Key::Named(NamedKey::PageDown) => self.keyboard_scroll_reads(self.canvas_page_height()),
             Key::Named(NamedKey::Home) => self.navigate_home(),
             Key::Named(NamedKey::Enter) => {
                 if let Some(track) = self.panels.active_mut().selected_track {
@@ -395,11 +421,7 @@ impl Viewer {
             self.panels.active_mut().contig_length,
         ) {
             self.panels.active_mut().viewport = viewport;
-            self.panels
-                .active_mut()
-                .navigation_history
-                .visit(viewport.interval());
-            self.viewport_changed();
+            self.viewport_step_changed();
         }
     }
 
@@ -409,16 +431,25 @@ impl Viewer {
             self.panels.active_mut().contig_length,
         ) {
             self.panels.active_mut().viewport = viewport;
-            self.panels
-                .active_mut()
-                .navigation_history
-                .visit(viewport.interval());
-            self.viewport_changed();
+            self.viewport_step_changed();
         }
     }
 
+    /// A discrete navigation: the caller has already recorded its history entry.
     pub(crate) fn viewport_changed(&mut self) {
         self.remember_current_locus();
+        self.discrete_viewport_changed();
+    }
+
+    /// One repeatable navigation step (key repeat, toolbar zoom, span slider). The viewport
+    /// updates immediately; history and recent loci get one entry when the burst settles.
+    pub(crate) fn viewport_step_changed(&mut self) {
+        self.sync_locus_editor();
+        self.note_navigation_gesture();
+        self.discrete_viewport_changed();
+    }
+
+    fn discrete_viewport_changed(&mut self) {
         self.panels.active_mut().hovered_alignment_hit = None;
         self.panels.active_mut().hover_inspector_target = None;
         self.panels.active_mut().hovered_junction_arc = None;
@@ -429,7 +460,8 @@ impl Viewer {
     }
 
     pub(crate) fn viewport_gesture_changed(&mut self) {
-        self.remember_current_locus();
+        self.sync_locus_editor();
+        self.note_navigation_gesture();
         self.panels.active_mut().hovered_alignment_hit = None;
         self.panels.active_mut().hover_inspector_target = None;
         self.panels.active_mut().hovered_junction_arc = None;
@@ -466,6 +498,7 @@ impl Viewer {
             ) && let Ok(viewport) =
                 Viewport::new(interval, self.panels.active_mut().viewport.pixel_width())
             {
+                self.commit_navigation_gesture();
                 self.panels.active_mut().viewport = viewport;
                 self.panels.active_mut().navigation_history.visit(interval);
                 self.horizontal_overview_drag = None;
@@ -491,6 +524,7 @@ impl Viewer {
                 .viewport
                 .centered_on(position, self.panels.active_mut().contig_length)
             {
+                self.commit_navigation_gesture();
                 self.panels.active_mut().viewport = viewport;
                 self.panels
                     .active_mut()
@@ -557,8 +591,7 @@ impl Viewer {
             }
         }
         if interaction.drag_stopped && self.horizontal_overview_drag.take().is_some() {
-            let interval = self.panels.active().viewport.interval();
-            self.panels.active_mut().navigation_history.visit(interval);
+            self.commit_navigation_gesture();
             self.finish_navigation_gesture();
         }
     }
@@ -1095,8 +1128,7 @@ impl Viewer {
             OverviewCapture::Horizontal => {
                 self.suppress_horizontal_overview_click = moved;
                 if self.horizontal_overview_drag.take().is_some() {
-                    let interval = self.panels.active().viewport.interval();
-                    self.panels.active_mut().navigation_history.visit(interval);
+                    self.commit_navigation_gesture();
                     self.finish_navigation_gesture();
                 }
             }
@@ -1557,6 +1589,42 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_scrolling_targets_the_track_in_use_before_the_primary_alignment() {
+        let (selected, hovered, primary) = (TrackId::new(7), TrackId::new(5), TrackId::new(1));
+        assert_eq!(
+            keyboard_scroll_track(Some(selected), Some(hovered), primary),
+            selected
+        );
+        assert_eq!(keyboard_scroll_track(None, Some(hovered), primary), hovered);
+        assert_eq!(keyboard_scroll_track(None, None, primary), primary);
+    }
+
+    #[test]
+    fn hover_is_hit_tested_only_where_a_click_would_reach_the_canvas() {
+        assert!(hover_hit_testing_allowed(false, false, true));
+        assert!(
+            !hover_hit_testing_allowed(false, false, false),
+            "a floating window over the canvas blocks hover"
+        );
+        assert!(!hover_hit_testing_allowed(true, false, true));
+        assert!(!hover_hit_testing_allowed(false, true, true));
+        // The obstruction test itself: the pointer is inside the canvas rectangle, but another
+        // layer (a floating window) is on top of it.
+        let canvas = egui::LayerId::background();
+        let window = egui::LayerId::new(egui::Order::Middle, egui::Id::new("floating"));
+        assert!(hover_hit_testing_allowed(
+            false,
+            false,
+            pointer_targets_unobstructed_canvas(true, Some(canvas), Some(canvas)),
+        ));
+        assert!(!hover_hit_testing_allowed(
+            false,
+            false,
+            pointer_targets_unobstructed_canvas(true, Some(canvas), Some(window)),
+        ));
+    }
 
     #[test]
     fn native_canvas_pointer_survives_coarse_egui_area_consumption() {

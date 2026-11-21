@@ -1,19 +1,5 @@
 use super::super::*;
 
-pub(crate) fn wheel_primary_axis(delta: MouseScrollDelta) -> f32 {
-    match delta {
-        MouseScrollDelta::LineDelta(x, y) => {
-            let axis = if y.abs() > f32::EPSILON { y } else { x };
-            axis * 40.0
-        }
-        MouseScrollDelta::PixelDelta(position) => {
-            let x = position.x as f32;
-            let y = position.y as f32;
-            if y.abs() > f32::EPSILON { y } else { x }
-        }
-    }
-}
-
 pub(crate) fn overview_drag_step(
     viewport: Viewport,
     anchor_fraction: f64,

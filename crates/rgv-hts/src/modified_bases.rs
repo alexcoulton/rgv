@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{AlignmentFlags, AlignmentRecord, AuxField, AuxValue, SequenceData};
+use crate::{AlignmentFlags, AlignmentRecord, AuxField, AuxValue, CigarOpKind, SequenceData};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum BaseModificationStrand {
@@ -52,7 +52,48 @@ pub fn decode_modified_bases(
         SequenceData::Missing => return Err(ModifiedBaseError::MissingSequence),
         SequenceData::NotLoaded => return Err(ModifiedBaseError::SequenceNotLoaded),
     };
-    decode_modified_bases_parts(sequence, record.flags, &mm.value, ml)
+    let hard_clipped = record
+        .cigar
+        .iter()
+        .any(|operation| operation.kind == CigarOpKind::HardClip);
+    let mn = find_tag(&record.auxiliary_fields, [b'M', b'N']).map(|field| &field.value);
+    decode_modified_bases_parts_checked(sequence, record.flags, &mm.value, ml, mn, hard_clipped)
+}
+
+/// Whether `MM` coordinates can be resolved against the stored `SEQ`.
+///
+/// `MM` counts bases of the sequence as it was when the tag was written. `MN` records that
+/// length: when present it must equal the stored sequence length. Without `MN`, a hard-clipped
+/// record is unresolvable because aligners commonly copy `MM` unchanged onto hard-clipped
+/// supplementary alignments, where the same deltas would land on the wrong bases.
+pub fn modified_bases_resolvable(
+    sequence_length: usize,
+    mn: Option<&AuxValue>,
+    hard_clipped: bool,
+) -> bool {
+    match mn {
+        Some(AuxValue::Unsigned(length)) => u64::try_from(sequence_length) == Ok(*length),
+        Some(AuxValue::Signed(length)) => i64::try_from(sequence_length) == Ok(*length),
+        Some(_) => false,
+        None => !hard_clipped,
+    }
+}
+
+/// Like [`decode_modified_bases_parts`], but reports no calls (rather than misplaced calls or an
+/// error) for a record whose `MM` tag cannot be resolved against the stored sequence; see
+/// [`modified_bases_resolvable`].
+pub fn decode_modified_bases_parts_checked(
+    sequence: &[u8],
+    flags: AlignmentFlags,
+    mm: &AuxValue,
+    ml: Option<&AuxValue>,
+    mn: Option<&AuxValue>,
+    hard_clipped: bool,
+) -> Result<Vec<ModifiedBaseCall>, ModifiedBaseError> {
+    if !modified_bases_resolvable(sequence.len(), mn, hard_clipped) {
+        return Ok(Vec::new());
+    }
+    decode_modified_bases_parts(sequence, flags, mm, ml)
 }
 
 /// Decode modified bases from packed-record components without materializing an alignment.
@@ -70,12 +111,15 @@ pub fn decode_modified_bases_parts(
     let mut calls = Vec::new();
     let mut probability_index = 0;
     for raw_group in mm.split(';').filter(|group| !group.is_empty()) {
+        // A group without a delta list (`C+m?;`) is valid SAM: the modification was assessed
+        // and no base of this read carries it.
         let (header, raw_deltas) = raw_group
             .split_once(',')
-            .ok_or_else(|| ModifiedBaseError::MalformedGroup(raw_group.to_owned()))?;
+            .map_or((raw_group, None), |(header, deltas)| (header, Some(deltas)));
         let group = parse_group_header(header)?;
         let deltas = raw_deltas
-            .split(',')
+            .into_iter()
+            .flat_map(|deltas| deltas.split(','))
             .map(|delta| {
                 delta
                     .parse::<usize>()
@@ -380,6 +424,78 @@ mod tests {
             aligned_position_for_sequencer_position(4, reverse.flags, 1),
             Some(2)
         );
+    }
+
+    #[test]
+    fn empty_group_contributes_no_calls_and_keeps_the_other_groups() {
+        // Sequence ACCCGCCCTA: cytosines at 1, 2, 3, 5, 6, 7. `C+h?;` lists no positions;
+        // `C+m,1;` skips one C and calls the second (position 2). The one ML value is its.
+        let calls = decode_modified_bases(&record("C+h?;C+m,1;", vec![77])).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].code, ModificationCode::Letter(b'm'));
+        assert_eq!(calls[0].sequencer_position, 2);
+        assert_eq!(calls[0].probability, Some(77));
+
+        assert_eq!(decode_modified_bases(&record("C+m?;", vec![])).unwrap(), []);
+        assert_eq!(decode_modified_bases(&record("C+m?", vec![])).unwrap(), []);
+        // A present-but-empty delta list is still malformed.
+        assert!(matches!(
+            decode_modified_bases(&record("C+m,;", vec![])).unwrap_err(),
+            ModifiedBaseError::InvalidDelta(_)
+        ));
+        assert!(decode_modified_bases(&record("not-valid", vec![])).is_err());
+    }
+
+    fn with_mn(mut record: AlignmentRecord, length: u64) -> AlignmentRecord {
+        record.auxiliary_fields.push(AuxField {
+            tag: *b"MN",
+            value: AuxValue::Unsigned(length),
+        });
+        record
+    }
+
+    #[test]
+    fn mn_must_match_the_stored_sequence_length() {
+        // The fixture sequence is 10 bases long.
+        let matching = with_mn(record("C+m,0,2;", vec![240, 128]), 10);
+        let calls = decode_modified_bases(&matching).unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|call| call.sequencer_position)
+                .collect::<Vec<_>>(),
+            [1, 5]
+        );
+        // MM was written for a 14-base read: the same deltas would hit the wrong bases, so the
+        // record is skipped rather than decoded or reported as malformed.
+        let stale = with_mn(record("C+m,0,2;", vec![240, 128]), 14);
+        assert_eq!(decode_modified_bases(&stale).unwrap(), []);
+    }
+
+    #[test]
+    fn hard_clipped_records_are_skipped_unless_mn_confirms_the_sequence() {
+        let hard_clipped = |mut record: AlignmentRecord| {
+            record.cigar.insert(
+                0,
+                CigarOp {
+                    kind: crate::CigarOpKind::HardClip,
+                    len: 4,
+                },
+            );
+            record
+        };
+        // Even a tag that would fail with `DeltaBeyondSequence` is skipped, not an error.
+        let unresolvable = hard_clipped(record("C+m,0,2,5;", vec![1, 2, 3]));
+        assert_eq!(decode_modified_bases(&unresolvable).unwrap(), []);
+        let confirmed = with_mn(hard_clipped(record("C+m,0,2;", vec![240, 128])), 10);
+        assert_eq!(decode_modified_bases(&confirmed).unwrap().len(), 2);
+        assert!(modified_bases_resolvable(10, None, false));
+        assert!(!modified_bases_resolvable(10, None, true));
+        assert!(!modified_bases_resolvable(
+            10,
+            Some(&AuxValue::String("10".to_owned())),
+            false
+        ));
     }
 
     #[test]

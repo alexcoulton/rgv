@@ -3116,6 +3116,49 @@ fn locus_parser_converts_one_based_inclusive_input() {
 }
 
 #[test]
+fn locus_parser_accepts_single_positions_bare_contigs_and_chr_prefix_variants() {
+    let dictionary = ReferenceDictionary::from_contigs([
+        ("chr1".to_owned(), 1_000_000),
+        ("chrM".to_owned(), 16_569),
+    ]);
+    let aliases = ContigAliases::default();
+
+    // A single one-based position is centred in a small window.
+    let (interval, name, _) =
+        resolve_initial_locus(&dictionary, &aliases, Some("chr1:12,345")).unwrap();
+    assert_eq!(name, "chr1");
+    assert_eq!((interval.start(), interval.end()), (12_324, 12_365));
+    // Near the contig start the window is clamped, not rejected.
+    let (interval, _, _) = resolve_initial_locus(&dictionary, &aliases, Some("chr1:5")).unwrap();
+    assert_eq!((interval.start(), interval.end()), (0, 25));
+
+    // A bare contig shows the whole contig.
+    let (interval, _, _) = resolve_initial_locus(&dictionary, &aliases, Some("chr1")).unwrap();
+    assert_eq!((interval.start(), interval.end()), (0, 1_000_000));
+
+    // The other naming convention resolves without a configured alias.
+    let (interval, name, _) =
+        resolve_initial_locus(&dictionary, &aliases, Some("1:101-200")).unwrap();
+    assert_eq!(name, "chr1");
+    assert_eq!((interval.start(), interval.end()), (100, 200));
+    let (_, name, _) = resolve_initial_locus(&dictionary, &aliases, Some("MT:1-10")).unwrap();
+    assert_eq!(name, "chrM");
+
+    let plain =
+        ReferenceDictionary::from_contigs([("1".to_owned(), 1_000), ("MT".to_owned(), 100)]);
+    let (_, name, _) = resolve_initial_locus(&plain, &aliases, Some("chr1:1-10")).unwrap();
+    assert_eq!(name, "1");
+    let (_, name, _) = resolve_initial_locus(&plain, &aliases, Some("chrM:1-10")).unwrap();
+    assert_eq!(name, "MT");
+
+    assert!(resolve_initial_locus(&dictionary, &aliases, Some("chr1:0")).is_err());
+    assert!(resolve_initial_locus(&dictionary, &aliases, Some("chr1:abc")).is_err());
+    let (interval, name, _) = standalone_locus("chr9:1,000").unwrap();
+    assert_eq!(name, "chr9");
+    assert_eq!((interval.start(), interval.end()), (979, 1_020));
+}
+
+#[test]
 fn locus_parser_rejects_unknown_contigs() {
     let dictionary = ReferenceDictionary::from_contigs([("chr1".to_owned(), 100)]);
     assert!(

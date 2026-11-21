@@ -879,35 +879,148 @@ pub struct LandmarkSearchEntry {
 pub struct LandmarkSearchIndex {
     pub entries: Vec<LandmarkSearchEntry>,
     by_transcript: HashMap<String, usize>,
+    /// Every searchable term, ordered by its ASCII-lowercased bytes, so a
+    /// prefix query is one binary search plus a walk over its own matches
+    /// instead of a scan and sort of the whole index.
+    sorted_terms: Vec<SearchTerm>,
+    /// `entries.len()` when `sorted_terms` was built. `entries` is public, so a
+    /// caller that resized it gets the exhaustive scan instead of stale hits.
+    sorted_entry_count: usize,
+}
+
+/// One searchable term of one entry: its class decides the match rank.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SearchTerm {
+    entry: u32,
+    /// 0 symbol, 1 synonym, 2 gene id, 3 transcript id.
+    class: u8,
+    synonym: u32,
+}
+
+impl SearchTerm {
+    fn text(self, entries: &[LandmarkSearchEntry]) -> &str {
+        let entry = &entries[self.entry as usize];
+        match self.class {
+            0 => &entry.display_symbol,
+            1 => &entry.synonyms[self.synonym as usize],
+            2 => &entry.gene_id,
+            _ => &entry.transcript_id,
+        }
+    }
+}
+
+fn lowercase_bytes(value: &str) -> impl Iterator<Item = u8> + '_ {
+    value.bytes().map(|byte| byte.to_ascii_lowercase())
+}
+
+fn build_sorted_terms(entries: &[LandmarkSearchEntry]) -> Vec<SearchTerm> {
+    let mut terms = Vec::with_capacity(entries.len().saturating_mul(3));
+    for (index, entry) in entries.iter().enumerate() {
+        let Ok(index) = u32::try_from(index) else {
+            break;
+        };
+        let mut push = |class: u8, synonym: usize, text: &str| {
+            if !text.is_empty() {
+                terms.push(SearchTerm {
+                    entry: index,
+                    class,
+                    synonym: u32::try_from(synonym).unwrap_or(u32::MAX),
+                });
+            }
+        };
+        push(0, 0, &entry.display_symbol);
+        for (synonym, text) in entry.synonyms.iter().enumerate() {
+            push(1, synonym, text);
+        }
+        push(2, 0, &entry.gene_id);
+        push(3, 0, &entry.transcript_id);
+    }
+    terms.sort_unstable_by(|left, right| {
+        lowercase_bytes(left.text(entries))
+            .cmp(lowercase_bytes(right.text(entries)))
+            .then_with(|| {
+                (left.entry, left.class, left.synonym).cmp(&(
+                    right.entry,
+                    right.class,
+                    right.synonym,
+                ))
+            })
+    });
+    terms
+}
+
+fn rank_search_matches(
+    entries: &[LandmarkSearchEntry],
+    mut matches: Vec<(u8, usize)>,
+    maximum_hits: usize,
+) -> Vec<&LandmarkSearchEntry> {
+    matches.sort_by(|(left_rank, left_index), (right_rank, right_index)| {
+        let (left, right) = (&entries[*left_index], &entries[*right_index]);
+        left_rank
+            .cmp(right_rank)
+            .then_with(|| left.normalized_term.cmp(&right.normalized_term))
+            .then_with(|| left.contig.cmp(&right.contig))
+            .then_with(|| left.start.cmp(&right.start))
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| left.gene_id.cmp(&right.gene_id))
+            .then_with(|| left.transcript_id.cmp(&right.transcript_id))
+            .then_with(|| left_index.cmp(right_index))
+    });
+    matches
+        .into_iter()
+        .take(maximum_hits)
+        .map(|(_, index)| &entries[index])
+        .collect()
 }
 
 impl LandmarkSearchIndex {
+    /// Returns the best `maximum_hits` entries whose symbol, synonym, gene id
+    /// or transcript id starts with `query` (ASCII case-insensitive).
     #[must_use]
     pub fn search(&self, query: &str, maximum_hits: usize) -> Vec<&LandmarkSearchEntry> {
         let normalized = query.trim().to_ascii_lowercase();
         if normalized.is_empty() || maximum_hits == 0 {
             return Vec::new();
         }
-        let mut matches = self
-            .entries
-            .iter()
-            .filter_map(|entry| search_match_rank(entry, &normalized).map(|rank| (rank, entry)))
-            .collect::<Vec<_>>();
-        matches.sort_by(|(left_rank, left), (right_rank, right)| {
-            left_rank
-                .cmp(right_rank)
-                .then_with(|| left.normalized_term.cmp(&right.normalized_term))
-                .then_with(|| left.contig.cmp(&right.contig))
-                .then_with(|| left.start.cmp(&right.start))
-                .then_with(|| left.end.cmp(&right.end))
-                .then_with(|| left.gene_id.cmp(&right.gene_id))
-                .then_with(|| left.transcript_id.cmp(&right.transcript_id))
+        if self.sorted_entry_count != self.entries.len() {
+            return self.search_by_scan(&normalized, maximum_hits);
+        }
+        let first = self.sorted_terms.partition_point(|term| {
+            lowercase_bytes(term.text(&self.entries)).lt(normalized.bytes())
         });
-        matches
-            .into_iter()
-            .take(maximum_hits)
-            .map(|(_, entry)| entry)
-            .collect()
+        let mut best = HashMap::<u32, u8>::new();
+        for term in &self.sorted_terms[first..] {
+            let text = term.text(&self.entries);
+            if !ascii_case_insensitive_prefix(text, &normalized) {
+                break;
+            }
+            let rank = term.class * 2 + u8::from(text.len() != normalized.len());
+            best.entry(term.entry)
+                .and_modify(|current| *current = (*current).min(rank))
+                .or_insert(rank);
+        }
+        rank_search_matches(
+            &self.entries,
+            best.into_iter()
+                .map(|(entry, rank)| (rank, entry as usize))
+                .collect(),
+            maximum_hits,
+        )
+    }
+
+    /// Exhaustive reference implementation of [`Self::search`].
+    fn search_by_scan(&self, normalized: &str, maximum_hits: usize) -> Vec<&LandmarkSearchEntry> {
+        rank_search_matches(
+            &self.entries,
+            self.entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    search_match_rank(entry, normalized).map(|rank| (rank, index))
+                })
+                .collect(),
+            maximum_hits,
+        )
     }
 
     #[must_use]
@@ -1030,9 +1143,12 @@ pub fn parse_landmark_search_index(
         .filter(|(_, entry)| !entry.transcript_id.is_empty())
         .map(|(index, entry)| (entry.transcript_id.clone(), index))
         .collect();
+    let sorted_terms = build_sorted_terms(&entries);
     Ok(LandmarkSearchIndex {
+        sorted_entry_count: entries.len(),
         entries,
         by_transcript,
+        sorted_terms,
     })
 }
 
@@ -1375,6 +1491,59 @@ mod tests {
             LandmarkSearchIndex::matching_term(&index.entries[1], "abc"),
             Some("ABC")
         );
+    }
+
+    #[test]
+    fn sorted_landmark_search_matches_the_exhaustive_scan() {
+        use std::fmt::Write as _;
+
+        let mut text = String::from("rgv_gene_names_v1\n");
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for index in 0..600_u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let symbol = format!(
+                "{}{}",
+                ["Ab", "aB", "abc", "B", "Zeta"][(state % 5) as usize],
+                state % 17
+            );
+            let synonym = if state.is_multiple_of(3) {
+                format!("AB{},b{}", state % 7, state % 5)
+            } else {
+                String::new()
+            };
+            let start = 5_000_000_000 + index;
+            writeln!(
+                text,
+                "{}\t{symbol}\tabG{}\tNM_{index}\tchr{}\t{start}\t{}\t+\t{synonym}",
+                symbol.to_ascii_lowercase(),
+                state % 11,
+                state % 4,
+                start + 10,
+            )
+            .unwrap();
+        }
+        let index = parse_landmark_search_index(&text).unwrap();
+        for query in [
+            "a", "AB", "ab1", "abc", "b", "b4", "zeta16", "nm_5", "abg", "q", " Ab ",
+        ] {
+            for maximum in [1, 7, 10_000] {
+                let normalized = query.trim().to_ascii_lowercase();
+                assert_eq!(
+                    index.search(query, maximum),
+                    index.search_by_scan(&normalized, maximum),
+                    "query {query:?} maximum {maximum}"
+                );
+            }
+        }
+        assert!(!index.search("ab", 10_000).is_empty());
+        assert!(index.search("", 5).is_empty());
+
+        // `entries` is public: a resized index falls back to the scan.
+        let mut resized = index.clone();
+        resized.entries.truncate(3);
+        assert_eq!(resized.search("a", 100), resized.search_by_scan("a", 100));
     }
 
     #[test]

@@ -124,18 +124,19 @@ pub fn project_alignment_gpu_instance(
     let row_top = camera.clip().y
         + (row - camera.row_scroll()) * camera.row_height()
         + (camera.row_height() - camera.read_height()) * 0.5;
-    let (mut y, mut height) = (row_top, camera.read_height());
+    // Minimum-size policy shared with `alignment_scene.wgsl` and the CPU projector: at least one
+    // point (>= one physical pixel) in both axes for every shape.
+    let (mut y, mut height) = (row_top, camera.read_height().max(1.0));
     if instance.shape == AlignmentGpuShape::EventLine as u32 {
         y = row_top + camera.read_height() * 0.45;
         height = (camera.read_height() * 0.10).max(1.0);
-    } else if instance.shape == AlignmentGpuShape::PointMarker as u32 {
+    }
+    if instance.shape == AlignmentGpuShape::PointMarker as u32 {
         let original_width = right - x;
         let marker_width = original_width.max(1.5);
         x -= (marker_width - original_width) * 0.5;
         right = x + marker_width;
-    } else if instance.shape == AlignmentGpuShape::DirectionTerminalRight as u32
-        || instance.shape == AlignmentGpuShape::DirectionTerminalLeft as u32
-    {
+    } else {
         right = right.max(x + 1.0);
     }
     let clip = camera.clip();
@@ -3030,6 +3031,20 @@ impl AlignmentGpuRenderer {
         pass: &mut wgpu::RenderPass<'pass>,
         frame: &'pass AlignmentGpuFrame,
     ) -> Result<(), AlignmentGpuRenderError> {
+        self.render_within(pass, frame, [u32::MAX; 2])
+    }
+
+    /// Replays `frame` like [`Self::render`], but first intersects every captured scissor with a
+    /// render target of `target_size` physical pixels. A frame is captured against one target
+    /// size and may be replayed after a resize or into a differently sized capture texture; a
+    /// scissor outside the attachment is a wgpu validation error, so draws whose scissor falls
+    /// wholly outside the target are skipped and the rest are clipped.
+    pub fn render_within<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        frame: &'pass AlignmentGpuFrame,
+        target_size: [u32; 2],
+    ) -> Result<(), AlignmentGpuRenderError> {
         if frame.device_generation != self.device_generation {
             return Err(AlignmentGpuRenderError::DeviceGenerationMismatch {
                 frame: frame.device_generation,
@@ -3048,12 +3063,18 @@ impl AlignmentGpuRenderer {
             let page = self
                 .page(draw.page)
                 .ok_or(AlignmentGpuRenderError::MissingPinnedPage(draw.page))?;
-            pass.set_scissor_rect(
-                draw.scissor.x,
-                draw.scissor.y,
-                draw.scissor.width,
-                draw.scissor.height,
-            );
+            let Some([x, y, width, height]) = crate::clamp_scissor_to_target(
+                [
+                    draw.scissor.x,
+                    draw.scissor.y,
+                    draw.scissor.width,
+                    draw.scissor.height,
+                ],
+                target_size,
+            ) else {
+                continue;
+            };
+            pass.set_scissor_rect(x, y, width, height);
             pass.set_bind_group(0, bind_group, &[draw.uniform_offset]);
             debug_assert!(page.instance_count > 0);
             pass.set_vertex_buffer(0, page.buffer.slice(..));
@@ -3071,6 +3092,40 @@ impl AlignmentGpuRenderer {
             pass.draw(0..6, 0..page.instance_count);
         }
         Ok(())
+    }
+
+    /// Rebuilds this renderer for a replacement GPU device, for example after the previous device
+    /// was lost. Every pipeline is recreated against `device` and `target_format`, every
+    /// device-derived page and frame buffer is dropped (releasing its ledger charge), and the
+    /// device generation advances so frames, leases and plans captured against the old device
+    /// are rejected instead of being replayed. Semantic scenes are untouched and are simply
+    /// admitted again.
+    pub fn rebuild_for_device(&mut self, device: &wgpu::Device, target_format: wgpu::TextureFormat) {
+        self.discard_device_resources();
+        let mut rebuilt = Self::new(device, target_format);
+        rebuilt.device_generation = self.device_generation;
+        rebuilt.revision = self.revision;
+        for (rebuilt, previous) in [
+            (
+                &rebuilt.content_manifest_builds,
+                &self.content_manifest_builds,
+            ),
+            (
+                &rebuilt.content_manifest_pages_enumerated,
+                &self.content_manifest_pages_enumerated,
+            ),
+            (
+                &rebuilt.prefetch_authority_keys_inspected,
+                &self.prefetch_authority_keys_inspected,
+            ),
+            (
+                &rebuilt.reclaim_authority_keys_inspected,
+                &self.reclaim_authority_keys_inspected,
+            ),
+        ] {
+            rebuilt.store(previous.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        *self = rebuilt;
     }
 
     /// Releases every device-derived page and frame buffer. Semantic scenes, picking, selection,
@@ -3807,7 +3862,7 @@ pub(crate) fn semantic_alignment_color(
     style: AlignmentStyleToken,
 ) -> [f32; 4] {
     match component {
-        AlignmentComponent::Base { base, .. } => base_color(base),
+        AlignmentComponent::Base { base, .. } => crate::palette::base_color(base),
         AlignmentComponent::ModifiedBase { state, .. } => match state {
             rgv_alignment_scene::ModificationState::Modified => [0.58, 0.24, 0.78, 1.0],
             rgv_alignment_scene::ModificationState::Canonical => [0.42, 0.42, 0.48, 1.0],
@@ -3854,23 +3909,25 @@ fn style_color(style: AlignmentStyleToken) -> [f32; 4] {
             ]
         }
         AlignmentBodyColorToken::Category(category) => category
-            .map_or([0.48, 0.48, 0.52, 1.0], |category| {
-                hash_color(category.get())
+            .map_or(crate::palette::UNCATEGORIZED_COLOR, |category| {
+                crate::palette::categorical_hash_color(category.get())
             }),
+        // Closed categories use explicit tables: hashing their small ranks put every member
+        // within a few degrees of red.
+        AlignmentBodyColorToken::PairOrientation(rank) => {
+            crate::palette::pair_orientation_color(rank)
+        }
         AlignmentBodyColorToken::TemplateLength { status, .. }
-        | AlignmentBodyColorToken::PairOrientation(status)
-        | AlignmentBodyColorToken::PairStatus(status) => hash_color(u64::from(status)),
+        | AlignmentBodyColorToken::PairStatus(status) => {
+            crate::palette::pair_classification_color(status)
+        }
         AlignmentBodyColorToken::FirstOfPairStrand(reverse) => match reverse {
             Some(false) => [0.28, 0.56, 0.78, 1.0],
             Some(true) => [0.80, 0.38, 0.42, 1.0],
             None => [0.50, 0.50, 0.54, 1.0],
         },
         AlignmentBodyColorToken::Specialist { mode, reverse } => {
-            let mut color = hash_color(u64::from(mode));
-            if reverse {
-                color[0] = (color[0] + 0.18).min(1.0);
-            }
-            color
+            crate::palette::specialist_body_color(mode, reverse)
         }
     }
 }
@@ -3921,31 +3978,6 @@ pub(crate) fn reference_interaction_color(
     }
     color[3] = 1.0;
     color
-}
-
-fn base_color(base: u8) -> [f32; 4] {
-    match base.to_ascii_uppercase() {
-        b'A' => [0.24, 0.66, 0.34, 1.0],
-        b'C' => [0.24, 0.46, 0.82, 1.0],
-        b'G' => [0.90, 0.64, 0.16, 1.0],
-        b'T' => [0.82, 0.28, 0.30, 1.0],
-        _ => [0.48, 0.48, 0.52, 1.0],
-    }
-}
-
-fn hash_color(value: u64) -> [f32; 4] {
-    let hue = (value % 360) as f32 / 360.0;
-    let sector = hue * 6.0;
-    let fraction = sector.fract();
-    let (r, g, b) = match sector as u32 % 6 {
-        0 => (1.0, fraction, 0.0),
-        1 => (1.0 - fraction, 1.0, 0.0),
-        2 => (0.0, 1.0, fraction),
-        3 => (0.0, 1.0 - fraction, 1.0),
-        4 => (fraction, 0.0, 1.0),
-        _ => (1.0, 0.0, 1.0 - fraction),
-    };
-    [0.25 + r * 0.50, 0.25 + g * 0.50, 0.25 + b * 0.50, 1.0]
 }
 
 fn camera_uniform(
@@ -4012,13 +4044,23 @@ fn create_camera_bind_group(
     })
 }
 
+/// Byte size of an immutable page buffer holding `count` instances of `T`.
+///
+/// Page buffers are written once and never grow, so they are allocated at their exact size,
+/// rounded up only to wgpu's copy alignment. (Rounding the instance count to a power of two, as
+/// the growable slot tables do, wasted up to half of every page's GPU memory.) The ledger is
+/// charged this same value, so accounted bytes equal allocated bytes.
 fn gpu_buffer_capacity<T>(count: usize) -> Result<usize, AlignmentGpuPageAdmissionError> {
-    if count == 0 {
-        return Ok(0);
-    }
-    next_capacity(count)?
-        .checked_mul(size_of::<T>())
+    exact_immutable_buffer_bytes(count, size_of::<T>())
         .ok_or(AlignmentGpuPageAdmissionError::CapacityOverflow)
+}
+
+/// `count * stride` rounded up to `wgpu::COPY_BUFFER_ALIGNMENT`, or `None` on overflow.
+pub(crate) fn exact_immutable_buffer_bytes(count: usize, stride: usize) -> Option<usize> {
+    let alignment = wgpu::COPY_BUFFER_ALIGNMENT as usize;
+    count
+        .checked_mul(stride)?
+        .checked_next_multiple_of(alignment)
 }
 
 fn next_capacity(count: usize) -> Result<usize, AlignmentGpuPageAdmissionError> {
@@ -4724,6 +4766,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: rgv_alignment_scene::ReadSampling::Complete,
         };
         let atlas = AlignmentRowAtlas::build(
             RowAtlasRevision::new(RevisionFingerprint::new(18, 19)),
@@ -4918,7 +4961,92 @@ mod tests {
             },
         )
         .unwrap();
-        let cpu = rgv_alignment_scene::CpuAlignmentProjector::project(&scene, 1, camera).unwrap();
+        assert_gpu_oracle_matches_cpu_projector(&scene, camera, false);
+    }
+
+    #[test]
+    fn sub_pixel_gpu_geometry_keeps_one_point_and_matches_the_cpu_projector() {
+        let ledger = AllocationLedger::new(16 << 20, 2 << 20);
+        let scene = test_scene(&ledger);
+        // The whole prepared interval squeezed into three points, with rows a quarter of a
+        // point tall: every primitive is far below one point in both axes.
+        let camera = AlignmentCamera::new(
+            scene.prepared_interval(),
+            0.0,
+            0.25,
+            0.2,
+            rgv_alignment_scene::CpuClipRect {
+                x: 17.0,
+                y: 23.0,
+                width: 3.0,
+                height: 137.0,
+            },
+        )
+        .unwrap();
+        assert_gpu_oracle_matches_cpu_projector(&scene, camera, true);
+    }
+
+    #[test]
+    fn immutable_page_buffers_are_exactly_sized() {
+        let stride = size_of::<AlignmentGpuInstance>();
+        assert_eq!(stride % wgpu::COPY_BUFFER_ALIGNMENT as usize, 0);
+        assert_eq!(gpu_buffer_capacity::<AlignmentGpuInstance>(0).unwrap(), 0);
+        for count in [1_usize, 2, 3, 5, 1_000, 1_025, 65_537] {
+            // Exactly the uploaded bytes: no power-of-two slack to waste or to mis-account.
+            assert_eq!(
+                gpu_buffer_capacity::<AlignmentGpuInstance>(count).unwrap(),
+                count * stride
+            );
+        }
+        // Odd strides are rounded up only to wgpu's copy alignment.
+        assert_eq!(exact_immutable_buffer_bytes(3, 5), Some(16));
+        assert_eq!(exact_immutable_buffer_bytes(4, 5), Some(20));
+        assert_eq!(exact_immutable_buffer_bytes(usize::MAX, 2), None);
+        assert!(matches!(
+            gpu_buffer_capacity::<AlignmentGpuInstance>(usize::MAX),
+            Err(AlignmentGpuPageAdmissionError::CapacityOverflow)
+        ));
+    }
+
+    #[test]
+    fn rebuilding_for_a_replacement_device_drops_pages_and_advances_the_generation() {
+        let Some((device, queue)) = headless_device() else {
+            return;
+        };
+        let ledger = AllocationLedger::new_with_transient_budget(16 << 20, 2 << 20, 8 << 20);
+        let scene = test_scene(&ledger);
+        let baseline = ledger.snapshot().unwrap().charged;
+        let mut renderer = AlignmentGpuRenderer::new(&device, wgpu::TextureFormat::Bgra8Unorm);
+        renderer
+            .admit_pages(&device, &queue, scene.pages(), &ledger, 10)
+            .unwrap();
+        assert!(renderer.resident_page_count() > 0);
+        assert!(ledger.snapshot().unwrap().charged > baseline);
+        let generation = renderer.device_generation;
+
+        // Stand-in for a lost device: a second, independent device.
+        let Some((replacement, replacement_queue)) = headless_device() else {
+            return;
+        };
+        renderer.rebuild_for_device(&replacement, wgpu::TextureFormat::Rgba8Unorm);
+        assert_eq!(renderer.resident_page_count(), 0);
+        assert!(renderer.device_generation > generation);
+        assert_eq!(ledger.snapshot().unwrap().charged, baseline);
+
+        // The rebuilt renderer is fully usable on the replacement device.
+        renderer
+            .admit_pages(&replacement, &replacement_queue, scene.pages(), &ledger, 11)
+            .unwrap();
+        assert!(renderer.resident_page_count() > 0);
+    }
+
+    fn assert_gpu_oracle_matches_cpu_projector(
+        scene: &Arc<AlignmentPresentationScene>,
+        camera: AlignmentCamera,
+        expect_minimum_size: bool,
+    ) {
+        let cpu = rgv_alignment_scene::CpuAlignmentProjector::project(scene, 1, camera).unwrap();
+        let mut compared = 0_usize;
 
         for page in scene.pages() {
             let packed = PackedAlignmentPage::from_semantic(page).unwrap();
@@ -4937,6 +5065,17 @@ mod tests {
                 ) else {
                     continue;
                 };
+                compared += 1;
+                if expect_minimum_size {
+                    // Unless the pane edge cuts it, nothing is thinner than one point.
+                    let clip = camera.clip();
+                    let cut_horizontally = gpu.x <= clip.x + 1.0e-9
+                        || gpu.x + gpu.width >= clip.x + clip.width - 1.0e-9;
+                    let cut_vertically = gpu.y <= clip.y + 1.0e-9
+                        || gpu.y + gpu.height >= clip.y + clip.height - 1.0e-9;
+                    assert!(cut_horizontally || gpu.width >= 1.0 - 1.0e-9, "{gpu:?}");
+                    assert!(cut_vertically || gpu.height >= 1.0 - 1.0e-9, "{gpu:?}");
+                }
                 let row = page.row_range().start + semantic.row_offset;
                 let matching = cpu.primitives.iter().find(|candidate| {
                     candidate.handle == semantic.handle
@@ -4954,6 +5093,7 @@ mod tests {
                 );
             }
         }
+        assert!(compared > 0, "the camera must project at least one instance");
     }
 
     #[test]

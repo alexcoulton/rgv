@@ -132,7 +132,7 @@ impl Viewer {
 
     pub(crate) fn start_session_save(&mut self, path: PathBuf) {
         if let Err(error) = self.try_start_session_save(path, None) {
-            self.data_status = format!("Could not start project save: {error}");
+            self.report_error(format!("Could not start project save: {error}"));
         }
     }
 
@@ -203,11 +203,22 @@ impl Viewer {
             return;
         }
         self.observe_document_changes();
+        // Rewriting an unchanged document would only rotate distinct older snapshots out of the
+        // retention window.
+        let marker = self.document_state.autosave_marker();
+        if !crate::app::shell_state::autosave_needed(
+            self.document_state.is_dirty(),
+            marker,
+            self.document_state.shell.last_autosaved,
+        ) {
+            return;
+        }
         let document = self.session_document();
         let ticket = self.document_state.ticket();
         let (path, prefix) = autosave_snapshot_path(
             &self.settings_path,
             self.current_session_path.as_deref(),
+            &self.application_instance_id,
             SystemTime::now(),
         );
         let path = match self.ensure_session_destination_available(&path) {
@@ -229,15 +240,20 @@ impl Viewer {
                         .map_err(|error| error.to_string())
                 }
             }) {
-            Ok(worker) => self.session_save_tasks.push(SessionSaveTask {
-                path,
-                kind: SessionSaveKind::Autosave,
-                automation_command: None,
-                ticket,
-                worker,
-            }),
+            Ok(worker) => {
+                // Recorded when the write starts; a failed write clears it so the next interval
+                // retries.
+                self.document_state.shell.last_autosaved = Some(marker);
+                self.session_save_tasks.push(SessionSaveTask {
+                    path,
+                    kind: SessionSaveKind::Autosave,
+                    automation_command: None,
+                    ticket,
+                    worker,
+                });
+            }
             Err(error) => {
-                self.data_status = format!("Could not start recovery autosave: {error}");
+                self.report_error(format!("Could not start recovery autosave: {error}"));
                 self.mark_display_dirty("explicit display invalidation");
             }
         }
@@ -260,6 +276,16 @@ impl Viewer {
             let path = task.path;
             let outcome = task.worker.join();
             let automation_command = task.automation_command;
+            let manual_save_succeeded = match (task.kind, &outcome) {
+                (SessionSaveKind::Manual, Ok(Ok(()))) => Some(true),
+                (SessionSaveKind::Manual, _) => Some(false),
+                (SessionSaveKind::Autosave, Ok(Ok(()))) => None,
+                (SessionSaveKind::Autosave, _) => {
+                    self.document_state.shell.last_autosaved = None;
+                    None
+                }
+            };
+            let failed = !matches!(outcome, Ok(Ok(())));
             let (status, automation_outcome) = match (task.kind, outcome) {
                 (SessionSaveKind::Manual, Ok(Ok(()))) => {
                     if self.document_state.complete_save(task.ticket) {
@@ -311,9 +337,17 @@ impl Viewer {
                     ("Recovery-autosave worker failed".to_owned(), None)
                 }
             };
-            self.data_status = status;
+            if failed {
+                self.report_error(status);
+            } else {
+                self.data_status = status;
+            }
             if let (Some(command_index), Some(outcome)) = (automation_command, automation_outcome) {
                 self.finish_automation_command(command_index, outcome);
+            }
+            if let Some(succeeded) = manual_save_succeeded {
+                // Resume an exit or project open that was waiting for this save.
+                self.unsaved_gate_save_finished(succeeded);
             }
             self.mark_display_dirty("explicit display invalidation");
         }
@@ -334,7 +368,7 @@ impl Viewer {
 
     pub(crate) fn start_session_load(&mut self, path: PathBuf, kind: SessionLoadKind) {
         if let Err(error) = self.try_start_session_load(path, kind, None, None, None) {
-            self.data_status = format!("Could not start project open: {error}");
+            self.report_error(format!("Could not start project open: {error}"));
         }
     }
 
@@ -397,9 +431,14 @@ impl Viewer {
                                 let parent = std::path::absolute(parent)
                                     .map_err(|error| error.to_string())?;
                                 document.resolve_project_paths(parent);
+                                let mut report = imported.report;
+                                crate::workspace::genomes::resolve_imported_session_genome(
+                                    &mut document,
+                                    &mut report,
+                                );
                                 Ok(LoadedSession {
                                     document,
-                                    igv_report: Some(imported.report),
+                                    igv_report: Some(report),
                                 })
                             }),
                     }
@@ -463,7 +502,15 @@ impl Viewer {
             {
                 self.current_session_path.clone_from(&task.save_destination);
             }
-            if !self.document_state.load_can_commit(task.ticket) {
+            // Automation asked for an exact replacement and keeps the strict revision check. A
+            // GUI open was already confirmed through the unsaved-changes gate, so revisions
+            // bumped by unrelated background work while the file was read do not reject it.
+            let can_commit = if task.automation_command.is_some() {
+                self.document_state.load_can_commit(task.ticket)
+            } else {
+                self.document_state.gui_load_can_commit(task.ticket)
+            };
+            if !can_commit {
                 let current = self.document_state.current_load(task.ticket);
                 let _ = task.worker.join();
                 if current {
@@ -537,21 +584,23 @@ impl Viewer {
                             self.schedule_next_autosave();
                         }
                         Err(error) => {
-                            self.data_status =
-                                format!("Could not apply project {}: {error}", path.display());
+                            self.report_error(format!(
+                                "Could not apply project {}: {error}",
+                                path.display()
+                            ));
                         }
                     }
                 }
                 Ok(Err(error)) => {
                     failure_code = AutomationErrorCode::Io;
-                    self.data_status = format!("Could not open {}: {error}", path.display());
+                    self.report_error(format!("Could not open {}: {error}", path.display()));
                 }
                 Err(_) => {
                     failure_code = AutomationErrorCode::Internal;
-                    self.data_status = format!(
+                    self.report_error(format!(
                         "Project-load worker failed while reading {}",
                         path.display()
-                    );
+                    ));
                 }
             }
             if let Some(command) = task.automation_command {
@@ -641,7 +690,11 @@ impl Viewer {
                     )
                 }
             };
-            self.data_status = status;
+            if status.starts_with("Exported ") {
+                self.data_status = status;
+            } else {
+                self.report_error(status);
+            }
             if let (Some(command_index), Some(outcome)) = (automation_command, automation_outcome) {
                 self.finish_automation_command(command_index, outcome);
             }

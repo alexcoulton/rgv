@@ -326,6 +326,26 @@ impl ExactSummaryRoot {
         &self.junctions
     }
 
+    /// Exact junctions which start left of the prepared interval and reach into it. Their owner
+    /// tile is not part of this root, so they are taken from the first prepared tile, whose
+    /// selection contains every supporting read.
+    #[must_use]
+    pub fn entering_junctions(&self) -> &[JunctionEvidence] {
+        self.junctions
+            .first()
+            .map_or(&[], |tile| tile.entering_junctions())
+    }
+
+    /// [`Self::entering_junctions`] when `tile` is the first prepared tile, otherwise nothing:
+    /// every later tile's entering junctions are owned by an earlier prepared tile.
+    #[must_use]
+    pub fn entering_junctions_for(&self, tile: crate::CanonicalGenomicTile) -> &[JunctionEvidence] {
+        self.junctions
+            .first()
+            .filter(|first| first.tile() == tile)
+            .map_or(&[], |first| first.entering_junctions())
+    }
+
     /// Stable expanded row for a junction owned by this immutable root.
     #[must_use]
     pub fn expanded_junction_row(&self, start: u64, end: u64) -> Option<u32> {
@@ -576,9 +596,13 @@ impl ExactSummaryRoot {
     ) -> Result<usize, ExactSummaryQueryError> {
         self.validate_query(interval)?;
         Ok(self
-            .junctions
+            .entering_junctions()
             .iter()
-            .flat_map(|tile| tile.summary().junctions.iter())
+            .chain(
+                self.junctions
+                    .iter()
+                    .flat_map(|tile| tile.summary().junctions.iter()),
+            )
             .filter(|junction| junction.start < interval.end() && junction.end > interval.start())
             .count())
     }
@@ -590,9 +614,14 @@ impl ExactSummaryRoot {
     ) -> Result<(), ExactSummaryQueryError> {
         self.validate_query(interval)?;
         for junction in self
-            .junctions
+            .entering_junctions()
             .iter()
-            .flat_map(|tile| tile.summary().junctions.iter().copied())
+            .copied()
+            .chain(
+                self.junctions
+                    .iter()
+                    .flat_map(|tile| tile.summary().junctions.iter().copied()),
+            )
             .filter(|junction| junction.start < interval.end() && junction.end > interval.start())
         {
             visit(junction);
@@ -854,9 +883,17 @@ fn project_overview_depths(
 fn expanded_junction_row_assignments(
     junctions: &[Arc<ExactJunctionSummaryTile>],
 ) -> Result<Vec<ExpandedJunctionRowAssignment>, ExactSummaryRootError> {
+    // Junctions entering the first prepared tile have no owner tile in this root but are drawn
+    // from it, so they take part in the same expanded-row packing.
     let mut spans = junctions
+        .first()
+        .map_or(&[][..], |tile| tile.entering_junctions())
         .iter()
-        .flat_map(|tile| tile.summary().junctions.iter())
+        .chain(
+            junctions
+                .iter()
+                .flat_map(|tile| tile.summary().junctions.iter()),
+        )
         .map(|junction| (junction.start, junction.end))
         .collect::<Vec<_>>();
     spans.sort_unstable();

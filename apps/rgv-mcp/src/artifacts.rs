@@ -35,21 +35,24 @@ impl ArtifactStore {
         })
     }
 
-    pub(crate) fn temporary_path(&self, extension: &str) -> PathBuf {
+    /// Reserves a unique temporary artifact path. The file the viewer writes there is removed
+    /// when the returned guard is dropped, so every exit path of a tool discards it.
+    pub(crate) fn temporary(&self, extension: &str) -> TemporaryArtifact {
         let identity = self.counter.fetch_add(1, Ordering::Relaxed);
-        self.temporary_directory.join(format!(
-            "rgv-mcp-{}-{identity}.{extension}",
-            std::process::id()
-        ))
+        TemporaryArtifact {
+            path: self.temporary_directory.join(format!(
+                "rgv-mcp-{}-{identity}.{extension}",
+                std::process::id()
+            )),
+            store: self.clone(),
+        }
     }
 
-    pub(crate) fn read_temporary_capture(&self, path: &Path) -> Result<Vec<u8>, ArtifactError> {
-        let result = self.read_confined(path, MAXIMUM_CAPTURE_BYTES);
-        self.discard_temporary(path);
-        result
+    fn read_temporary_capture(&self, path: &Path) -> Result<Vec<u8>, ArtifactError> {
+        self.read_confined(path, MAXIMUM_CAPTURE_BYTES)
     }
 
-    pub(crate) fn discard_temporary(&self, path: &Path) {
+    fn discard_temporary(&self, path: &Path) {
         if path.parent() == Some(self.temporary_directory.as_ref()) {
             let _ = std::fs::remove_file(path);
         }
@@ -114,6 +117,30 @@ impl ArtifactStore {
     }
 }
 
+/// A temporary artifact owned by one tool call. Dropping the guard removes the file, whether the
+/// call succeeded, failed validation, or returned early.
+pub(crate) struct TemporaryArtifact {
+    path: PathBuf,
+    store: ArtifactStore,
+}
+
+impl TemporaryArtifact {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Reads the bounded, root-confined capture. The file itself is removed on drop.
+    pub(crate) fn read_capture(&self) -> Result<Vec<u8>, ArtifactError> {
+        self.store.read_temporary_capture(&self.path)
+    }
+}
+
+impl Drop for TemporaryArtifact {
+    fn drop(&mut self) {
+        self.store.discard_temporary(&self.path);
+    }
+}
+
 fn ensure_directory_without_symlinks(
     root: &Path,
     relative: &Path,
@@ -170,10 +197,87 @@ mod tests {
     fn generated_artifacts_are_confined_and_removed_after_reading() {
         let root = tempfile::tempdir().unwrap();
         let store = ArtifactStore::new(root.path(), Path::new("artifacts")).unwrap();
-        let path = store.temporary_path("png");
+        let temporary = store.temporary("png");
+        let path = temporary.path().to_owned();
         std::fs::write(&path, b"png").unwrap();
-        assert_eq!(store.read_temporary_capture(&path).unwrap(), b"png");
+        assert_eq!(temporary.read_capture().unwrap(), b"png");
+        assert!(path.exists(), "the guard, not the read, owns removal");
+        drop(temporary);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn temporary_artifact_is_removed_on_an_early_return_without_a_read() {
+        fn fails_before_reading(store: &ArtifactStore) -> Result<PathBuf, PathBuf> {
+            let temporary = store.temporary("png");
+            std::fs::write(temporary.path(), b"png").unwrap();
+            // Models a validation failure between the viewer write and the adapter read.
+            Err(temporary.path().to_owned())
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::new(root.path(), Path::new("artifacts")).unwrap();
+        let path = fails_before_reading(&store).unwrap_err();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn temporary_artifact_guard_tolerates_a_file_that_was_never_written() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::new(root.path(), Path::new("artifacts")).unwrap();
+        let temporary = store.temporary("png");
+        let path = temporary.path().to_owned();
+        assert!(temporary.read_capture().is_err());
+        drop(temporary);
+        assert!(!path.exists());
+        assert_ne!(store.temporary("png").path(), path);
+    }
+
+    #[test]
+    fn oversized_and_non_regular_captures_are_rejected_and_discarded() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::new(root.path(), Path::new("artifacts")).unwrap();
+        let temporary = store.temporary("png");
+        std::fs::create_dir(temporary.path()).unwrap();
+        assert!(matches!(
+            temporary.read_capture(),
+            Err(ArtifactError::NotRegularFile)
+        ));
+        let directory = temporary.path().to_owned();
+        drop(temporary);
+        // Only regular files are discarded; a directory is left for the operator to inspect.
+        assert!(directory.is_dir());
+        assert!(matches!(
+            store.read_confined(&directory, 1),
+            Err(ArtifactError::NotRegularFile)
+        ));
+        let file = root.path().join("artifacts/large.txt");
+        std::fs::write(&file, b"four").unwrap();
+        assert!(matches!(
+            store.read_confined(&file, 3),
+            Err(ArtifactError::TooLarge)
+        ));
+        assert_eq!(store.read_durable_text(&file, 3).unwrap(), None);
+    }
+
+    #[test]
+    fn durable_paths_reject_traversal_and_absolute_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::new(root.path(), Path::new("artifacts")).unwrap();
+        assert!(matches!(
+            store.durable_path(Path::new("../escape.tsv")),
+            Err(ArtifactError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            store.durable_path(Path::new("/etc/passwd")),
+            Err(ArtifactError::InvalidPath(_))
+        ));
+        let accepted = store.durable_path(Path::new("exports/a.tsv")).unwrap();
+        std::fs::write(&accepted, b"x").unwrap();
+        assert_eq!(
+            store.relative_display(&accepted).unwrap(),
+            Path::new("exports").join("a.tsv").display().to_string()
+        );
     }
 
     #[cfg(unix)]

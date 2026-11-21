@@ -269,6 +269,7 @@ pub(super) fn alignment_scene_snapshot() -> Arc<AlignmentSceneSnapshot> {
         view_as_pairs: false,
         pair_length_bounds: TemplateLengthBounds::default(),
         promoted_template: None,
+        sampling: rgv_alignment_scene::ReadSampling::Complete,
     };
     let atlas = AlignmentRowAtlas::build(
         RowAtlasRevision::new(RevisionFingerprint::new(20, 21)),

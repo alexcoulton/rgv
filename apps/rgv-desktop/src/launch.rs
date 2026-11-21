@@ -28,6 +28,10 @@ pub(super) struct LaunchOptions {
     /// Portable JSON genome bundle describing FASTA, aliases, cytobands, and default annotations.
     #[arg(long, conflicts_with_all = ["session", "import_igv"])]
     pub(super) genome_config: Option<PathBuf>,
+    /// IGV-compatible genome: a hosted genome id such as hg38, or the path or URL of an IGV
+    /// genome JSON. Its small resources are cached, so it opens offline afterwards.
+    #[arg(long, conflicts_with_all = ["session", "import_igv", "genome_config"])]
+    pub(super) genome: Option<String>,
     /// UCSC cytoband TSV used to draw chromosome ideograms.
     #[arg(long)]
     pub(super) cytobands: Option<PathBuf>,
@@ -153,6 +157,42 @@ pub(super) struct LaunchOptions {
 }
 
 impl LaunchOptions {
+    /// Loads `--genome-config` or `--genome` and derives the reference and ideogram from it.
+    fn load_launch_genome(&mut self) -> Result<()> {
+        let configuration = if let Some(path) = &self.genome_config {
+            Some(GenomeConfiguration::read(path).with_context(|| {
+                format!("failed to read genome configuration {}", path.display())
+            })?)
+        } else if let Some(genome) = &self.genome {
+            let import = crate::workspace::genomes::load_genome_blocking(genome)?;
+            for notice in &import.notices {
+                tracing::warn!(%genome, %notice, "genome description notice");
+            }
+            Some(import.configuration)
+        } else {
+            None
+        };
+        self.loaded_genome = if let Some(configuration) = configuration {
+            self.reference = Some(source_path(&configuration.reference));
+            if self.remote_reference_index_url.is_none() {
+                self.remote_reference_index_url
+                    .clone_from(&configuration.reference_index);
+            }
+            self.genome_name.clone_from(&configuration.name);
+            self.cytobands = match &configuration.cytobands {
+                Some(TrackSource::Local { path }) => Some(PathBuf::from(path)),
+                Some(TrackSource::Remote { .. }) => {
+                    anyhow::bail!("remote cytoband files are not yet supported")
+                }
+                None => None,
+            };
+            Some(configuration)
+        } else {
+            None
+        };
+        Ok(())
+    }
+
     pub(super) fn load_session(&mut self) -> Result<()> {
         self.load_landmark_catalogue();
         let settings_path = self
@@ -178,23 +218,7 @@ impl LaunchOptions {
         } else {
             DesktopSettings::default()
         };
-        self.loaded_genome = if let Some(path) = &self.genome_config {
-            let configuration = GenomeConfiguration::read(path).with_context(|| {
-                format!("failed to read genome configuration {}", path.display())
-            })?;
-            self.reference = Some(source_path(&configuration.reference));
-            self.genome_name.clone_from(&configuration.name);
-            self.cytobands = match &configuration.cytobands {
-                Some(TrackSource::Local { path }) => Some(PathBuf::from(path)),
-                Some(TrackSource::Remote { .. }) => {
-                    anyhow::bail!("remote cytoband files are not yet supported")
-                }
-                None => None,
-            };
-            Some(configuration)
-        } else {
-            None
-        };
+        self.load_launch_genome()?;
         let mut document = if let Some(path) = &self.session {
             Some(
                 SessionDocument::read(path)
@@ -211,7 +235,13 @@ impl LaunchOptions {
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
             document.resolve_project_paths(std::path::absolute(parent)?);
-            self.loaded_igv_report = Some(imported.report);
+            let mut report = imported.report;
+            crate::workspace::genomes::resolve_imported_session_genome(&mut document, &mut report);
+            if document.remote_reference_index_url.is_some() {
+                self.remote_reference_index_url
+                    .clone_from(&document.remote_reference_index_url);
+            }
+            self.loaded_igv_report = Some(report);
             Some(document)
         } else {
             None
@@ -585,12 +615,35 @@ pub(super) fn autosave_group_prefix(project_path: Option<&Path>) -> String {
     format!("{safe}-{:016x}", stable_path_hash(project_path))
 }
 
+/// Autosave group for one document in one running instance.
+///
+/// A saved project is identified by its path. Untitled projects have no path, so every running
+/// instance would otherwise share one group and rotate out each other's snapshots; they are
+/// scoped by the application instance instead.
+pub(super) fn autosave_instance_prefix(project_path: Option<&Path>, instance_id: &str) -> String {
+    let group = autosave_group_prefix(project_path);
+    if project_path.is_some() {
+        return group;
+    }
+    let instance = instance_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(16)
+        .collect::<String>();
+    if instance.is_empty() {
+        group
+    } else {
+        format!("{group}-{instance}")
+    }
+}
+
 pub(super) fn autosave_snapshot_path(
     settings_path: &Path,
     project_path: Option<&Path>,
+    instance_id: &str,
     now: SystemTime,
 ) -> (PathBuf, String) {
-    let prefix = autosave_group_prefix(project_path);
+    let prefix = autosave_instance_prefix(project_path, instance_id);
     let milliseconds = now
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -599,26 +652,49 @@ pub(super) fn autosave_snapshot_path(
     (autosave_directory(settings_path).join(name), prefix)
 }
 
+fn autosave_timestamp(path: &Path) -> Option<&str> {
+    path.file_name()?
+        .to_str()?
+        .strip_suffix(".autosave.json")?
+        .rsplit('-')
+        .next()
+}
+
+/// Keeps the newest `retention` snapshots of this group, then bounds the whole directory:
+/// instance-scoped groups of earlier runs are never pruned by their own instance again, so the
+/// oldest snapshots of other groups are removed beyond [`MAX_RECOVERY_CANDIDATES`].
 pub(super) fn prune_autosaves(
     directory: &Path,
     prefix: &str,
     retention: usize,
 ) -> std::io::Result<()> {
     let file_prefix = format!("{prefix}-");
-    let mut matching = std::fs::read_dir(directory)?
+    let (mut matching, mut others): (Vec<_>, Vec<_>) = std::fs::read_dir(directory)?
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
                 .and_then(|value| value.to_str())
-                .is_some_and(|name| {
-                    name.starts_with(&file_prefix) && name.ends_with(".autosave.json")
-                })
+                .is_some_and(|name| name.ends_with(".autosave.json"))
         })
-        .collect::<Vec<_>>();
+        .partition(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with(&file_prefix))
+        });
     matching.sort_unstable();
     let remove_count = matching.len().saturating_sub(retention);
     for path in matching.into_iter().take(remove_count) {
+        std::fs::remove_file(path)?;
+    }
+    // Oldest first by the zero-padded timestamp, which sorts lexicographically.
+    others.sort_unstable_by(|left, right| {
+        autosave_timestamp(left)
+            .cmp(&autosave_timestamp(right))
+            .then_with(|| left.cmp(right))
+    });
+    let remove_count = others.len().saturating_sub(MAX_RECOVERY_CANDIDATES);
+    for path in others.into_iter().take(remove_count) {
         std::fs::remove_file(path)?;
     }
     Ok(())
@@ -642,6 +718,54 @@ pub(super) fn discover_recovery_candidates(settings_path: &Path) -> Vec<PathBuf>
     candidates
 }
 
+/// Whether a process with this id is currently running. An undeterminable answer counts as
+/// not running, so a recovery prompt is offered rather than suppressed.
+pub(super) fn process_is_alive(pid: u32) -> bool {
+    use std::process::{Command, Stdio};
+    if cfg!(unix) {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    } else if cfg!(windows) {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+            })
+    } else {
+        false
+    }
+}
+
+/// Process id recorded in a run marker file name or, for the legacy shared marker, its body.
+fn run_marker_pid(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    if let Some(pid) = name
+        .strip_prefix("rgv-running.")
+        .and_then(|rest| rest.strip_suffix(".marker"))
+        && let Ok(pid) = pid.parse()
+    {
+        return Some(pid);
+    }
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// One marker per running process (`rgv-running.<pid>.marker`). A marker whose process is no
+/// longer alive is evidence of an unclean exit; a marker of a live process is simply another
+/// instance and is left alone.
 pub(super) struct RunMarker {
     path: Option<PathBuf>,
     previous_unclean_exit: bool,
@@ -649,21 +773,54 @@ pub(super) struct RunMarker {
 
 impl RunMarker {
     pub(super) fn start(settings_path: &Path) -> Self {
-        let marker_path = settings_path.with_file_name("rgv-running.marker");
-        let previous_unclean_exit = marker_path.exists();
-        let parent_ready = marker_path.parent().is_none_or(|parent| {
-            if parent.as_os_str().is_empty() {
-                return true;
+        Self::start_with(settings_path, std::process::id(), process_is_alive)
+    }
+
+    pub(super) fn start_with(
+        settings_path: &Path,
+        own_pid: u32,
+        is_alive: impl Fn(u32) -> bool,
+    ) -> Self {
+        let marker_path = settings_path.with_file_name(format!("rgv-running.{own_pid}.marker"));
+        let directory = marker_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let mut previous_unclean_exit = false;
+        if let Ok(entries) = std::fs::read_dir(&directory) {
+            for path in entries
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+            {
+                let is_marker = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("rgv-running") && name.ends_with(".marker")
+                    });
+                if !is_marker {
+                    continue;
+                }
+                // Our own pid cannot belong to an earlier live instance: the marker is stale.
+                let stale = run_marker_pid(&path).is_none_or(|pid| pid == own_pid || !is_alive(pid));
+                if stale {
+                    previous_unclean_exit = true;
+                    if let Err(error) = std::fs::remove_file(&path) {
+                        tracing::warn!(%error, "could not remove stale run marker");
+                    }
+                }
             }
-            if let Err(error) = std::fs::create_dir_all(parent) {
+        }
+        let parent_ready = match std::fs::create_dir_all(&directory) {
+            Ok(()) => true,
+            Err(error) => {
                 tracing::warn!(%error, "could not create run-marker directory");
-                return false;
+                false
             }
-            true
-        });
+        };
         let path = parent_ready
             .then(|| {
-                let marker = format!("pid={}\n", std::process::id());
+                let marker = format!("pid={own_pid}\n");
                 match std::fs::write(&marker_path, marker) {
                     Ok(()) => Some(marker_path.clone()),
                     Err(error) => {
@@ -695,6 +852,102 @@ impl RunMarker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_markers_are_per_process_and_only_dead_processes_mean_an_unclean_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let alive = |pid: u32| pid == 100;
+
+        let mut first = RunMarker::start_with(&settings, 100, alive);
+        assert!(!first.previous_unclean_exit());
+        assert!(directory.path().join("rgv-running.100.marker").exists());
+
+        // A second instance starts while the first is still running: not a crash, and the
+        // first instance's marker is untouched.
+        let mut second = RunMarker::start_with(&settings, 200, alive);
+        assert!(!second.previous_unclean_exit());
+        assert!(directory.path().join("rgv-running.100.marker").exists());
+
+        // The second exits cleanly without clearing the first instance's marker.
+        second.finish();
+        assert!(directory.path().join("rgv-running.100.marker").exists());
+        assert!(!directory.path().join("rgv-running.200.marker").exists());
+
+        // Process 300 crashed earlier and left its marker; a legacy shared marker is also stale.
+        std::fs::write(directory.path().join("rgv-running.300.marker"), "pid=300\n").unwrap();
+        std::fs::write(directory.path().join("rgv-running.marker"), "pid=301\n").unwrap();
+        let mut third = RunMarker::start_with(&settings, 400, alive);
+        assert!(third.previous_unclean_exit());
+        assert!(!directory.path().join("rgv-running.300.marker").exists());
+        assert!(!directory.path().join("rgv-running.marker").exists());
+        assert!(directory.path().join("rgv-running.100.marker").exists());
+
+        // The stale markers were consumed: the next start is clean.
+        let mut fourth = RunMarker::start_with(&settings, 500, |pid| pid == 100 || pid == 400);
+        assert!(!fourth.previous_unclean_exit());
+        first.finish();
+        third.finish();
+        fourth.finish();
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn this_process_is_alive_and_an_unused_pid_is_not() {
+        assert!(process_is_alive(std::process::id()));
+        assert!(!process_is_alive(u32::MAX - 7));
+    }
+
+    #[test]
+    fn untitled_autosaves_are_scoped_to_the_instance_and_the_directory_is_bounded() {
+        let project = Path::new("/data/review.json");
+        assert_eq!(
+            autosave_instance_prefix(Some(project), "instance-a"),
+            autosave_instance_prefix(Some(project), "instance-b"),
+            "a saved project is one group whichever instance writes it"
+        );
+        let first = autosave_instance_prefix(None, "instance-a");
+        let second = autosave_instance_prefix(None, "instance-b");
+        assert_ne!(first, second);
+        assert!(first.starts_with("untitled-"));
+
+        let directory = tempfile::tempdir().unwrap();
+        let settings = directory.path().join("settings.json");
+        let autosaves = autosave_directory(&settings);
+        std::fs::create_dir(&autosaves).unwrap();
+        let write = |instance: &str, millisecond: u64| {
+            let (path, prefix) = autosave_snapshot_path(
+                &settings,
+                None,
+                instance,
+                UNIX_EPOCH + Duration::from_millis(millisecond),
+            );
+            std::fs::write(&path, b"snapshot").unwrap();
+            (path, prefix)
+        };
+        let (other_instance, _) = write("instance-b", 1);
+        let mut prefix = String::new();
+        for millisecond in 2..=5 {
+            prefix = write("instance-a", millisecond).1;
+        }
+        prune_autosaves(&autosaves, &prefix, 2).unwrap();
+        assert!(
+            other_instance.exists(),
+            "one instance's retention never rotates out another instance's snapshot"
+        );
+        assert_eq!(std::fs::read_dir(&autosaves).unwrap().count(), 3);
+
+        // Groups left by earlier runs are bounded as a whole, oldest first.
+        for index in 0..MAX_RECOVERY_CANDIDATES as u64 + 5 {
+            write(&format!("old{index}"), 1_000 + index);
+        }
+        prune_autosaves(&autosaves, &prefix, 2).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&autosaves).unwrap().count(),
+            MAX_RECOVERY_CANDIDATES + 2
+        );
+        assert!(!other_instance.exists(), "the oldest foreign snapshot goes first");
+    }
 
     #[test]
     fn manual_diagnostic_trace_launch_is_explicit_and_selects_its_output_directory() {

@@ -16,7 +16,7 @@ use rgv_alignment_scene::{
 use rgv_core::ReferenceDictionary;
 use rgv_hts::{
     AlignmentHeaderMetadata, AlignmentIndexOverview, AlignmentOpenOptions, AlignmentSource,
-    LocalAlignmentSource, QueryOptions,
+    ProductionAlignmentSource, QueryOptions,
 };
 
 use crate::alignment_scene_coordinator::coordinator_budget_pressure;
@@ -27,11 +27,25 @@ use crate::{
     AlignmentScenePreparationPolicy, AlignmentSceneSourceCoordinator, AlignmentSourceActor,
     CanonicalAlignmentSourceBackend, EngineQueueError, LocalBamCanonicalBackend, SourceIntentKind,
     SourceOwnerId,
-    mailbox::{CoalescingReceiver, CoalescingSender, TryMailboxSendError, bounded_coalescing},
+    mailbox::{
+        CoalescingReceiver, CoalescingSender, TryMailboxSendError, bounded_coalescing,
+        bounded_coalescing_to_ui, run_thread_root,
+    },
 };
 
-const WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
+/// Safety timeout for a worker with nothing runnable. Every request arrives through the mailbox
+/// and wakes the worker at once; this bound only limits how long a missed wake could last and
+/// how soon a pressure-paused lane notices capacity released by another ledger owner.
+const WORKER_IDLE_WAIT: Duration = Duration::from_millis(250);
+/// How long the worker listens for requests while its decoder thread has no finished unit and
+/// the backend cannot wake it. This is the polling fallback only.
+const SOURCE_POLL_WAIT: Duration = Duration::from_millis(1);
+/// Safety timeout for the same wait when the backend wakes the worker as soon as a unit is ready.
+const SOURCE_WAKE_SAFETY_WAIT: Duration = Duration::from_millis(100);
 const MAXIMUM_INPUT_BURST: usize = 32;
+/// Foreground turns a pending reclaim may be passed over before it is given one quantum. Visible
+/// work goes first, but a long decode must not starve a transaction another owner waits on.
+const MAXIMUM_RECLAIM_DEFERRALS: u32 = 4;
 /// Maintenance deliberately yields after this many ownership removals. The value bounds work per
 /// checkpoint; it is not a memory-policy constant and does not change which exact data is kept.
 const MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM: usize = 256;
@@ -83,6 +97,10 @@ pub enum AlignmentInactiveEvictionSupersession {
     DisjointCamera,
     BudgetPolicyChange,
     CacheClear,
+    /// A newer reclaim request adopted the in-flight cycle; the older ID will never complete.
+    NewerRequest,
+    /// The reclaim itself failed. The accompanying `Error` event carries the cause.
+    ReclaimFailed,
 }
 
 /// Coarse worker boundary used only for slow-phase diagnostics. It identifies which synchronous
@@ -358,10 +376,15 @@ where
     pub fn spawn(coordinator: AlignmentSceneSourceCoordinator<B>, control_capacity: usize) -> Self {
         let ledger = coordinator.actor().store().ledger();
         let (input_tx, input_rx) = bounded_coalescing(control_capacity);
-        let (output_tx, output_rx) = bounded_coalescing(control_capacity);
+        let (output_tx, output_rx) = bounded_coalescing_to_ui(control_capacity);
         let worker = thread::Builder::new()
             .name("rgv-alignment-scene-source".to_owned())
-            .spawn(move || scene_worker_loop(coordinator, &input_rx, &output_tx))
+            .spawn(move || {
+                run_thread_root(
+                    || scene_worker_loop(coordinator, &input_rx, &output_tx),
+                    |message| report_worker_panic(&output_tx, false, &message),
+                );
+            })
             .expect("failed to spawn RGV unified alignment scene worker");
         Self {
             input: Some(input_tx),
@@ -678,76 +701,26 @@ where
 }
 
 impl AlignmentSceneEngine<LocalBamCanonicalBackend> {
-    /// Opens and owns a local BAM entirely on the unified scene source thread. The caller can
+    /// Opens and owns one alignment source entirely on the unified scene source thread. The
+    /// path may name a local BAM or CRAM, or an `http(s)` BAM or CRAM URL. The caller can
     /// immediately retain the enforcing ledger and mailbox; source metadata arrives through
     /// `SourceOpened` before any lane can be installed.
     #[must_use]
     pub fn spawn_local_bam(config: LocalAlignmentSceneEngineConfig) -> Self {
         let ledger = config.ledger.clone();
         let (input_tx, input_rx) = bounded_coalescing(config.mailbox_control_capacity.get());
-        let (output_tx, output_rx) = bounded_coalescing(config.mailbox_control_capacity.get());
+        let (output_tx, output_rx) =
+            bounded_coalescing_to_ui(config.mailbox_control_capacity.get());
         let worker_ledger = ledger.clone();
         let worker = thread::Builder::new()
             .name("rgv-local-bam-scene-source".to_owned())
             .spawn(move || {
-                let source = match LocalAlignmentSource::open(&config.path, &config.open_options) {
-                    Ok(source) => source,
-                    Err(error) => {
-                        send_error(
-                            &output_tx,
-                            None,
-                            None,
-                            AlignmentSceneEngineOperation::OpenSource,
-                            error,
-                        );
-                        return;
-                    }
-                };
-                let dictionary = source.reference_dictionary().clone();
-                let index_overview = source.index_overview().cloned().map(Arc::new);
-                let header = Arc::clone(source.header_metadata());
-                let normalization_mapped_records = source.normalization_mapped_records();
-                let backend = match LocalBamCanonicalBackend::new(source, config.query_options) {
-                    Ok(backend) => backend,
-                    Err(error) => {
-                        send_error(
-                            &output_tx,
-                            None,
-                            None,
-                            AlignmentSceneEngineOperation::OpenSource,
-                            error,
-                        );
-                        return;
-                    }
-                };
-                let source_revision = backend.source_revision();
-                let record_contract = backend.record_contract();
-                let store = EvidenceStore::new(source_revision, record_contract, worker_ledger);
-                let actor = AlignmentSourceActor::new(
-                    backend,
-                    store,
-                    config.source_control_capacity,
-                    config.maximum_source_control_burst,
-                );
-                if !send_control(
-                    &output_tx,
-                    AlignmentSceneEngineEvent::SourceOpened {
-                        metadata: AlignmentSceneSourceMetadata {
-                            dictionary,
-                            header,
-                            index_overview,
-                            source_revision,
-                            record_contract,
-                            normalization_mapped_records,
-                        },
-                    },
-                ) {
-                    return;
-                }
-                scene_worker_loop(
-                    AlignmentSceneSourceCoordinator::new(actor),
-                    &input_rx,
-                    &output_tx,
+                // Until `SourceOpened` is published a panic is an open failure; afterwards it is
+                // a failure of the running source.
+                let opened = std::cell::Cell::new(false);
+                run_thread_root(
+                    || local_bam_worker(config, worker_ledger, &input_rx, &output_tx, &opened),
+                    |message| report_worker_panic(&output_tx, !opened.get(), &message),
                 );
             })
             .expect("failed to spawn RGV local BAM unified scene worker");
@@ -758,6 +731,96 @@ impl AlignmentSceneEngine<LocalBamCanonicalBackend> {
             ledger,
         }
     }
+}
+
+/// A panic on the scene worker is terminal for the source, but never silent: the desktop receives
+/// one error event carrying the panic text, and the dropped mailboxes then report disconnection.
+fn report_worker_panic(
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+    opening: bool,
+    message: &str,
+) {
+    tracing::error!(message, "unified alignment scene worker panicked");
+    send_error(
+        output,
+        None,
+        None,
+        if opening {
+            AlignmentSceneEngineOperation::OpenSource
+        } else {
+            AlignmentSceneEngineOperation::PumpSource
+        },
+        format_args!("the alignment scene worker stopped after an internal error: {message}"),
+    );
+}
+
+fn local_bam_worker(
+    config: LocalAlignmentSceneEngineConfig,
+    worker_ledger: AllocationLedger,
+    input_rx: &CoalescingReceiver<AlignmentSceneEngineRequest<crate::LocalBamSourceControl>>,
+    output_tx: &CoalescingSender<AlignmentSceneEngineEvent>,
+    opened: &std::cell::Cell<bool>,
+) {
+    let source = match ProductionAlignmentSource::open(&config.path, &config.open_options) {
+        Ok(source) => source,
+        Err(error) => {
+            send_error(
+                output_tx,
+                None,
+                None,
+                AlignmentSceneEngineOperation::OpenSource,
+                error,
+            );
+            return;
+        }
+    };
+    let dictionary = source.reference_dictionary().clone();
+    let index_overview = source.index_overview().cloned().map(Arc::new);
+    let header = Arc::clone(source.header_metadata());
+    let normalization_mapped_records = source.normalization_mapped_records();
+    let backend = match LocalBamCanonicalBackend::new(source, config.query_options) {
+        Ok(backend) => backend.with_nonblocking_checkpoints(),
+        Err(error) => {
+            send_error(
+                output_tx,
+                None,
+                None,
+                AlignmentSceneEngineOperation::OpenSource,
+                error,
+            );
+            return;
+        }
+    };
+    let source_revision = backend.source_revision();
+    let record_contract = backend.record_contract();
+    let store = EvidenceStore::new(source_revision, record_contract, worker_ledger);
+    let actor = AlignmentSourceActor::new(
+        backend,
+        store,
+        config.source_control_capacity,
+        config.maximum_source_control_burst,
+    );
+    if !send_control(
+        output_tx,
+        AlignmentSceneEngineEvent::SourceOpened {
+            metadata: AlignmentSceneSourceMetadata {
+                dictionary,
+                header,
+                index_overview,
+                source_revision,
+                record_contract,
+                normalization_mapped_records,
+            },
+        },
+    ) {
+        return;
+    }
+    opened.set(true);
+    scene_worker_loop(
+        AlignmentSceneSourceCoordinator::new(actor),
+        input_rx,
+        output_tx,
+    );
 }
 
 impl<B> Drop for AlignmentSceneEngine<B>
@@ -907,341 +970,561 @@ fn merge_inactive_eviction(
     }
 }
 
+/// What the worker does on one loop iteration, in strict priority order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerTurn {
+    /// Build a missing visible row block.
+    ForegroundPresentation,
+    /// Apply a source control or advance a foreground decode.
+    ForegroundSource,
+    /// Release one bounded quantum of inactive cache.
+    Reclaim,
+    /// Advance optional read-ahead.
+    SpeculativeSource,
+    /// Warm optional off-screen rows.
+    OptionalPresentation,
+    /// Nothing is runnable: wait for a request or a wake.
+    Wait,
+}
+
+/// The runnable work classes observed after the mailbox was drained. Each flag is an
+/// independent observation, not a state machine.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WorkerDemand {
+    foreground_presentation: bool,
+    foreground_source: bool,
+    reclaim: bool,
+    speculative_source: bool,
+    optional_presentation: bool,
+}
+
+/// The worker's whole scheduling policy. Requests are always drained first by the caller; then
+/// visible presentation, visible source work, cache reclaim, and finally optional work. The one
+/// exception keeps the order from becoming starvation: a reclaim passed over
+/// `MAXIMUM_RECLAIM_DEFERRALS` times in a row gets a single quantum.
+fn next_worker_turn(demand: WorkerDemand, reclaim_deferrals: u32) -> WorkerTurn {
+    if demand.reclaim && reclaim_deferrals >= MAXIMUM_RECLAIM_DEFERRALS {
+        WorkerTurn::Reclaim
+    } else if demand.foreground_presentation {
+        WorkerTurn::ForegroundPresentation
+    } else if demand.foreground_source {
+        WorkerTurn::ForegroundSource
+    } else if demand.reclaim {
+        WorkerTurn::Reclaim
+    } else if demand.speculative_source {
+        WorkerTurn::SpeculativeSource
+    } else if demand.optional_presentation {
+        WorkerTurn::OptionalPresentation
+    } else {
+        WorkerTurn::Wait
+    }
+}
+
+/// Outcome of one source checkpoint, as far as the scheduling loop is concerned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceTurn {
+    Progressed,
+    /// The decoder had no finished unit; asking again at once would spin.
+    Waiting,
+    /// The event receiver is gone; the worker must exit.
+    Closed,
+}
+
 fn scene_worker_loop<B>(
     mut coordinator: AlignmentSceneSourceCoordinator<B>,
     input: &CoalescingReceiver<AlignmentSceneEngineRequest<B::Control>>,
     output: &CoalescingSender<AlignmentSceneEngineEvent>,
 ) where
     B: CanonicalAlignmentSourceBackend,
+    B::Control: Send + 'static,
     B::Error: Error + Send + Sync + 'static,
 {
     let mut request_tokens = BTreeMap::new();
     let mut pending_eviction = None;
+    // A backend that wakes this mailbox when a decoded unit is ready lets the worker sleep
+    // instead of polling it.
+    let source_wait = if coordinator
+        .actor_mut()
+        .backend_mut()
+        .set_checkpoint_waker(input.waker())
+    {
+        SOURCE_WAKE_SAFETY_WAIT
+    } else {
+        SOURCE_POLL_WAIT
+    };
+    // Set when the last source checkpoint found the decoder thread with nothing ready.
+    let mut source_waiting = false;
+    let mut reclaim_deferrals = 0_u32;
     loop {
-        let first = if coordinator.has_pending_source_work()
-            || coordinator.has_pending_presentation_work()
-            || pending_eviction.is_some()
-        {
-            input.try_receive()
-        } else {
-            input.receive_timeout(WORKER_IDLE_WAIT)
+        // 1. Input. Requests are never queued behind work.
+        for _ in 0..MAXIMUM_INPUT_BURST {
+            match input.try_receive() {
+                Ok(Some(request)) => {
+                    if !apply_request(
+                        &mut coordinator,
+                        &mut request_tokens,
+                        &mut pending_eviction,
+                        output,
+                        request,
+                    ) {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return,
+            }
+        }
+
+        coordinator.set_capacity_reclaim_active(pending_eviction.is_some());
+        let source_was_waiting = std::mem::take(&mut source_waiting);
+        let source_pending = coordinator.has_pending_source_work();
+        let foreground_source = source_pending && coordinator.has_pending_foreground_source_work();
+        let foreground_presentation = coordinator.has_pending_foreground_presentation_work();
+        // A decoder that just had nothing ready is not asked again on the very next turn:
+        // other runnable work goes first, and with none the worker sleeps below.
+        let source_runnable = source_pending && !source_was_waiting;
+        let reclaim = pending_eviction.is_some();
+        let demand = WorkerDemand {
+            foreground_presentation,
+            foreground_source: source_runnable && foreground_source,
+            reclaim,
+            speculative_source: source_runnable && !foreground_source,
+            // Only consulted when nothing above it is runnable, and the costliest to answer.
+            optional_presentation: !foreground_presentation
+                && !source_runnable
+                && !reclaim
+                && coordinator.has_pending_presentation_work(),
         };
-        match first {
-            Ok(Some(request)) => {
-                if !apply_request(
+        let turn = next_worker_turn(demand, reclaim_deferrals);
+        reclaim_deferrals = match turn {
+            WorkerTurn::ForegroundPresentation | WorkerTurn::ForegroundSource
+                if demand.reclaim =>
+            {
+                reclaim_deferrals.saturating_add(1)
+            }
+            _ => 0,
+        };
+        match turn {
+            WorkerTurn::ForegroundPresentation | WorkerTurn::OptionalPresentation => {
+                if !run_presentation_turn(
                     &mut coordinator,
-                    &mut request_tokens,
+                    &request_tokens,
                     &mut pending_eviction,
                     output,
-                    request,
                 ) {
                     return;
                 }
-                for _ in 1..MAXIMUM_INPUT_BURST {
-                    match input.try_receive() {
-                        Ok(Some(request)) => {
-                            if !apply_request(
-                                &mut coordinator,
-                                &mut request_tokens,
-                                &mut pending_eviction,
-                                output,
-                                request,
-                            ) {
-                                return;
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(_) => return,
-                    }
+            }
+            WorkerTurn::ForegroundSource | WorkerTurn::SpeculativeSource => {
+                match run_source_turn(
+                    &mut coordinator,
+                    &request_tokens,
+                    &mut pending_eviction,
+                    output,
+                ) {
+                    SourceTurn::Progressed => {}
+                    SourceTurn::Waiting => source_waiting = true,
+                    SourceTurn::Closed => return,
                 }
             }
-            Ok(None) => {}
-            Err(_) => return,
-        }
-
-        // Reclaim yields to the mailbox between bounded quanta, but not to foreground allocation.
-        // Letting one page build between quanta consumed freshly released bytes and made a large
-        // low-water target mathematically unreachable—the exact saturation loop this worker is
-        // responsible for breaking.
-        let run_maintenance = pending_eviction.is_some();
-        if run_maintenance {
-            let mut pending = pending_eviction
-                .take()
-                .expect("the selected maintenance turn still has a reclaim transaction");
-            match coordinator
-                .evict_inactive_batch(pending.target_charged, MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM)
-            {
-                Ok(eviction) => {
-                    if output
-                        .send_latest_system(
-                            0,
-                            AlignmentSceneEngineEvent::InactiveEvictionProgress {
-                                request_id: pending.request_id,
-                                eviction,
-                            },
-                        )
-                        .is_err()
-                    {
-                        return;
-                    }
-                    let stopped_without_progress = eviction.quantum_entries == 0;
-                    let complete = eviction.reclaim_complete || stopped_without_progress;
-                    pending.accumulated =
-                        Some(merge_inactive_eviction(pending.accumulated, eviction));
-                    if complete {
-                        let eviction = pending
-                            .accumulated
-                            .expect("a completed reclaim has at least one bounded result");
-                        if !send_control(
-                            output,
-                            AlignmentSceneEngineEvent::InactiveEvicted {
-                                request_id: pending.request_id,
-                                eviction,
-                            },
-                        ) {
-                            return;
-                        }
-                    } else {
-                        pending_eviction = Some(pending);
-                    }
-                }
-                Err(error) => {
-                    if !send_error(
-                        output,
-                        None,
-                        None,
-                        AlignmentSceneEngineOperation::EvictInactive,
-                        error,
-                    ) {
-                        return;
-                    }
+            WorkerTurn::Reclaim => {
+                if !run_reclaim_quantum(&mut coordinator, &mut pending_eviction, output) {
+                    return;
                 }
             }
-        } else if coordinator.has_pending_source_work() {
-            let pump_started = Instant::now();
-            let pump_result = coordinator.pump_once();
-            if !report_slow_worker_phase(
-                output,
-                AlignmentSceneWorkerPhase::PumpSource,
-                None,
-                pump_started,
-            ) {
-                return;
-            }
-            match pump_result {
-                Ok(pump) => {
-                    for publication in pump.publications {
-                        let Ok(Some(frame)) = coordinator.frame(publication.owner) else {
-                            continue;
-                        };
-                        let Ok(telemetry) = coordinator.telemetry(publication.owner) else {
-                            continue;
-                        };
-                        let Ok(work) = coordinator.owner_work_state(publication.owner) else {
-                            continue;
-                        };
-                        if output
-                            .send_latest_for(
-                                publication.owner.get(),
-                                AlignmentSceneEngineEvent::FrameUpdated {
-                                    owner: publication.owner,
-                                    request_token: current_request_token(
-                                        &request_tokens,
-                                        publication.owner,
-                                    ),
-                                    cause: AlignmentSceneFrameCause::SourcePublication,
-                                    update: None,
-                                    published_scene: Some(publication.revision),
-                                    frame,
-                                    work,
-                                    telemetry,
-                                },
-                            )
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    for owner in pump.source_settlements {
-                        if !send_frame(
-                            &coordinator,
-                            output,
-                            owner,
-                            current_request_token(&request_tokens, owner),
-                            AlignmentSceneFrameCause::SourceSettlement,
-                            None,
-                            None,
-                        ) {
-                            return;
-                        }
-                    }
-                    for refusal in pump.refusals {
-                        let Ok(Some(frame)) = coordinator.frame(refusal.owner) else {
-                            continue;
-                        };
-                        let Ok(telemetry) = coordinator.telemetry(refusal.owner) else {
-                            continue;
-                        };
-                        // This is a terminal source decision, not replaceable viewport data. A
-                        // later camera/clip frame may carry the same typed refusal, but must not
-                        // erase the only explicit terminal edge before the desktop consumes it.
-                        if output
-                            .send_control(AlignmentSceneEngineEvent::IndividualReadsRefused {
-                                owner: refusal.owner,
-                                request_token: current_request_token(
-                                    &request_tokens,
-                                    refusal.owner,
-                                ),
-                                target: refusal.target,
-                                complete_read_limit: refusal.complete_read_limit,
-                                eligible_records: refusal.eligible_records,
-                                frame,
-                                telemetry,
-                            })
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    for pressure in pump.pressures {
-                        schedule_internal_reclaim(
+            WorkerTurn::Wait => {
+                // Nothing is runnable. Block until a request arrives or the decoder signals a
+                // finished unit; the timeout is only a safety net.
+                let timeout = if source_pending {
+                    source_wait
+                } else {
+                    WORKER_IDLE_WAIT
+                };
+                match input.receive_timeout(timeout) {
+                    Ok(Some(request)) => {
+                        if !apply_request(
                             &mut coordinator,
+                            &mut request_tokens,
                             &mut pending_eviction,
-                            pressure.owner,
-                            pressure.pressure,
-                        );
-                        if !send_resource_pressure(
                             output,
-                            pressure.owner,
-                            current_request_token(&request_tokens, pressure.owner),
-                            pressure.target,
-                            AlignmentSceneEngineOperation::PumpSource,
-                            pressure.intent,
-                            pressure.pressure,
+                            request,
                         ) {
                             return;
                         }
                     }
-                }
-                Err(error) => {
-                    if !handle_source_pump_error(
-                        &mut coordinator,
-                        &request_tokens,
-                        &mut pending_eviction,
-                        output,
-                        error,
-                    ) {
-                        return;
-                    }
-                }
-            }
-        } else if coordinator.has_pending_presentation_work() {
-            let pump_started = Instant::now();
-            let pump_result = coordinator.pump_presentation_once();
-            if !report_slow_worker_phase(
-                output,
-                AlignmentSceneWorkerPhase::PumpPresentation,
-                None,
-                pump_started,
-            ) {
-                return;
-            }
-            match pump_result {
-                Ok(Some(pump)) => {
-                    if let Some(pressure) = pump.pressure {
-                        if pump.intent == SourceIntentKind::Foreground {
-                            schedule_internal_reclaim(
-                                &mut coordinator,
-                                &mut pending_eviction,
-                                pump.owner,
-                                pressure,
-                            );
-                        }
-                        let target = coordinator
-                            .frame(pump.owner)
-                            .ok()
-                            .flatten()
-                            .map(|frame| frame.camera.interval());
-                        let Some(target) = target else {
-                            if !send_error(
-                                output,
-                                Some(pump.owner),
-                                Some(current_request_token(&request_tokens, pump.owner)),
-                                AlignmentSceneEngineOperation::PumpPresentation,
-                                AlignmentSceneCoordinatorConfigError::UnknownOwner(pump.owner),
-                            ) {
-                                return;
-                            }
-                            continue;
-                        };
-                        if pump.intent == SourceIntentKind::Speculative
-                            && pressure.intrinsically_exceeds_limit()
-                        {
-                            // Full-height residency is optional. The coordinator has already
-                            // latched this lane as BudgetLimited while preserving its current
-                            // visible-complete snapshot, so publish that truthful state instead of
-                            // turning an oversized background row block into a read-data failure.
-                            if !send_frame(
-                                &coordinator,
-                                output,
-                                pump.owner,
-                                current_request_token(&request_tokens, pump.owner),
-                                AlignmentSceneFrameCause::VerticalResidency,
-                                None,
-                                None,
-                            ) {
-                                return;
-                            }
-                        } else if !send_resource_pressure(
-                            output,
-                            pump.owner,
-                            current_request_token(&request_tokens, pump.owner),
-                            target,
-                            AlignmentSceneEngineOperation::PumpPresentation,
-                            pump.intent,
-                            pressure,
-                        ) {
-                            return;
-                        }
-                    } else if pump.published_scene.is_some() || pump.completed || pump.failed {
-                        // Intermediate independent row-block warms neither replace the semantic
-                        // scene nor require a desktop redraw. Publish one coalesced status/frame
-                        // update only when the whole directory becomes warm or optional warming
-                        // becomes unavailable. The latter preserves the complete visible scene.
-                        if !send_frame(
-                            &coordinator,
-                            output,
-                            pump.owner,
-                            current_request_token(&request_tokens, pump.owner),
-                            if pump.intent == SourceIntentKind::Foreground {
-                                AlignmentSceneFrameCause::RowCamera
-                            } else {
-                                AlignmentSceneFrameCause::VerticalResidency
-                            },
-                            None,
-                            pump.published_scene,
-                        ) {
-                            return;
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    if output
-                        .send_control(AlignmentSceneEngineEvent::Error {
-                            owner: None,
-                            request_token: None,
-                            operation: AlignmentSceneEngineOperation::PumpPresentation,
-                            message: Arc::from(error.to_string()),
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
+                    Ok(None) => {}
+                    Err(_) => return,
                 }
             }
         }
     }
+}
+
+/// Runs one bounded reclaim quantum for the in-flight transaction. Returns `false` once the
+/// event receiver is gone.
+///
+/// Reclaim yields to the mailbox and to runnable visible work between quanta, but a lane whose
+/// allocation was refused stays paused until the transaction ends (see
+/// `set_capacity_reclaim_active`): letting that lane rebuild between quanta consumed freshly
+/// released bytes and made a large low-water target unreachable.
+fn run_reclaim_quantum<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+) -> bool
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + Send + Sync + 'static,
+{
+    let mut pending = pending_eviction
+        .take()
+        .expect("the selected maintenance turn still has a reclaim transaction");
+    match coordinator
+        .evict_inactive_batch(pending.target_charged, MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM)
+    {
+        Ok(eviction) => {
+            if output
+                .send_latest_system(
+                    0,
+                    AlignmentSceneEngineEvent::InactiveEvictionProgress {
+                        request_id: pending.request_id,
+                        eviction,
+                    },
+                )
+                .is_err()
+            {
+                return false;
+            }
+            let stopped_without_progress = eviction.quantum_entries == 0;
+            let complete = eviction.reclaim_complete || stopped_without_progress;
+            pending.accumulated =
+                Some(merge_inactive_eviction(pending.accumulated, eviction));
+            if complete {
+                let eviction = pending
+                    .accumulated
+                    .expect("a completed reclaim has at least one bounded result");
+                if !send_control(
+                    output,
+                    AlignmentSceneEngineEvent::InactiveEvicted {
+                        request_id: pending.request_id,
+                        eviction,
+                    },
+                ) {
+                    return false;
+                }
+            } else {
+                *pending_eviction = Some(pending);
+            }
+        }
+        Err(error) => {
+            // The transaction is over. Settle its request ID first so an aggregate caller
+            // waiting on that exact ID is released, then report why.
+            *pending_eviction = Some(pending);
+            if !supersede_pending_eviction(
+                pending_eviction,
+                output,
+                AlignmentInactiveEvictionSupersession::ReclaimFailed,
+            ) || !send_error(
+                output,
+                None,
+                None,
+                AlignmentSceneEngineOperation::EvictInactive,
+                error,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Runs one source control or decoder checkpoint and publishes what it settled.
+#[allow(clippy::too_many_lines)]
+fn run_source_turn<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    request_tokens: &BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+) -> SourceTurn
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + Send + Sync + 'static,
+{
+    let mut waiting = false;
+    let pump_started = Instant::now();
+    let pump_result = coordinator.pump_once();
+    if !report_slow_worker_phase(
+        output,
+        AlignmentSceneWorkerPhase::PumpSource,
+        None,
+        pump_started,
+    ) {
+        return SourceTurn::Closed;
+    }
+    match pump_result {
+        Ok(pump) => {
+            if matches!(
+                pump.source_event,
+                Some(crate::AlignmentSourceActorEvent::SourceWaiting { .. })
+            ) {
+                // The decoder thread is busy. The caller gives other runnable work the next
+                // turn, or sleeps until the decoder or a request wakes it.
+                waiting = true;
+            }
+            for publication in pump.publications {
+                let Ok(Some(frame)) = coordinator.frame(publication.owner) else {
+                    continue;
+                };
+                let Ok(telemetry) = coordinator.telemetry(publication.owner) else {
+                    continue;
+                };
+                let Ok(work) = coordinator.owner_work_state(publication.owner) else {
+                    continue;
+                };
+                if output
+                    .send_latest_for(
+                        publication.owner.get(),
+                        AlignmentSceneEngineEvent::FrameUpdated {
+                            owner: publication.owner,
+                            request_token: current_request_token(
+                                request_tokens,
+                                publication.owner,
+                            ),
+                            cause: AlignmentSceneFrameCause::SourcePublication,
+                            update: None,
+                            published_scene: Some(publication.revision),
+                            frame,
+                            work,
+                            telemetry,
+                        },
+                    )
+                    .is_err()
+                {
+                    return SourceTurn::Closed;
+                }
+            }
+            for owner in pump.source_settlements {
+                if !send_frame(
+                    coordinator,
+                    output,
+                    owner,
+                    current_request_token(request_tokens, owner),
+                    AlignmentSceneFrameCause::SourceSettlement,
+                    None,
+                    None,
+                ) {
+                    return SourceTurn::Closed;
+                }
+            }
+            for refusal in pump.refusals {
+                let Ok(Some(frame)) = coordinator.frame(refusal.owner) else {
+                    continue;
+                };
+                let Ok(telemetry) = coordinator.telemetry(refusal.owner) else {
+                    continue;
+                };
+                // This is a terminal source decision, not replaceable viewport data. A
+                // later camera/clip frame may carry the same typed refusal, but must not
+                // erase the only explicit terminal edge before the desktop consumes it.
+                if output
+                    .send_control(AlignmentSceneEngineEvent::IndividualReadsRefused {
+                        owner: refusal.owner,
+                        request_token: current_request_token(
+                            request_tokens,
+                            refusal.owner,
+                        ),
+                        target: refusal.target,
+                        complete_read_limit: refusal.complete_read_limit,
+                        eligible_records: refusal.eligible_records,
+                        frame,
+                        telemetry,
+                    })
+                    .is_err()
+                {
+                    return SourceTurn::Closed;
+                }
+            }
+            for failure in pump.failures {
+                // One owner's scene candidate failed. That owner's current request is
+                // settled; the shared source and every other owner carry on.
+                if !send_error(
+                    output,
+                    Some(failure.owner),
+                    Some(current_request_token(request_tokens, failure.owner)),
+                    AlignmentSceneEngineOperation::PumpSource,
+                    failure.message,
+                ) {
+                    return SourceTurn::Closed;
+                }
+            }
+            for pressure in pump.pressures {
+                schedule_internal_reclaim(
+                    coordinator,
+                    pending_eviction,
+                    pressure.owner,
+                    pressure.pressure,
+                );
+                if !send_resource_pressure(
+                    output,
+                    pressure.owner,
+                    current_request_token(request_tokens, pressure.owner),
+                    pressure.target,
+                    AlignmentSceneEngineOperation::PumpSource,
+                    pressure.intent,
+                    pressure.pressure,
+                ) {
+                    return SourceTurn::Closed;
+                }
+            }
+        }
+        Err(error) => {
+            if !handle_source_pump_error(
+                coordinator,
+                request_tokens,
+                pending_eviction,
+                output,
+                error,
+            ) {
+                return SourceTurn::Closed;
+            }
+        }
+    }
+    if waiting {
+        SourceTurn::Waiting
+    } else {
+        SourceTurn::Progressed
+    }
+}
+
+/// Builds at most one row block (visible first, then optional) and publishes the outcome.
+/// Returns `false` once the event receiver is gone.
+#[allow(clippy::too_many_lines)]
+fn run_presentation_turn<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    request_tokens: &BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+) -> bool
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + Send + Sync + 'static,
+{
+    let pump_started = Instant::now();
+    let pump_result = coordinator.pump_presentation_once();
+    if !report_slow_worker_phase(
+        output,
+        AlignmentSceneWorkerPhase::PumpPresentation,
+        None,
+        pump_started,
+    ) {
+        return false;
+    }
+    match pump_result {
+        Ok(Some(pump)) => {
+            if let Some(pressure) = pump.pressure {
+                if pump.intent == SourceIntentKind::Foreground {
+                    schedule_internal_reclaim(coordinator, pending_eviction, pump.owner, pressure);
+                }
+                let target = coordinator
+                    .frame(pump.owner)
+                    .ok()
+                    .flatten()
+                    .map(|frame| frame.camera.interval());
+                let Some(target) = target else {
+                    if !send_error(
+                        output,
+                        Some(pump.owner),
+                        Some(current_request_token(request_tokens, pump.owner)),
+                        AlignmentSceneEngineOperation::PumpPresentation,
+                        AlignmentSceneCoordinatorConfigError::UnknownOwner(pump.owner),
+                    ) {
+                        return false;
+                    }
+                    return true;
+                };
+                if pump.intent == SourceIntentKind::Speculative
+                    && pressure.intrinsically_exceeds_limit()
+                {
+                    // Full-height residency is optional. The coordinator has already
+                    // latched this lane as BudgetLimited while preserving its current
+                    // visible-complete snapshot, so publish that truthful state instead of
+                    // turning an oversized background row block into a read-data failure.
+                    if !send_frame(
+                        coordinator,
+                        output,
+                        pump.owner,
+                        current_request_token(request_tokens, pump.owner),
+                        AlignmentSceneFrameCause::VerticalResidency,
+                        None,
+                        None,
+                    ) {
+                        return false;
+                    }
+                } else if !send_resource_pressure(
+                    output,
+                    pump.owner,
+                    current_request_token(request_tokens, pump.owner),
+                    target,
+                    AlignmentSceneEngineOperation::PumpPresentation,
+                    pump.intent,
+                    pressure,
+                ) {
+                    return false;
+                }
+            } else if pump.failed && pump.intent == SourceIntentKind::Foreground {
+                // The coordinator latched this failure for the lane's exact authority, so it
+                // is reported once, to the owner it belongs to, and not rebuilt every turn.
+                let message = coordinator
+                    .foreground_presentation_failure(pump.owner)
+                    .unwrap_or_else(|| Arc::from("visible alignment rows could not be prepared"));
+                if !send_error(
+                    output,
+                    Some(pump.owner),
+                    Some(current_request_token(request_tokens, pump.owner)),
+                    AlignmentSceneEngineOperation::PumpPresentation,
+                    message,
+                ) {
+                    return false;
+                }
+            } else if pump.published_scene.is_some() || pump.completed || pump.failed {
+                // Intermediate independent row-block warms neither replace the semantic
+                // scene nor require a desktop redraw. Publish one coalesced status/frame
+                // update only when the whole directory becomes warm or optional warming
+                // becomes unavailable. The latter preserves the complete visible scene.
+                if !send_frame(
+                    coordinator,
+                    output,
+                    pump.owner,
+                    current_request_token(request_tokens, pump.owner),
+                    if pump.intent == SourceIntentKind::Foreground {
+                        AlignmentSceneFrameCause::RowCamera
+                    } else {
+                        AlignmentSceneFrameCause::VerticalResidency
+                    },
+                    None,
+                    pump.published_scene,
+                ) {
+                    return false;
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            if output
+                .send_control(AlignmentSceneEngineEvent::Error {
+                    owner: None,
+                    request_token: None,
+                    operation: AlignmentSceneEngineOperation::PumpPresentation,
+                    message: Arc::from(error.to_string()),
+                })
+                .is_err()
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Converts a retained-budget refusal into the demand-derived low-water target maintained by the
@@ -1274,9 +1557,11 @@ fn schedule_reclaim_target(
 ) {
     if let Some(pending) = pending_eviction {
         pending.target_charged = pending.target_charged.min(target_charged);
-        // Preserve a desktop request ID so its cross-owner transaction receives completion even
-        // when an internal foreground target tightens the same coalesced reclaim cycle.
-        if pending.request_id == 0 && request_id != 0 {
+        // A desktop request ID always wins over an internal (zero) one, and the newest desktop
+        // ID wins over an older one: the caller waits for exactly the ID it sent last, so the
+        // coalesced cycle must complete under that ID. An internal target only tightens the
+        // cycle and never takes its ID away. `adopt_reclaim_request` settles a replaced ID.
+        if request_id != 0 {
             pending.request_id = request_id;
         }
         return;
@@ -1286,6 +1571,45 @@ fn schedule_reclaim_target(
         target_charged,
         accumulated: None,
     });
+}
+
+/// Hands an in-flight reclaim cycle to a newer desktop request. The older request can no longer
+/// receive `InactiveEvicted`, so it is settled as superseded here, with the progress made on its
+/// behalf, and the cycle's accounting restarts for the request that now owns it. Returns `false`
+/// once the event receiver is gone.
+fn adopt_reclaim_request(
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+    request_id: u64,
+) -> bool {
+    let Some(pending) = pending_eviction.as_mut() else {
+        return true;
+    };
+    if request_id == 0 || pending.request_id == 0 || pending.request_id == request_id {
+        return true;
+    }
+    let superseded = std::mem::replace(
+        pending,
+        PendingInactiveEviction {
+            request_id,
+            target_charged: pending.target_charged,
+            accumulated: None,
+        },
+    );
+    send_control(
+        output,
+        AlignmentSceneEngineEvent::InactiveEvictionSuperseded {
+            request_id: superseded.request_id,
+            target_charged: superseded.target_charged,
+            released_bytes: superseded
+                .accumulated
+                .map_or(0, |eviction| eviction.released),
+            relinquished_cache_entries: superseded
+                .accumulated
+                .map_or(0, |eviction| eviction.relinquished_cache_entries),
+            reason: AlignmentInactiveEvictionSupersession::NewerRequest,
+        },
+    )
 }
 
 fn camera_change_retargets_reclaim(
@@ -1813,6 +2137,9 @@ where
             target_charged,
         } => match coordinator.aggregate_foreground_low_water_target() {
             Ok(measured_target) => {
+                if !adopt_reclaim_request(pending_eviction, output, request_id) {
+                    return false;
+                }
                 schedule_reclaim_target(
                     pending_eviction,
                     request_id,
@@ -1820,13 +2147,26 @@ where
                 );
                 true
             }
-            Err(error) => send_error(
-                output,
-                None,
-                None,
-                AlignmentSceneEngineOperation::EvictInactive,
-                error,
-            ),
+            // This request never became a reclaim cycle. Settle its ID before reporting the
+            // cause: the error event has no request ID and the caller waits on exactly this one.
+            Err(error) => {
+                send_control(
+                    output,
+                    AlignmentSceneEngineEvent::InactiveEvictionSuperseded {
+                        request_id,
+                        target_charged,
+                        released_bytes: 0,
+                        relinquished_cache_entries: 0,
+                        reason: AlignmentInactiveEvictionSupersession::ReclaimFailed,
+                    },
+                ) && send_error(
+                    output,
+                    None,
+                    None,
+                    AlignmentSceneEngineOperation::EvictInactive,
+                    error,
+                )
+            }
         },
         AlignmentSceneEngineRequest::ClearCacheBudget { restore_budget } => {
             if !supersede_pending_eviction(
@@ -2135,6 +2475,440 @@ mod tests {
                 reason: AlignmentInactiveEvictionSupersession::DisjointCamera,
             }
         ));
+    }
+
+    #[test]
+    fn worker_turns_follow_the_documented_priority_order() {
+        let all = WorkerDemand {
+            foreground_presentation: true,
+            foreground_source: true,
+            reclaim: true,
+            speculative_source: true,
+            optional_presentation: true,
+        };
+        assert_eq!(next_worker_turn(all, 0), WorkerTurn::ForegroundPresentation);
+        let without_presentation = WorkerDemand {
+            foreground_presentation: false,
+            ..all
+        };
+        assert_eq!(
+            next_worker_turn(without_presentation, 0),
+            WorkerTurn::ForegroundSource
+        );
+        let without_foreground = WorkerDemand {
+            foreground_source: false,
+            ..without_presentation
+        };
+        assert_eq!(next_worker_turn(without_foreground, 0), WorkerTurn::Reclaim);
+        let optional_only = WorkerDemand {
+            reclaim: false,
+            ..without_foreground
+        };
+        assert_eq!(
+            next_worker_turn(optional_only, 0),
+            WorkerTurn::SpeculativeSource
+        );
+        assert_eq!(
+            next_worker_turn(
+                WorkerDemand {
+                    speculative_source: false,
+                    ..optional_only
+                },
+                0
+            ),
+            WorkerTurn::OptionalPresentation
+        );
+        assert_eq!(
+            next_worker_turn(WorkerDemand::default(), MAXIMUM_RECLAIM_DEFERRALS),
+            WorkerTurn::Wait
+        );
+    }
+
+    #[test]
+    fn continuous_foreground_work_cannot_starve_a_pending_reclaim() {
+        let busy = WorkerDemand {
+            foreground_presentation: true,
+            foreground_source: true,
+            reclaim: true,
+            ..WorkerDemand::default()
+        };
+        assert_eq!(
+            next_worker_turn(busy, MAXIMUM_RECLAIM_DEFERRALS - 1),
+            WorkerTurn::ForegroundPresentation
+        );
+        assert_eq!(
+            next_worker_turn(busy, MAXIMUM_RECLAIM_DEFERRALS),
+            WorkerTurn::Reclaim
+        );
+        // Without a reclaim the deferral count is irrelevant.
+        assert_eq!(
+            next_worker_turn(
+                WorkerDemand {
+                    reclaim: false,
+                    ..busy
+                },
+                u32::MAX
+            ),
+            WorkerTurn::ForegroundPresentation
+        );
+    }
+
+    fn idle_coordinator() -> AlignmentSceneSourceCoordinator<LedgerPressureBackend> {
+        let source_revision = AlignmentSourceRevision::new(
+            SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+            RevisionFingerprint::new(3, 4),
+        );
+        let record_contract = ContractFingerprint::new(9);
+        let store = EvidenceStore::new(
+            source_revision,
+            record_contract,
+            AllocationLedger::new(1_000, 0),
+        );
+        AlignmentSceneSourceCoordinator::new(AlignmentSourceActor::new(
+            LedgerPressureBackend {
+                checkpoints: Arc::new(AtomicUsize::new(0)),
+            },
+            store,
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn a_newer_reclaim_request_adopts_the_cycle_and_settles_the_older_id() {
+        let mut coordinator = idle_coordinator();
+        let (output, events) = bounded_coalescing(16);
+        let mut request_tokens = BTreeMap::new();
+        let mut pending = None;
+
+        // An internal foreground reclaim is already in flight when the desktop asks twice.
+        schedule_reclaim_target(&mut pending, 0, 900);
+        for request_id in [5, 6] {
+            assert!(apply_request(
+                &mut coordinator,
+                &mut request_tokens,
+                &mut pending,
+                &output,
+                AlignmentSceneEngineRequest::EvictInactive {
+                    request_id,
+                    target_charged: 800,
+                },
+            ));
+        }
+        // A later internal target tightens the cycle but never takes the desktop's ID away.
+        schedule_reclaim_target(&mut pending, 0, 700);
+        let adopted = pending.expect("the coalesced cycle is still in flight");
+        assert_eq!(adopted.request_id, 6);
+        assert_eq!(adopted.target_charged, 700);
+
+        // The older desktop ID is settled explicitly, exactly once; adopting the internal
+        // cycle (ID zero) settled nothing.
+        assert!(matches!(
+            events.try_receive().unwrap(),
+            Some(AlignmentSceneEngineEvent::InactiveEvictionSuperseded {
+                request_id: 5,
+                target_charged: 800,
+                released_bytes: 0,
+                relinquished_cache_entries: 0,
+                reason: AlignmentInactiveEvictionSupersession::NewerRequest,
+            })
+        ));
+        assert!(events.try_receive().unwrap().is_none());
+
+        // The cycle completes under the newest ID, which is the one the desktop waits for.
+        assert!(run_reclaim_quantum(&mut coordinator, &mut pending, &output));
+        assert!(pending.is_none());
+        let completed = std::iter::from_fn(|| events.try_receive().unwrap())
+            .filter_map(|event| match event {
+                AlignmentSceneEngineEvent::InactiveEvicted { request_id, .. } => Some(request_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed, vec![6]);
+    }
+
+    #[test]
+    fn a_failed_reclaim_settles_its_request_id() {
+        let (output, events) = bounded_coalescing(4);
+        let mut pending = Some(PendingInactiveEviction {
+            request_id: 9,
+            target_charged: 640,
+            accumulated: None,
+        });
+        // This is the settlement both eviction error paths emit before their `Error` event.
+        assert!(supersede_pending_eviction(
+            &mut pending,
+            &output,
+            AlignmentInactiveEvictionSupersession::ReclaimFailed,
+        ));
+        assert!(pending.is_none());
+        assert!(matches!(
+            events.try_receive().unwrap(),
+            Some(AlignmentSceneEngineEvent::InactiveEvictionSuperseded {
+                request_id: 9,
+                target_charged: 640,
+                reason: AlignmentInactiveEvictionSupersession::ReclaimFailed,
+                ..
+            })
+        ));
+    }
+
+    /// A backend whose decoder either panics or stays busy until released, and which can wake
+    /// its driver.
+    struct ScriptedBackend {
+        panic_on_begin: bool,
+        ready: Arc<AtomicBool>,
+        polls: Arc<AtomicUsize>,
+        waker: Arc<Mutex<Option<crate::mailbox::MailboxWaker>>>,
+        supports_wake: bool,
+    }
+
+    impl CanonicalAlignmentSourceBackend for ScriptedBackend {
+        type Control = ();
+        type Error = LocalBamCanonicalBackendError;
+
+        fn apply_control(&mut self, _control: Self::Control) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn begin_work(
+            &mut self,
+            _work: &SourceWork,
+            _ledger: &AllocationLedger,
+        ) -> Result<(), Self::Error> {
+            assert!(!self.panic_on_begin, "scripted backend exploded at block 7");
+            Ok(())
+        }
+
+        fn next_checkpoint(
+            &mut self,
+            _work: &SourceWork,
+            _ledger: &AllocationLedger,
+        ) -> Result<CanonicalDecodeCheckpoint, Self::Error> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.ready.load(Ordering::SeqCst) {
+                Err(LocalBamCanonicalBackendError::DecoderStopped)
+            } else {
+                Ok(CanonicalDecodeCheckpoint::Pending)
+            }
+        }
+
+        fn retarget(&mut self, _work: &SourceWork) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn cancel(&mut self, _work: &SourceWork) {}
+
+        fn set_checkpoint_waker(&mut self, waker: Arc<dyn Fn() + Send + Sync>) -> bool {
+            if self.supports_wake {
+                *self.waker.lock().unwrap() = Some(waker);
+            }
+            self.supports_wake
+        }
+    }
+
+    fn scripted_engine(backend: ScriptedBackend) -> AlignmentSceneEngine<ScriptedBackend> {
+        let source_revision = AlignmentSourceRevision::new(
+            SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+            RevisionFingerprint::new(3, 4),
+        );
+        let record_contract = ContractFingerprint::new(9);
+        let store = EvidenceStore::new(
+            source_revision,
+            record_contract,
+            AllocationLedger::new(1_000, 0),
+        );
+        let mut actor = AlignmentSourceActor::new(
+            backend,
+            store,
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        actor
+            .submit_foreground_for(
+                SourceOwnerId::new(77),
+                AlignmentSourceIntentSpec::new(
+                    source_revision,
+                    record_contract,
+                    PayloadContract::new(
+                        CapabilityRequirement::NotRequired,
+                        CapabilityRequirement::NotRequired,
+                        [],
+                        None,
+                    ),
+                    GenomicInterval::new(ContigId::new(0), 100, 200).unwrap(),
+                ),
+            )
+            .unwrap();
+        AlignmentSceneEngine::spawn(AlignmentSceneSourceCoordinator::new(actor), 8)
+    }
+
+    #[test]
+    fn a_worker_panic_becomes_one_terminal_error_event_and_then_disconnection() {
+        let engine = scripted_engine(ScriptedBackend {
+            panic_on_begin: true,
+            ready: Arc::new(AtomicBool::new(false)),
+            polls: Arc::new(AtomicUsize::new(0)),
+            waker: Arc::new(Mutex::new(None)),
+            supports_wake: false,
+        });
+        let event = receive_matching(&engine, |event| {
+            matches!(event, AlignmentSceneEngineEvent::Error { .. })
+        });
+        let AlignmentSceneEngineEvent::Error {
+            owner,
+            request_token,
+            operation,
+            message,
+        } = event
+        else {
+            unreachable!("the matching event is an error")
+        };
+        assert_eq!(owner, None);
+        assert_eq!(request_token, None);
+        assert_eq!(operation, AlignmentSceneEngineOperation::PumpSource);
+        assert!(
+            message.contains("scripted backend exploded at block 7"),
+            "the event must carry the panic message, got {message:?}"
+        );
+
+        // The worker is gone: the event stream ends and requests are refused instead of being
+        // accepted into a mailbox nobody reads.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match engine.receive_timeout(Duration::from_millis(50)) {
+                Err(EngineQueueError::Disconnected) => break,
+                Ok(_) => assert!(Instant::now() < deadline, "the worker never disconnected"),
+                Err(other) => panic!("unexpected queue error {other:?}"),
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while engine.try_remove_lane(SourceOwnerId::new(77)) != Err(EngineQueueError::Disconnected)
+        {
+            assert!(Instant::now() < deadline, "requests were still accepted");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_waking_backend_is_not_polled_while_its_decoder_is_busy() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let waker = Arc::new(Mutex::new(None));
+        let engine = scripted_engine(ScriptedBackend {
+            panic_on_begin: false,
+            ready: Arc::clone(&ready),
+            polls: Arc::clone(&polls),
+            waker: Arc::clone(&waker),
+            supports_wake: true,
+        });
+        // Wait until the worker has installed its waker and found the decoder busy.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while polls.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the worker never reached the decoder");
+            thread::yield_now();
+        }
+        let before = polls.load(Ordering::SeqCst);
+        thread::sleep(SOURCE_WAKE_SAFETY_WAIT * 3);
+        let idle_polls = polls.load(Ordering::SeqCst) - before;
+        assert!(
+            idle_polls <= 8,
+            "a busy decoder was polled {idle_polls} times in three safety periods; \
+             the 1 ms polling fallback would be in the hundreds"
+        );
+
+        // A finished unit plus one wake is enough: the worker returns without waiting out a poll
+        // interval and publishes the decoder's result.
+        ready.store(true, Ordering::SeqCst);
+        let wake = waker
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the worker installed a checkpoint waker");
+        wake();
+        assert!(matches!(
+            receive_matching(&engine, |event| matches!(
+                event,
+                AlignmentSceneEngineEvent::Error { .. }
+            )),
+            AlignmentSceneEngineEvent::Error {
+                operation: AlignmentSceneEngineOperation::PumpSource,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn foreground_row_pressure_is_reported_and_then_the_worker_goes_quiet() {
+        let (engine, mut contract, policy, camera, _) = test_engine_with_ledger(
+            None,
+            AllocationLedger::new_with_transient_budget(64 << 20, 0, 64 << 20),
+        );
+        contract.row_block_rows = NonZeroU32::new(1).unwrap();
+        let owner = SourceOwnerId::new(91);
+        engine.try_insert_lane(owner, contract, policy).unwrap();
+        engine.try_update_camera(owner, camera).unwrap();
+        receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated { owner: seen, frame, .. }
+                    if *seen == owner && frame.visible_complete()
+            )
+        });
+        // Let optional read-ahead settle so only the row block below contends for capacity.
+        while engine
+            .receive_timeout(Duration::from_millis(300))
+            .unwrap()
+            .is_some()
+        {}
+
+        let ledger = engine.ledger().clone();
+        ledger
+            .set_budget(ledger.snapshot().unwrap().charged)
+            .unwrap();
+        let scrolled = AlignmentCamera::from_viewport(
+            camera.viewport(),
+            72.0,
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap();
+        engine.try_update_camera(owner, scrolled).unwrap();
+        receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::ResourcePressure {
+                    owner: seen,
+                    operation: AlignmentSceneEngineOperation::PumpPresentation,
+                    intent: SourceIntentKind::Foreground,
+                    ..
+                } if *seen == owner
+            )
+        });
+
+        // An unlatched worker rebuilds the block and re-reports it on every iteration, so the
+        // event stream never falls silent. A latched one finishes its reclaim and stops.
+        let mut repeated_pressures = 0_usize;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the worker kept emitting events under standing pressure"
+            );
+            match engine.receive_timeout(Duration::from_millis(600)).unwrap() {
+                Some(AlignmentSceneEngineEvent::ResourcePressure {
+                    operation: AlignmentSceneEngineOperation::PumpPresentation,
+                    ..
+                }) => repeated_pressures += 1,
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(
+            repeated_pressures <= 2,
+            "the same refusal was reported {repeated_pressures} more times"
+        );
     }
 
     #[test]
@@ -2484,15 +3258,27 @@ mod tests {
         }
     }
 
-    fn test_engine_with_completion_gate(
-        completion_gate: Option<Arc<AtomicBool>>,
-    ) -> (
+    type TestEngineFixture = (
         AlignmentSceneEngine<ThreadRecordingBackend>,
         AlignmentSceneBuildContract,
         AlignmentScenePreparationPolicy,
         AlignmentCamera,
         Arc<Mutex<Vec<ThreadId>>>,
-    ) {
+    );
+
+    fn test_engine_with_completion_gate(
+        completion_gate: Option<Arc<AtomicBool>>,
+    ) -> TestEngineFixture {
+        test_engine_with_ledger(
+            completion_gate,
+            AllocationLedger::new_with_transient_budget(64 << 20, 32 << 20, 64 << 20),
+        )
+    }
+
+    fn test_engine_with_ledger(
+        completion_gate: Option<Arc<AtomicBool>>,
+        ledger: AllocationLedger,
+    ) -> TestEngineFixture {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
         let source = LocalAlignmentSource::open(path, &AlignmentOpenOptions::default()).unwrap();
         let contig = ContigId::new(0);
@@ -2514,7 +3300,6 @@ mod tests {
             completion_gate,
             pending_completion: None,
         };
-        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 32 << 20, 64 << 20);
         let store = EvidenceStore::new(source_revision, record_contract, ledger);
         let actor = AlignmentSourceActor::new(
             backend,
@@ -2553,6 +3338,7 @@ mod tests {
                 view_as_pairs: false,
                 pair_length_bounds: TemplateLengthBounds::default(),
                 promoted_template: None,
+                sampling: rgv_alignment_scene::ReadSampling::Complete,
             },
             presentation: PresentationContract {
                 geometry_lod: GeometryLod::Read,
@@ -2593,13 +3379,7 @@ mod tests {
         )
     }
 
-    fn test_engine() -> (
-        AlignmentSceneEngine<ThreadRecordingBackend>,
-        AlignmentSceneBuildContract,
-        AlignmentScenePreparationPolicy,
-        AlignmentCamera,
-        Arc<Mutex<Vec<ThreadId>>>,
-    ) {
+    fn test_engine() -> TestEngineFixture {
         test_engine_with_completion_gate(None)
     }
 

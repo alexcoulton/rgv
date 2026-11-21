@@ -4,6 +4,7 @@ mod alignment;
 mod bisulfite;
 mod exact_depth;
 mod filter;
+mod igv_genome;
 mod index_overview;
 mod junction;
 mod local;
@@ -22,6 +23,7 @@ mod summary_index;
 mod supplementary;
 mod tdf;
 mod tracks;
+mod two_bit;
 mod ultima;
 
 pub use alignment::{
@@ -38,6 +40,10 @@ pub use bisulfite::{
 };
 pub use exact_depth::{ExactDepthRun, ExactDepthTile, ExactDepthTileBuilder};
 pub use filter::{AlignmentFilter, AuxComparison, AuxPredicate, FilterParseError, FilterValue};
+pub use igv_genome::{
+    IgvGenomeImport, IgvGenomeLoadError, load_hosted_igv_genome, load_igv_genome,
+    load_igv_genome_list,
+};
 pub use index_overview::{ALIGNMENT_INDEX_OVERVIEW_BINS, AlignmentIndexOverview};
 pub use junction::{
     JunctionEvidence, JunctionObservation, JunctionProvenance, JunctionStrand, JunctionStrandInput,
@@ -60,7 +66,8 @@ pub use modification_summary::{
 pub use modified_bases::{
     BaseModificationStrand, ImplicitModificationMode, ModificationCode, ModifiedBaseCall,
     ModifiedBaseError, aligned_position_for_sequencer_position, decode_modified_bases,
-    decode_modified_bases_parts, sequencer_base_matches,
+    decode_modified_bases_parts, decode_modified_bases_parts_checked, modified_bases_resolvable,
+    sequencer_base_matches,
 };
 pub use pair::{
     MAX_TEMPLATE_LENGTH_SAMPLES, MIN_TEMPLATE_LENGTH_SAMPLES, MateVisibility, PairClassification,
@@ -68,10 +75,12 @@ pub use pair::{
     TemplateLengthBounds, pair_evidence, pair_evidence_at, pair_evidence_view, template_id,
 };
 pub use pileup::{
-    AlleleSupport, OverlapCollapser as AlignmentMateOverlapCollapser,
-    OverlapMask as AlignmentMateOverlapMask, PileupBin, PileupBuilder, PileupProvenance,
-    PileupSummary, QUALITY_WEIGHT_SCALE, QualityWeightedAlleleSupport, add_unmasked_range,
-    aligned_observation,
+    AlleleSupport, MateAlignment as AlignmentMateAlignment,
+    MateOverlapMask as AlignmentMateCoverageMask,
+    OverlapCollapser as AlignmentMateOverlapCollapser, OverlapMask as AlignmentMateOverlapMask,
+    PileupBin, PileupBuilder, PileupProvenance, PileupSummary, QUALITY_WEIGHT_SCALE,
+    QualityWeightedAlleleSupport, add_unmasked_range, aligned_observation,
+    base_observation_is_counted,
 };
 pub use reference::{FastaOpenOptions, FastaReference, ReferenceSlice};
 pub use remote::{

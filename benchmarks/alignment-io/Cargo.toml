@@ -22,5 +22,5 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rgv-core = { path = "../../crates/rgv-core" }
-rgv-hts = { path = "../../crates/rgv-hts" }
+rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
+rgv-hts = { version = "0.1.0", path = "../../crates/rgv-hts" }

@@ -51,6 +51,11 @@ pub struct ExactJunctionSummaryTile {
     normalization_mapped_records: Option<u64>,
     tile: CanonicalGenomicTile,
     summary: JunctionSummary,
+    /// Junctions which start left of this tile and reach into it. Every read supporting one
+    /// spans the tile's first base, so the counts are exact from this tile's own selection.
+    /// They are owned by an earlier tile whenever that tile is prepared; a summary root reads
+    /// them only from its first tile, where no owner exists.
+    entering: Vec<JunctionEvidence>,
     maximum_end: Option<u64>,
     allocation: AllocationLease,
 }
@@ -78,18 +83,26 @@ impl ExactJunctionSummaryTile {
         }
         let interval = tile.interval(contig_length)?;
         let selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
-        let maximum_junctions = (0..selection.len()).fold(0_usize, |total, index| {
-            total.saturating_add(selection.record_view(index).map_or(0, |record| {
-                record
-                    .cigar()
-                    .iter()
-                    .filter(|operation| operation.kind == CigarOpKind::ReferenceSkip)
-                    .count()
-            }))
-        });
-        let junction_capacity = maximum_junctions
+        // Only skips this tile can retain are counted: those it owns (start inside the tile)
+        // and those entering across its left edge.
+        let (maximum_owned, maximum_entering) =
+            (0..selection.len()).fold((0_usize, 0_usize), |(owned, entering), index| {
+                let (record_owned, record_entering) = selection
+                    .record_view(index)
+                    .map_or((0, 0), |record| retained_skip_counts(record, interval));
+                (
+                    owned.saturating_add(record_owned),
+                    entering.saturating_add(record_entering),
+                )
+            });
+        let junction_capacity = maximum_owned
             .checked_next_power_of_two()
-            .unwrap_or(usize::MAX);
+            .unwrap_or(usize::MAX)
+            .saturating_add(
+                maximum_entering
+                    .checked_next_power_of_two()
+                    .unwrap_or(usize::MAX),
+            );
         let maximum_bytes = size_of::<Self>()
             .saturating_add(junction_capacity.saturating_mul(size_of::<JunctionEvidence>()));
         let mut reservation = ledger.reserve(
@@ -103,6 +116,11 @@ impl ExactJunctionSummaryTile {
             reservation_kind,
         )?;
         let mut builder = JunctionSummaryBuilder::exact(
+            interval,
+            contract.minimum_flank(),
+            normalization_mapped_records,
+        );
+        let mut entering_builder = JunctionSummaryBuilder::exact(
             interval,
             contract.minimum_flank(),
             normalization_mapped_records,
@@ -139,27 +157,54 @@ impl ExactJunctionSummaryTile {
             }
             let (mut observations, dropped) = collector.finish();
             debug_assert_eq!(dropped, 0);
+            let entering_observations = observations
+                .iter()
+                .filter(|observation| {
+                    observation.start < interval.start() && observation.end > interval.start()
+                })
+                .copied()
+                .collect::<Vec<_>>();
             observations.retain(|observation| interval.contains(observation.start));
-            if observations.is_empty() {
+            if observations.is_empty() && entering_observations.is_empty() {
                 continue;
             }
             let strand = junction_strand(selection.auxiliary_field(index, *b"XS")?);
-            builder.add_record_junctions(
-                &observations,
-                dropped,
-                record.flags().is_reverse(),
-                strand,
-            );
+            if !observations.is_empty() {
+                builder.add_record_junctions(
+                    &observations,
+                    dropped,
+                    record.flags().is_reverse(),
+                    strand,
+                );
+            }
+            if !entering_observations.is_empty() {
+                entering_builder.add_record_junctions(
+                    &entering_observations,
+                    0,
+                    record.flags().is_reverse(),
+                    strand,
+                );
+            }
         }
         let mut summary = builder.finish(selection.len(), true);
+        let entering_summary = entering_builder.finish(selection.len(), true);
         if summary.provenance.dropped_record_junction_observations > 0
             || summary.provenance.dropped_distinct_junctions > 0
+            || entering_summary
+                .provenance
+                .dropped_record_junction_observations
+                > 0
+            || entering_summary.provenance.dropped_distinct_junctions > 0
         {
             return Err(ExactJunctionSummaryError::IncompleteAggregation);
         }
         summary.junctions.shrink_to_fit();
+        let mut entering = entering_summary.junctions;
+        entering.shrink_to_fit();
         let maximum_end = summary.junctions.iter().map(|junction| junction.end).max();
-        let retained_bytes = size_of::<Self>().saturating_add(summary.estimated_bytes());
+        let retained_bytes = size_of::<Self>()
+            .saturating_add(summary.estimated_bytes())
+            .saturating_add(entering_bytes(&entering));
         let allocation = reservation.register(retained_bytes, publication_revision)?;
         Ok(Arc::new(Self {
             source_revision: evidence.source_revision(),
@@ -169,6 +214,7 @@ impl ExactJunctionSummaryTile {
             normalization_mapped_records,
             tile,
             summary,
+            entering,
             maximum_end,
             allocation,
         }))
@@ -205,6 +251,16 @@ impl ExactJunctionSummaryTile {
         &self.summary
     }
 
+    /// Exact evidence for junctions which start before this tile and end after its first base.
+    ///
+    /// These are not part of [`Self::summary`]: the tile containing a junction's start owns it,
+    /// so that summing tiles never counts a junction twice. A consumer may use this list only
+    /// for the leftmost tile it has prepared, where the owning tile is absent.
+    #[must_use]
+    pub fn entering_junctions(&self) -> &[JunctionEvidence] {
+        &self.entering
+    }
+
     #[must_use]
     pub const fn maximum_end(&self) -> Option<u64> {
         self.maximum_end
@@ -221,8 +277,53 @@ impl ExactJunctionSummaryTile {
 
     #[must_use]
     pub fn estimated_bytes(&self) -> usize {
-        size_of::<Self>().saturating_add(self.summary.estimated_bytes())
+        size_of::<Self>()
+            .saturating_add(self.summary.estimated_bytes())
+            .saturating_add(entering_bytes(&self.entering))
     }
+}
+
+fn entering_bytes(entering: &Vec<JunctionEvidence>) -> usize {
+    entering
+        .capacity()
+        .saturating_mul(size_of::<JunctionEvidence>())
+}
+
+/// Reference skips of `record` this tile retains: `(owned, entering)`.
+fn retained_skip_counts(
+    record: rgv_hts::AlignmentRecordView<'_>,
+    tile: rgv_core::GenomicInterval,
+) -> (usize, usize) {
+    let mut owned = 0_usize;
+    let mut entering = 0_usize;
+    let mut reference_position = record.start();
+    for operation in record.cigar() {
+        if reference_position >= tile.end() {
+            break;
+        }
+        match operation.kind {
+            CigarOpKind::Match
+            | CigarOpKind::SequenceMatch
+            | CigarOpKind::SequenceMismatch
+            | CigarOpKind::Deletion => {
+                reference_position = reference_position.saturating_add(u64::from(operation.len));
+            }
+            CigarOpKind::ReferenceSkip => {
+                let end = reference_position.saturating_add(u64::from(operation.len));
+                if tile.contains(reference_position) {
+                    owned = owned.saturating_add(1);
+                } else if end > tile.start() {
+                    entering = entering.saturating_add(1);
+                }
+                reference_position = end;
+            }
+            CigarOpKind::Insertion
+            | CigarOpKind::SoftClip
+            | CigarOpKind::HardClip
+            | CigarOpKind::Padding => {}
+        }
+    }
+    (owned, entering)
 }
 
 fn junction_strand(field: Option<AuxField>) -> JunctionStrandInput {
@@ -449,6 +550,42 @@ mod tests {
             left.allocation().snapshot().unwrap().charged_capacity,
             left.estimated_bytes()
         );
+    }
+
+    #[test]
+    fn junctions_entering_a_tile_are_exact_but_stay_out_of_its_owned_summary() {
+        let ledger = AllocationLedger::new(1 << 20, 0);
+        let root = evidence(&ledger, true);
+        let build = |coordinate: u64| {
+            ExactJunctionSummaryTile::build(
+                &root,
+                tile(coordinate),
+                300,
+                JunctionSummaryContract::new(5),
+                Some(1_000),
+                &ledger,
+                ReservationKind::Normal,
+                3 + coordinate,
+            )
+            .unwrap()
+        };
+        let owner = build(0);
+        assert!(owner.entering_junctions().is_empty());
+        assert_eq!(owner.summary().junctions.len(), 1);
+        // The junction (90, 210) crosses the left edge of both later tiles. The read supporting
+        // it is resident in each, so each can report it exactly without owning it.
+        for coordinate in [1, 2] {
+            let later = build(coordinate);
+            assert!(later.summary().junctions.is_empty());
+            assert_eq!(
+                later.entering_junctions(),
+                owner.summary().junctions.as_slice()
+            );
+            assert_eq!(
+                later.allocation().snapshot().unwrap().charged_capacity,
+                later.estimated_bytes()
+            );
+        }
     }
 
     #[test]

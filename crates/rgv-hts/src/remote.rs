@@ -1,12 +1,10 @@
 use std::{
     fmt, fs,
+    hash::{BuildHasher, Hasher},
     io::{self, Read, Seek, SeekFrom},
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, OnceLock},
     thread,
     time::Duration,
 };
@@ -16,7 +14,7 @@ use reqwest::{
     blocking::{Client, RequestBuilder},
     header::{
         AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderName, HeaderValue, IF_RANGE,
-        LAST_MODIFIED, RANGE,
+        LAST_MODIFIED, LOCATION, RANGE, RETRY_AFTER,
     },
     redirect::Policy,
 };
@@ -169,9 +167,21 @@ pub(crate) struct RemoteObjectVersion {
 }
 
 impl Validator {
+    /// `If-Range` accepts only a strong entity tag or a date (RFC 9110 section 13.1.5). A weak
+    /// tag there makes a compliant server ignore the range and answer `200`, which would be
+    /// misreported as a changed object; the weak tag is still compared on every response.
     fn if_range(&self) -> Option<HeaderValue> {
-        self.etag.clone().or_else(|| self.last_modified.clone())
+        self.etag
+            .as_ref()
+            .filter(|etag| is_strong_entity_tag(etag))
+            .or(self.last_modified.as_ref())
+            .cloned()
     }
+}
+
+fn is_strong_entity_tag(etag: &HeaderValue) -> bool {
+    let bytes = etag.as_bytes();
+    bytes.len() >= 2 && bytes.starts_with(b"\"") && bytes.ends_with(b"\"")
 }
 
 #[derive(Debug)]
@@ -190,7 +200,6 @@ pub struct HttpRangeReader {
     blocks: LruCache<u64, CachedBlock>,
     current_block: Option<(u64, Vec<u8>)>,
     stats: RemoteIoStats,
-    redirect_count: Arc<AtomicU64>,
     cancellation: Option<RemoteCancellation>,
     cancellation_reported: bool,
     transfer_budget: Option<ActiveRemoteTransferBudget>,
@@ -203,49 +212,9 @@ impl HttpRangeReader {
         if !matches!(url.scheme(), "http" | "https") {
             return Err(RemoteError::UnsupportedScheme(url.scheme().to_owned()));
         }
-        let redirect_count = Arc::new(AtomicU64::new(0));
-        let policy_count = Arc::clone(&redirect_count);
-        // A custom credential is not one of reqwest's automatically stripped
-        // headers. Bind it to the opening origin for the entire redirect chain,
-        // including the probe and every later range request.
-        let authentication_origin =
-            (!matches!(config.authentication, RemoteAuthentication::None)).then(|| url.origin());
-        let redirect_policy = Policy::custom(move |attempt| {
-            if attempt.previous().len() > 10 {
-                return attempt.error(io::Error::other("remote redirect limit exceeded"));
-            }
-            let next = attempt.url();
-            if !matches!(next.scheme(), "http" | "https") {
-                return attempt.error(io::Error::other(
-                    "remote redirect used an unsupported scheme",
-                ));
-            }
-            if attempt
-                .previous()
-                .last()
-                .is_some_and(|previous| previous.scheme() == "https" && next.scheme() == "http")
-            {
-                return attempt.error(io::Error::other(
-                    "remote redirect attempted a secure transport downgrade",
-                ));
-            }
-            if authentication_origin
-                .as_ref()
-                .is_some_and(|origin| *origin != next.origin())
-            {
-                return attempt.error(io::Error::other(
-                    "authenticated remote redirect crossed its authorized origin",
-                ));
-            }
-            policy_count.fetch_add(1, Ordering::Relaxed);
-            attempt.follow()
-        });
-        let client = Client::builder()
-            .timeout(config.request_timeout)
-            .redirect(redirect_policy)
-            .build()?;
+        let client = shared_client()?;
         let (response, probe_requests, probe_retries) =
-            send_probe_with_retry(&client, &url, &config, &redirect_count)?;
+            send_probe_with_retry(&client, &url, &config)?;
         if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
             return Err(RemoteError::ObjectChangedOrRangeUnsupported);
         }
@@ -263,7 +232,7 @@ impl HttpRangeReader {
             etag: response.headers().get(ETAG).cloned(),
             last_modified: response.headers().get(LAST_MODIFIED).cloned(),
         };
-        let initial_response_bytes = read_bounded_response(response, 1)?.len() as u64;
+        let initial_response_bytes = read_bounded_response(response, 1, None)?.len() as u64;
         let block_capacity = config
             .maximum_cache_bytes
             .get()
@@ -286,7 +255,6 @@ impl HttpRangeReader {
                 retries: probe_retries,
                 ..RemoteIoStats::default()
             },
-            redirect_count,
             cancellation: None,
             cancellation_reported: false,
             transfer_budget: None,
@@ -415,25 +383,7 @@ impl HttpRangeReader {
             .saturating_add(desired_chunks.saturating_mul(chunk_size))
             .min(self.length)
             .saturating_sub(1);
-        let response = self.send_range_with_retry(start, end)?;
-        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(RemoteError::ObjectChangedOrRangeUnsupported);
-        }
-        validate_response_validator(&self.validator, response.headers())?;
-        let (response_start, response_end, response_length) =
-            parse_content_range(response.headers())?;
-        if response_start != start || response_end != end || response_length != self.length {
-            return Err(RemoteError::UnexpectedContentRange {
-                requested_start: start,
-                requested_end: end,
-                response_start,
-                response_end,
-                response_length,
-            });
-        }
-        let expected_bytes = usize::try_from(end.saturating_sub(start).saturating_add(1))
-            .map_err(|_| RemoteError::ResponseTooLarge(u64::MAX))?;
-        let bytes = read_bounded_response(response, expected_bytes)?;
+        let bytes = self.fetch_range_with_retry(start, end)?;
         self.stats.response_bytes = self.stats.response_bytes.saturating_add(bytes.len() as u64);
         for (offset, data) in bytes.chunks(self.config.chunk_size.get()).enumerate() {
             let block_index = first_block.saturating_add(offset as u64);
@@ -453,52 +403,220 @@ impl HttpRangeReader {
         Ok(())
     }
 
-    fn send_range_with_retry(
-        &mut self,
-        start: u64,
-        end: u64,
-    ) -> Result<reqwest::blocking::Response, RemoteError> {
+    /// Fetches one byte range, retrying transient failures of the request *and* of the body
+    /// transfer: a connection dropped halfway through a body is as transient as a refused one.
+    fn fetch_range_with_retry(&mut self, start: u64, end: u64) -> Result<Vec<u8>, RemoteError> {
         let expected_response_bytes = end.saturating_sub(start).saturating_add(1);
-        for attempt in 0..=self.config.maximum_retries {
+        let mut attempt = 0;
+        loop {
             self.check_cancellation()?;
             self.check_transfer_budget(expected_response_bytes)?;
-            let mut request = self.config.authentication.apply(
-                self.client
-                    .get(self.url.clone())
-                    .header(RANGE, format!("bytes={start}-{end}")),
-            );
-            if let Some(if_range) = self.validator.if_range() {
-                request = request.header(IF_RANGE, if_range);
-            }
-            self.stats.requests = self.stats.requests.saturating_add(1);
-            let redirects_before = self.redirect_count.load(Ordering::Relaxed);
-            let response = request.send();
-            let redirects = self
-                .redirect_count
-                .load(Ordering::Relaxed)
-                .saturating_sub(redirects_before);
-            self.stats.requests = self.stats.requests.saturating_add(redirects);
-            self.check_cancellation()?;
-            match response {
-                Ok(response)
-                    if is_retryable_status(response.status())
-                        && attempt < self.config.maximum_retries =>
+            match self.fetch_range_once(start, end) {
+                Ok(bytes) => return Ok(bytes),
+                Err(RangeAttemptError::Transient { retry_after, .. })
+                    if attempt < self.config.maximum_retries =>
                 {
                     self.stats.retries = self.stats.retries.saturating_add(1);
-                    thread::sleep(retry_delay(attempt));
+                    let delay = retry_delay(attempt, retry_after);
+                    let cancellation = self.cancellation.clone();
+                    sleep_unless_cancelled(delay, cancellation.as_ref());
+                    attempt += 1;
                 }
-                Ok(response) => return Ok(response.error_for_status()?),
-                Err(error)
-                    if (error.is_timeout() || error.is_connect())
-                        && attempt < self.config.maximum_retries =>
-                {
-                    self.stats.retries = self.stats.retries.saturating_add(1);
-                    thread::sleep(retry_delay(attempt));
-                }
-                Err(error) => return Err(error.into()),
+                Err(
+                    RangeAttemptError::Transient { error, .. } | RangeAttemptError::Fatal(error),
+                ) => return Err(error),
             }
         }
-        unreachable!("retry loop always returns on its final attempt")
+    }
+
+    fn fetch_range_once(&mut self, start: u64, end: u64) -> Result<Vec<u8>, RangeAttemptError> {
+        self.stats.requests = self.stats.requests.saturating_add(1);
+        let range = format!("bytes={start}-{end}");
+        let if_range = self.validator.if_range();
+        let (response, redirects) = send_following_redirects(
+            &self.client,
+            &self.url,
+            &self.config,
+            &range,
+            if_range.as_ref(),
+        );
+        self.stats.requests = self.stats.requests.saturating_add(redirects);
+        self.check_cancellation()
+            .map_err(RangeAttemptError::Fatal)?;
+        let response = classify_response(response)?;
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(RangeAttemptError::Fatal(
+                RemoteError::ObjectChangedOrRangeUnsupported,
+            ));
+        }
+        validate_response_validator(&self.validator, response.headers())
+            .map_err(RangeAttemptError::Fatal)?;
+        let (response_start, response_end, response_length) =
+            parse_content_range(response.headers()).map_err(RangeAttemptError::Fatal)?;
+        if response_start != start || response_end != end || response_length != self.length {
+            return Err(RangeAttemptError::Fatal(
+                RemoteError::UnexpectedContentRange {
+                    requested_start: start,
+                    requested_end: end,
+                    response_start,
+                    response_end,
+                    response_length,
+                },
+            ));
+        }
+        let expected_bytes = usize::try_from(end.saturating_sub(start).saturating_add(1))
+            .map_err(|_| RangeAttemptError::Fatal(RemoteError::ResponseTooLarge(u64::MAX)))?;
+        if declared_length_mismatch(&response, expected_bytes) {
+            // The server itself announced the wrong size; repeating the request cannot help.
+            return Err(RangeAttemptError::Fatal(
+                RemoteError::UnexpectedResponseLength {
+                    expected: expected_bytes as u64,
+                    actual: response.content_length(),
+                },
+            ));
+        }
+        let cancellation = self.cancellation.clone();
+        match read_bounded_response(response, expected_bytes, cancellation.as_ref()) {
+            Ok(bytes) => Ok(bytes),
+            Err(RemoteError::Cancelled) => {
+                // Routes through the reader so the cancellation is counted exactly once.
+                self.check_cancellation()
+                    .map_err(RangeAttemptError::Fatal)?;
+                Err(RangeAttemptError::Fatal(RemoteError::Cancelled))
+            }
+            Err(
+                error @ (RemoteError::Io(_)
+                | RemoteError::UnexpectedResponseLength {
+                    actual: Some(_), ..
+                }),
+            ) => Err(RangeAttemptError::Transient {
+                error,
+                retry_after: None,
+            }),
+            Err(error) => Err(RangeAttemptError::Fatal(error)),
+        }
+    }
+}
+
+/// Outcome of one range attempt that did not produce bytes.
+enum RangeAttemptError {
+    /// Worth repeating: timeout, connection failure, `408`/`429`/`5xx`, or a body that broke
+    /// off mid-transfer.
+    Transient {
+        error: RemoteError,
+        retry_after: Option<Duration>,
+    },
+    Fatal(RemoteError),
+}
+
+enum SendError {
+    Transport(reqwest::Error),
+    Redirect,
+}
+
+impl From<SendError> for RemoteError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::Transport(error) => error.into(),
+            SendError::Redirect => Self::Http(RemoteHttpError {
+                status: None,
+                category: "failed while following a redirect",
+            }),
+        }
+    }
+}
+
+/// One connection pool for every remote reader in the process, so opening a second track on the
+/// same host reuses established (TLS) connections. Redirects are followed by
+/// [`send_following_redirects`] because the policy depends on each reader's opening origin.
+fn shared_client() -> Result<Client, RemoteError> {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client.clone());
+    }
+    let client = Client::builder().redirect(Policy::none()).build()?;
+    Ok(CLIENT.get_or_init(|| client).clone())
+}
+
+const MAXIMUM_REDIRECTS: u64 = 10;
+
+/// Sends one range request, following redirects under the reader's policy: at most ten hops,
+/// `http`/`https` only, never from `https` down to `http`, and never away from the opening
+/// origin while a credential is attached (a custom credential header is not something an HTTP
+/// client strips on its own). Returns the response and the number of redirects followed.
+fn send_following_redirects(
+    client: &Client,
+    url: &Url,
+    config: &HttpRangeConfig,
+    range: &str,
+    if_range: Option<&HeaderValue>,
+) -> (Result<reqwest::blocking::Response, SendError>, u64) {
+    let authentication_origin =
+        (!matches!(config.authentication, RemoteAuthentication::None)).then(|| url.origin());
+    let mut current = url.clone();
+    let mut redirects = 0_u64;
+    loop {
+        let mut request = config.authentication.apply(
+            client
+                .get(current.clone())
+                .timeout(config.request_timeout)
+                .header(RANGE, range),
+        );
+        if let Some(if_range) = if_range {
+            request = request.header(IF_RANGE, if_range);
+        }
+        let response = match request.send() {
+            Ok(response) => response,
+            Err(error) => return (Err(SendError::Transport(error)), redirects),
+        };
+        let is_redirect = matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308);
+        let Some(location) = response.headers().get(LOCATION).filter(|_| is_redirect) else {
+            return (Ok(response), redirects);
+        };
+        let next = location
+            .to_str()
+            .ok()
+            .and_then(|location| current.join(location).ok());
+        let Some(next) = next.filter(|next| {
+            redirects < MAXIMUM_REDIRECTS
+                && matches!(next.scheme(), "http" | "https")
+                && !(current.scheme() == "https" && next.scheme() == "http")
+                && authentication_origin
+                    .as_ref()
+                    .is_none_or(|origin| *origin == next.origin())
+        }) else {
+            return (Err(SendError::Redirect), redirects);
+        };
+        redirects += 1;
+        current = next;
+    }
+}
+
+/// Separates responses worth retrying from final ones.
+fn classify_response(
+    response: Result<reqwest::blocking::Response, SendError>,
+) -> Result<reqwest::blocking::Response, RangeAttemptError> {
+    match response {
+        Ok(response) if is_retryable_status(response.status()) => {
+            let retry_after = parse_retry_after(response.headers());
+            match response.error_for_status() {
+                Ok(response) => Ok(response),
+                Err(error) => Err(RangeAttemptError::Transient {
+                    error: error.into(),
+                    retry_after,
+                }),
+            }
+        }
+        Ok(response) => response
+            .error_for_status()
+            .map_err(|error| RangeAttemptError::Fatal(error.into())),
+        Err(SendError::Transport(error)) if error.is_timeout() || error.is_connect() => {
+            Err(RangeAttemptError::Transient {
+                error: error.into(),
+                retry_after: None,
+            })
+        }
+        Err(error) => Err(RangeAttemptError::Fatal(error.into())),
     }
 }
 
@@ -506,41 +624,29 @@ fn send_probe_with_retry(
     client: &Client,
     url: &Url,
     config: &HttpRangeConfig,
-    redirect_count: &AtomicU64,
 ) -> Result<(reqwest::blocking::Response, u64, u64), RemoteError> {
     let mut requests = 0_u64;
     let mut retries = 0_u64;
-    for attempt in 0..=config.maximum_retries {
-        let redirects_before = redirect_count.load(Ordering::Relaxed);
+    let mut attempt = 0;
+    loop {
         requests = requests.saturating_add(1);
-        let response = config
-            .authentication
-            .apply(client.get(url.clone()).header(RANGE, "bytes=0-0"))
-            .send();
-        requests = requests.saturating_add(
-            redirect_count
-                .load(Ordering::Relaxed)
-                .saturating_sub(redirects_before),
-        );
-        match response {
-            Ok(response)
-                if is_retryable_status(response.status()) && attempt < config.maximum_retries =>
+        let (response, redirects) =
+            send_following_redirects(client, url, config, "bytes=0-0", None);
+        requests = requests.saturating_add(redirects);
+        match classify_response(response) {
+            Ok(response) => return Ok((response, requests, retries)),
+            Err(RangeAttemptError::Transient { retry_after, .. })
+                if attempt < config.maximum_retries =>
             {
                 retries = retries.saturating_add(1);
-                thread::sleep(retry_delay(attempt));
+                sleep_unless_cancelled(retry_delay(attempt, retry_after), None);
+                attempt += 1;
             }
-            Ok(response) => return Ok((response.error_for_status()?, requests, retries)),
-            Err(error)
-                if (error.is_timeout() || error.is_connect())
-                    && attempt < config.maximum_retries =>
-            {
-                retries = retries.saturating_add(1);
-                thread::sleep(retry_delay(attempt));
+            Err(RangeAttemptError::Transient { error, .. } | RangeAttemptError::Fatal(error)) => {
+                return Err(error);
             }
-            Err(error) => return Err(error.into()),
         }
     }
-    unreachable!("probe retry loop always returns on its final attempt")
 }
 
 fn validate_config(config: &HttpRangeConfig) -> Result<(), RemoteError> {
@@ -593,25 +699,42 @@ fn parse_content_range(
     Ok((start, end, length))
 }
 
-fn read_bounded_response(
-    mut response: reqwest::blocking::Response,
-    expected_bytes: usize,
-) -> Result<Vec<u8>, RemoteError> {
-    if response
+fn declared_length_mismatch(response: &reqwest::blocking::Response, expected_bytes: usize) -> bool {
+    response
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .is_some_and(|length| length != expected_bytes as u64)
-    {
+}
+
+/// Body bytes read between two cancellation checks.
+const BODY_READ_SLICE_BYTES: usize = 64 * 1024;
+
+fn read_bounded_response(
+    mut response: reqwest::blocking::Response,
+    expected_bytes: usize,
+    cancellation: Option<&RemoteCancellation>,
+) -> Result<Vec<u8>, RemoteError> {
+    if declared_length_mismatch(&response, expected_bytes) {
         return Err(RemoteError::UnexpectedResponseLength {
             expected: expected_bytes as u64,
             actual: response.content_length(),
         });
     }
-    let limit = expected_bytes.saturating_add(1) as u64;
+    let limit = expected_bytes.saturating_add(1);
     let mut bytes = Vec::with_capacity(expected_bytes.min(1024 * 1024));
-    response.by_ref().take(limit).read_to_end(&mut bytes)?;
+    // A large body is read in slices so a view change abandons it mid-transfer instead of
+    // after the last byte.
+    while bytes.len() < limit {
+        if cancellation.is_some_and(|keep_going| !keep_going()) {
+            return Err(RemoteError::Cancelled);
+        }
+        let slice = (limit - bytes.len()).min(BODY_READ_SLICE_BYTES) as u64;
+        if response.by_ref().take(slice).read_to_end(&mut bytes)? == 0 {
+            break;
+        }
+    }
     if bytes.len() != expected_bytes {
         return Err(RemoteError::UnexpectedResponseLength {
             expected: expected_bytes as u64,
@@ -644,8 +767,50 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
         || status.is_server_error()
 }
 
-fn retry_delay(attempt: usize) -> Duration {
-    Duration::from_millis(25_u64.saturating_mul(1_u64 << attempt.min(5)))
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+/// Longest wait a server can impose through `Retry-After` before the request is retried anyway;
+/// an interactive viewer must not park a worker for minutes on a server's say-so.
+const MAXIMUM_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// Exponential backoff with jitter (between one and two times `100 ms * 2^attempt`), raised to
+/// the server's `Retry-After` when that is longer. Jitter keeps the many readers of one session
+/// from retrying a recovering server in lockstep.
+fn retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    let base = RETRY_BASE_DELAY.saturating_mul(1_u32 << attempt.min(5));
+    let base_millis = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
+    // `RandomState` is seeded per instance from process-level randomness.
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let jittered = base.saturating_add(Duration::from_millis(random % base_millis.max(1)));
+    jittered.max(retry_after.unwrap_or_default().min(MAXIMUM_RETRY_AFTER))
+}
+
+/// Parses the delay-seconds form of `Retry-After`. The HTTP-date form is ignored (plain
+/// backoff applies) rather than trusted against a possibly skewed local clock.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
+/// Sleeps in short slices so a cancelled generation does not sit out a full backoff.
+fn sleep_unless_cancelled(delay: Duration, cancellation: Option<&RemoteCancellation>) {
+    const SLICE: Duration = Duration::from_millis(20);
+    let mut remaining = delay;
+    while !remaining.is_zero() {
+        if cancellation.is_some_and(|keep_going| !keep_going()) {
+            return;
+        }
+        let slice = remaining.min(SLICE);
+        thread::sleep(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
 }
 
 impl Read for HttpRangeReader {
@@ -689,6 +854,98 @@ impl Seek for HttpRangeReader {
         }
         self.position = next as u64;
         Ok(self.position)
+    }
+}
+
+/// Steers a remote reader after it has been moved into a format decoder that exposes no
+/// mutable access to it (bigWig/bigBed). Changes take effect at the reader's next read.
+#[derive(Clone, Default)]
+pub(crate) struct RemoteReaderControl(Arc<std::sync::Mutex<RemoteReaderControlState>>);
+
+#[derive(Default)]
+struct RemoteReaderControlState {
+    cancellation: PendingChange<RemoteCancellation>,
+    transfer_budget: PendingChange<RemoteTransferBudget>,
+    stats: RemoteIoStats,
+}
+
+/// A setting change waiting for the reader's next read.
+#[derive(Default)]
+enum PendingChange<T> {
+    #[default]
+    Unchanged,
+    Set(Option<T>),
+}
+
+impl RemoteReaderControl {
+    fn state(&self) -> std::sync::MutexGuard<'_, RemoteReaderControlState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn set_cancellation(&self, cancellation: Option<RemoteCancellation>) {
+        self.state().cancellation = PendingChange::Set(cancellation);
+    }
+
+    pub(crate) fn set_transfer_budget(&self, budget: Option<RemoteTransferBudget>) {
+        self.state().transfer_budget = PendingChange::Set(budget);
+    }
+
+    /// Transfer statistics as of the reader's most recent read.
+    pub(crate) fn stats(&self) -> RemoteIoStats {
+        self.state().stats
+    }
+}
+
+/// A [`HttpRangeReader`] that applies [`RemoteReaderControl`] changes before each read.
+pub(crate) struct ControlledRangeReader {
+    reader: HttpRangeReader,
+    control: RemoteReaderControl,
+}
+
+impl ControlledRangeReader {
+    pub(crate) fn open(
+        url: &str,
+        config: HttpRangeConfig,
+    ) -> Result<(Self, RemoteReaderControl), RemoteError> {
+        let reader = HttpRangeReader::open(url, config)?;
+        let control = RemoteReaderControl::default();
+        control.state().stats = reader.stats();
+        Ok((
+            Self {
+                reader,
+                control: control.clone(),
+            },
+            control,
+        ))
+    }
+}
+
+impl Read for ControlledRangeReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let (cancellation, transfer_budget) = {
+            let mut state = self.control.state();
+            (
+                std::mem::take(&mut state.cancellation),
+                std::mem::take(&mut state.transfer_budget),
+            )
+        };
+        if let PendingChange::Set(cancellation) = cancellation {
+            self.reader.set_cancellation(cancellation);
+        }
+        if let PendingChange::Set(transfer_budget) = transfer_budget {
+            self.reader.set_transfer_budget(transfer_budget);
+        }
+        let result = self.reader.read(buffer);
+        self.control.state().stats = self.reader.stats();
+        result
+    }
+}
+
+impl Seek for ControlledRangeReader {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.reader.seek(position)
     }
 }
 
@@ -1476,6 +1733,186 @@ mod tests {
         );
         assert!(error.to_string().contains("expected 8 bytes"));
         assert!(error.to_string().contains("received Some(7)"));
+    }
+
+    #[test]
+    fn a_body_that_breaks_off_mid_transfer_is_retried() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let data = (0_u8..64).collect::<Vec<_>>();
+        let served = data.clone();
+        // Request 1 is the probe, request 2 promises eight bytes and hangs up after three,
+        // request 3 is the retry.
+        let worker = thread::spawn(move || {
+            for request_number in 1..=3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("range:") {
+                        range = parse_test_range(value.trim(), served.len());
+                    }
+                }
+                let (start, end) = range.unwrap();
+                let body = &served[start..=end];
+                write!(
+                    stream,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\n\
+                     Content-Length: {}\r\nETag: \"broken-body\"\r\nConnection: close\r\n\r\n",
+                    served.len(),
+                    body.len(),
+                )
+                .unwrap();
+                let sent = if request_number == 2 { 3 } else { body.len() };
+                stream.write_all(&body[..sent]).unwrap();
+            }
+        });
+        let mut reader = HttpRangeReader::open(
+            &format!("http://{address}/broken.bin"),
+            HttpRangeConfig {
+                chunk_size: NonZeroUsize::new(8).unwrap(),
+                maximum_cache_bytes: NonZeroUsize::new(16).unwrap(),
+                maximum_coalesced_chunks: NonZeroUsize::MIN,
+                maximum_retries: 1,
+                ..HttpRangeConfig::default()
+            },
+        )
+        .unwrap();
+        let mut bytes = [0_u8; 8];
+        reader.read_exact(&mut bytes).unwrap();
+        worker.join().unwrap();
+        assert_eq!(bytes, data[..8]);
+        assert_eq!(reader.stats().requests, 3);
+        assert_eq!(reader.stats().retries, 1);
+        assert_eq!(reader.stats().response_bytes, 9);
+    }
+
+    #[test]
+    fn retry_delay_is_jittered_backoff_bounded_by_retry_after() {
+        for _ in 0..64 {
+            let first = retry_delay(0, None);
+            assert!((Duration::from_millis(100)..Duration::from_millis(200)).contains(&first));
+            let second = retry_delay(1, None);
+            assert!((Duration::from_millis(200)..Duration::from_millis(400)).contains(&second));
+        }
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(3))),
+            Duration::from_secs(3)
+        );
+        // A server cannot park the reader for longer than the cap.
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(600))),
+            MAXIMUM_RETRY_AFTER
+        );
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&headers), None);
+        headers.insert(RETRY_AFTER, HeaderValue::from_static(" 7 "));
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(7)));
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn retry_backoff_ends_early_when_the_generation_is_cancelled() {
+        let cancellation: RemoteCancellation = Arc::new(|| false);
+        let started = std::time::Instant::now();
+        sleep_unless_cancelled(Duration::from_secs(5), Some(&cancellation));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn if_range_never_carries_a_weak_entity_tag() {
+        let validator =
+            |etag: Option<&'static str>, last_modified: Option<&'static str>| Validator {
+                etag: etag.map(HeaderValue::from_static),
+                last_modified: last_modified.map(HeaderValue::from_static),
+            };
+        let date = "Wed, 21 Oct 2026 07:28:00 GMT";
+        assert_eq!(
+            validator(Some("\"strong\""), Some(date)).if_range(),
+            Some(HeaderValue::from_static("\"strong\""))
+        );
+        assert_eq!(
+            validator(Some("W/\"weak\""), Some(date)).if_range(),
+            Some(HeaderValue::from_static(date))
+        );
+        assert_eq!(validator(Some("W/\"weak\""), None).if_range(), None);
+        assert_eq!(validator(None, None).if_range(), None);
+    }
+
+    #[test]
+    fn weak_entity_tags_do_not_turn_range_reads_into_changed_object_errors() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            let data = (0_u8..64).collect::<Vec<_>>();
+            while !worker_stop.load(Ordering::Relaxed) {
+                let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(20)) else {
+                    continue;
+                };
+                // RFC 9110: a weak validator in If-Range never matches, so the whole
+                // representation is sent with 200.
+                let weak_if_range = request.headers().iter().any(|header| {
+                    header.field.equiv("If-Range") && header.value.as_str().starts_with("W/")
+                });
+                if weak_if_range {
+                    request
+                        .respond(
+                            Response::from_data(data.clone())
+                                .with_header(test_header("ETag", "W/\"weak-fixture\"")),
+                        )
+                        .unwrap();
+                    continue;
+                }
+                let (start, end) = request
+                    .headers()
+                    .iter()
+                    .find(|header| header.field.equiv("Range"))
+                    .and_then(|header| parse_test_range(header.value.as_str(), data.len()))
+                    .unwrap();
+                request
+                    .respond(
+                        Response::from_data(data[start..=end].to_vec())
+                            .with_status_code(StatusCode(206))
+                            .with_header(test_header(
+                                "Content-Range",
+                                format!("bytes {start}-{end}/{}", data.len()),
+                            ))
+                            .with_header(test_header("ETag", "W/\"weak-fixture\"")),
+                    )
+                    .unwrap();
+            }
+        });
+        let mut reader = HttpRangeReader::open(
+            &format!("http://{address}/weak.bin"),
+            HttpRangeConfig {
+                chunk_size: NonZeroUsize::new(8).unwrap(),
+                maximum_cache_bytes: NonZeroUsize::new(16).unwrap(),
+                ..HttpRangeConfig::default()
+            },
+        )
+        .unwrap();
+        let mut bytes = [0_u8; 8];
+        let result = reader.read_exact(&mut bytes);
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        result.unwrap();
+        assert_eq!(bytes, [0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
     fn parse_test_range(value: &str, length: usize) -> Option<(usize, usize)> {

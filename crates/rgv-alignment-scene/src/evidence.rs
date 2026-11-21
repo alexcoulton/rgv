@@ -1,9 +1,7 @@
 use std::{collections::HashSet, mem::size_of, sync::Arc};
 
 use rgv_core::GenomicInterval;
-use rgv_hts::{
-    AlignmentOverlapIndex, AlignmentRecordView, AuxField, PackedRecordError, SequenceView,
-};
+use rgv_hts::{AlignmentRecordView, AuxField, PackedRecordError, SequenceView};
 use thiserror::Error;
 
 use crate::{
@@ -18,7 +16,6 @@ use crate::{
 #[derive(Debug)]
 pub struct EvidenceChunk {
     chunk: CanonicalRecordChunk,
-    overlap: AlignmentOverlapIndex,
     core_allocation: AllocationLease,
     overlap_allocation: AllocationLease,
     payload: Option<Arc<PayloadSidecar>>,
@@ -27,10 +24,10 @@ pub struct EvidenceChunk {
 impl EvidenceChunk {
     #[must_use]
     pub fn footprint(chunk: &CanonicalRecordChunk) -> EvidenceChunkFootprint {
-        let overlap = AlignmentOverlapIndex::new(chunk.batch());
+        // The index is built once here and kept by the chunk, so admission reuses it.
         EvidenceChunkFootprint {
             core_bytes: chunk.estimated_bytes(),
-            overlap_index_bytes: overlap.estimated_bytes(),
+            overlap_index_bytes: chunk.overlap_index().estimated_bytes(),
         }
     }
 
@@ -63,7 +60,6 @@ impl EvidenceChunk {
         {
             return Err(EvidenceChunkError::PayloadOwnerMismatch);
         }
-        let overlap = AlignmentOverlapIndex::new(chunk.batch());
         validate_allocation(
             &core_allocation,
             AllocationClass::CoreChunk,
@@ -72,11 +68,10 @@ impl EvidenceChunk {
         validate_allocation(
             &overlap_allocation,
             AllocationClass::OverlapIndex,
-            overlap.estimated_bytes(),
+            chunk.overlap_index().estimated_bytes(),
         )?;
         Ok(Self {
             chunk,
-            overlap,
             core_allocation,
             overlap_allocation,
             payload,
@@ -104,11 +99,15 @@ impl EvidenceChunk {
     }
 
     pub(crate) fn overlapping_record_indices(&self, interval: GenomicInterval) -> Vec<usize> {
-        self.overlap.select(self.chunk.batch(), interval)
+        self.chunk
+            .overlap_index()
+            .select(self.chunk.batch(), interval)
     }
 
     pub(crate) fn overlapping_record_count(&self, interval: GenomicInterval) -> usize {
-        self.overlap.count(self.chunk.batch(), interval)
+        self.chunk
+            .overlap_index()
+            .count(self.chunk.batch(), interval)
     }
 }
 
@@ -226,12 +225,22 @@ impl EvidenceRootBuilder {
         // summing chunk lengths is not exact. Compute the unique count once while this root is
         // still builder-owned; every published root is immutable and can thereafter expose the
         // value without rebuilding a million-entry set on UI or diagnostic paths.
+        // A handle names its owning source chunk, and handles are unique within one chunk, so
+        // only fragments sharing a chunk id can repeat a record. Deduplicating inside those
+        // (rare) groups keeps the count exact without hashing every handle of every root.
         let record_count = self
             .chunks
-            .iter()
-            .flat_map(|chunk| chunk.chunk.handles().iter().copied())
-            .collect::<HashSet<_>>()
-            .len();
+            .chunk_by(|left, right| left.chunk.id() == right.chunk.id())
+            .fold(0_usize, |total, fragments| {
+                total.saturating_add(match fragments {
+                    [only] => only.chunk.handles().len(),
+                    fragments => fragments
+                        .iter()
+                        .flat_map(|chunk| chunk.chunk.handles().iter().copied())
+                        .collect::<HashSet<_>>()
+                        .len(),
+                })
+            });
         let retained_metadata_bytes = self
             .chunks
             .len()
@@ -479,10 +488,14 @@ impl EvidenceRoot {
             maximum_scratch,
             reservation_kind,
         )?;
-        let mut records = Vec::with_capacity(maximum_records);
-        let mut seen = HashSet::with_capacity(maximum_records);
+        // Sort keys are read once per record. Evaluating them inside the comparator, and
+        // deduplicating through a hash set, dominated selection at deep loci.
+        let mut keyed = Vec::<(u64, u64, EvidenceRecordRef)>::with_capacity(maximum_records);
         for (chunk_index, chunk) in self.chunks.iter().enumerate() {
-            for record_index in chunk.overlap.select(chunk.chunk.batch(), interval) {
+            let chunk_index_u32 =
+                u32::try_from(chunk_index).map_err(|_| EvidenceSelectionError::IndexOverflow)?;
+            let batch = chunk.chunk.batch();
+            for record_index in chunk.chunk.overlap_index().select(batch, interval) {
                 let record_index_u32 = u32::try_from(record_index)
                     .map_err(|_| EvidenceSelectionError::IndexOverflow)?;
                 let handle = *chunk
@@ -498,26 +511,25 @@ impl EvidenceRoot {
                 {
                     continue;
                 }
-                if !seen.insert(handle) {
-                    continue;
-                }
-                records.push(EvidenceRecordRef {
-                    chunk: u32::try_from(chunk_index)
-                        .map_err(|_| EvidenceSelectionError::IndexOverflow)?,
-                    record: record_index_u32,
-                    handle,
-                });
+                keyed.push((
+                    batch.start(record_index).unwrap_or_default(),
+                    batch.end(record_index).unwrap_or_default(),
+                    EvidenceRecordRef {
+                        chunk: chunk_index_u32,
+                        record: record_index_u32,
+                        handle,
+                    },
+                ));
             }
         }
-        records.sort_by_key(|record| {
-            let chunk = &self.chunks[record.chunk as usize];
-            let batch = chunk.chunk.batch();
-            (
-                batch.start(record.record as usize).unwrap_or_default(),
-                batch.end(record.record as usize).unwrap_or_default(),
-                record.handle,
-            )
-        });
+        // Stable: among copies of one physical record the first chunk wins, as before. Copies
+        // share start, end and handle, so they are adjacent after sorting.
+        keyed.sort_by_key(|(start, end, record)| (*start, *end, record.handle));
+        keyed.dedup_by_key(|(_, _, record)| record.handle);
+        let mut records = keyed
+            .into_iter()
+            .map(|(_, _, record)| record)
+            .collect::<Vec<_>>();
         records.shrink_to_fit();
         let retained_scratch = evidence_selection_retained_bytes(records.capacity());
         let records: Arc<[EvidenceRecordRef]> = records.into();
@@ -719,14 +731,14 @@ impl EvidenceRoot {
     }
 }
 
+/// Peak scratch of [`EvidenceRoot::select_impl`]: the keyed sort vector (two cached `u64` sort
+/// keys beside each record reference), the retained record vector collected from it, and the
+/// largest per-chunk overlap result. Selection deduplicates by sorting, so there is no hash set
+/// to charge for.
 fn evidence_selection_scratch_bytes(records: usize, maximum_chunk_records: usize) -> usize {
-    let retained_twice = evidence_selection_retained_bytes(records).saturating_mul(2);
-    let hash_buckets = records
+    evidence_selection_retained_bytes(records)
         .saturating_mul(2)
-        .checked_next_power_of_two()
-        .unwrap_or(usize::MAX);
-    retained_twice
-        .saturating_add(hash_buckets.saturating_mul(size_of::<AlignmentHandle>().saturating_add(1)))
+        .saturating_add(records.saturating_mul(size_of::<(u64, u64)>()))
         .saturating_add(maximum_chunk_records.saturating_mul(size_of::<usize>()))
 }
 

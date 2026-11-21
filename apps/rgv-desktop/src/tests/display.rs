@@ -956,11 +956,20 @@ fn unified_annotation_lane_layout_exists_without_a_legacy_query() {
 
 #[test]
 fn shifted_macos_wheel_uses_horizontal_fallback_for_vertical_scroll() {
-    let horizontal_line = wheel_primary_axis(MouseScrollDelta::LineDelta(2.0, 0.0));
-    let horizontal_pixel = wheel_primary_axis(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+    use crate::app::shell_state::{ScrollIntent, ScrollModifiers, interpret_scroll};
+    let shift = ScrollModifiers {
+        shift: true,
+        primary: false,
+    };
+    let points = |delta| match interpret_scroll(delta, 1.0, shift, true) {
+        ScrollIntent::ScrollTracks { points } => points,
+        other => panic!("shifted wheel scrolls tracks, got {other:?}"),
+    };
+    let horizontal_line = points(MouseScrollDelta::LineDelta(2.0, 0.0));
+    let horizontal_pixel = points(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
         -24.0, 0.0,
     )));
-    let vertical_wins = wheel_primary_axis(MouseScrollDelta::LineDelta(8.0, -1.0));
+    let vertical_wins = points(MouseScrollDelta::LineDelta(8.0, -1.0));
     assert!((horizontal_line - 80.0).abs() < f32::EPSILON);
     assert!((horizontal_pixel + 24.0).abs() < f32::EPSILON);
     assert!((vertical_wins + 40.0).abs() < f32::EPSILON);

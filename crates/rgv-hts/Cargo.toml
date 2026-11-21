@@ -11,6 +11,9 @@ bigtools.workspace = true
 flate2.workspace = true
 lru.workspace = true
 noodles.workspace = true
+# Not used directly: selects the workspace `libdeflate` feature so every binary that links
+# rgv-hts (not only the benchmarks) inflates BGZF blocks with libdeflate.
+noodles-bgzf.workspace = true
 reqwest.workspace = true
 rgv-core = { version = "0.1.0", path = "../rgv-core" }
 rust-htslib.workspace = true

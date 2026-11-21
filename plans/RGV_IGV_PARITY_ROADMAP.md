@@ -2,6 +2,13 @@
 
 Status date: 23 August 2026
 
+> **Correction, 11 November 2026.** An independent assessment found this roadmap's status table
+> overstated. On `feature/unified-alignment-scene`, local CRAM and remote BAM/CRAM did not open
+> (reconnected on 11 November 2026, automated coverage only); "VCF and genotype review" lacks on-track genotype rows; and none of the gaps in
+> `audits/FEATURE_AUDIT_2026-08-25.md` has been closed. Current engineering order is in
+> [`RGV_FOUNDATION_AND_PARITY_PRIORITY_PLAN.md`](RGV_FOUNDATION_AND_PARITY_PRIORITY_PLAN.md).
+> The text below is kept as the record of what was built.
+
 ## 1. Authority and purpose
 
 This document is the current forward plan for turning RGV into a fast, native desktop genome
@@ -161,7 +168,7 @@ composition, and specialist sequencing modes.
 | Collapsed/squished/expanded display | Complete | Pending | Broad release acceptance in Phase 9 |
 | Coverage inspection and consensus | Complete | Pending | Broad real-data and release acceptance in Phase 9 |
 | Sequencing-specific BAM semantics | Complete | Pending | Qualify bisulfite, PacBio kinetics, SBX, and Ultima flow-indel evidence on representative data in Phase 9 |
-| VCF and genotype review | Complete | Pending | Qualify cohort and pedigree workflows in Phase 9 |
+| VCF and genotype review | Partial (corrected 20 November 2026; previously "Complete") | Pending | Implemented: indexed VCF/BCF site glyphs coloured by variant type or by aggregate genotype; quality, FILTER, type, allele-frequency, genotype and INFO/FORMAT field filters; sample subset; and a genotype table in the variant inspector ordered by sample, genotype, or pedigree. Not implemented: on-track per-sample genotype rows (`VariantTrackSettings` has no genotype-row fields and variant layout draws no sample rows), allele-frequency colouring, and VCF density modes. See DOC-3 and PROD-3 in `audits/COMPREHENSIVE_REVIEW_2026-11-20.md`. Build the on-track genotype matrix before qualifying cohort and pedigree workflows |
 | RNA and Sashimi | Complete | Pending | Qualify representative RNA data and interaction in Phase 9 |
 | Quantitative comparison | Complete | Pending | Broad representative-data and release acceptance in Phase 9 |
 | Structural/interaction formats | Complete | Pending | Qualify BEDPE/interact arcs and linked endpoint panels in Phase 9 |

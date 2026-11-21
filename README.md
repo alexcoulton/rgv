@@ -10,14 +10,19 @@ The current native prototype supports:
   contig selectors, locus history, chromosome context, adaptive coordinate ruler, fixed track-label
   gutter, contextual track controls, integrated scrollbar, and compact status bar.
 - Cursor-centred zooming, drag panning, and clipped vertical scrolling across stacked tracks.
-- Indexed local BAM/CRAM queries with a shared four-thread decompression pool.
+- Indexed local BAM queries with a four-thread decompression pool, plus local CRAM and HTTP/S
+  BAM/CRAM through the same alignment scene. CRAM needs its reference FASTA loaded. Remote and
+  CRAM alignments have automated coverage but have not yet had hands-on desktop testing on this
+  branch.
 - Standalone indexed FASTA genomes with FASTA-backed contig navigation, an independent pinned
   reference track, and bounded off-thread sequence fetching; the same FASTA also configures CRAM.
 - All CIGAR operations, secondary/supplementary reads, arbitrary auxiliary fields, and missing
   sequence/quality states in the normalized alignment model.
-- Complete-or-refuse individual reads with a configurable workspace ceiling: a viewport either
-  presents every eligible read or asks the user to zoom in or raise the limit; reads are never
-  sampled or partially presented.
+- Two read-display modes per alignment track. **Downsampled** (the default for new tracks) shows
+  at most 100 reads per 50-base window, chosen by a stable hash of the read name so the subset
+  does not change while panning; the track label states how many reads are shown. **Complete**
+  presents every eligible read or asks the user to zoom in or raise the limit. Coverage, alleles,
+  junctions, and modification summaries always count every eligible read in both modes.
 - Transactional pan/zoom previews retain orientation while coalesced exact queries settle, then
   switch atomically without fading; preview pixels are never exposed as current evidence.
 - CPU read packing and instanced GPU rendering for coverage and CIGAR geometry.
@@ -250,6 +255,10 @@ FASTA.
 
 ## Run the interaction benchmark
 
+No matched RGV-versus-IGV comparison has been run; see the status section at the top of
+[benchmarks/IGV_COMPARISON.md](benchmarks/IGV_COMPARISON.md). The benchmark below is headless and
+is a regression gate, not a comparison with IGV.
+
 The interaction benchmark measures indexed query, coverage/sampling, read packing, and display-list
 construction as one pipeline:
 
@@ -279,12 +288,28 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 ```
 
-The same checks run on macOS, Linux, and Windows in CI.
+The toolchain is pinned in `rust-toolchain.toml`; `./test.rgv.sh` runs the formatting, Clippy and
+test steps in one go. `.github/workflows/ci.yml` runs a plain build-and-test job and a separate
+formatting/Clippy job on macOS, Linux, and Windows (without `--all-features`/`--all-targets`).
+CI is not yet a passing baseline: the 2026-11-20 review
+([audits/COMPREHENSIVE_REVIEW_2026-11-20.md](audits/COMPREHENSIVE_REVIEW_2026-11-20.md), OPS-1
+and OPS-2) found that no CI run had succeeded and that Windows had not compiled.
+
+A plain `cargo build` or `cargo test` at the repository root skips `rgv-alignment-bench`, the
+only crate that pulls the benchmark-only alignment backends; pass `--workspace` or
+`-p rgv-alignment-bench` to include it.
 
 ## Current limitations
 
-- Text BED/GFF/GTF, genePred/refFlat, and narrowPeak inputs are currently loaded into bounded
-  in-memory indexes. BigBed, bigGenePred, and bigNarrowPeak stay indexed and on-demand; explicit
+- Local CRAM and HTTP/S BAM/CRAM alignments open through the unified alignment scene but are
+  newly connected: a superseded remote request is not yet cancelled mid-transfer.
+- Hosted genomes (Genomes → Hosted genomes, or `--genome hg38`) read IGV's genome list and
+  genome JSON files, including `.2bit` references. This has automated coverage but has not yet
+  been exercised against the live hosting or tested hands-on.
+
+- Unindexed text BED/GFF/GTF, genePred/refFlat, and peak inputs are loaded into bounded
+  in-memory indexes (2,000,000 rows). Compress large files with `bgzip` and index them with
+  `tabix`; RGV then reads them on demand with no row limit. BigBed, bigGenePred, and bigNarrowPeak stay indexed and on-demand; explicit
   name search without a BigBed extra index performs a bounded background scan.
 - Release signing requires the platform credentials described in
   [docs/RELEASING.md](docs/RELEASING.md).

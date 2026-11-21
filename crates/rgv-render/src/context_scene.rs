@@ -661,6 +661,20 @@ impl ContextSceneGpuRenderer {
         pass: &mut wgpu::RenderPass<'pass>,
         frame: &'pass ContextSceneGpuFrame,
     ) {
+        self.render_within(pass, frame, [u32::MAX; 2]);
+    }
+
+    /// Replays `frame` like [`Self::render`], but first intersects every captured scissor with a
+    /// render target of `target_size` physical pixels. A frame is captured against one target
+    /// size and may be replayed after a resize or into a differently sized capture texture; a
+    /// scissor outside the attachment is a wgpu validation error, so draws whose scissor falls
+    /// wholly outside the target are skipped and the rest are clipped.
+    pub fn render_within<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        frame: &'pass ContextSceneGpuFrame,
+        target_size: [u32; 2],
+    ) {
         pass.set_pipeline(&self.pipeline);
         for draw in &frame.draws {
             let Some(lane) = self.resident.get(&draw.key) else {
@@ -669,12 +683,18 @@ impl ContextSceneGpuRenderer {
             if lane.content_revision != draw.content_revision || lane.instance_count == 0 {
                 continue;
             }
-            pass.set_scissor_rect(
-                draw.scissor.x,
-                draw.scissor.y,
-                draw.scissor.width,
-                draw.scissor.height,
-            );
+            let Some([x, y, width, height]) = crate::clamp_scissor_to_target(
+                [
+                    draw.scissor.x,
+                    draw.scissor.y,
+                    draw.scissor.width,
+                    draw.scissor.height,
+                ],
+                target_size,
+            ) else {
+                continue;
+            };
+            pass.set_scissor_rect(x, y, width, height);
             pass.set_bind_group(0, &lane.camera_bind_groups[draw.camera_slot], &[]);
             pass.set_vertex_buffer(0, lane.instance_buffer.slice(..));
             pass.draw(0..6, 0..lane.instance_count);

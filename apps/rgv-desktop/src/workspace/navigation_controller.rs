@@ -1,5 +1,23 @@
 use super::super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LociNavigationPlan {
+    /// Move only the active panel; every other panel keeps its locus.
+    RetargetActivePanel,
+    /// Lay the workspace out as exactly the listed loci, one panel each.
+    ReplaceWorkspacePanels,
+}
+
+/// Entering a single locus navigates the active panel. Only an explicit multi-locus expression
+/// redefines the set of panels.
+pub(crate) const fn loci_navigation_plan(locus_count: usize) -> LociNavigationPlan {
+    if locus_count <= 1 {
+        LociNavigationPlan::RetargetActivePanel
+    } else {
+        LociNavigationPlan::ReplaceWorkspacePanels
+    }
+}
+
 impl Viewer {
     pub(crate) fn navigate_to_viewport(
         &mut self,
@@ -7,6 +25,7 @@ impl Viewer {
         contig_name: String,
         contig_length: u64,
     ) {
+        self.commit_navigation_gesture();
         let interval = viewport.interval();
         let panel = self.panels.active_mut();
         panel.viewport = viewport;
@@ -14,6 +33,29 @@ impl Viewer {
         panel.contig_length = contig_length;
         panel.navigation_history.visit(interval);
         self.viewport_changed();
+    }
+
+    /// Whether every whitespace-separated item is a coordinate locus or a known contig name,
+    /// so the expression should navigate directly and not be sent to feature search.
+    pub(crate) fn locus_expression_is_coordinates(&self, expression: &str) -> bool {
+        let dictionary = self
+            .panels
+            .active()
+            .selected_alignment_track
+            .and_then(|id| self.alignment_dictionary_for_track(id))
+            .or_else(|| self.primary_alignment_dictionary())
+            .or(self.reference_dictionary.as_ref());
+        let mut items = expression.split_ascii_whitespace().peekable();
+        items.peek().is_some()
+            && items.all(|item| {
+                item.contains(':')
+                    || dictionary.is_some_and(|dictionary| {
+                        resolve_typed_contig(dictionary, &self.contig_aliases, item)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                    })
+            })
     }
 
     pub(crate) fn navigate_to_locus(&mut self, locus: &str) -> Result<()> {
@@ -29,6 +71,7 @@ impl Viewer {
         } else {
             standalone_locus(locus)?
         };
+        self.commit_navigation_gesture();
         self.panels.active_mut().viewport =
             Viewport::new(interval, self.panels.active().viewport.pixel_width())?;
         self.panels.active_mut().contig_name = contig_name;
@@ -131,6 +174,11 @@ impl Viewer {
 
     pub(crate) fn navigate_to_loci(&mut self, expression: &str) -> Result<()> {
         let loci = split_locus_expression(expression)?;
+        if loci_navigation_plan(loci.len()) == LociNavigationPlan::RetargetActivePanel {
+            // One locus is a navigation of the panel being looked at; the other panels and
+            // their loci are left alone.
+            return self.navigate_to_locus(loci[0]);
+        }
         anyhow::ensure!(
             self.workspace_layout.projected_canvas_width(loci.len()) >= 140.0,
             "the window is too narrow to display {} readable panels",
@@ -195,18 +243,22 @@ impl Viewer {
     }
 
     pub(crate) fn navigate_history_back(&mut self) {
+        // Record an unsettled gesture first, so Back returns to where it started.
+        self.commit_navigation_gesture();
         if let Some(interval) = self.panels.active_mut().navigation_history.back() {
             self.navigate_to_history_interval(interval);
         }
     }
 
     pub(crate) fn navigate_history_forward(&mut self) {
+        self.commit_navigation_gesture();
         if let Some(interval) = self.panels.active_mut().navigation_history.forward() {
             self.navigate_to_history_interval(interval);
         }
     }
 
     pub(crate) fn navigate_home(&mut self) {
+        self.commit_navigation_gesture();
         let home = self.panels.active().home_interval;
         self.panels.active_mut().navigation_history.visit(home);
         self.navigate_to_history_interval(home);
@@ -227,6 +279,7 @@ impl Viewer {
     }
 
     pub(crate) fn navigate_to_contig(&mut self, contig_id: ContigId) {
+        self.commit_navigation_gesture();
         let Some(contig) = self.assembly.dictionary.get(contig_id) else {
             return;
         };
@@ -252,5 +305,26 @@ impl Viewer {
         );
         self.locus_editor.clone_from(&locus);
         self.settings.remember_locus(locus);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_single_locus_never_replaces_the_other_panels() {
+        assert_eq!(
+            loci_navigation_plan(1),
+            LociNavigationPlan::RetargetActivePanel
+        );
+        assert_eq!(
+            loci_navigation_plan(2),
+            LociNavigationPlan::ReplaceWorkspacePanels
+        );
+        assert_eq!(
+            loci_navigation_plan(5),
+            LociNavigationPlan::ReplaceWorkspacePanels
+        );
     }
 }

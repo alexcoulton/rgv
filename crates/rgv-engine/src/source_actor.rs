@@ -239,6 +239,10 @@ pub enum CanonicalDecodeCheckpoint {
         genomic_span: GenomicInterval,
     },
     Complete(CompleteCoverage),
+    /// The decoder runs on its own thread and has no finished unit yet. Nothing was consumed;
+    /// the actor uses the pause to observe controls and newer targets, and the driver is free
+    /// to do presentation work instead of blocking on source I/O.
+    Pending,
     /// The full source population was evaluated exactly, but individual evidence exceeded the
     /// configured Complete admission policy. Previously completed chunks remain salvageable;
     /// this transaction must not publish an evidence root.
@@ -290,6 +294,14 @@ pub trait CanonicalAlignmentSourceBackend {
     fn retarget(&mut self, work: &SourceWork) -> Result<(), Self::Error>;
 
     fn cancel(&mut self, work: &SourceWork);
+
+    /// Offers a callback the backend invokes, from any thread, whenever a
+    /// [`CanonicalDecodeCheckpoint::Pending`] answer may have stopped being true. Returns whether
+    /// the backend will do so. A driver that receives `false` must keep polling; one that
+    /// receives `true` may sleep until woken (with a coarse safety timeout).
+    fn set_checkpoint_waker(&mut self, _waker: Arc<dyn Fn() + Send + Sync>) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -303,6 +315,10 @@ pub enum AlignmentSourceActorEvent {
     SourceProgressed {
         work: SourceWork,
         genomic_span: GenomicInterval,
+    },
+    /// The active work's decoder had no finished unit; the work is still current.
+    SourceWaiting {
+        work: SourceWork,
     },
     WorkRetargeted {
         previous: AlignmentSourceIntent,
@@ -338,6 +354,9 @@ where
     backend: B,
     store: EvidenceStore,
     transaction_chunks: Vec<Arc<EvidenceChunk>>,
+    /// Span of the last finished source unit of the active work, used as the checkpoint
+    /// position when the work is superseded while its decoder is still busy.
+    last_progress: Option<GenomicInterval>,
 }
 
 impl<B> AlignmentSourceActor<B>
@@ -356,6 +375,7 @@ where
             backend,
             store,
             transaction_chunks: Vec::new(),
+            last_progress: None,
         }
     }
 
@@ -430,10 +450,10 @@ where
                 current
             }
             SourceIntentKind::Speculative => {
-                let current = self.schedule.desired_speculation().is_some_and(|intent| {
-                    intent.owner() == work.intent().owner()
-                        && intent.sequence() == work.intent().sequence()
-                });
+                let current = self
+                    .schedule
+                    .desired_speculation_for(work.intent().owner())
+                    .is_some_and(|intent| intent.sequence() == work.intent().sequence());
                 if current {
                     self.schedule.cancel_speculation_for(work.intent().owner());
                 }
@@ -506,6 +526,7 @@ where
                 }
                 AlignmentSourceActorAction::Work(work) => {
                     self.transaction_chunks.clear();
+                    self.last_progress = None;
                     self.backend
                         .begin_work(&work, &self.store.ledger())
                         .map_err(AlignmentSourceActorError::Backend)?;
@@ -534,6 +555,7 @@ where
                     record_contract: chunk.chunk().record_contract(),
                     genomic_span,
                 };
+                self.last_progress = Some(genomic_span);
                 let disposition = self.schedule.completed_chunk(completed)?;
                 let chunk = self.store.admit_chunk(chunk)?;
                 if !self
@@ -588,36 +610,20 @@ where
                 }))
             }
             CanonicalDecodeCheckpoint::Progress { genomic_span } => {
-                match self.schedule.checkpoint(genomic_span)? {
-                    SourceCheckpointDecision::Continue(work) => {
-                        Ok(Some(AlignmentSourceActorEvent::SourceProgressed {
-                            work,
-                            genomic_span,
-                        }))
-                    }
-                    SourceCheckpointDecision::Retarget { previous, current } => {
-                        let salvaged_chunks = self.transaction_chunks.len();
-                        self.transaction_chunks.clear();
-                        self.backend
-                            .retarget(&current)
-                            .map_err(AlignmentSourceActorError::Backend)?;
-                        Ok(Some(AlignmentSourceActorEvent::WorkRetargeted {
-                            previous,
-                            current,
-                            salvaged_chunks,
-                        }))
-                    }
-                    SourceCheckpointDecision::Yield { work, reason } => {
-                        let salvaged_chunks = self.transaction_chunks.len();
-                        self.transaction_chunks.clear();
-                        self.backend.cancel(&work);
-                        Ok(Some(AlignmentSourceActorEvent::WorkYielded {
-                            work,
-                            reason,
-                            salvaged_chunks,
-                        }))
-                    }
+                self.last_progress = Some(genomic_span);
+                self.checkpoint_without_chunk(genomic_span).map(Some)
+            }
+            CanonicalDecodeCheckpoint::Pending => {
+                if !self.schedule.active_is_superseded() {
+                    return Ok(Some(AlignmentSourceActorEvent::SourceWaiting { work }));
                 }
+                // A newer target or control is waiting. Do not wait for the decoder to finish
+                // a unit it may be blocked on: yield or retarget now, which cancels the
+                // in-flight read.
+                let span = self
+                    .last_progress
+                    .unwrap_or_else(|| work.intent().spec().target());
+                self.checkpoint_without_chunk(span).map(Some)
             }
             CanonicalDecodeCheckpoint::Refused {
                 coverage,
@@ -633,6 +639,41 @@ where
                     eligible_records,
                     publish: completed.publish,
                 }))
+            }
+        }
+    }
+
+    fn checkpoint_without_chunk(
+        &mut self,
+        genomic_span: GenomicInterval,
+    ) -> Result<AlignmentSourceActorEvent, AlignmentSourceActorError<B::Error>> {
+        match self.schedule.checkpoint(genomic_span)? {
+            SourceCheckpointDecision::Continue(work) => {
+                Ok(AlignmentSourceActorEvent::SourceProgressed { work, genomic_span })
+            }
+            SourceCheckpointDecision::Retarget { previous, current } => {
+                let salvaged_chunks = self.transaction_chunks.len();
+                self.transaction_chunks.clear();
+                self.last_progress = None;
+                self.backend
+                    .retarget(&current)
+                    .map_err(AlignmentSourceActorError::Backend)?;
+                Ok(AlignmentSourceActorEvent::WorkRetargeted {
+                    previous,
+                    current,
+                    salvaged_chunks,
+                })
+            }
+            SourceCheckpointDecision::Yield { work, reason } => {
+                let salvaged_chunks = self.transaction_chunks.len();
+                self.transaction_chunks.clear();
+                self.last_progress = None;
+                self.backend.cancel(&work);
+                Ok(AlignmentSourceActorEvent::WorkYielded {
+                    work,
+                    reason,
+                    salvaged_chunks,
+                })
             }
         }
     }
@@ -654,6 +695,12 @@ where
     #[must_use]
     pub const fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Mutable backend access for driver wiring (for example installing a checkpoint waker).
+    /// Decoding itself must still go through [`Self::pump_once`].
+    pub const fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
     }
 }
 
@@ -725,8 +772,10 @@ pub enum AlignmentSourceWorkError<E> {
 
 /// Bounded latest-wins control plane for the single mutable alignment source owner.
 ///
-/// The schedule stores the latest desired foreground target per live owner, one speculative
-/// target, one active bounded work item, and a configured number of non-discardable controls.
+/// The schedule stores the latest desired foreground target and the latest speculative target per
+/// live owner, one active bounded work item, and a configured number of non-discardable controls.
+/// Owners take turns in submission-age order within each class, so one panel's read-ahead can
+/// neither overwrite nor starve another panel's.
 /// Source I/O must return to `checkpoint` between canonical chunks, which makes preemption and
 /// owner-fairness latency a property of the canonical unit rather than the length of a stale FIFO.
 #[derive(Debug)]
@@ -735,18 +784,19 @@ pub struct AlignmentSourceActorSchedule<C> {
     control_capacity: NonZeroUsize,
     maximum_control_burst: NonZeroUsize,
     controls_since_work: usize,
-    desired_foreground: BTreeMap<SourceOwnerId, ForegroundSlot>,
-    desired_speculation: Option<AlignmentSourceIntent>,
+    desired_foreground: BTreeMap<SourceOwnerId, OwnerIntentSlot>,
+    desired_speculation: BTreeMap<SourceOwnerId, OwnerIntentSlot>,
     satisfied_foreground: BTreeMap<SourceOwnerId, SourceIntentSequence>,
-    satisfied_speculation: Option<SourceIntentSequence>,
+    satisfied_speculation: BTreeMap<SourceOwnerId, SourceIntentSequence>,
     active: Option<SourceWork>,
     next_intent_sequence: u64,
     next_fairness_age: u64,
     next_work_id: u64,
 }
 
+/// One owner's latest desired intent of one class, with its place in that class's turn order.
 #[derive(Debug)]
-struct ForegroundSlot {
+struct OwnerIntentSlot {
     intent: AlignmentSourceIntent,
     fairness_age: u64,
 }
@@ -760,9 +810,9 @@ impl<C> AlignmentSourceActorSchedule<C> {
             maximum_control_burst,
             controls_since_work: 0,
             desired_foreground: BTreeMap::new(),
-            desired_speculation: None,
+            desired_speculation: BTreeMap::new(),
             satisfied_foreground: BTreeMap::new(),
-            satisfied_speculation: None,
+            satisfied_speculation: BTreeMap::new(),
             active: None,
             next_intent_sequence: 1,
             next_fairness_age: 1,
@@ -805,7 +855,7 @@ impl<C> AlignmentSourceActorSchedule<C> {
         };
         self.desired_foreground.insert(
             owner,
-            ForegroundSlot {
+            OwnerIntentSlot {
                 intent,
                 fairness_age,
             },
@@ -827,7 +877,25 @@ impl<C> AlignmentSourceActorSchedule<C> {
     ) -> Result<SourceIntentSequence, SourceScheduleError<()>> {
         let intent = self.next_intent(owner, spec)?;
         let sequence = intent.sequence;
-        self.desired_speculation = Some(intent);
+        // As for foreground: a replaced but still unserved request keeps its place in line, so
+        // an owner whose camera keeps moving cannot be overtaken forever, and a served owner
+        // rejoins behind the owners still waiting.
+        let waiting_age = self
+            .desired_speculation
+            .get(&owner)
+            .filter(|slot| self.satisfied_speculation.get(&owner) != Some(&slot.intent.sequence))
+            .map(|slot| slot.fairness_age);
+        let fairness_age = match waiting_age {
+            Some(age) => age,
+            None => self.take_fairness_age()?,
+        };
+        self.desired_speculation.insert(
+            owner,
+            OwnerIntentSlot {
+                intent,
+                fairness_age,
+            },
+        );
         Ok(sequence)
     }
 
@@ -840,19 +908,15 @@ impl<C> AlignmentSourceActorSchedule<C> {
         self.satisfied_foreground.remove(&owner);
     }
 
+    /// Cancels every owner's speculation.
     pub fn cancel_speculation(&mut self) {
-        self.desired_speculation = None;
-        self.satisfied_speculation = None;
+        self.desired_speculation.clear();
+        self.satisfied_speculation.clear();
     }
 
     pub fn cancel_speculation_for(&mut self, owner: SourceOwnerId) {
-        if self
-            .desired_speculation
-            .as_ref()
-            .is_some_and(|intent| intent.owner() == owner)
-        {
-            self.cancel_speculation();
-        }
+        self.desired_speculation.remove(&owner);
+        self.satisfied_speculation.remove(&owner);
     }
 
     fn next_intent(
@@ -911,11 +975,10 @@ impl<C> AlignmentSourceActorSchedule<C> {
             self.controls_since_work = self.controls_since_work.saturating_add(1);
             return Ok(Some(AlignmentSourceActorAction::Control(control)));
         }
-        if self.speculation_pending() {
-            let intent = self
-                .desired_speculation
-                .clone()
-                .expect("pending speculation has a desired intent");
+        if let Some(intent) = self
+            .oldest_pending_speculation()
+            .map(|slot| slot.intent.clone())
+        {
             return self
                 .begin_work(SourceIntentKind::Speculative, intent)
                 .map(Some);
@@ -968,7 +1031,10 @@ impl<C> AlignmentSourceActorSchedule<C> {
                     reason: SourceYieldReason::ForegroundPreemption,
                 });
             }
-            SourceIntentKind::Speculative => self.desired_speculation.clone(),
+            SourceIntentKind::Speculative => self
+                .desired_speculation
+                .get(&active.intent.owner)
+                .map(|slot| slot.intent.clone()),
         };
         let Some(desired) = desired else {
             self.active = None;
@@ -1009,6 +1075,30 @@ impl<C> AlignmentSourceActorSchedule<C> {
         })
     }
 
+    /// Whether the next checkpoint would yield or retarget the active work instead of letting
+    /// it continue. Read-only: the decision itself is taken by [`Self::checkpoint`].
+    #[must_use]
+    pub fn active_is_superseded(&self) -> bool {
+        let Some(active) = &self.active else {
+            return false;
+        };
+        if !self.controls.is_empty() {
+            return true;
+        }
+        let desired = match active.kind {
+            SourceIntentKind::Foreground => self
+                .desired_foreground
+                .get(&active.intent.owner)
+                .map(|slot| slot.intent.sequence),
+            SourceIntentKind::Speculative if self.foreground_pending() => return true,
+            SourceIntentKind::Speculative => self
+                .desired_speculation
+                .get(&active.intent.owner)
+                .map(|slot| slot.intent.sequence),
+        };
+        desired != Some(active.intent.sequence)
+    }
+
     /// Classifies a successfully decoded canonical chunk before any candidate-publication check.
     /// Compatible completed work is always salvageable into the actor-owned cache.
     pub fn completed_chunk(
@@ -1035,11 +1125,15 @@ impl<C> AlignmentSourceActorSchedule<C> {
                 })
                 .min_by_key(|slot| slot.fairness_age)
                 .map(|slot| slot.intent.sequence),
-            useful_speculation: self.desired_speculation.as_ref().and_then(|intent| {
-                (decode_compatible(&active.intent.spec, &intent.spec)
-                    && intent.spec.target.overlaps(chunk.genomic_span))
-                .then_some(intent.sequence)
-            }),
+            useful_speculation: self
+                .desired_speculation
+                .values()
+                .filter(|slot| {
+                    decode_compatible(&active.intent.spec, &slot.intent.spec)
+                        && slot.intent.spec.target.overlaps(chunk.genomic_span)
+                })
+                .min_by_key(|slot| slot.fairness_age)
+                .map(|slot| slot.intent.sequence),
         })
     }
 
@@ -1065,11 +1159,12 @@ impl<C> AlignmentSourceActorSchedule<C> {
             SourceIntentKind::Speculative
                 if self
                     .desired_speculation
-                    .as_ref()
-                    .map(|intent| intent.sequence)
+                    .get(&work.intent.owner)
+                    .map(|slot| slot.intent.sequence)
                     == Some(work.intent.sequence) =>
             {
-                self.satisfied_speculation = Some(work.intent.sequence);
+                self.satisfied_speculation
+                    .insert(work.intent.owner, work.intent.sequence);
                 None
             }
             _ => None,
@@ -1108,17 +1203,34 @@ impl<C> AlignmentSourceActorSchedule<C> {
         })
     }
 
+    /// The speculative intent that would run next: the longest-waiting unserved owner's, or
+    /// otherwise the longest-retained settled one. Each owner has its own slot; see
+    /// [`Self::desired_speculation_for`].
     #[must_use]
     pub fn desired_speculation(&self) -> Option<&AlignmentSourceIntent> {
-        self.desired_speculation.as_ref()
+        self.oldest_pending_speculation()
+            .or_else(|| {
+                self.desired_speculation
+                    .iter()
+                    .min_by_key(|(owner, slot)| (slot.fairness_age, **owner))
+                    .map(|(_, slot)| slot)
+            })
+            .map(|slot| &slot.intent)
     }
 
-    /// Whether the exact latest speculative intent belongs to `owner` and is still queued or
-    /// actively decoding. A retained desired slot may instead describe already-settled work.
+    #[must_use]
+    pub fn desired_speculation_for(&self, owner: SourceOwnerId) -> Option<&AlignmentSourceIntent> {
+        self.desired_speculation
+            .get(&owner)
+            .map(|slot| &slot.intent)
+    }
+
+    /// Whether `owner`'s exact latest speculative intent is still queued or actively decoding.
+    /// A retained desired slot may instead describe already-settled work.
     #[must_use]
     pub fn speculation_pending_for(&self, owner: SourceOwnerId) -> bool {
-        self.desired_speculation.as_ref().is_some_and(|intent| {
-            intent.owner == owner && Some(intent.sequence) != self.satisfied_speculation
+        self.desired_speculation.get(&owner).is_some_and(|slot| {
+            self.satisfied_speculation.get(&owner) != Some(&slot.intent.sequence)
         })
     }
 
@@ -1127,8 +1239,21 @@ impl<C> AlignmentSourceActorSchedule<C> {
         self.controls
             .len()
             .saturating_add(self.pending_foreground_count())
-            .saturating_add(usize::from(self.speculation_pending()))
+            .saturating_add(self.pending_speculation_count())
             .saturating_add(usize::from(self.active.is_some()))
+    }
+
+    /// Whether anything other than optional read-ahead can run: a non-discardable control, an
+    /// unserved foreground intent, or an active foreground transaction. Threaded drivers use
+    /// this to order user-visible source work ahead of cache maintenance and speculation.
+    #[must_use]
+    pub fn foreground_work_pending(&self) -> bool {
+        !self.controls.is_empty()
+            || self.foreground_pending()
+            || self
+                .active
+                .as_ref()
+                .is_some_and(|work| work.kind == SourceIntentKind::Foreground)
     }
 
     #[must_use]
@@ -1149,7 +1274,7 @@ impl<C> AlignmentSourceActorSchedule<C> {
             .count()
     }
 
-    fn oldest_pending_foreground(&self) -> Option<(SourceOwnerId, &ForegroundSlot)> {
+    fn oldest_pending_foreground(&self) -> Option<(SourceOwnerId, &OwnerIntentSlot)> {
         self.desired_foreground
             .iter()
             .filter(|(owner, slot)| {
@@ -1159,10 +1284,19 @@ impl<C> AlignmentSourceActorSchedule<C> {
             .map(|(owner, slot)| (*owner, slot))
     }
 
-    fn speculation_pending(&self) -> bool {
+    fn pending_speculation_count(&self) -> usize {
         self.desired_speculation
-            .as_ref()
-            .is_some_and(|intent| self.speculation_pending_for(intent.owner))
+            .keys()
+            .filter(|owner| self.speculation_pending_for(**owner))
+            .count()
+    }
+
+    fn oldest_pending_speculation(&self) -> Option<&OwnerIntentSlot> {
+        self.desired_speculation
+            .iter()
+            .filter(|(owner, _)| self.speculation_pending_for(**owner))
+            .min_by_key(|(owner, slot)| (slot.fairness_age, **owner))
+            .map(|(_, slot)| slot)
     }
 }
 
@@ -1437,6 +1571,62 @@ mod tests {
     }
 
     #[test]
+    fn speculation_owners_keep_independent_slots_and_take_turns() {
+        let mut schedule = schedule();
+        let (first_owner, second_owner) = (SourceOwnerId::new(11), SourceOwnerId::new(22));
+        schedule
+            .submit_speculation_for(first_owner, intent(0, 100))
+            .unwrap();
+        let second = schedule
+            .submit_speculation_for(second_owner, intent(500, 600))
+            .unwrap();
+        // The second owner did not overwrite the first, and a replaced unserved request keeps
+        // its place in line.
+        let first = schedule
+            .submit_speculation_for(first_owner, intent(10, 110))
+            .unwrap();
+        assert_eq!(schedule.pending_slots(), 2);
+        assert!(schedule.speculation_pending_for(first_owner));
+        assert!(schedule.speculation_pending_for(second_owner));
+        assert!(!schedule.foreground_work_pending());
+
+        let work = take_work(&mut schedule);
+        assert_eq!(work.kind, SourceIntentKind::Speculative);
+        assert_eq!(work.intent.sequence(), first);
+        // Another owner waiting does not restart the running transaction.
+        assert!(matches!(
+            schedule.checkpoint(interval(10, 20)).unwrap(),
+            SourceCheckpointDecision::Continue(_)
+        ));
+        assert!(schedule.finish_active().unwrap().publish.is_none());
+        assert!(!schedule.speculation_pending_for(first_owner));
+
+        // A served owner that asks again rejoins behind the owner still waiting.
+        schedule
+            .submit_speculation_for(first_owner, intent(20, 120))
+            .unwrap();
+        let work = take_work(&mut schedule);
+        assert_eq!(work.intent.owner(), second_owner);
+        assert_eq!(work.intent.sequence(), second);
+
+        // Cancelling one owner leaves the other's slot alone and yields only its own work.
+        schedule.cancel_speculation_for(second_owner);
+        assert!(schedule.desired_speculation_for(second_owner).is_none());
+        assert!(schedule.speculation_pending_for(first_owner));
+        assert!(matches!(
+            schedule.checkpoint(interval(500, 510)).unwrap(),
+            SourceCheckpointDecision::Yield {
+                reason: SourceYieldReason::SpeculationCancelled,
+                ..
+            }
+        ));
+        assert_eq!(take_work(&mut schedule).intent.owner(), first_owner);
+        assert!(schedule.finish_active().is_ok());
+        assert!(schedule.next_action().unwrap().is_none());
+        assert_eq!(schedule.pending_slots(), 0);
+    }
+
+    #[test]
     fn foreground_preempts_speculation_at_the_next_chunk_checkpoint() {
         let mut schedule = schedule();
         schedule.submit_speculation(intent(0, 100)).unwrap();
@@ -1576,6 +1766,47 @@ mod tests {
         assert_eq!(actor.store().chunk_count(), 2);
         assert_eq!(actor.store().acquisition_count(), 0);
         assert_eq!(actor.backend().cancelled.len(), 1);
+    }
+
+    #[test]
+    fn a_busy_decoder_keeps_current_work_waiting_and_yields_superseded_work_at_once() {
+        let ledger = AllocationLedger::new(2 << 20, 0);
+        let mut actor = actor(
+            &ledger,
+            [
+                CanonicalDecodeCheckpoint::Pending,
+                CanonicalDecodeCheckpoint::Pending,
+            ],
+        );
+        actor.submit_foreground(intent(0, 100)).unwrap();
+        assert!(matches!(
+            actor.pump_once().unwrap(),
+            Some(AlignmentSourceActorEvent::WorkStarted(_))
+        ));
+        // Still the latest target: nothing is consumed and nothing is cancelled.
+        assert!(matches!(
+            actor.pump_once().unwrap(),
+            Some(AlignmentSourceActorEvent::SourceWaiting { .. })
+        ));
+        assert!(actor.backend().cancelled.is_empty());
+
+        // A disjoint target arrives while the decoder is still inside its first unit. The
+        // stale work is cancelled without waiting for that unit to finish.
+        actor.submit_foreground(intent(500, 600)).unwrap();
+        assert!(matches!(
+            actor.pump_once().unwrap(),
+            Some(AlignmentSourceActorEvent::WorkYielded {
+                reason: SourceYieldReason::IncompatibleRetarget,
+                salvaged_chunks: 0,
+                ..
+            })
+        ));
+        assert_eq!(actor.backend().cancelled.len(), 1);
+        assert!(matches!(
+            actor.pump_once().unwrap(),
+            Some(AlignmentSourceActorEvent::WorkStarted(_))
+        ));
+        assert_eq!(actor.backend().begun.len(), 2);
     }
 
     #[test]

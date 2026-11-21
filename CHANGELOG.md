@@ -5,6 +5,15 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Repository and build hygiene from the 2026-11-20 review: pinned the toolchain in
+  `rust-toolchain.toml` (1.93.1) and made every workflow use it; split CI into separate
+  build-and-test and formatting/Clippy jobs per operating system; run each fuzz target as its own
+  job; added `[profile.release]` (thin LTO, one codegen unit, stripped debuginfo) and a fat-LTO
+  `[profile.dist]` used by the signed-release workflow; excluded `rgv-alignment-bench` from the
+  workspace default members. Documentation now states that the matched IGV comparison has not
+  been run, that local CRAM uses the `noodles` decoder, that "VCF and genotype review" is partial,
+  and where SVG export, landmark gene bundles, and read filter predicates are reachable.
+
 - Added a deterministic, ready-to-open mixed-format manual-test project under
   `benchmark-data/demo-tracks`. It combines the checked-in alignment/reference truth with 19
   auxiliary track examples and a SHA-256 manifest. The generator reopens the portable project,

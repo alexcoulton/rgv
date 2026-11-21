@@ -364,6 +364,7 @@ pub fn paint_genome_context(
     let mut keyboard_pan_fraction = None;
     let mut keyboard_zoom_factor = None;
     let mut keyboard_show_all = false;
+    let mut ideogram_clicked_position = None;
     if overview_response.has_focus() {
         ui.input_mut(|input| {
             if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
@@ -389,6 +390,12 @@ pub fn paint_genome_context(
                 egui::Sense::click(),
             )
             .on_hover_cursor(egui::CursorIcon::Crosshair);
+        // A click on the ideogram centres the view there, like a click on the overview below.
+        ideogram_clicked_position = ideogram_click_position(
+            ideogram_response.clicked(),
+            ideogram_response.interact_pointer_pos().map(|pointer| pointer.x),
+            |x| contig_axis.position_at_x(x),
+        );
         let hovered_segment = ideogram_response
             .hover_pos()
             .map(|pointer| contig_axis.position_at_x(pointer.x))
@@ -599,7 +606,8 @@ pub fn paint_genome_context(
             && !clicked_on_handle)
             .then_some(pointer_position)
             .flatten()
-            .map(|value| contig_axis.position_at_x(value.x)),
+            .map(|value| contig_axis.position_at_x(value.x))
+            .or(ideogram_clicked_position),
         pointer_position: pointer_position.map(|value| contig_axis.position_at_x(value.x)),
         pointer_x: pointer_position.map(|value| f64::from(value.x)),
         pointer_y: pointer_position.map(|value| f64::from(value.y)),
@@ -694,6 +702,19 @@ fn ideogram_segment_at_position(
         .segments
         .iter()
         .find(|segment| segment.start <= position && position < segment.end)
+}
+
+/// Genomic position a click on the chromosome ideogram navigates to.
+fn ideogram_click_position(
+    clicked: bool,
+    pointer_x: Option<f32>,
+    position_at_x: impl FnOnce(f32) -> u64,
+) -> Option<u64> {
+    if clicked {
+        pointer_x.map(position_at_x)
+    } else {
+        None
+    }
 }
 
 fn cytoband_hover_text(contig_name: &str, segment: &IdeogramSegment) -> String {
@@ -793,6 +814,18 @@ fn stain_color(stain: CytobandStain) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ideogram_click_navigates_to_the_clicked_position() {
+        let position_at_x = |x: f32| (x * 1_000.0) as u64;
+        assert_eq!(
+            ideogram_click_position(true, Some(12.5), position_at_x),
+            Some(12_500)
+        );
+        assert_eq!(ideogram_click_position(false, Some(12.5), position_at_x), None);
+        assert_eq!(ideogram_click_position(true, None, position_at_x), None);
+    }
+
 
     #[test]
     fn two_panel_contig_length_is_measured_inside_metadata_and_clear_of_the_ruler() {

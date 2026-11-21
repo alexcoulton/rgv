@@ -164,12 +164,21 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                     }
                     let modification_background = matches!(&derived.options,
                         AlignmentDerivedLaneOptions::Modifications(options) if options.color_mode == ModifiedBaseColorMode::ModifiedVsUnmodified);
+                    let clip = camera.clip();
+                    // Arc bounds are unclamped; the visible part of an arc that leaves the lane
+                    // is exported as thin slices, which need their own reservation.
+                    let arc_slices = projected
+                        .primitives
+                        .iter()
+                        .map(|primitive| clipped_arc_slice_count(primitive, clip))
+                        .fold(0_usize, usize::saturating_add);
                     output.reserve(
                         ledger,
                         projected
                             .primitives
                             .len()
-                            .saturating_mul(if modification_background { 2 } else { 1 }),
+                            .saturating_mul(if modification_background { 2 } else { 1 })
+                            .saturating_add(arc_slices),
                     )?;
                     if modification_background {
                         for primitive in projected.primitives.iter() {
@@ -189,6 +198,15 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                         .iter()
                         .filter(|p| p.shape != CpuSummaryPrimitiveShape::TextLabel)
                     {
+                        if clipped_arc_slice_count(primitive, clip) > 0 {
+                            push_clipped_arc_slices(
+                                &mut output.display.rectangles,
+                                primitive,
+                                clip,
+                                summary_color(primitive.component, &derived.options),
+                            );
+                            continue;
+                        }
                         output.display.rectangles.push(RectPrimitive {
                             x: primitive.x as f32,
                             y: primitive.y as f32,
@@ -256,6 +274,93 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
     Ok(output)
 }
 
+/// Width, in points, of the slices that stand in for a junction arc leaving its lane.
+const CLIPPED_ARC_SLICE_WIDTH: f64 = 0.5;
+
+/// The part of a junction arc's horizontal extent that lies inside the lane clip, if the arc
+/// extends beyond the clip at all. Arcs wholly inside the lane return `None` and are exported as
+/// one exact arc primitive.
+fn clipped_arc_span(
+    primitive: &rgv_alignment_scene::CpuSummaryProjectedPrimitive,
+    clip: rgv_alignment_scene::CpuClipRect,
+) -> Option<(f64, f64)> {
+    if !matches!(
+        primitive.shape,
+        CpuSummaryPrimitiveShape::JunctionArcUp | CpuSummaryPrimitiveShape::JunctionArcDown
+    ) {
+        return None;
+    }
+    let right = primitive.x + primitive.width;
+    let clip_right = clip.x + clip.width;
+    if primitive.x >= clip.x && right <= clip_right {
+        return None;
+    }
+    Some((primitive.x.max(clip.x), right.min(clip_right)))
+}
+
+/// Number of display rectangles [`push_clipped_arc_slices`] emits for `primitive`; zero when the
+/// primitive is not an arc that leaves the lane.
+fn clipped_arc_slice_count(
+    primitive: &rgv_alignment_scene::CpuSummaryProjectedPrimitive,
+    clip: rgv_alignment_scene::CpuClipRect,
+) -> usize {
+    clipped_arc_span(primitive, clip).map_or(0, |(left, right)| {
+        if right > left {
+            ((right - left) / CLIPPED_ARC_SLICE_WIDTH).ceil().max(1.0) as usize
+        } else {
+            // Nothing visible, but report one so the caller still routes the arc here instead of
+            // exporting the unclipped primitive.
+            1
+        }
+    })
+}
+
+/// Exports the visible part of a junction arc whose unclamped span leaves its lane.
+///
+/// The display list has no per-primitive clip, so an arc that extends beyond the lane cannot be
+/// exported as one arc primitive without painting over neighbouring panels. Its visible part is
+/// instead traced as thin rectangles that follow the same parabola and stroke width the arc
+/// shader draws, parameterised over the full span, so the off-screen end stays off-screen.
+fn push_clipped_arc_slices(
+    rectangles: &mut Vec<RectPrimitive>,
+    primitive: &rgv_alignment_scene::CpuSummaryProjectedPrimitive,
+    clip: rgv_alignment_scene::CpuClipRect,
+    color: Rgba,
+) {
+    let Some((left, right)) = clipped_arc_span(primitive, clip) else {
+        return;
+    };
+    let upward = primitive.shape == CpuSummaryPrimitiveShape::JunctionArcUp;
+    let stroke = f64::from(rgv_layout::junction_arc_stroke_width(primitive.height as f32));
+    let inner_height = (primitive.height - stroke).max(0.0);
+    let centre_line = |x: f64| {
+        let centred = ((x - primitive.x) / primitive.width).clamp(0.0, 1.0) - 0.5;
+        let offset = stroke * 0.5 + inner_height * 4.0 * centred * centred;
+        if upward {
+            primitive.y + offset
+        } else {
+            primitive.y + primitive.height - offset
+        }
+    };
+    let mut slice_left = left;
+    while slice_left < right {
+        let slice_right = (slice_left + CLIPPED_ARC_SLICE_WIDTH).min(right);
+        let (first, second) = (centre_line(slice_left), centre_line(slice_right));
+        let top = (first.min(second) - stroke * 0.5).max(primitive.y);
+        let bottom = (first.max(second) + stroke * 0.5).min(primitive.y + primitive.height);
+        rectangles.push(RectPrimitive {
+            x: slice_left as f32,
+            y: top as f32,
+            width: (slice_right - slice_left) as f32,
+            height: (bottom - top).max(0.0) as f32,
+            color,
+            object_id: 0,
+            shape: RectShape::Rectangle,
+        });
+        slice_left += CLIPPED_ARC_SLICE_WIDTH;
+    }
+}
+
 // Reference palette for alignment_summary.wgsl, kept alongside renderer code.
 fn summary_color(
     component: CpuSummaryProjectedComponent,
@@ -266,13 +371,16 @@ fn summary_color(
         C::Depth { .. } => Rgba::new(0.48, 0.48, 0.48, 0.90),
         C::CoverageCenterLine => Rgba::new(0.72, 0.75, 0.82, 0.72),
         C::CoverageSelectedPosition { .. } => Rgba::new(1.0, 0.78, 0.18, 0.92),
-        C::Allele { allele, .. } => match allele {
-            CpuAlleleToken::A => Rgba::new(0.24, 0.78, 0.38, 1.0),
-            CpuAlleleToken::C => Rgba::new(0.22, 0.52, 0.96, 1.0),
-            CpuAlleleToken::G => Rgba::new(0.96, 0.65, 0.18, 1.0),
-            CpuAlleleToken::T => Rgba::new(0.94, 0.28, 0.28, 1.0),
-            _ => Rgba::new(0.60, 0.64, 0.70, 1.0),
-        },
+        C::Allele { allele, .. } => {
+            let [r, g, b, a] = crate::palette::BASE_COLORS[match allele {
+                CpuAlleleToken::A => crate::palette::BASE_A,
+                CpuAlleleToken::C => crate::palette::BASE_C,
+                CpuAlleleToken::G => crate::palette::BASE_G,
+                CpuAlleleToken::T => crate::palette::BASE_T,
+                _ => crate::palette::BASE_N,
+            }];
+            Rgba::new(r, g, b, a)
+        }
         C::Bisulfite { observation, .. } => match observation {
             BisulfiteObservationToken::Protected => Rgba::new(0.86, 0.46, 0.12, 1.0),
             BisulfiteObservationToken::Converted => Rgba::new(0.18, 0.62, 0.78, 1.0),
@@ -297,5 +405,93 @@ fn summary_color(
             _ => Rgba::new(0.90, 0.24, 0.92, 0.92),
         },
         _ => Rgba::new(0.46, 0.48, 0.52, 0.92),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rgv_alignment_scene::{CpuClipRect, CpuSummaryProjectedPrimitive};
+
+    use super::*;
+
+    const CLIP: CpuClipRect = CpuClipRect {
+        x: 100.0,
+        y: 0.0,
+        width: 200.0,
+        height: 60.0,
+    };
+
+    fn arc(x: f64, width: f64, shape: CpuSummaryPrimitiveShape) -> CpuSummaryProjectedPrimitive {
+        CpuSummaryProjectedPrimitive {
+            x,
+            y: 10.0,
+            width,
+            height: 20.0,
+            shape,
+            component: CpuSummaryProjectedComponent::JunctionBaseline { row: 0 },
+            draw_order: 0,
+            text: None,
+        }
+    }
+
+    #[test]
+    fn arcs_inside_the_lane_are_exported_as_one_exact_primitive() {
+        let inside = arc(120.0, 150.0, CpuSummaryPrimitiveShape::JunctionArcUp);
+        assert_eq!(clipped_arc_slice_count(&inside, CLIP), 0);
+        let touching = arc(100.0, 200.0, CpuSummaryPrimitiveShape::JunctionArcDown);
+        assert_eq!(clipped_arc_slice_count(&touching, CLIP), 0);
+        // Non-arc shapes are never sliced, whatever their extent.
+        let bar = arc(0.0, 1_000.0, CpuSummaryPrimitiveShape::Bar);
+        assert_eq!(clipped_arc_slice_count(&bar, CLIP), 0);
+    }
+
+    #[test]
+    fn arcs_leaving_the_lane_are_clipped_and_keep_their_unclamped_curve() {
+        // The arc starts 100 points left of the lane and ends in its middle, so the lane's left
+        // edge is the apex and the stroke falls monotonically to the baseline at x = 200.
+        let upward = arc(0.0, 200.0, CpuSummaryPrimitiveShape::JunctionArcUp);
+        let mut slices = Vec::new();
+        push_clipped_arc_slices(&mut slices, &upward, CLIP, Rgba::new(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(slices.len(), clipped_arc_slice_count(&upward, CLIP));
+        assert_eq!(slices.len(), 200);
+        for slice in &slices {
+            assert!(slice.x >= 100.0 && slice.x + slice.width <= 200.0 + 1.0e-3);
+            assert!(slice.y >= 10.0 - 1.0e-3 && slice.y + slice.height <= 30.0 + 1.0e-3);
+            assert!(slice.height > 0.0);
+            assert_eq!(slice.shape, RectShape::Rectangle);
+        }
+        for pair in slices.windows(2) {
+            assert!((pair[0].x + pair[0].width - pair[1].x).abs() < 1.0e-3);
+            assert!(pair[1].y >= pair[0].y - 1.0e-4);
+        }
+        let stroke = rgv_layout::junction_arc_stroke_width(20.0);
+        // At the lane edge the curve is at its apex (the top of the bounds), not at the
+        // baseline where a span clamped to the lane would have started it.
+        assert!((slices[0].y - 10.0).abs() < 0.05);
+        let last = slices.last().unwrap();
+        assert!((last.y + last.height - 30.0).abs() < 1.0e-3);
+        assert!(last.height >= stroke * 0.5);
+
+        // The mirrored arc leaving on the right is clipped at the right edge.
+        let downward = arc(250.0, 400.0, CpuSummaryPrimitiveShape::JunctionArcDown);
+        let mut slices = Vec::new();
+        push_clipped_arc_slices(&mut slices, &downward, CLIP, Rgba::new(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(slices.len(), clipped_arc_slice_count(&downward, CLIP));
+        assert_eq!(slices.len(), 100);
+        assert!((slices[0].x - 250.0).abs() < 1.0e-3);
+        let last = slices.last().unwrap();
+        assert!((last.x + last.width - 300.0).abs() < 1.0e-3);
+        // A downward arc starts on its top edge (the baseline) and descends.
+        assert!((slices[0].y - 10.0).abs() < 1.0e-3);
+        assert!(last.y > slices[0].y);
+    }
+
+    #[test]
+    fn arcs_wholly_outside_the_lane_export_nothing() {
+        let outside = arc(400.0, 50.0, CpuSummaryPrimitiveShape::JunctionArcUp);
+        assert_eq!(clipped_arc_slice_count(&outside, CLIP), 1);
+        let mut slices = Vec::new();
+        push_clipped_arc_slices(&mut slices, &outside, CLIP, Rgba::new(0.0, 0.0, 0.0, 1.0));
+        assert!(slices.is_empty());
     }
 }

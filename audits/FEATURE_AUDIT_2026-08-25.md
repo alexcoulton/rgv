@@ -1,5 +1,31 @@
 # RGV versus IGV Desktop feature audit
 
+> **Superseded (note added 20 November 2026).** This audit is kept as a historical record. The
+> current assessment is
+> [`COMPREHENSIVE_REVIEW_2026-11-20.md`](COMPREHENSIVE_REVIEW_2026-11-20.md) (see §11 for product
+> gaps and documentation discrepancies), with remediation tracked in
+> [`../plans/COMPREHENSIVE_REVIEW_REMEDIATION_PLAN_2026-11-20.md`](../plans/COMPREHENSIVE_REVIEW_REMEDIATION_PLAN_2026-11-20.md).
+>
+> The following items are reported below as missing but have since been implemented. Each was
+> checked against the code on 20 November 2026; all have automated coverage only and none has
+> been qualified hands-on:
+>
+> - **Hosted genome catalogue** — **Genomes → Hosted genomes** and `--genome <id>` read IGV's
+>   hosted genome list (`IGV_HOSTED_GENOME_LIST_URL` in `crates/rgv-core/src/igv_genome.rs`; menu
+>   in `apps/rgv-desktop/src/ui/frame/menus.rs`).
+> - **IGV genome JSON** — parsed and loaded by `crates/rgv-core/src/igv_genome.rs` and
+>   `crates/rgv-hts/src/igv_genome.rs`; `.rgvgenome` is no longer the only genome description.
+> - **2bit reference** — `crates/rgv-hts/src/two_bit.rs` (soft-masking is not reported).
+> - **Remote text annotation tracks** — BED, GFF3, GTF, genePred, refFlat, narrowPeak, broadPeak
+>   and PSL URLs are accepted by downloading the whole file, up to 256 MiB
+>   (`TextFeatureSource::open` in `crates/rgv-hts/src/tracks/text_feature.rs`). This is not
+>   remote random access; there is no remote tabix.
+>
+> Everything else in this document should be read as the state on 25 August 2026. Items it lists
+> as missing that the new review still lists as gaps include the whole-genome view, UCSC track
+> hubs/GenArk, hosted *track* catalogues, on-track VCF genotype matrices, cloud authentication
+> (`s3://`, `gs://`, OAuth), SAM, bgzip FASTA, GenBank, and interactive workspace SVG export.
+
 **Audit date:** 25 August 2026
 
 **RGV baseline:** the current workspace, including uncommitted changes present during the audit

@@ -7,6 +7,8 @@ pub(crate) struct AutomationRunner {
     pub(crate) report_path: Option<PathBuf>,
     pub(crate) report_worker: Option<JoinHandle<std::result::Result<(), String>>>,
     pub(crate) control_reply: Option<std::sync::mpsc::SyncSender<AutomationRunReport>>,
+    /// Set by the control service when its client stopped waiting for this batch.
+    pub(crate) control_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub(crate) exit_after_report: bool,
     pub(crate) finished: bool,
     pub(crate) run_started: Instant,
@@ -63,6 +65,8 @@ pub(crate) enum AutomationWait {
     },
     File {
         command_index: usize,
+        /// A file worker that never finishes must not block the batch for ever.
+        deadline: Instant,
     },
     Reference {
         command_index: usize,
@@ -131,6 +135,7 @@ impl AutomationRunner {
             report_path: Some(report_path),
             report_worker: None,
             control_reply: None,
+            control_cancelled: None,
             exit_after_report: false,
             finished: false,
             run_started: Instant::now(),
@@ -156,6 +161,7 @@ impl AutomationRunner {
             report_path: None,
             report_worker: None,
             control_reply: Some(request.reply),
+            control_cancelled: Some(request.cancelled),
             exit_after_report: false,
             finished: false,
             run_started: Instant::now(),
@@ -350,11 +356,68 @@ impl AutomationRunner {
         }
     }
 
+    fn in_flight_command(&self) -> Option<usize> {
+        self.active_command
+            .as_ref()
+            .map(|active| active.index)
+            .or_else(|| {
+                self.waiting.as_ref().map(|waiting| match waiting {
+                    AutomationWait::Settled { command_index, .. }
+                    | AutomationWait::File { command_index, .. }
+                    | AutomationWait::Reference { command_index, .. }
+                    | AutomationWait::AlignmentTrack { command_index, .. }
+                    | AutomationWait::AuxiliaryTrack { command_index, .. }
+                    | AutomationWait::ExactBaseSelection { command_index, .. } => *command_index,
+                })
+            })
+    }
+
+    /// Stops a control batch whose client is no longer waiting: the command in flight fails
+    /// with a timeout, the rest are skipped and nothing further runs. Returns whether the batch
+    /// was cancelled by this call.
+    pub(crate) fn cancel_if_requested(&mut self) -> bool {
+        let requested = self
+            .control_cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire));
+        if !requested || self.finished {
+            return false;
+        }
+        let message = "Cancelled: the control request timed out before the batch completed";
+        if let Some(command_index) = self.in_flight_command() {
+            let _ = self.finish_command(
+                command_index,
+                Err((AutomationErrorCode::Timeout, message.to_owned())),
+            );
+        }
+        for (index, skipped) in self.commands.drain(..) {
+            self.results.push(AutomationCommandResult {
+                command_index: index,
+                command: skipped.name().to_owned(),
+                status: AutomationCommandStatus::Skipped,
+                error_code: None,
+                message: message.to_owned(),
+                data: serde_json::Value::Null,
+                elapsed_ms: 0.0,
+            });
+        }
+        self.waiting = None;
+        self.active_command = None;
+        // The receiving side has already answered its client.
+        self.control_reply = None;
+        self.finished = true;
+        true
+    }
+
     pub(crate) fn finish_command(
         &mut self,
         command_index: usize,
         outcome: std::result::Result<(String, serde_json::Value), (AutomationErrorCode, String)>,
     ) -> bool {
+        if self.finished {
+            // A late completion from a worker that outlived a cancelled or timed-out batch.
+            return false;
+        }
         if self
             .active_command
             .as_ref()
@@ -364,7 +427,7 @@ impl AutomationRunner {
         }
         if let Some(waiting_index) = self.waiting.as_ref().map(|waiting| match waiting {
             AutomationWait::Settled { command_index, .. }
-            | AutomationWait::File { command_index }
+            | AutomationWait::File { command_index, .. }
             | AutomationWait::Reference { command_index, .. }
             | AutomationWait::AlignmentTrack { command_index, .. }
             | AutomationWait::AuxiliaryTrack { command_index, .. }

@@ -18,7 +18,7 @@ use rgv_alignment_scene::{
     ExactAlleleSummaryError, ExactDepthSummaryError, ExactFilterSummaryError,
     ExactJunctionSummaryError, ExactModificationSummaryError, ExactPairSummaryError,
     ExactSummaryRootError, GeometryLod, JunctionAnnotationIndex, LayoutContract, LedgerError,
-    PayloadContract, PresentationContract, PresentationStorePressure, ReferenceRevision,
+    LedgerProgress, PayloadContract, PresentationContract, PresentationStorePressure, ReferenceRevision,
     ReservationKind, RowAtlasRevision, SceneRevision, SemanticPageError, StorePressure,
     SummaryContract, SummarySemanticPageError, alignment_filter_reference_horizon,
 };
@@ -520,6 +520,8 @@ pub struct AlignmentCoordinatorPump {
     pub published_scene: Option<SceneRevision>,
     pub refusal: Option<AlignmentSceneOwnerRefusal>,
     pub pressure: Option<AlignmentSceneOwnerPressure>,
+    /// Terminal scene-build failure for this lane's current authority.
+    pub failure: Option<AlignmentSceneOwnerFailure>,
     pub foreground_submitted: Option<SourceIntentSequence>,
     pub speculation_submitted: Option<SourceIntentSequence>,
 }
@@ -624,6 +626,7 @@ where
             source_settlements: _,
             refusals,
             pressures,
+            failures,
             foreground_submitted,
             speculation_submitted,
         } = self.source.pump_once()?;
@@ -637,11 +640,15 @@ where
         let pressure = pressures
             .into_iter()
             .find(|pressure| pressure.owner == self.owner);
+        let failure = failures
+            .into_iter()
+            .find(|failure| failure.owner == self.owner);
         Ok(AlignmentCoordinatorPump {
             source_event,
             published_scene,
             refusal,
             pressure,
+            failure,
             foreground_submitted,
             speculation_submitted,
         })
@@ -765,6 +772,10 @@ pub struct AlignmentSceneSourcePump {
     pub source_settlements: Vec<SourceOwnerId>,
     pub refusals: Vec<AlignmentSceneOwnerRefusal>,
     pub pressures: Vec<AlignmentSceneOwnerPressure>,
+    /// Owners whose own scene candidate could not be built for a reason other than allocation
+    /// pressure. Each is terminal for that owner's current authority only; the shared source and
+    /// every other owner keep working.
+    pub failures: Vec<AlignmentSceneOwnerFailure>,
     pub foreground_submitted: Option<SourceIntentSequence>,
     pub speculation_submitted: Option<SourceIntentSequence>,
 }
@@ -812,6 +823,14 @@ pub struct AlignmentSceneOwnerPressure {
     pub pressure: LedgerError,
 }
 
+/// A scene-build failure attributed to the one owner whose candidate failed. It is not evidence
+/// that the shared source is unavailable and never cancels another owner's work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AlignmentSceneOwnerFailure {
+    pub owner: SourceOwnerId,
+    pub message: Arc<str>,
+}
+
 /// A refused foreground lane which was returned to `Pending` after its admission policy changed.
 /// The replacement source intent is queued behind the already-enqueued non-discardable control,
 /// so it cannot decode under the superseded policy.
@@ -837,6 +856,9 @@ where
     /// cost learned at ACTB across a disjoint visit without retaining ACTB's derivative pages.
     foreground_working_set_history: VecDeque<ForegroundWorkingSetSample>,
     last_measured_scene_by_owner: BTreeMap<SourceOwnerId, SceneRevision>,
+    /// While the driver is still reclaiming capacity, a pressure-paused foreground row block
+    /// waits for that reclaim to finish instead of consuming each quantum's freed bytes.
+    capacity_reclaim_active: bool,
 }
 
 const MAXIMUM_FOREGROUND_WORKING_SET_ISLANDS: usize = 32;
@@ -879,6 +901,51 @@ struct AlignmentSceneSourceLane {
     /// reference-backed view/highlight predicates. Until then the ordinary source horizon is the
     /// truthful initial request; the expanded requirement is published on the next frame.
     filter_reference_horizon: Option<GenomicInterval>,
+    /// Why the exact visible row block is not being rebuilt right now. Without this latch a
+    /// refused or failing block would be retried on every worker iteration.
+    foreground_row_pause: Option<ForegroundRowPresentationPause>,
+    /// This lane's scene candidate failed for a reason other than allocation pressure. Source
+    /// completions belonging to other owners must not rebuild (and re-report) it; a new camera,
+    /// contract, policy, reference, or explicit retry clears it.
+    scene_build_failed: bool,
+}
+
+/// Everything a foreground row-block build depends on. A pause applies only while this is
+/// unchanged, so a new scene, row range, interval, or presentation is always attempted afresh.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ForegroundRowPresentationAuthority {
+    scene: SceneRevision,
+    presentation: PresentationContract,
+    prepared_interval: GenomicInterval,
+    rows: Range<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct ForegroundRowPresentationPause {
+    /// `None` when the authority itself could not be derived; that state is equally stable.
+    authority: Option<ForegroundRowPresentationAuthority>,
+    cause: ForegroundRowPresentationPauseCause,
+}
+
+#[derive(Clone, Debug)]
+enum ForegroundRowPresentationPauseCause {
+    /// Paused until `RetryResourcePressure`, a camera/contract change, or the shared ledger
+    /// gaining capacity relative to this snapshot taken after the refusal.
+    Pressure(Option<Box<LedgerProgress>>),
+    /// Terminal for this authority.
+    Failed(Arc<str>),
+}
+
+/// Whether a refused allocation has become worth retrying: the policy changed, or occupancy
+/// fell. Unrelated allocations elsewhere (which only raise occupancy) never resume the lane.
+fn ledger_capacity_improved(paused: &LedgerProgress, now: &LedgerProgress) -> bool {
+    now.policy_revision != paused.policy_revision
+        || now.budget > paused.budget
+        || now.transient_budget > paused.transient_budget
+        || now.active_replacement_bundle != paused.active_replacement_bundle
+        || now.charged.saturating_add(now.reserved)
+            < paused.charged.saturating_add(paused.reserved)
+        || now.transient < paused.transient
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -966,6 +1033,7 @@ where
             last_presentation_owner: None,
             foreground_working_set_history: VecDeque::new(),
             last_measured_scene_by_owner: BTreeMap::new(),
+            capacity_reclaim_active: false,
         }
     }
 
@@ -1004,6 +1072,8 @@ where
                 row_activity_cache: RefCell::new(None),
                 row_activity_telemetry: Cell::new(AlignmentRowActivityTelemetry::default()),
                 filter_reference_horizon: None,
+                foreground_row_pause: None,
+                scene_build_failed: false,
             },
         );
         Ok(())
@@ -1446,6 +1516,7 @@ where
         let mut source_settlements = Vec::new();
         let mut refusals = Vec::new();
         let mut pressures = Vec::new();
+        let mut failures = Vec::new();
         let mut foreground_submitted = None;
         let mut speculation_submitted = None;
         if let (Some(event), Some(owner)) = (&event, event_owner)
@@ -1512,6 +1583,11 @@ where
                 let visible_incomplete = lane
                     .frame(owner, &self.presentation)
                     .is_none_or(|frame| !frame.visible_complete());
+                if lane.scene_build_failed {
+                    // Already reported as terminal for this lane's authority. Another owner's
+                    // completion must not rebuild and re-report the same failing candidate.
+                    continue;
+                }
                 if completing_foreground == Some(owner) || visible_incomplete {
                     let reconciliation = lane.reconcile_from_resident_or_cache(
                         owner,
@@ -1532,19 +1608,24 @@ where
                             source_settlements.push(owner);
                         }
                         Err(error) => {
-                            let Some(pressure) = coordinator_budget_pressure(&error) else {
-                                return Err(error);
-                            };
-                            let Some(target) =
-                                lane.desired.as_ref().map(|desired| desired.source_horizon)
-                            else {
-                                return Err(error);
-                            };
                             // Candidate construction is lane-local even though its immutable roots
                             // share one store. Cancel only this owner's redundant source intents;
                             // other owners and every already-published scene remain authoritative.
                             self.actor.cancel_foreground_for(owner);
                             self.actor.cancel_speculation_for(owner);
+                            let pressure_target = coordinator_budget_pressure(&error).zip(
+                                lane.desired.as_ref().map(|desired| desired.source_horizon),
+                            );
+                            let Some((pressure, target)) = pressure_target else {
+                                let Some(message) = scene_build_failure_message(&error) else {
+                                    return Err(error);
+                                };
+                                // Not a capacity refusal: terminal for this owner's authority,
+                                // reported once, and invisible to every other owner.
+                                lane.scene_build_failed = true;
+                                failures.push(AlignmentSceneOwnerFailure { owner, message });
+                                continue;
+                            };
                             pressures.push(AlignmentSceneOwnerPressure {
                                 owner,
                                 target,
@@ -1567,6 +1648,7 @@ where
             if let Some(owner) = event_owner
                 && let Some(lane) = self.lanes.get_mut(&owner)
                 && !pressures.iter().any(|pressure| pressure.owner == owner)
+                && !lane.scene_build_failed
                 && !lane.prepared_covers_desired(owner, &self.presentation)
             {
                 if lane
@@ -1590,6 +1672,7 @@ where
             source_settlements,
             refusals,
             pressures,
+            failures,
             foreground_submitted,
             speculation_submitted,
         })
@@ -1702,9 +1785,38 @@ where
             .ok_or(AlignmentSceneCoordinatorConfigError::UnknownOwner(owner))?;
         Ok(AlignmentSceneOwnerWorkState {
             source_pending: self.actor.schedule().foreground_pending_for(owner),
-            presentation_pending: lane.needs_foreground_row_presentation(owner, &self.presentation)
+            // A pressure-paused block is still owned work (it resumes on capacity progress or an
+            // explicit retry); a terminally failed one is not.
+            presentation_pending: (lane
+                .needs_foreground_row_presentation(owner, &self.presentation)
+                && !lane.foreground_row_presentation_failed(owner, &self.presentation))
                 || lane.needs_vertical_residency(owner, &self.presentation),
         })
+    }
+
+    /// Whether user-visible source work (a control, an unserved foreground intent, or an active
+    /// foreground transaction) can run, as opposed to optional read-ahead only.
+    #[must_use]
+    pub fn has_pending_foreground_source_work(&self) -> bool {
+        self.actor.schedule().foreground_work_pending()
+    }
+
+    /// Tells the coordinator whether its driver still has a capacity reclaim in flight. While
+    /// one is, a pressure-paused foreground row block is not resumed by ledger progress: letting
+    /// it rebuild between reclaim quanta would consume the bytes each quantum just released.
+    pub const fn set_capacity_reclaim_active(&mut self, active: bool) {
+        self.capacity_reclaim_active = active;
+    }
+
+    /// The message of a terminal (non-pressure) foreground row-block failure that still applies
+    /// to `owner`'s current authority.
+    #[must_use]
+    pub fn foreground_presentation_failure(&self, owner: SourceOwnerId) -> Option<Arc<str>> {
+        let lane = self.lanes.get(&owner)?;
+        match &lane.foreground_row_pause(owner, &self.presentation)?.cause {
+            ForegroundRowPresentationPauseCause::Failed(message) => Some(Arc::clone(message)),
+            ForegroundRowPresentationPauseCause::Pressure(_) => None,
+        }
     }
 
     /// Whether a visible-complete lane has optional vertical presentation work. This never makes
@@ -1713,19 +1825,27 @@ where
     #[must_use]
     pub fn has_pending_presentation_work(&self) -> bool {
         self.lanes.iter().any(|(owner, lane)| {
-            lane.needs_foreground_row_presentation(*owner, &self.presentation)
-                || lane.needs_vertical_residency(*owner, &self.presentation)
+            lane.foreground_row_presentation_runnable(
+                *owner,
+                &self.presentation,
+                !self.capacity_reclaim_active,
+            ) || lane.needs_vertical_residency(*owner, &self.presentation)
         })
     }
 
-    /// Whether an exact visible row block is missing. This is separate from optional whole-stack
-    /// warming so the worker can yield bounded cache maintenance to user-visible work without
-    /// allowing speculation to delay reclaim.
+    /// Whether an exact visible row block is missing and can be built now. This is separate from
+    /// optional whole-stack warming so the worker can yield bounded cache maintenance to
+    /// user-visible work without allowing speculation to delay reclaim. A block paused by
+    /// allocation pressure or a terminal failure is not runnable and is not reported here.
     #[must_use]
     pub fn has_pending_foreground_presentation_work(&self) -> bool {
-        self.lanes
-            .iter()
-            .any(|(owner, lane)| lane.needs_foreground_row_presentation(*owner, &self.presentation))
+        self.lanes.iter().any(|(owner, lane)| {
+            lane.foreground_row_presentation_runnable(
+                *owner,
+                &self.presentation,
+                !self.capacity_reclaim_active,
+            )
+        })
     }
 
     /// Builds and atomically publishes at most one additional canonical row block. A normal
@@ -1738,8 +1858,12 @@ where
             .lanes
             .iter()
             .filter_map(|(owner, lane)| {
-                lane.needs_foreground_row_presentation(*owner, &self.presentation)
-                    .then_some(*owner)
+                lane.foreground_row_presentation_runnable(
+                    *owner,
+                    &self.presentation,
+                    !self.capacity_reclaim_active,
+                )
+                .then_some(*owner)
             })
             .collect::<Vec<_>>();
         if !foreground.is_empty() {
@@ -1775,8 +1899,15 @@ where
             .lanes
             .get_mut(&owner)
             .expect("an eligible presentation owner remains installed");
-        let outcome = lane.expand_vertical_residency_once(owner, &mut self.presentation)?;
-        Ok(Some(outcome))
+        match lane.expand_vertical_residency_once(owner, &mut self.presentation) {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(error) => {
+                // A checkpoint that could not even be planned would be selected again on the
+                // next worker turn. Optional warming stops for this authority instead.
+                lane.vertical_residency_failed = true;
+                Err(error)
+            }
+        }
     }
 
     fn next_presentation_owner(&mut self, eligible: &[SourceOwnerId]) -> SourceOwnerId {
@@ -1858,14 +1989,33 @@ where
         // cannot spin at frame rate. An explicit, current-token resume makes exactly one new
         // checkpoint eligible alongside the foreground reconciliation below.
         lane.vertical_residency_budget_limited = false;
+        // The same explicit signal resumes a pressure-paused visible row block and lets a failed
+        // scene candidate be attempted once more.
+        lane.foreground_row_pause = None;
+        lane.scene_build_failed = false;
 
         let camera_sequence = desired.camera_sequence;
         let before = self
             .presentation
             .prepared_for(presentation_owner(owner))
             .map(|scene| scene.revision());
-        let published =
-            lane.reconcile_from_resident_or_cache(owner, &mut self.actor, &mut self.presentation)?;
+        let published = match lane.reconcile_from_resident_or_cache(
+            owner,
+            &mut self.actor,
+            &mut self.presentation,
+        ) {
+            Ok(published) => published,
+            Err(error) => {
+                // The caller reports this outcome for the retry itself. Stay paused so the
+                // worker does not immediately rebuild the same candidate and report it twice.
+                if coordinator_budget_pressure(&error).is_some() {
+                    lane.pause_foreground_rows_for_pressure(owner, &self.presentation);
+                } else {
+                    lane.scene_build_failed = true;
+                }
+                return Err(error);
+            }
+        };
         let frame = lane
             .frame(owner, &self.presentation)
             .expect("a pressure retry retains desired camera state");
@@ -2124,6 +2274,7 @@ fn source_event_owner(event: &AlignmentSourceActorEvent) -> Option<SourceOwnerId
         | AlignmentSourceActorEvent::AcquisitionRefused { work, .. } => Some(work.intent().owner()),
         AlignmentSourceActorEvent::WorkRetargeted { current, .. } => Some(current.intent().owner()),
         AlignmentSourceActorEvent::ControlApplied
+        | AlignmentSourceActorEvent::SourceWaiting { .. }
         | AlignmentSourceActorEvent::ChunkAdmitted { .. } => None,
     }
 }
@@ -2153,6 +2304,19 @@ impl AlignmentSceneSourceLane {
         let previous_source_horizon = previous_desired
             .as_ref()
             .map(|desired| desired.source_horizon);
+        // A new camera (and every contract or policy change, which arrives through here) is a
+        // new admission decision for a pressure-paused row block and for a failed candidate.
+        // A terminal row-block failure stays keyed to its exact authority instead.
+        if matches!(
+            self.foreground_row_pause,
+            Some(ForegroundRowPresentationPause {
+                cause: ForegroundRowPresentationPauseCause::Pressure(_),
+                ..
+            })
+        ) {
+            self.foreground_row_pause = None;
+        }
+        self.scene_build_failed = false;
         let camera_sequence = self.take_camera_sequence()?;
         let direction = camera_direction(self.previous_exact_start, camera.exact_start());
         self.previous_exact_start = Some(camera.exact_start());
@@ -2312,6 +2476,7 @@ impl AlignmentSceneSourceLane {
         self.contract = contract;
         self.vertical_residency_budget_limited = false;
         self.vertical_residency_failed = false;
+        self.foreground_row_pause = None;
         // Every contract replacement creates a new derived authority. Reusing a prepared interval
         // retained from an earlier, much wider zoom can make a fine-detail contract materialise
         // per-base summaries or reference semantics across millions of offscreen bases. Rebase
@@ -2367,6 +2532,8 @@ impl AlignmentSceneSourceLane {
         }
 
         self.contract.reference = Some(authority);
+        self.foreground_row_pause = None;
+        self.scene_build_failed = false;
         let published_scene = self.reconcile_from_resident_or_cache(owner, actor, presentation)?;
         if self.prepared_covers_desired(owner, presentation) {
             actor.cancel_foreground_for(owner);
@@ -2416,10 +2583,7 @@ impl AlignmentSceneSourceLane {
         else {
             return Ok(false);
         };
-        if current.summaries().contract() != self.contract.summaries
-            || current.reads().atlas().layout_contract() != self.contract.layout
-            || current.reads().evidence().view_filter().fingerprint()
-                != self.contract.view_filter_evaluation_fingerprint()
+        if !self.scene_roots_satisfy_contract(&current)
             || !current
                 .reads()
                 .evidence()
@@ -2487,10 +2651,7 @@ impl AlignmentSceneSourceLane {
         });
         let scene_contracts_current = snapshot.as_ref().is_some_and(|scene| {
             presentation_core_matches(scene.reads().presentation(), self.contract.presentation)
-                && scene.summaries().contract() == self.contract.summaries
-                && scene.reads().atlas().layout_contract() == self.contract.layout
-                && scene.reads().evidence().view_filter().fingerprint()
-                    == self.contract.view_filter_evaluation_fingerprint()
+                && self.scene_roots_satisfy_contract(scene)
         });
         let reference_requirement = self.reference_requirement(desired);
         let reference_products_current = snapshot.as_ref().is_some_and(|scene| {
@@ -2798,11 +2959,7 @@ impl AlignmentSceneSourceLane {
         };
         let reads = current.reads();
         presentation_core_matches(reads.presentation(), self.contract.presentation)
-            && reads.evidence().payload().satisfies(&self.contract.payload)
-            && reads.evidence().view_filter().fingerprint()
-                == self.contract.view_filter_evaluation_fingerprint()
-            && current.summaries().contract() == self.contract.summaries
-            && reads.atlas().layout_contract() == self.contract.layout
+            && self.scene_roots_satisfy_contract(current)
             && reads.evidence().coverage().covers(desired.source_horizon)
             && current
                 .summaries()
@@ -2824,6 +2981,110 @@ impl AlignmentSceneSourceLane {
             .is_some_and(|desired| desired.camera.has_visible_rows())
             && !self.prepared_covers_desired(owner, presentation)
             && self.current_roots_cover_desired_except_rows(owner, presentation)
+    }
+
+    /// The single statement of "this scene's immutable evidence, summary, and row roots were
+    /// built under this lane's current contracts". Every reuse decision (frame completeness,
+    /// coverage, retention, row extension, residency, prewarm) asks this one function, so a
+    /// payload, filter, summary, or layout change cannot be honoured by one and missed by another.
+    /// Presentation and coverage are compared separately because their rules differ per caller.
+    fn scene_roots_satisfy_contract(&self, scene: &AlignmentSceneSnapshot) -> bool {
+        let reads = scene.reads();
+        reads.evidence().payload().satisfies(&self.contract.payload)
+            && reads.evidence().view_filter().fingerprint()
+                == self.contract.view_filter_evaluation_fingerprint()
+            && scene.summaries().contract() == self.contract.summaries
+            && reads.atlas().layout_contract() == self.contract.layout
+    }
+
+    /// The exact inputs of the next foreground row-block build, if they can be derived.
+    fn foreground_row_authority(
+        &self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+    ) -> Option<ForegroundRowPresentationAuthority> {
+        let desired = self.desired.as_ref()?;
+        let current = presentation.prepared_for(presentation_owner(owner))?;
+        let rows = desired_rows(
+            desired,
+            current.reads().atlas().row_count(),
+            self.policy.vertical_margin_rows,
+        )
+        .ok()?;
+        let (presentation_contract, _) =
+            self.available_presentation_contract(desired.source_horizon);
+        Some(ForegroundRowPresentationAuthority {
+            scene: current.revision(),
+            presentation: presentation_contract,
+            prepared_interval: desired.prepared_interval,
+            rows,
+        })
+    }
+
+    /// The pause that still applies to the lane's current foreground row authority.
+    fn foreground_row_pause(
+        &self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+    ) -> Option<&ForegroundRowPresentationPause> {
+        let pause = self.foreground_row_pause.as_ref()?;
+        (pause.authority == self.foreground_row_authority(owner, presentation)).then_some(pause)
+    }
+
+    fn foreground_row_presentation_failed(
+        &self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+    ) -> bool {
+        self.foreground_row_pause(owner, presentation)
+            .is_some_and(|pause| {
+                matches!(pause.cause, ForegroundRowPresentationPauseCause::Failed(_))
+            })
+    }
+
+    /// Whether the missing visible row block should be built on this worker turn. A paused block
+    /// does no work: a terminal failure never resumes for the same authority, and a capacity
+    /// refusal resumes only once the shared ledger has gained room (and, while the driver is
+    /// still reclaiming, not before that reclaim has finished).
+    fn foreground_row_presentation_runnable(
+        &self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+        resume_on_ledger_progress: bool,
+    ) -> bool {
+        if !self.needs_foreground_row_presentation(owner, presentation) {
+            return false;
+        }
+        match self
+            .foreground_row_pause(owner, presentation)
+            .map(|pause| &pause.cause)
+        {
+            None => true,
+            Some(ForegroundRowPresentationPauseCause::Failed(_)) => false,
+            Some(ForegroundRowPresentationPauseCause::Pressure(paused)) => {
+                resume_on_ledger_progress
+                    && paused.as_ref().is_some_and(|paused| {
+                        presentation
+                            .ledger()
+                            .progress()
+                            .is_ok_and(|now| ledger_capacity_improved(paused, &now))
+                    })
+            }
+        }
+    }
+
+    fn pause_foreground_rows_for_pressure(
+        &mut self,
+        owner: SourceOwnerId,
+        presentation: &AlignmentPresentationStore,
+    ) {
+        self.foreground_row_pause = Some(ForegroundRowPresentationPause {
+            authority: self.foreground_row_authority(owner, presentation),
+            // Taken after the refused reservation was released, so only later relief counts.
+            cause: ForegroundRowPresentationPauseCause::Pressure(
+                presentation.ledger().progress().ok().map(Box::new),
+            ),
+        });
     }
 
     fn desired_row_pages_are_fully_cached(
@@ -2876,13 +3137,17 @@ impl AlignmentSceneSourceLane {
             .desired
             .clone()
             .ok_or(AlignmentSceneCoordinatorError::MissingCamera)?;
-        match self.prepare_from_current_roots(owner, presentation, &desired) {
+        // Captured before the attempt: a failed build leaves the current scene, and therefore
+        // this authority, unchanged, which is exactly what keeps the pause in force.
+        let authority = self.foreground_row_authority(owner, presentation);
+        let failure = match self.prepare_from_current_roots(owner, presentation, &desired) {
             Ok(Some(scene)) => {
+                self.foreground_row_pause = None;
                 self.telemetry.foreground_row_block_publications = self
                     .telemetry
                     .foreground_row_block_publications
                     .saturating_add(1);
-                Ok(AlignmentPresentationPump {
+                return Ok(AlignmentPresentationPump {
                     owner,
                     published_scene: Some(scene.revision()),
                     intent: SourceIntentKind::Foreground,
@@ -2890,24 +3155,43 @@ impl AlignmentSceneSourceLane {
                     failed: false,
                     completed: true,
                     pressure: None,
-                })
+                });
             }
-            Ok(None) => Err(AlignmentSceneCoordinatorError::MissingCamera),
-            Err(error) => {
-                let Some(pressure) = coordinator_budget_pressure(&error) else {
-                    return Err(error);
-                };
-                Ok(AlignmentPresentationPump {
-                    owner,
-                    published_scene: None,
-                    intent: SourceIntentKind::Foreground,
-                    budget_limited: false,
-                    failed: false,
-                    completed: false,
-                    pressure: Some(pressure),
-                })
-            }
+            Ok(None) => AlignmentSceneCoordinatorError::<E>::MissingCamera,
+            Err(error) => error,
+        };
+        if let Some(pressure) = coordinator_budget_pressure(&failure) {
+            self.pause_foreground_rows_for_pressure(owner, presentation);
+            return Ok(AlignmentPresentationPump {
+                owner,
+                published_scene: None,
+                intent: SourceIntentKind::Foreground,
+                budget_limited: false,
+                failed: false,
+                completed: false,
+                pressure: Some(pressure),
+            });
         }
+        // A deterministic failure would otherwise be rebuilt, and reported, on every worker
+        // iteration. Latch it for this exact authority and attribute it to this owner alone;
+        // the message is read back through `foreground_presentation_failure`.
+        self.foreground_row_pause = Some(ForegroundRowPresentationPause {
+            authority,
+            cause: ForegroundRowPresentationPauseCause::Failed(
+                scene_build_failure_message(&failure).unwrap_or_else(|| {
+                    Arc::from("the alignment source failed while preparing visible rows")
+                }),
+            ),
+        });
+        Ok(AlignmentPresentationPump {
+            owner,
+            published_scene: None,
+            intent: SourceIntentKind::Foreground,
+            budget_limited: false,
+            failed: true,
+            completed: false,
+            pressure: None,
+        })
     }
 
     /// Reconciles the lane's exact row-block directory with semantic cache ownership after a
@@ -3009,11 +3293,7 @@ impl AlignmentSceneSourceLane {
         let reads = current.reads();
         let evidence = reads.evidence();
         let atlas = reads.atlas();
-        if !evidence.payload().satisfies(&self.contract.payload)
-            || evidence.view_filter().fingerprint()
-                != self.contract.view_filter_evaluation_fingerprint()
-            || current.summaries().contract() != self.contract.summaries
-            || atlas.layout_contract() != self.contract.layout
+        if !self.scene_roots_satisfy_contract(&current)
             || !evidence.coverage().covers(desired.source_horizon)
             || !current
                 .summaries()
@@ -3269,10 +3549,7 @@ impl AlignmentSceneSourceLane {
         let (available_presentation, _) =
             self.available_presentation_contract(desired.source_horizon);
         if scene.reads().presentation() != available_presentation
-            || scene.summaries().contract() != self.contract.summaries
-            || scene.reads().atlas().layout_contract() != self.contract.layout
-            || scene.reads().evidence().view_filter().fingerprint()
-                != self.contract.view_filter_evaluation_fingerprint()
+            || !self.scene_roots_satisfy_contract(scene)
             || !scene
                 .reads()
                 .evidence()
@@ -3301,10 +3578,7 @@ impl AlignmentSceneSourceLane {
     ) -> Option<(GenomicInterval, Option<Range<u32>>)> {
         let scene = presentation.prepared_for(presentation_owner(owner))?;
         if !presentation_core_matches(scene.reads().presentation(), self.contract.presentation)
-            || scene.summaries().contract() != self.contract.summaries
-            || scene.reads().atlas().layout_contract() != self.contract.layout
-            || scene.reads().evidence().view_filter().fingerprint()
-                != self.contract.view_filter_evaluation_fingerprint()
+            || !self.scene_roots_satisfy_contract(scene)
             || !scene
                 .prepared_interval()
                 .contains_interval(camera.interval())
@@ -3372,10 +3646,7 @@ impl AlignmentSceneSourceLane {
             .frame(owner, presentation)
             .is_some_and(|frame| frame.visible_complete())
             || scene.reads().presentation() != available_presentation
-            || scene.summaries().contract() != self.contract.summaries
-            || scene.reads().atlas().layout_contract() != self.contract.layout
-            || scene.reads().evidence().view_filter().fingerprint()
-                != self.contract.view_filter_evaluation_fingerprint()
+            || !self.scene_roots_satisfy_contract(scene)
             || !scene
                 .reads()
                 .evidence()
@@ -3683,8 +3954,7 @@ impl AlignmentSceneSourceLane {
         if actor.schedule().speculation_pending_for(owner)
             && actor
                 .schedule()
-                .desired_speculation()
-                .filter(|intent| intent.owner() == owner)
+                .desired_speculation_for(owner)
                 .is_some_and(|intent| {
                     source_intent_covers(intent.spec(), missing, missing, &self.contract)
                 })
@@ -3720,6 +3990,7 @@ impl AlignmentSceneSourceLane {
             }
             AlignmentSourceActorEvent::ControlApplied
             | AlignmentSourceActorEvent::ChunkAdmitted { .. }
+            | AlignmentSourceActorEvent::SourceWaiting { .. }
             | AlignmentSourceActorEvent::SourceProgressed { .. } => {}
         }
     }
@@ -4057,6 +4328,42 @@ pub(crate) fn coordinator_budget_pressure<E>(
     }
 }
 
+/// Text of a lane-local scene-build failure. The backend error type is not required to be
+/// displayable at this boundary, so a failure of the shared source itself yields `None` and
+/// keeps its existing source-wide handling.
+fn scene_build_failure_message<E>(error: &AlignmentSceneCoordinatorError<E>) -> Option<Arc<str>> {
+    type Plain = AlignmentSceneCoordinatorError<std::convert::Infallible>;
+    let message = match error {
+        AlignmentSceneCoordinatorError::Source(_) => return None,
+        AlignmentSceneCoordinatorError::Schedule(error) => error.to_string(),
+        AlignmentSceneCoordinatorError::Store(error) => error.to_string(),
+        AlignmentSceneCoordinatorError::Presentation(error) => error.to_string(),
+        AlignmentSceneCoordinatorError::Config(error) => error.to_string(),
+        AlignmentSceneCoordinatorError::CameraContigMismatch => {
+            Plain::CameraContigMismatch.to_string()
+        }
+        AlignmentSceneCoordinatorError::UnknownOwner(owner) => {
+            Plain::UnknownOwner(*owner).to_string()
+        }
+        AlignmentSceneCoordinatorError::CameraOutsideContig {
+            interval,
+            contig_length,
+        } => Plain::CameraOutsideContig {
+            interval: *interval,
+            contig_length: *contig_length,
+        }
+        .to_string(),
+        AlignmentSceneCoordinatorError::CameraSequenceOverflow => {
+            Plain::CameraSequenceOverflow.to_string()
+        }
+        AlignmentSceneCoordinatorError::MissingCamera => Plain::MissingCamera.to_string(),
+        AlignmentSceneCoordinatorError::IncompleteCachedHorizon(horizon) => {
+            Plain::IncompleteCachedHorizon(*horizon).to_string()
+        }
+    };
+    Some(Arc::from(message))
+}
+
 fn intersect_intervals(left: GenomicInterval, right: GenomicInterval) -> Option<GenomicInterval> {
     if left.contig() != right.contig() {
         return None;
@@ -4263,6 +4570,7 @@ mod tests {
                 view_as_pairs: false,
                 pair_length_bounds: TemplateLengthBounds::default(),
                 promoted_template: None,
+                sampling: rgv_alignment_scene::ReadSampling::Complete,
             },
             presentation: PresentationContract {
                 geometry_lod: GeometryLod::Read,
@@ -7392,6 +7700,385 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .visible_complete()
+        );
+    }
+
+    fn scrolled_camera(camera: AlignmentCamera, row_offset: f64) -> AlignmentCamera {
+        AlignmentCamera::from_viewport(
+            camera.viewport(),
+            row_offset,
+            camera.row_height(),
+            camera.read_height(),
+            camera.clip(),
+        )
+        .unwrap()
+    }
+
+    /// One published lane whose row blocks are a single row tall, so a vertical scroll always
+    /// needs a new foreground row block and nothing else.
+    fn published_single_row_block_lane() -> (
+        AlignmentSceneSourceCoordinator<LocalBamCanonicalBackend>,
+        SourceOwnerId,
+        AlignmentCamera,
+    ) {
+        let (mut coordinator, mut contract, policy, camera) = test_source_coordinator_with_ledger(
+            AllocationLedger::new_with_transient_budget(64 << 20, 0, 64 << 20),
+        );
+        contract.row_block_rows = NonZeroU32::new(1).unwrap();
+        let owner = SourceOwnerId::new(7);
+        coordinator.insert_lane(owner, contract, policy).unwrap();
+        coordinator.update_camera(owner, camera).unwrap();
+        assert!(
+            (0..256).any(|_| !coordinator.pump_once().unwrap().publications.is_empty()),
+            "the fixture lane should publish its first scene"
+        );
+        (coordinator, owner, camera)
+    }
+
+    #[test]
+    fn pressure_paused_foreground_row_block_does_no_work_until_capacity_camera_or_retry() {
+        let (mut coordinator, owner, camera) = published_single_row_block_lane();
+        let ledger = coordinator.actor().store().ledger();
+        let roomy_budget = ledger.snapshot().unwrap().budget;
+        let fill_budget = |ledger: &AllocationLedger| {
+            ledger
+                .set_budget(ledger.snapshot().unwrap().charged)
+                .unwrap();
+        };
+
+        fill_budget(&ledger);
+        let update = coordinator
+            .update_camera(owner, scrolled_camera(camera, 72.0))
+            .unwrap();
+        assert!(update.published_scene.is_none());
+        assert!(coordinator.has_pending_foreground_presentation_work());
+        let refused = coordinator.pump_presentation_once().unwrap().unwrap();
+        assert_eq!(refused.intent, SourceIntentKind::Foreground);
+        assert!(refused.pressure.is_some());
+        assert!(!refused.failed);
+
+        // The worker loop asks these questions on every iteration. While the refusal stands
+        // there is nothing runnable, nothing is rebuilt, and nothing is reported again.
+        let attempts = coordinator.telemetry(owner).unwrap().presentation_candidates;
+        for _ in 0..64 {
+            assert!(!coordinator.has_pending_foreground_presentation_work());
+            assert!(!coordinator.has_pending_presentation_work());
+            assert!(coordinator.pump_presentation_once().unwrap().is_none());
+        }
+        assert_eq!(
+            coordinator.telemetry(owner).unwrap().presentation_candidates,
+            attempts
+        );
+        assert!(
+            coordinator
+                .owner_work_state(owner)
+                .unwrap()
+                .presentation_pending,
+            "a paused block is still owned work, not an idle worker"
+        );
+        assert!(coordinator.foreground_presentation_failure(owner).is_none());
+
+        // An explicit retry that is refused again reports through its own result and leaves
+        // the lane paused rather than runnable.
+        let target = coordinator
+            .frame(owner)
+            .unwrap()
+            .unwrap()
+            .camera
+            .interval();
+        let retry = coordinator.retry_resource_pressure(owner, target);
+        assert!(retry.is_err_and(|error| coordinator_budget_pressure(&error).is_some()));
+        assert!(!coordinator.has_pending_foreground_presentation_work());
+
+        // Ledger progress resumes the block, but not while the driver is still reclaiming.
+        ledger.set_budget(roomy_budget).unwrap();
+        coordinator.set_capacity_reclaim_active(true);
+        assert!(!coordinator.has_pending_foreground_presentation_work());
+        coordinator.set_capacity_reclaim_active(false);
+        assert!(coordinator.has_pending_foreground_presentation_work());
+        let resumed = coordinator.pump_presentation_once().unwrap().unwrap();
+        assert!(resumed.published_scene.is_some());
+        assert!(coordinator.frame(owner).unwrap().unwrap().visible_complete());
+
+    }
+
+    #[test]
+    fn a_new_camera_or_an_explicit_retry_resumes_a_pressure_paused_row_block() {
+        let (mut coordinator, owner, camera) = published_single_row_block_lane();
+        let ledger = coordinator.actor().store().ledger();
+        let roomy_budget = ledger.snapshot().unwrap().budget;
+        ledger
+            .set_budget(ledger.snapshot().unwrap().charged)
+            .unwrap();
+        coordinator
+            .update_camera(owner, scrolled_camera(camera, 72.0))
+            .unwrap();
+        assert!(
+            coordinator
+                .pump_presentation_once()
+                .unwrap()
+                .unwrap()
+                .pressure
+                .is_some()
+        );
+        assert!(!coordinator.has_pending_foreground_presentation_work());
+
+        // A new camera is a new admission decision: exactly one more attempt, then paused.
+        coordinator
+            .update_camera(owner, scrolled_camera(camera, 84.0))
+            .unwrap();
+        assert!(coordinator.has_pending_foreground_presentation_work());
+        assert!(
+            coordinator
+                .pump_presentation_once()
+                .unwrap()
+                .unwrap()
+                .pressure
+                .is_some()
+        );
+        assert!(!coordinator.has_pending_foreground_presentation_work());
+        assert!(coordinator.pump_presentation_once().unwrap().is_none());
+
+        // A successful explicit retry clears the pause and publishes.
+        ledger.set_budget(roomy_budget).unwrap();
+        let target = coordinator
+            .frame(owner)
+            .unwrap()
+            .unwrap()
+            .camera
+            .interval();
+        let update = coordinator
+            .retry_resource_pressure(owner, target)
+            .unwrap()
+            .unwrap();
+        assert!(update.published_scene.is_some());
+        assert!(update.visible_complete);
+        assert!(!coordinator.has_pending_presentation_work());
+    }
+
+    #[test]
+    fn failed_foreground_row_block_is_terminal_for_its_authority_and_owner_scoped() {
+        let (mut coordinator, owner, camera) = published_single_row_block_lane();
+        let prepared_end = coordinator
+            .frame(owner)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .unwrap()
+            .prepared_interval()
+            .end();
+        coordinator
+            .update_camera(owner, scrolled_camera(camera, 72.0))
+            .unwrap();
+        assert!(coordinator.has_pending_foreground_presentation_work());
+        // Invalidate only the tile horizon, as the optional-warm failure test does: the visible
+        // scene stays valid while the next row-block build fails deterministically.
+        let contract = coordinator.contract(owner).unwrap().clone();
+        coordinator
+            .lanes
+            .get_mut(&owner)
+            .unwrap()
+            .contract
+            .contig_length = prepared_end.saturating_sub(1);
+
+        let failed = coordinator
+            .pump_presentation_once()
+            .expect("a lane-local build failure is not a coordinator error")
+            .unwrap();
+        assert_eq!(failed.owner, owner);
+        assert_eq!(failed.intent, SourceIntentKind::Foreground);
+        assert!(failed.failed);
+        assert!(failed.pressure.is_none());
+        let message = coordinator
+            .foreground_presentation_failure(owner)
+            .expect("the failure message is retained for its owner");
+        assert!(!message.is_empty());
+
+        let attempts = coordinator.telemetry(owner).unwrap().presentation_candidates;
+        for _ in 0..64 {
+            assert!(!coordinator.has_pending_foreground_presentation_work());
+            assert!(!coordinator.has_pending_presentation_work());
+            assert!(coordinator.pump_presentation_once().unwrap().is_none());
+        }
+        assert_eq!(
+            coordinator.telemetry(owner).unwrap().presentation_candidates,
+            attempts
+        );
+        assert!(
+            !coordinator
+                .owner_work_state(owner)
+                .unwrap()
+                .presentation_pending,
+            "a terminally failed block is not reported as work in progress"
+        );
+        // Ledger progress and a reclaim ending do not revive a terminal failure.
+        coordinator.set_capacity_reclaim_active(false);
+        assert!(!coordinator.has_pending_foreground_presentation_work());
+
+        // A contract replacement is a new authority: the pause is gone and the lane converges.
+        coordinator
+            .lanes
+            .get_mut(&owner)
+            .unwrap()
+            .contract
+            .contig_length = contract.contig_length;
+        assert!(coordinator.foreground_presentation_failure(owner).is_some());
+        let update = coordinator.replace_contract(owner, contract).unwrap();
+        assert!(coordinator.foreground_presentation_failure(owner).is_none());
+        if update.published_scene.is_none() && !update.visible_complete {
+            assert!(coordinator.has_pending_foreground_presentation_work());
+            assert!(
+                coordinator
+                    .pump_presentation_once()
+                    .unwrap()
+                    .unwrap()
+                    .published_scene
+                    .is_some()
+            );
+        }
+        assert!(coordinator.frame(owner).unwrap().unwrap().visible_complete());
+    }
+
+    #[test]
+    fn one_owners_scene_build_failure_is_reported_once_and_spares_other_owners() {
+        let (mut coordinator, contract, policy, dense_camera) = test_source_coordinator();
+        let resident_owner = SourceOwnerId::new(601);
+        let failing_owner = SourceOwnerId::new(602);
+        let waiting_owner = SourceOwnerId::new(603);
+        let small_camera = |start: u64| {
+            AlignmentCamera::new(
+                GenomicInterval::new(contract.contig, start, start + 2).unwrap(),
+                0.0,
+                dense_camera.row_height(),
+                dense_camera.read_height(),
+                dense_camera.clip(),
+            )
+            .unwrap()
+        };
+        coordinator
+            .insert_lane(resident_owner, contract.clone(), policy)
+            .unwrap();
+        coordinator
+            .update_camera(resident_owner, small_camera(0))
+            .unwrap();
+        let resident_revision = (0..256)
+            .find_map(|_| {
+                coordinator
+                    .pump_once()
+                    .unwrap()
+                    .publications
+                    .into_iter()
+                    .find(|publication| publication.owner == resident_owner)
+                    .map(|publication| publication.revision)
+            })
+            .expect("the resident owner should publish first");
+
+        coordinator
+            .insert_lane(failing_owner, contract.clone(), policy)
+            .unwrap();
+        coordinator
+            .insert_lane(waiting_owner, contract.clone(), policy)
+            .unwrap();
+        coordinator
+            .update_camera(failing_owner, dense_camera)
+            .unwrap();
+        coordinator
+            .update_camera(waiting_owner, small_camera(15_000))
+            .unwrap();
+        assert!(
+            coordinator
+                .actor()
+                .schedule()
+                .foreground_pending_for(waiting_owner)
+        );
+        // Make only the failing owner's candidate impossible to build once its evidence
+        // arrives; its camera was validated against the real contig length above.
+        coordinator
+            .lanes
+            .get_mut(&failing_owner)
+            .unwrap()
+            .contract
+            .contig_length = dense_camera.interval().start();
+
+        let mut failures = Vec::new();
+        let mut waiting_published = false;
+        for _ in 0..2_048 {
+            let pump = coordinator
+                .pump_once()
+                .expect("a lane-local build failure must not fail the shared source pump");
+            failures.extend(pump.failures);
+            waiting_published |= pump
+                .publications
+                .iter()
+                .any(|publication| publication.owner == waiting_owner);
+            if !coordinator.has_pending_source_work() {
+                break;
+            }
+        }
+        assert_eq!(
+            failures.len(),
+            1,
+            "the failure is reported once, not on every later source completion"
+        );
+        assert_eq!(failures[0].owner, failing_owner);
+        assert!(!failures[0].message.is_empty());
+        assert!(
+            waiting_published,
+            "another owner's queued foreground must still run to publication"
+        );
+        let resident = coordinator.frame(resident_owner).unwrap().unwrap();
+        assert!(resident.visible_complete());
+        assert_eq!(
+            resident.snapshot.as_ref().map(|scene| scene.revision()),
+            Some(resident_revision)
+        );
+        let schedule = coordinator.actor().schedule();
+        assert!(
+            schedule.desired_foreground_for(failing_owner).is_none(),
+            "the failed owner must not restart the same source target"
+        );
+    }
+
+    #[test]
+    fn a_stronger_payload_contract_is_not_satisfied_by_a_scene_built_without_it() {
+        let (mut coordinator, camera) = test_coordinator();
+        coordinator.update_camera(camera).unwrap();
+        pump_until_publication(&mut coordinator);
+        assert!(coordinator.frame().unwrap().visible_complete());
+
+        // Same presentation, summaries, layout, and filters; only the retained record payload
+        // grows. Every reuse predicate must agree that the resident evidence no longer suffices.
+        let mut contract = coordinator.contract().clone();
+        contract.payload = PayloadContract::new(
+            CapabilityRequirement::Required,
+            CapabilityRequirement::Required,
+            [*b"XS"],
+            None,
+        );
+        let required = contract.payload.clone();
+        let update = coordinator.replace_contract(contract).unwrap();
+        assert!(update.published_scene.is_none());
+        assert!(!update.visible_complete);
+        assert!(
+            update.foreground_submitted.is_some(),
+            "the missing payload must be acquired, not assumed"
+        );
+        let frame = coordinator.frame().unwrap();
+        assert!(!frame.scene_contracts_current);
+        assert!(!frame.visible_complete());
+        assert!(!coordinator.has_pending_presentation_work());
+
+        pump_until_publication(&mut coordinator);
+        let frame = coordinator.frame().unwrap();
+        assert!(frame.visible_complete());
+        assert!(
+            frame
+                .snapshot
+                .unwrap()
+                .reads()
+                .evidence()
+                .payload()
+                .satisfies(&required)
         );
     }
 

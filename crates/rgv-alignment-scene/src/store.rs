@@ -45,9 +45,80 @@ pub struct EvidenceStore {
     modification_summaries: Vec<CachedModificationSummary>,
     filter_summaries: Vec<CachedFilterSummary>,
     row_atlases: Vec<CachedRowAtlas>,
+    /// Keyed positions into the cache vectors above. The vectors stay the eviction-ordered
+    /// owners; these only replace the linear scan every lookup used to make.
+    chunk_index: CachePositionIndex<SourceChunkId>,
+    depth_index: CachePositionIndex<(ExactDepthSummaryKey, crate::ContractFingerprint)>,
+    allele_index: CachePositionIndex<(ExactAlleleSummaryKey, crate::ContractFingerprint)>,
+    junction_index: CachePositionIndex<(ExactJunctionSummaryKey, crate::ContractFingerprint)>,
+    pair_index: CachePositionIndex<(ExactPairSummaryKey, crate::ContractFingerprint)>,
+    modification_index:
+        CachePositionIndex<(ExactModificationSummaryKey, crate::ContractFingerprint)>,
+    filter_index: CachePositionIndex<(ExactFilterSummaryKey, crate::ContractFingerprint)>,
     current: Option<PublishedEvidence>,
     next_revision: u64,
     eviction_order_dirty: bool,
+}
+
+/// Lazily maintained `key -> positions` index over one cache vector.
+///
+/// Appending keeps the index current. Anything which reorders or removes entries (eviction
+/// sorting, `retain`) calls [`Self::invalidate`]; the next lookup rebuilds it in one pass. A
+/// burst of lookups, such as preparing every summary family for every tile of a horizon, is
+/// therefore one rebuild plus constant-time probes instead of a scan per probe.
+#[derive(Debug)]
+struct CachePositionIndex<K> {
+    positions: HashMap<K, Vec<usize>>,
+    valid: bool,
+}
+
+impl<K: Copy + Eq + std::hash::Hash> CachePositionIndex<K> {
+    fn new() -> Self {
+        Self {
+            positions: HashMap::new(),
+            valid: true,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    /// Positions of every entry stored under `key`, in vector order.
+    fn positions<T>(&mut self, entries: &[T], key_of: impl Fn(&T) -> K, key: K) -> &[usize] {
+        if !self.valid {
+            self.positions.clear();
+            for (position, entry) in entries.iter().enumerate() {
+                self.positions
+                    .entry(key_of(entry))
+                    .or_default()
+                    .push(position);
+            }
+            self.valid = true;
+        }
+        self.positions.get(&key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Records an entry appended at `position`.
+    fn appended(&mut self, key: K, position: usize) {
+        if self.valid {
+            self.positions.entry(key).or_default().push(position);
+        }
+    }
+}
+
+/// Cache entries set aside during one eviction pass because they back the published authority.
+#[derive(Default)]
+struct ProtectedCacheEntries {
+    acquisitions: Vec<CachedAcquisition>,
+    chunks: Vec<CachedEvidenceChunk>,
+    depth_summaries: Vec<CachedDepthSummary>,
+    allele_summaries: Vec<CachedAlleleSummary>,
+    junction_summaries: Vec<CachedJunctionSummary>,
+    pair_summaries: Vec<CachedPairSummary>,
+    modification_summaries: Vec<CachedModificationSummary>,
+    filter_summaries: Vec<CachedFilterSummary>,
+    row_atlases: Vec<CachedRowAtlas>,
 }
 
 #[derive(Debug)]
@@ -165,6 +236,13 @@ impl EvidenceStore {
             modification_summaries: Vec::new(),
             filter_summaries: Vec::new(),
             row_atlases: Vec::new(),
+            chunk_index: CachePositionIndex::new(),
+            depth_index: CachePositionIndex::new(),
+            allele_index: CachePositionIndex::new(),
+            junction_index: CachePositionIndex::new(),
+            pair_index: CachePositionIndex::new(),
+            modification_index: CachePositionIndex::new(),
+            filter_index: CachePositionIndex::new(),
             current: None,
             next_revision: 1,
             eviction_order_dirty: false,
@@ -347,12 +425,13 @@ impl EvidenceStore {
         }
         let revision = self.take_revision()?;
         let matching = self
-            .chunks
-            .iter()
-            .enumerate()
-            .filter(|(_, cached)| cached.chunk.chunk().id() == chunk.chunk().id())
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
+            .chunk_index
+            .positions(
+                &self.chunks,
+                |cached| cached.chunk.chunk().id(),
+                chunk.chunk().id(),
+            )
+            .to_vec();
         for index in matching.iter().copied() {
             if self.chunks[index].chunk.chunk().handles() != chunk.chunk().handles() {
                 // Indexed transactions may enter or leave one physical owner unit at different
@@ -389,6 +468,8 @@ impl EvidenceStore {
             return Ok(chunk);
         }
         let interval = evidence_chunk_interval(&chunk);
+        self.chunk_index
+            .appended(chunk.chunk().id(), self.chunks.len());
         self.chunks.push(CachedEvidenceChunk {
             residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
@@ -664,9 +745,17 @@ impl EvidenceStore {
         let key =
             ExactDepthSummaryKey::new(self.source_revision, self.record_contract, contract, tile);
         let revision = self.take_revision()?;
-        if let Some(cached) = self.depth_summaries.iter_mut().find(|cached| {
-            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
-        }) {
+        let view_filter = evidence.view_filter().fingerprint();
+        let cached_position = self
+            .depth_index
+            .positions(
+                &self.depth_summaries,
+                |cached| (cached.key, cached.view_filter),
+                (key, view_filter),
+            )
+            .first()
+            .copied();
+        if let Some(cached) = cached_position.map(|position| &mut self.depth_summaries[position]) {
             cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
@@ -683,11 +772,13 @@ impl EvidenceStore {
             revision,
         )?;
         debug_assert_eq!(summary.key(), key);
+        self.depth_index
+            .appended((key, view_filter), self.depth_summaries.len());
         self.depth_summaries.push(CachedDepthSummary {
             residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
-            view_filter: evidence.view_filter().fingerprint(),
+            view_filter,
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -706,9 +797,17 @@ impl EvidenceStore {
         let key =
             ExactAlleleSummaryKey::new(self.source_revision, self.record_contract, contract, tile);
         let revision = self.take_revision()?;
-        if let Some(cached) = self.allele_summaries.iter_mut().find(|cached| {
-            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
-        }) {
+        let view_filter = evidence.view_filter().fingerprint();
+        let cached_position = self
+            .allele_index
+            .positions(
+                &self.allele_summaries,
+                |cached| (cached.key, cached.view_filter),
+                (key, view_filter),
+            )
+            .first()
+            .copied();
+        if let Some(cached) = cached_position.map(|position| &mut self.allele_summaries[position]) {
             cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
@@ -725,11 +824,13 @@ impl EvidenceStore {
             revision,
         )?;
         debug_assert_eq!(summary.key(), key);
+        self.allele_index
+            .appended((key, view_filter), self.allele_summaries.len());
         self.allele_summaries.push(CachedAlleleSummary {
             residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
-            view_filter: evidence.view_filter().fingerprint(),
+            view_filter,
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -754,9 +855,18 @@ impl EvidenceStore {
             tile,
         );
         let revision = self.take_revision()?;
-        if let Some(cached) = self.junction_summaries.iter_mut().find(|cached| {
-            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
-        }) {
+        let view_filter = evidence.view_filter().fingerprint();
+        let cached_position = self
+            .junction_index
+            .positions(
+                &self.junction_summaries,
+                |cached| (cached.key, cached.view_filter),
+                (key, view_filter),
+            )
+            .first()
+            .copied();
+        if let Some(cached) = cached_position.map(|position| &mut self.junction_summaries[position])
+        {
             cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
@@ -774,11 +884,13 @@ impl EvidenceStore {
             revision,
         )?;
         debug_assert_eq!(summary.key(), key);
+        self.junction_index
+            .appended((key, view_filter), self.junction_summaries.len());
         self.junction_summaries.push(CachedJunctionSummary {
             residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
-            view_filter: evidence.view_filter().fingerprint(),
+            view_filter,
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -797,9 +909,17 @@ impl EvidenceStore {
         let key =
             ExactPairSummaryKey::new(self.source_revision, self.record_contract, contract, tile);
         let revision = self.take_revision()?;
-        if let Some(cached) = self.pair_summaries.iter_mut().find(|cached| {
-            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
-        }) {
+        let view_filter = evidence.view_filter().fingerprint();
+        let cached_position = self
+            .pair_index
+            .positions(
+                &self.pair_summaries,
+                |cached| (cached.key, cached.view_filter),
+                (key, view_filter),
+            )
+            .first()
+            .copied();
+        if let Some(cached) = cached_position.map(|position| &mut self.pair_summaries[position]) {
             cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
@@ -816,11 +936,13 @@ impl EvidenceStore {
             revision,
         )?;
         debug_assert_eq!(summary.key(), key);
+        self.pair_index
+            .appended((key, view_filter), self.pair_summaries.len());
         self.pair_summaries.push(CachedPairSummary {
             residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
-            view_filter: evidence.view_filter().fingerprint(),
+            view_filter,
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -843,9 +965,19 @@ impl EvidenceStore {
             tile,
         );
         let revision = self.take_revision()?;
-        if let Some(cached) = self.modification_summaries.iter_mut().find(|cached| {
-            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
-        }) {
+        let view_filter = evidence.view_filter().fingerprint();
+        let cached_position = self
+            .modification_index
+            .positions(
+                &self.modification_summaries,
+                |cached| (cached.key, cached.view_filter),
+                (key, view_filter),
+            )
+            .first()
+            .copied();
+        if let Some(cached) =
+            cached_position.map(|position| &mut self.modification_summaries[position])
+        {
             cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
@@ -862,11 +994,13 @@ impl EvidenceStore {
             revision,
         )?;
         debug_assert_eq!(summary.key(), key);
+        self.modification_index
+            .appended((key, view_filter), self.modification_summaries.len());
         self.modification_summaries.push(CachedModificationSummary {
             residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
-            view_filter: evidence.view_filter().fingerprint(),
+            view_filter,
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -892,9 +1026,17 @@ impl EvidenceStore {
             tile,
         );
         let revision = self.take_revision()?;
-        if let Some(cached) = self.filter_summaries.iter_mut().find(|cached| {
-            cached.key == key && cached.view_filter == evidence.view_filter().fingerprint()
-        }) {
+        let view_filter = evidence.view_filter().fingerprint();
+        let cached_position = self
+            .filter_index
+            .positions(
+                &self.filter_summaries,
+                |cached| (cached.key, cached.view_filter),
+                (key, view_filter),
+            )
+            .first()
+            .copied();
+        if let Some(cached) = cached_position.map(|position| &mut self.filter_summaries[position]) {
             cached.residency = AlignmentCacheResidencyClass::ActiveNearBuffer;
             cached.admitted_revision = revision;
             self.ledger
@@ -912,11 +1054,13 @@ impl EvidenceStore {
             revision,
         )?;
         debug_assert_eq!(summary.key(), key);
+        self.filter_index
+            .appended((key, view_filter), self.filter_summaries.len());
         self.filter_summaries.push(CachedFilterSummary {
             residency: AlignmentCacheResidencyClass::ActiveNearBuffer,
             admitted_revision: revision,
             key,
-            view_filter: evidence.view_filter().fingerprint(),
+            view_filter,
             summary: Arc::clone(&summary),
         });
         Ok(summary)
@@ -1083,6 +1227,7 @@ impl EvidenceStore {
     ) -> Result<RowAtlasCandidate, EvidenceStoreError> {
         self.validate_summary_evidence(evidence)?;
         let revision_number = self.take_revision()?;
+        let current_atlas = self.current_row_atlas().cloned();
 
         let containing = self
             .row_atlases
@@ -1092,7 +1237,18 @@ impl EvidenceStore {
                 atlas_compatible(&cached.atlas, evidence, layout_contract)
                     && cached.atlas.interval().contains_interval(target)
             })
-            .min_by_key(|(_, cached)| cached.atlas.interval().len())
+            // Prefer the published atlas, then the widest, then the newest. Choosing the
+            // smallest container flipped a contained camera back to the superseded atlas (and
+            // its row space and page keys) straight after an extension had published a wider one.
+            .max_by_key(|(_, cached)| {
+                (
+                    current_atlas
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &cached.atlas)),
+                    cached.atlas.interval().len(),
+                    cached.admitted_revision,
+                )
+            })
             .map(|(index, _)| index);
         if let Some(index) = containing {
             let cached = &mut self.row_atlases[index];
@@ -1249,6 +1405,7 @@ impl EvidenceStore {
             .retain(|cached| evidence_chunk_overlaps(&cached.chunk, target));
         self.acquisitions
             .retain(|cached| cached.acquisition.coverage().interval().overlaps(target));
+        self.invalidate_cache_indices();
         before_acquisitions
             .saturating_sub(self.acquisitions.len())
             .saturating_add(before_chunks.saturating_sub(self.chunks.len()))
@@ -1451,6 +1608,7 @@ impl EvidenceStore {
     /// Releases a bounded number of reloadable evidence entries. Collections are ordered with
     /// their oldest entry at the tail so removal is `Vec::pop`, avoiding the repeated whole-vector
     /// shifts previously caused by `remove(0)` at dense loci.
+    #[allow(clippy::too_many_lines)]
     pub fn evict_inactive_batch(
         &mut self,
         target_charged: usize,
@@ -1476,7 +1634,17 @@ impl EvidenceStore {
             self.row_atlases
                 .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
             self.eviction_order_dirty = false;
+            self.invalidate_cache_indices();
         }
+        // Entries backing the published authority are set aside, not dropped: releasing the
+        // cache's reference to them frees nothing while the published root pins them, and it
+        // strips the lookup entries the next extension of the visible locus needs.
+        let protected = if self.ledger.progress()?.charged > target_charged {
+            self.published_allocations()
+        } else {
+            HashSet::new()
+        };
+        let mut held = ProtectedCacheEntries::default();
         let mut candidates_inspected = 0_usize;
         let mut evicted_acquisitions = 0;
         let mut evicted_chunks = 0;
@@ -1489,45 +1657,90 @@ impl EvidenceStore {
             let Some(candidate) = candidate else {
                 break;
             };
+            // Pops the tail entry of one family. A protected entry moves to `held` and the loop
+            // looks at the next-oldest candidate without spending the eviction quantum.
+            macro_rules! relinquish {
+                ($entries:ident, $evicted:ident, |$cached:ident| $protected:expr) => {{
+                    let Some(entry) = self.$entries.pop() else {
+                        break;
+                    };
+                    let $cached = &entry;
+                    if $protected {
+                        held.$entries.push(entry);
+                        continue;
+                    }
+                    $evicted += 1;
+                }};
+            }
             match candidate {
                 EvidenceCacheLocation::RowAtlas => {
-                    self.row_atlases.pop();
-                    evicted_row_atlases += 1;
+                    relinquish!(row_atlases, evicted_row_atlases, |cached| protected
+                        .contains(&cached.atlas.metadata_allocation().id()));
                 }
                 EvidenceCacheLocation::DepthSummary => {
-                    self.depth_summaries.pop();
-                    evicted_exact_summaries += 1;
+                    relinquish!(depth_summaries, evicted_exact_summaries, |cached| protected
+                        .contains(&cached.summary.allocation().id()));
                 }
                 EvidenceCacheLocation::AlleleSummary => {
-                    self.allele_summaries.pop();
-                    evicted_exact_summaries += 1;
+                    relinquish!(allele_summaries, evicted_exact_summaries, |cached| {
+                        protected.contains(&cached.summary.allocation().id())
+                    });
                 }
                 EvidenceCacheLocation::JunctionSummary => {
-                    self.junction_summaries.pop();
-                    evicted_exact_summaries += 1;
+                    relinquish!(junction_summaries, evicted_exact_summaries, |cached| {
+                        protected.contains(&cached.summary.allocation().id())
+                    });
                 }
                 EvidenceCacheLocation::PairSummary => {
-                    self.pair_summaries.pop();
-                    evicted_exact_summaries += 1;
+                    relinquish!(pair_summaries, evicted_exact_summaries, |cached| protected
+                        .contains(&cached.summary.allocation().id()));
                 }
                 EvidenceCacheLocation::ModificationSummary => {
-                    self.modification_summaries.pop();
-                    evicted_exact_summaries += 1;
+                    relinquish!(modification_summaries, evicted_exact_summaries, |cached| {
+                        protected.contains(&cached.summary.allocation().id())
+                    });
                 }
                 EvidenceCacheLocation::FilterSummary => {
-                    self.filter_summaries.pop();
-                    evicted_exact_summaries += 1;
+                    relinquish!(filter_summaries, evicted_exact_summaries, |cached| {
+                        protected.contains(&cached.summary.allocation().id())
+                    });
                 }
                 EvidenceCacheLocation::Chunk => {
-                    self.chunks.pop();
-                    evicted_chunks += 1;
+                    relinquish!(chunks, evicted_chunks, |cached| protected
+                        .contains(&cached.chunk.core_allocation().id()));
                 }
+                // A certificate is what lets the visible locus be extended from cache; it backs
+                // the published root as soon as any of its chunks does.
                 EvidenceCacheLocation::Acquisition => {
-                    self.acquisitions.pop();
-                    evicted_acquisitions += 1;
+                    relinquish!(acquisitions, evicted_acquisitions, |cached| cached
+                        .acquisition
+                        .chunks()
+                        .iter()
+                        .any(|chunk| protected.contains(&chunk.core_allocation().id())));
                 }
             }
             removed = removed.saturating_add(1);
+        }
+        // Held entries left their tails oldest-first, so pushing them back newest-first restores
+        // the exact eviction order.
+        macro_rules! restore {
+            ($($entries:ident),+) => {
+                $(self.$entries.extend(held.$entries.into_iter().rev());)+
+            };
+        }
+        restore!(
+            acquisitions,
+            chunks,
+            depth_summaries,
+            allele_summaries,
+            junction_summaries,
+            pair_summaries,
+            modification_summaries,
+            filter_summaries,
+            row_atlases
+        );
+        if removed > 0 {
+            self.invalidate_cache_indices();
         }
         let progress = self.ledger.progress()?;
         let reclaim_complete = progress.charged <= target_charged || removed < maximum_entries;
@@ -1548,6 +1761,61 @@ impl EvidenceStore {
             pinned: progress.pinned,
             pinned_overage: progress.pinned_overage,
         })
+    }
+
+    fn invalidate_cache_indices(&mut self) {
+        self.chunk_index.invalidate();
+        self.depth_index.invalidate();
+        self.allele_index.invalidate();
+        self.junction_index.invalidate();
+        self.pair_index.invalidate();
+        self.modification_index.invalidate();
+        self.filter_index.invalidate();
+    }
+
+    /// Allocations owned by the currently published evidence, summaries and row atlas. Cache
+    /// entries holding one of these mirror the presentation store's protected page set.
+    fn published_allocations(&self) -> HashSet<AllocationId> {
+        let mut protected = HashSet::new();
+        let Some(current) = &self.current else {
+            return protected;
+        };
+        protected.extend(
+            current
+                .root
+                .chunks()
+                .iter()
+                .map(|chunk| chunk.core_allocation().id()),
+        );
+        if let Some(summaries) = &current.summaries {
+            let root = &summaries.root;
+            protected.extend(root.depth_tiles().iter().map(|tile| tile.allocation().id()));
+            protected.extend(
+                root.allele_tiles()
+                    .iter()
+                    .map(|tile| tile.allocation().id()),
+            );
+            protected.extend(
+                root.junction_tiles()
+                    .iter()
+                    .map(|tile| tile.allocation().id()),
+            );
+            protected.extend(root.pair_tiles().iter().map(|tile| tile.allocation().id()));
+            protected.extend(
+                root.filter_tiles()
+                    .iter()
+                    .map(|tile| tile.allocation().id()),
+            );
+            protected.extend(
+                root.modification_tiles()
+                    .iter()
+                    .map(|tile| tile.allocation().id()),
+            );
+        }
+        if let Some(atlas) = &current.row_atlas {
+            protected.insert(atlas.root.metadata_allocation().id());
+        }
+        protected
     }
 
     fn take_revision(&mut self) -> Result<u64, EvidenceStoreError> {
@@ -2031,6 +2299,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: crate::ReadSampling::Complete,
         }
     }
 
@@ -2351,8 +2620,15 @@ mod tests {
         assert!(Arc::ptr_eq(&canonical_chunk, &filtered.root().chunks()[0]));
         assert!(!filtered.root().contains_handle(retained_handle));
         store.publish(filtered);
+        // Eviction keeps the certificate backing the published root, so model its release (a
+        // locus change discarding the cache) explicitly.
         let pressure = store.evict_inactive_until(0).unwrap();
-        assert!(pressure.evicted_acquisitions > 0);
+        assert_eq!(pressure.evicted_acquisitions, 0);
+        assert!(
+            store.discard_disjoint_cache(
+                GenomicInterval::new(ContigId::new(0), 10_000, 10_100).unwrap()
+            ) > 0
+        );
 
         let restored = store
             .prepare(target, no_payload(), ReservationKind::Transition)
@@ -2402,11 +2678,17 @@ mod tests {
         assert!(filtered.root().eligible_coverage().covers(broad));
         store.publish(filtered);
 
-        // Model the production cache-pressure state from the trace: the immutable filtered root
-        // is current, while the independently cached acquisition has been released. Its shared
-        // canonical chunks and broader eligible certificate are still sufficient for zoom-out.
+        // Model the state from the production trace: the immutable filtered root is current,
+        // while the independently cached acquisition has been released. Its shared canonical
+        // chunks and broader eligible certificate are still sufficient for zoom-out. Eviction
+        // itself now keeps entries backing the published root, so release it explicitly.
         let pressure = store.evict_inactive_until(0).unwrap();
-        assert!(pressure.evicted_acquisitions > 0);
+        assert_eq!(pressure.evicted_acquisitions, 0);
+        assert!(
+            store.discard_disjoint_cache(
+                GenomicInterval::new(ContigId::new(0), 10_000, 10_100).unwrap()
+            ) > 0
+        );
         assert_eq!(store.acquisition_count(), 0);
         assert!(store.cached_covers(broad, &no_payload()));
 
@@ -2439,11 +2721,16 @@ mod tests {
         let current = store.publish(candidate);
         let pressure = store.reduce_budget(0).unwrap();
 
-        assert_eq!(pressure.evicted_acquisitions, 1);
+        // The only cache entries back the published root: dropping them would free nothing
+        // (the root pins every byte) and would forget the certificate the next extension needs.
+        assert_eq!(pressure.evicted_acquisitions, 0);
+        assert_eq!(pressure.evicted_chunks, 0);
+        assert!(pressure.reclaim_complete);
         assert!(pressure.charged > 0);
         assert_eq!(pressure.pinned, pressure.charged);
         assert_eq!(pressure.pinned_overage, pressure.charged);
-        assert_eq!(store.acquisition_count(), 0);
+        assert_eq!(store.acquisition_count(), 1);
+        assert_eq!(store.chunk_count(), 1);
         assert_eq!(
             current
                 .select(GenomicInterval::new(ContigId::new(0), 1, 2).unwrap())
@@ -2451,6 +2738,215 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn eviction_skips_entries_backing_the_published_locus_without_spending_its_quantum() {
+        let ledger = AllocationLedger::new(1 << 20, 0);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        let visible = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let elsewhere = GenomicInterval::new(ContigId::new(0), 1_000, 1_100).unwrap();
+        // The visible locus is admitted first, so its entries are the oldest in every family
+        // and sit at the eviction tail.
+        store
+            .admit(one_record_acquisition(
+                &ledger,
+                visible.start(),
+                visible.end(),
+                7,
+            ))
+            .unwrap();
+        store
+            .admit(one_record_acquisition(
+                &ledger,
+                elsewhere.start(),
+                elsewhere.end(),
+                8,
+            ))
+            .unwrap();
+        let candidate = store
+            .prepare(visible, no_payload(), ReservationKind::Normal)
+            .unwrap();
+        let _current = store.publish(candidate);
+
+        // One entry per quantum: the protected tail entries must not consume it.
+        let first = store.evict_inactive_batch(0, 1).unwrap();
+        assert_eq!(first.evicted_chunks + first.evicted_acquisitions, 1);
+        let rest = store.evict_inactive_until(0).unwrap();
+        assert_eq!(first.evicted_chunks + rest.evicted_chunks, 1);
+        assert_eq!(first.evicted_acquisitions + rest.evicted_acquisitions, 1);
+        assert!(rest.reclaim_complete);
+
+        assert_eq!(store.acquisition_count(), 1);
+        assert_eq!(store.chunk_count(), 1);
+        // The visible locus can still be re-prepared and extended from cache alone...
+        assert!(
+            store
+                .prepare(visible, no_payload(), ReservationKind::Normal)
+                .is_ok()
+        );
+        // ...while the other locus is gone and needs its source again.
+        assert!(matches!(
+            store.prepare(elsewhere, no_payload(), ReservationKind::Normal),
+            Err(EvidenceStoreError::UncoveredTarget(_))
+        ));
+
+        // Protection follows publication, not admission: once another locus is published the
+        // old entries are ordinary cache again.
+        store
+            .admit(one_record_acquisition(
+                &ledger,
+                elsewhere.start(),
+                elsewhere.end(),
+                8,
+            ))
+            .unwrap();
+        let candidate = store
+            .prepare(elsewhere, no_payload(), ReservationKind::Normal)
+            .unwrap();
+        let _current = store.publish(candidate);
+        let moved = store.evict_inactive_until(0).unwrap();
+        assert_eq!(moved.evicted_acquisitions, 1);
+        assert_eq!(moved.evicted_chunks, 1);
+        assert!(
+            store
+                .prepare(elsewhere, no_payload(), ReservationKind::Normal)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn keyed_summary_lookups_stay_correct_across_eviction_reordering() {
+        let ledger = AllocationLedger::new(1 << 20, 1 << 20);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        store
+            .admit(one_record_acquisition(&ledger, 0, 300, 7))
+            .unwrap();
+        let evidence = store
+            .prepare(
+                GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+                no_payload(),
+                ReservationKind::Normal,
+            )
+            .unwrap();
+        let contract = DepthSummaryContract::new(OverlappingMatePolicy::CountBoth);
+        let depth = |store: &mut EvidenceStore, coordinate: u64| {
+            store
+                .exact_depth_summary(
+                    evidence.root(),
+                    CanonicalGenomicTile::new(
+                        ContigId::new(0),
+                        coordinate,
+                        NonZeroU64::new(100).unwrap(),
+                    ),
+                    300,
+                    contract,
+                    ReservationKind::Normal,
+                )
+                .unwrap()
+        };
+        let tiles = (0..3)
+            .map(|coordinate| depth(&mut store, coordinate))
+            .collect::<Vec<_>>();
+        assert_eq!(store.depth_summary_count(), 3);
+        // A hit returns the cached tile and adds nothing.
+        assert!(Arc::ptr_eq(&depth(&mut store, 1), &tiles[1]));
+        assert_eq!(store.depth_summary_count(), 3);
+
+        // Eviction sorts and pops the cache vector; the keyed index must follow. Tile 0 is now
+        // the least recently used summary.
+        let pressure = store.evict_inactive_batch(0, 1).unwrap();
+        assert_eq!(pressure.evicted_exact_summaries, 1);
+        assert_eq!(store.depth_summary_count(), 2);
+        assert!(Arc::ptr_eq(&depth(&mut store, 2), &tiles[2]));
+        assert!(Arc::ptr_eq(&depth(&mut store, 1), &tiles[1]));
+        assert!(!Arc::ptr_eq(&depth(&mut store, 0), &tiles[0]));
+        assert_eq!(store.depth_summary_count(), 3);
+        for (coordinate, tile) in tiles.iter().enumerate() {
+            assert_eq!(tile.tile().coordinate(), coordinate as u64);
+        }
+    }
+
+    #[test]
+    fn contained_target_stays_on_the_published_then_widest_row_atlas() {
+        let ledger = AllocationLedger::new(4 << 20, 1 << 20);
+        let mut store = EvidenceStore::new(source_revision(), ContractFingerprint::new(9), ledger);
+        store.admit(empty_acquisition(0, 100)).unwrap();
+        store.admit(empty_acquisition(100, 200)).unwrap();
+        let narrow = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let wide = GenomicInterval::new(ContigId::new(0), 0, 200).unwrap();
+        let contained = GenomicInterval::new(ContigId::new(0), 10, 50).unwrap();
+        let authority = |store: &mut EvidenceStore, target: GenomicInterval| {
+            let evidence = store
+                .prepare(target, junction_payload(), ReservationKind::Normal)
+                .unwrap();
+            let summaries = store
+                .prepare_exact_summaries(
+                    evidence.root(),
+                    target,
+                    NonZeroU64::new(100).unwrap(),
+                    200,
+                    summary_contract(),
+                    None,
+                    ReservationKind::Normal,
+                )
+                .unwrap();
+            let rows = store
+                .prepare_row_atlas(
+                    evidence.root(),
+                    target,
+                    layout_contract(),
+                    ReservationKind::Normal,
+                )
+                .unwrap();
+            (evidence, summaries, rows)
+        };
+        let contained_atlas = |store: &mut EvidenceStore| {
+            let evidence = store
+                .prepare(contained, junction_payload(), ReservationKind::Normal)
+                .unwrap();
+            Arc::clone(
+                store
+                    .prepare_row_atlas(
+                        evidence.root(),
+                        contained,
+                        layout_contract(),
+                        ReservationKind::Normal,
+                    )
+                    .unwrap()
+                    .root(),
+            )
+        };
+
+        let (evidence, summaries, rows) = authority(&mut store, narrow);
+        let (_, _, narrow_atlas) = store
+            .publish_complete_authority(evidence, summaries, rows)
+            .unwrap();
+        // A wider atlas is prepared by extension but not yet published.
+        let (evidence, summaries, rows) = authority(&mut store, wide);
+        let wide_atlas = Arc::clone(rows.root());
+        assert!(!Arc::ptr_eq(&narrow_atlas, &wide_atlas));
+        assert_eq!(store.row_atlas_count(), 2);
+        // The camera stays on the published authority while the wider one is only a candidate.
+        assert!(Arc::ptr_eq(&contained_atlas(&mut store), &narrow_atlas));
+
+        store
+            .publish_complete_authority(evidence, summaries, rows)
+            .unwrap();
+        // After the extension publishes, a contained target must not flip back to the
+        // superseded, smaller atlas and its older revision.
+        let reused = contained_atlas(&mut store);
+        assert!(Arc::ptr_eq(&reused, &wide_atlas));
+        assert_eq!(reused.revision(), wide_atlas.revision());
+        assert_eq!(store.row_atlas_count(), 2);
     }
 
     #[test]

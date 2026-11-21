@@ -663,28 +663,60 @@ fn show_inspector_document(
     response
 }
 
+/// The inspector snapshots that both the status bar and the Properties panel read, built once
+/// per frame. Building them decodes modified bases and formats CIGAR strings, so they must not
+/// be rebuilt by each consumer.
+pub(crate) struct InspectorFrame {
+    pub(crate) inspector: Option<InspectorSnapshot>,
+    pub(crate) pileup_inspector: Option<InspectorSnapshot>,
+    pub(crate) modification_inspector: Option<InspectorSnapshot>,
+    pub(crate) junction_inspector: Option<InspectorSnapshot>,
+    pub(crate) feature_inspector: Option<FeatureInspectorSnapshot>,
+    pub(crate) variant_inspector: Option<VariantInspectorSnapshot>,
+    pub(crate) variant_alignment_evidence: Vec<VariantAlignmentEvidence>,
+}
+
+impl InspectorFrame {
+    pub(crate) fn capture(viewer: &Viewer) -> Self {
+        let variant_inspector = viewer.variant_inspector_snapshot();
+        let variant_alignment_evidence = variant_inspector
+            .as_ref()
+            .map_or_else(Vec::new, |inspector| {
+                viewer.variant_alignment_evidence(inspector)
+            });
+        Self {
+            inspector: viewer.inspector_snapshot(),
+            pileup_inspector: viewer.pileup_inspector_snapshot(),
+            modification_inspector: viewer.modification_inspector_snapshot(),
+            junction_inspector: viewer.junction_inspector_snapshot(),
+            feature_inspector: viewer.feature_inspector_snapshot(),
+            variant_inspector,
+            variant_alignment_evidence,
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn show_properties(
     viewer: &Viewer,
     ui: &mut egui::Ui,
+    frame: &InspectorFrame,
     mut variant_sample_search: String,
 ) -> InspectorUiActions {
-    let inspector = viewer.inspector_snapshot();
-    let pileup_inspector = viewer.pileup_inspector_snapshot();
-    let modification_inspector = viewer.modification_inspector_snapshot();
-    let junction_inspector = viewer.junction_inspector_snapshot();
-    let feature_inspector = viewer.feature_inspector_snapshot();
-    let variant_inspector = viewer.variant_inspector_snapshot();
+    let InspectorFrame {
+        inspector,
+        pileup_inspector,
+        modification_inspector,
+        junction_inspector,
+        feature_inspector,
+        variant_inspector,
+        variant_alignment_evidence,
+    } = frame;
     let gwas_inspector = viewer.gwas_inspector_snapshot();
     let quantitative_inspector = viewer.quantitative_inspector_snapshot();
     let copy_number_inspector = viewer.copy_number_inspector_snapshot();
     let mutation_inspector = viewer.mutation_inspector_snapshot();
     let interaction_inspector = viewer.interaction_inspector_snapshot();
-    let variant_alignment_evidence = variant_inspector
-        .as_ref()
-        .map_or_else(Vec::new, |inspector| {
-            viewer.variant_alignment_evidence(inspector)
-        });
     let chain_inspector = viewer.panels.active().selected_chain.clone();
     let mate_target_available = viewer.selected_mate_target().is_some();
     let visible_consensus = viewer.visible_consensus();

@@ -47,11 +47,41 @@ impl Contig {
 }
 
 /// Ordered contig metadata from an alignment or reference header.
+///
+/// Deserialization rebuilds the name index, reassigns every [`ContigId`] from
+/// its position (the identifier is defined as the index), and rejects
+/// duplicate names, so a decoded dictionary is indistinguishable from one
+/// built through [`ReferenceDictionary::from_contigs`].
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SerializedReferenceDictionary")]
 pub struct ReferenceDictionary {
     contigs: Vec<Contig>,
     #[serde(skip)]
     names: HashMap<String, ContigId>,
+}
+
+#[derive(Deserialize)]
+struct SerializedReferenceDictionary {
+    contigs: Vec<Contig>,
+}
+
+impl TryFrom<SerializedReferenceDictionary> for ReferenceDictionary {
+    type Error = DuplicateContigError;
+
+    fn try_from(serialized: SerializedReferenceDictionary) -> Result<Self, Self::Error> {
+        let mut dictionary = Self::default();
+        for contig in serialized.contigs {
+            dictionary.try_push(contig.name, contig.length)?;
+        }
+        Ok(dictionary)
+    }
+}
+
+/// A contig name was supplied more than once to one dictionary.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("reference dictionary already contains contig {name}")]
+pub struct DuplicateContigError {
+    pub name: String,
 }
 
 impl ReferenceDictionary {
@@ -63,12 +93,39 @@ impl ReferenceDictionary {
         dictionary
     }
 
+    /// Builds a dictionary, rejecting a repeated contig name.
+    pub fn try_from_contigs(
+        contigs: impl IntoIterator<Item = (String, u64)>,
+    ) -> Result<Self, DuplicateContigError> {
+        let mut dictionary = Self::default();
+        for (name, length) in contigs {
+            dictionary.try_push(name, length)?;
+        }
+        Ok(dictionary)
+    }
+
+    /// Appends a contig. A repeated name keeps its positional entry but never
+    /// shadows the first contig of that name: name lookup stays stable and
+    /// agrees before and after serialization. Prefer [`Self::try_push`].
     pub fn push(&mut self, name: impl Into<String>, length: u64) -> ContigId {
         let id = ContigId::new(u32::try_from(self.contigs.len()).expect("too many contigs"));
         let name = name.into();
-        self.names.insert(name.clone(), id);
+        self.names.entry(name.clone()).or_insert(id);
         self.contigs.push(Contig::new(id, name, length));
         id
+    }
+
+    /// Appends a contig, rejecting a name the dictionary already contains.
+    pub fn try_push(
+        &mut self,
+        name: impl Into<String>,
+        length: u64,
+    ) -> Result<ContigId, DuplicateContigError> {
+        let name = name.into();
+        if self.names.contains_key(&name) {
+            return Err(DuplicateContigError { name });
+        }
+        Ok(self.push(name, length))
     }
 
     pub fn get(&self, id: ContigId) -> Option<&Contig> {
@@ -78,13 +135,8 @@ impl ReferenceDictionary {
     }
 
     pub fn id_by_name(&self, name: &str) -> Option<ContigId> {
-        self.names.get(name).copied().or_else(|| {
-            // Rebuild-on-read makes a serde round trip valid without serializing the index.
-            self.contigs
-                .iter()
-                .find(|contig| contig.name() == name)
-                .map(Contig::id)
-        })
+        // Every construction path, including deserialization, maintains the index.
+        self.names.get(name).copied()
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &Contig> {
@@ -140,11 +192,30 @@ pub enum ContigAliasError {
 }
 
 /// A validated zero-based, half-open genomic interval.
+///
+/// Deserialization goes through [`GenomicInterval::new`], so an empty or
+/// reversed interval is a decode error instead of a later `len()` underflow.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SerializedGenomicInterval")]
 pub struct GenomicInterval {
     contig: ContigId,
     start: u64,
     end: u64,
+}
+
+#[derive(Deserialize)]
+struct SerializedGenomicInterval {
+    contig: ContigId,
+    start: u64,
+    end: u64,
+}
+
+impl TryFrom<SerializedGenomicInterval> for GenomicInterval {
+    type Error = IntervalError;
+
+    fn try_from(serialized: SerializedGenomicInterval) -> Result<Self, Self::Error> {
+        Self::new(serialized.contig, serialized.start, serialized.end)
+    }
 }
 
 impl GenomicInterval {
@@ -249,6 +320,63 @@ mod tests {
         let json = serde_json::to_string(&dictionary).unwrap();
         let decoded: ReferenceDictionary = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.id_by_name("chr1"), Some(ContigId::new(0)));
+    }
+
+    #[test]
+    fn decoded_dictionary_rebuilds_index_and_positional_ids() {
+        // A foreign writer disagreed about ids; position is authoritative.
+        let json = r#"{"contigs":[{"id":7,"name":"chr1","length":100},{"id":0,"name":"chr2","length":50}]}"#;
+        let decoded: ReferenceDictionary = serde_json::from_str(json).unwrap();
+        let built =
+            ReferenceDictionary::from_contigs([("chr1".to_owned(), 100), ("chr2".to_owned(), 50)]);
+        assert_eq!(decoded, built);
+        assert_eq!(decoded.id_by_name("chr2"), Some(ContigId::new(1)));
+        assert_eq!(
+            decoded.get(ContigId::new(1)).unwrap().id(),
+            ContigId::new(1)
+        );
+        assert_eq!(decoded.id_by_name("missing"), None);
+    }
+
+    #[test]
+    fn duplicate_contig_names_are_rejected_and_never_shadow() {
+        let json = r#"{"contigs":[{"id":0,"name":"chr1","length":100},{"id":1,"name":"chr1","length":50}]}"#;
+        assert!(serde_json::from_str::<ReferenceDictionary>(json).is_err());
+
+        let mut dictionary = ReferenceDictionary::default();
+        assert_eq!(dictionary.try_push("chr1", 100), Ok(ContigId::new(0)));
+        assert_eq!(
+            dictionary.try_push("chr1", 50),
+            Err(DuplicateContigError {
+                name: "chr1".to_owned()
+            })
+        );
+        assert_eq!(dictionary.len(), 1);
+        // The legacy infallible path keeps the first mapping.
+        dictionary.push("chr1", 50);
+        assert_eq!(dictionary.id_by_name("chr1"), Some(ContigId::new(0)));
+        assert!(
+            ReferenceDictionary::try_from_contigs([("a".to_owned(), 1), ("a".to_owned(), 2)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decoded_intervals_are_validated() {
+        let valid: GenomicInterval =
+            serde_json::from_str(r#"{"contig":0,"start":5000000000,"end":5000000010}"#).unwrap();
+        assert_eq!(valid.len(), 10);
+        assert_eq!(
+            serde_json::from_str::<GenomicInterval>(&serde_json::to_string(&valid).unwrap())
+                .unwrap(),
+            valid
+        );
+        assert!(
+            serde_json::from_str::<GenomicInterval>(r#"{"contig":0,"start":20,"end":10}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<GenomicInterval>(r#"{"contig":0,"start":10,"end":10}"#).is_err()
+        );
     }
 
     #[test]

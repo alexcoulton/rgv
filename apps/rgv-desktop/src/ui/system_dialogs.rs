@@ -43,14 +43,15 @@ pub(crate) fn show_system_dialogs(
     ui: &mut egui::Ui,
     draft: &mut SystemDialogDraft,
 ) {
-    let recent_alignments = viewer.settings.recent_alignments.clone();
-    let recent_sessions = viewer.settings.recent_sessions.clone();
-    let recent_loci = viewer.settings.recent_loci.clone();
-    let settings_path = viewer.settings_path.display().to_string();
-    let unresolved_session_sources = viewer.unresolved_session_sources.clone();
-    let session_migration_notices = viewer.session_migration_notices.clone();
-    let igv_import_report = viewer.igv_import_report.clone();
-    let recovery_candidates = viewer.recovery_candidates.clone();
+    // Borrowed, not copied: this runs every frame whether or not any dialog is open.
+    let recent_alignments = &viewer.settings.recent_alignments;
+    let recent_sessions = &viewer.settings.recent_sessions;
+    let recent_loci = &viewer.settings.recent_loci;
+    let settings_path = &viewer.settings_path;
+    let unresolved_session_sources = &viewer.unresolved_session_sources;
+    let session_migration_notices = &viewer.session_migration_notices;
+    let igv_import_report = &viewer.igv_import_report;
+    let recovery_candidates = &viewer.recovery_candidates;
 
     if draft.command_palette_open {
         let context = ui.ctx().clone();
@@ -392,7 +393,7 @@ pub(crate) fn show_system_dialogs(
                         if recent_alignments.is_empty() {
                             ui.label("None");
                         }
-                        for source in &recent_alignments {
+                        for source in recent_alignments {
                             let label = source.redacted_label();
                             if ui.button(&label).on_hover_text("Open alignment").clicked() {
                                 draft.recent_alignment_requested = Some(source.clone());
@@ -402,7 +403,7 @@ pub(crate) fn show_system_dialogs(
                         if recent_sessions.is_empty() {
                             ui.label("None");
                         }
-                        for path in &recent_sessions {
+                        for path in recent_sessions {
                             if ui.button(path).on_hover_text("Open session").clicked() {
                                 draft.recent_session_requested = Some(path.clone());
                             }
@@ -411,7 +412,7 @@ pub(crate) fn show_system_dialogs(
                         if recent_loci.is_empty() {
                             ui.label("None");
                         }
-                        for locus in &recent_loci {
+                        for locus in recent_loci {
                             if ui
                                 .button(locus)
                                 .on_hover_text("Navigate to locus")
@@ -424,7 +425,7 @@ pub(crate) fn show_system_dialogs(
                         if ui.button("Clear recent items").clicked() {
                             draft.clear_recent_requested = true;
                         }
-                        ui.small(format!("Settings file: {settings_path}"));
+                        ui.small(format!("Settings file: {}", settings_path.display()));
                     });
     }
     if draft.project_issues_open {
@@ -439,7 +440,7 @@ pub(crate) fn show_system_dialogs(
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if !session_migration_notices.is_empty() {
                         ui.strong("Session migration repairs");
-                        for notice in &session_migration_notices {
+                        for notice in session_migration_notices {
                             ui.label(format!("• {notice}"));
                         }
                         ui.add_space(10.0);
@@ -451,7 +452,7 @@ pub(crate) fn show_system_dialogs(
                         );
                         ui.add_space(6.0);
                     }
-                    for issue in &unresolved_session_sources {
+                    for issue in unresolved_session_sources {
                         ui.strong(&issue.label);
                         ui.monospace(issue.path.display().to_string());
                         ui.add_space(8.0);
@@ -460,7 +461,7 @@ pub(crate) fn show_system_dialogs(
             });
     }
     if draft.igv_report_open
-        && let Some(report) = &igv_import_report
+        && let Some(report) = igv_import_report
     {
         let context = ui.ctx().clone();
         egui::Window::new("IGV session import report")

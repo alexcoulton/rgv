@@ -18,6 +18,9 @@ pub(crate) struct DocumentState {
     latest_load: u64,
     last_applied_save: u64,
     document: Option<SessionDocument>,
+    /// Window-shell policy state (unsaved-changes gate, gesture commits, notifications, …).
+    /// Hosted here so it is constructed together with the document identity.
+    pub(crate) shell: super::shell_state::ShellState,
 }
 
 impl DocumentState {
@@ -80,6 +83,22 @@ impl DocumentState {
         self.current_load(ticket) && ticket.revision == self.revision
     }
 
+    /// Commit rule for a load the user started from the GUI. The unsaved-changes gate has
+    /// already resolved what happens to the current document, so revision bumps that happen
+    /// while the file is read (finished track loads, navigation, hover-driven persisted state)
+    /// must not reject the open. Only a newer load or a replaced document supersedes it.
+    pub(crate) fn gui_load_can_commit(&self, ticket: DocumentTicket) -> bool {
+        self.current_load(ticket)
+    }
+
+    /// Identity of the current document content for autosave bookkeeping.
+    pub(crate) fn autosave_marker(&self) -> super::shell_state::AutosaveMarker {
+        super::shell_state::AutosaveMarker {
+            epoch: self.epoch,
+            revision: self.revision,
+        }
+    }
+
     pub(crate) fn complete_save(&mut self, ticket: DocumentTicket) -> bool {
         if ticket.epoch != self.epoch || ticket.request < self.last_applied_save {
             return false;
@@ -115,6 +134,26 @@ mod tests {
             start: 0,
             end: 100,
         })
+    }
+
+    #[test]
+    fn gui_opens_survive_background_revisions_but_not_newer_loads() {
+        let mut state = DocumentState::default();
+        let mut doc = document();
+        state.replace(doc.clone(), true);
+        let load = state.begin_load();
+        doc.locus.end += 10;
+        assert!(state.observe(doc), "a background change bumps the revision");
+        assert!(
+            !state.load_can_commit(load),
+            "automation keeps the strict revision check"
+        );
+        assert!(state.gui_load_can_commit(load));
+        let newer = state.begin_load();
+        assert!(!state.gui_load_can_commit(load));
+        assert!(state.gui_load_can_commit(newer));
+        state.replace(document(), true);
+        assert!(!state.gui_load_can_commit(newer));
     }
 
     #[test]

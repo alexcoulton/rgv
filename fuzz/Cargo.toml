@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 rgv-core = { version = "0.1.0", path = "../crates/rgv-core" }
 rgv-hts = { version = "0.1.0", path = "../crates/rgv-hts" }
+rust-htslib = { version = "1.0.1", default-features = false, features = ["curl", "libdeflate"] }
 tempfile = "3.23"
 
 [[bin]]

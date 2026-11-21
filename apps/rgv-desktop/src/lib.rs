@@ -72,40 +72,40 @@ use rgv_alignment_scene::{
     CpuDepthProjectionOptions, CpuJunctionProjectionOptions, CpuModificationProjectionOptions,
     CpuProjectionError, CpuSummaryCamera, GeometryLod, LayoutContract, LedgerError, LedgerProgress,
     LedgerProgressEpoch, LedgerProgressSubscription, LedgerSnapshot,
-    MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract, ReferenceRevision,
-    RevisionFingerprint, RowAtlasRevision, RowCoordinateSpaceRevision, SummaryContract,
-    SummaryPageFamily, SummaryRevision, SummarySemanticComponent,
+    MAXIMUM_HIDDEN_MODIFICATION_CODES, PayloadContract, PresentationContract, ReadSampling,
+    ReferenceRevision, RevisionFingerprint, RowAtlasRevision, RowCoordinateSpaceRevision,
+    SummaryContract, SummaryPageFamily, SummaryRevision, SummarySemanticComponent,
     build_alignment_semantic_retirement_claim_set, evaluate_alignment_filter,
 };
 use rgv_core::{
     AUTOMATION_SCHEMA_VERSION, AlignmentAuxComparison, AlignmentAuxFilterValue,
-    AlignmentPredicateScope, AlignmentViewPredicate, AutomationAlignmentRelationship,
-    AutomationAlignmentReveal, AutomationAlignmentSceneDiagnostics, AutomationAlignmentSelector,
-    AutomationAlignmentState, AutomationAlignmentTrackSnapshot, AutomationBatch, AutomationCommand,
-    AutomationCommandResult, AutomationCommandStatus, AutomationContextLaneSnapshot,
-    AutomationCytobandAvailability, AutomationEnvironmentTelemetry, AutomationErrorCode,
-    AutomationEvidenceField, AutomationExportKind, AutomationFrameTelemetry,
-    AutomationGenomeSnapshot, AutomationGpuTelemetry, AutomationHistoryNavigation,
-    AutomationLandmarkIntegrityState, AutomationLandmarkSnapshot, AutomationLandmarkTrackState,
-    AutomationNavigationDestination, AutomationNavigationTelemetry, AutomationOptionScope,
-    AutomationPaneItemLayoutSnapshot, AutomationPaneLayoutSnapshot, AutomationPanelSnapshot,
-    AutomationPresentationCompositeSnapshot, AutomationPresentationGroupSnapshot,
-    AutomationPresentationNodeSnapshot, AutomationReadPanelStateSnapshot,
-    AutomationReadPresentationState, AutomationRectSnapshot, AutomationRenderLaneSnapshot,
-    AutomationRenderOmissionReason, AutomationReviewNavigation, AutomationRunReport,
-    AutomationRunTelemetry, AutomationSelection, AutomationSelectionGranularity,
-    AutomationSelectionKind, AutomationSelectionSnapshot, AutomationSetting,
-    AutomationSnapshotFormat, AutomationSnapshotScope, AutomationTrackGestureKind,
-    AutomationTrackGestureSnapshot, AutomationTrackLifecycle, AutomationTrackSnapshot,
-    AutomationUnsavedChangesPolicy, AutomationViewportOperation, AutomationWorkspaceLayoutSnapshot,
-    AutomationWorkspacePanelLayoutSnapshot, AutomationWorkspaceSnapshot, BisulfiteContext,
-    ContigAliases, ContigId, CopyNumberSortLocus, CopyNumberSortMode, CopyNumberTrackSettings,
-    CopyNumberValueMode, CoverageScaleTransform, DesktopSettings, DetailLevel, FeatureDisplayMode,
-    GenerationClock, GeneticCode, GenomeAssembly, GenomeAssemblyIdentity, GenomeConfiguration,
-    GenomeLandmarkCatalogue, GenomicInterval, GenomicSourceFormat, GwasColorMode,
-    GwasTrackSettings, IgvImportReport, InspectorActivation, InteractionDisplayMode,
-    InteractionTrackSettings, JunctionDisplayMode, LandmarkAssetRole, LandmarkSearchIndex,
-    MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_AUTOMATION_EVIDENCE_FIELDS,
+    AlignmentPredicateScope, AlignmentReadSampling, AlignmentViewPredicate,
+    AutomationAlignmentRelationship, AutomationAlignmentReveal,
+    AutomationAlignmentSceneDiagnostics, AutomationAlignmentSelector, AutomationAlignmentState,
+    AutomationAlignmentTrackSnapshot, AutomationBatch, AutomationCommand, AutomationCommandResult,
+    AutomationCommandStatus, AutomationContextLaneSnapshot, AutomationCytobandAvailability,
+    AutomationEnvironmentTelemetry, AutomationErrorCode, AutomationEvidenceField,
+    AutomationExportKind, AutomationFrameTelemetry, AutomationGenomeSnapshot,
+    AutomationGpuTelemetry, AutomationHistoryNavigation, AutomationLandmarkIntegrityState,
+    AutomationLandmarkSnapshot, AutomationLandmarkTrackState, AutomationNavigationDestination,
+    AutomationNavigationTelemetry, AutomationOptionScope, AutomationPaneItemLayoutSnapshot,
+    AutomationPaneLayoutSnapshot, AutomationPanelSnapshot, AutomationPresentationCompositeSnapshot,
+    AutomationPresentationGroupSnapshot, AutomationPresentationNodeSnapshot,
+    AutomationReadPanelStateSnapshot, AutomationReadPresentationState, AutomationRectSnapshot,
+    AutomationRenderLaneSnapshot, AutomationRenderOmissionReason, AutomationReviewNavigation,
+    AutomationRunReport, AutomationRunTelemetry, AutomationSelection,
+    AutomationSelectionGranularity, AutomationSelectionKind, AutomationSelectionSnapshot,
+    AutomationSetting, AutomationSnapshotFormat, AutomationSnapshotScope,
+    AutomationTrackGestureKind, AutomationTrackGestureSnapshot, AutomationTrackLifecycle,
+    AutomationTrackSnapshot, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
+    AutomationWorkspaceLayoutSnapshot, AutomationWorkspacePanelLayoutSnapshot,
+    AutomationWorkspaceSnapshot, BisulfiteContext, ContigAliases, ContigId, CopyNumberSortLocus,
+    CopyNumberSortMode, CopyNumberTrackSettings, CopyNumberValueMode, CoverageScaleTransform,
+    DesktopSettings, DetailLevel, FeatureDisplayMode, GenerationClock, GeneticCode, GenomeAssembly,
+    GenomeAssemblyIdentity, GenomeConfiguration, GenomeLandmarkCatalogue, GenomicInterval,
+    GenomicSourceFormat, GwasColorMode, GwasTrackSettings, IgvImportReport, InspectorActivation,
+    InteractionDisplayMode, InteractionTrackSettings, JunctionDisplayMode, LandmarkAssetRole,
+    LandmarkSearchIndex, MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_AUTOMATION_EVIDENCE_FIELDS,
     MAXIMUM_AUTOMATION_HISTORY_ENTRIES, MAXIMUM_AUTOMATION_LOCI,
     MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS, MAXIMUM_AUTOSAVE_INTERVAL_SECONDS,
     MAXIMUM_AUTOSAVE_RETENTION, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, MAXIMUM_CACHE_BUDGET_MIB,
@@ -151,7 +151,6 @@ use rgv_hts::{
     smrt_kinetics_series, summarize_bisulfite_record, summarize_sbx_record,
 };
 #[cfg(test)]
-use rgv_hts::{AlignmentQuery, QueryStats};
 #[cfg(test)]
 use rgv_layout::layout_features;
 use rgv_layout::{
@@ -270,6 +269,17 @@ fn apply_accessibility_preferences(context: &egui::Context, settings: &DesktopSe
     }
 }
 
+static DESKTOP_UI_WAKER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Wakes the event loop from a desktop-owned worker thread (the control service), so the
+/// window does not have to poll for its requests. A no-op before the event loop exists.
+pub(crate) fn wake_ui() {
+    if let Some(waker) = DESKTOP_UI_WAKER.get() {
+        waker();
+    }
+}
+
 pub fn run() -> Result<()> {
     let process_started = Instant::now();
     tracing_subscriber::fmt()
@@ -304,11 +314,26 @@ pub fn run() -> Result<()> {
         }
     };
     event_loop.set_control_flow(ControlFlow::Wait);
+    // Workers wake the event loop when they publish, so results are picked up at once instead
+    // of at the next poll. One pending wake is enough however many results arrive.
+    let worker_wake_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let proxy = event_loop.create_proxy();
+        let pending = Arc::clone(&worker_wake_pending);
+        let waker = move || {
+            if !pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let _ = proxy.send_event(());
+            }
+        };
+        let _ = DESKTOP_UI_WAKER.set(Box::new(waker.clone()));
+        rgv_engine::set_ui_waker(waker);
+    }
     let result = event_loop
         .run_app(&mut Application {
             viewer: None,
             options,
             process_started,
+            worker_wake_pending,
         })
         .context("RGV event loop failed");
     run_marker.finish();
@@ -407,7 +432,7 @@ fn validate_remote_source_editor(editor: &RemoteSourceEditor) -> Result<RemoteSo
             if classified_source.map(|source| source.format)
                 != Some(GenomicSourceFormat::Fasta) =>
         {
-            anyhow::bail!("a reference URL must end in .fa, .fasta, or .fna")
+            anyhow::bail!("a reference URL must end in .fa, .fasta, .fna, or .2bit")
         }
         RemoteSourceKind::IndexedTrack => {
             anyhow::ensure!(
@@ -423,9 +448,17 @@ fn validate_remote_source_editor(editor: &RemoteSourceEditor) -> Result<RemoteSo
                     | TrackSpecKind::BigBed
                     | TrackSpecKind::BigGenePred
                     | TrackSpecKind::BigNarrowPeak
+                    | TrackSpecKind::Bed
+                    | TrackSpecKind::Gff3
+                    | TrackSpecKind::Gtf
+                    | TrackSpecKind::GenePred
+                    | TrackSpecKind::RefFlat
+                    | TrackSpecKind::NarrowPeak
+                    | TrackSpecKind::BroadPeak
+                    | TrackSpecKind::Psl
             ) {
                 anyhow::bail!(
-                    "remote desktop tracks currently require indexed VCF/BCF, BigWig, TDF, BigBed, bigGenePred, or bigNarrowPeak data"
+                    "remote desktop tracks currently require indexed VCF/BCF, BigWig, TDF, BigBed, bigGenePred, or bigNarrowPeak data, or a BED, GFF3, GTF, genePred, refFlat, peak, or PSL text file"
                 );
             }
         }
@@ -1469,6 +1502,8 @@ struct Viewer {
     session_save_tasks: Vec<SessionSaveTask>,
     session_load_tasks: Vec<SessionLoadTask>,
     workspace_list_import_tasks: Vec<WorkspaceListImportTask>,
+    genome_tasks: Vec<crate::workspace::genomes::GenomeTask>,
+    hosted_genomes: crate::workspace::genomes::HostedGenomes,
     /// Ephemeral selection ordering; never written to sessions or diagnostics.
     promoted_read: Option<(TrackId, u64)>,
     synthetic: bool,

@@ -111,6 +111,10 @@ pub struct GenomeConfiguration {
     #[serde(default)]
     pub assembly_identity: Option<GenomeAssemblyIdentity>,
     pub reference: TrackSource,
+    /// Companion to the reference: a FASTA index (`.fai`) for a remote FASTA with a
+    /// non-conventional index location, or a `chrom.sizes` table for a `.2bit` reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_index: Option<String>,
     #[serde(default)]
     pub cytobands: Option<TrackSource>,
     #[serde(default)]
@@ -482,6 +486,7 @@ mod tests {
             reference: TrackSource::Local {
                 path: "reference/genome.fa".to_owned(),
             },
+            reference_index: None,
             cytobands: Some(TrackSource::Local {
                 path: "metadata/cytobands.tsv".to_owned(),
             }),

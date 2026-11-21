@@ -10,6 +10,7 @@ publish = false
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
+image.workspace = true
 reqwest.workspace = true
 rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
 rgv-control-client = { version = "0.1.0", path = "../../crates/rgv-control-client" }

@@ -24,6 +24,67 @@ const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) struct ControlRequest {
     pub(crate) batch: AutomationBatch,
     pub(crate) reply: SyncSender<AutomationRunReport>,
+    /// Set by the HTTP side when nobody is waiting for the result any more (the request timed
+    /// out or the service is stopping). The executor then stops instead of running the rest of
+    /// the batch unobserved.
+    pub(crate) cancelled: Arc<AtomicBool>,
+}
+
+/// Why a `/v1/status` request is refused, as an HTTP status, error code and message.
+type StatusRefusal = (u16, &'static str, &'static str);
+
+/// Whether a `Host` header value names this machine's loopback interface.
+fn host_is_loopback(host: &str) -> bool {
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        // Bracketed IPv6 literal, optionally followed by `:port`.
+        match rest.split_once(']') {
+            Some((address, port)) if port.is_empty() || port.starts_with(':') => address,
+            _ => return false,
+        }
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                name
+            }
+            Some(_) => return false,
+            None => host,
+        }
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// `/v1/status` is unauthenticated, so it must not be readable by a web page. A page reaching
+/// the service through DNS rebinding sends its own host name, and any cross-origin browser
+/// request carries an `Origin` header; native clients send a loopback `Host` and no `Origin`.
+fn status_request_refusal(host: Option<&str>, origin: Option<&str>) -> Option<StatusRefusal> {
+    if origin.is_some() {
+        return Some((
+            403,
+            "forbidden_origin",
+            "Browser-originated requests are not accepted",
+        ));
+    }
+    match host {
+        Some(host) if host_is_loopback(host) => None,
+        Some(_) => Some((
+            403,
+            "forbidden_host",
+            "The Host header must name the loopback interface",
+        )),
+        None => Some((400, "missing_host", "A loopback Host header is required")),
+    }
+}
+
+fn header_value<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv(name))
+        .map(|header| header.value.as_str())
 }
 
 pub(crate) struct ControlService {
@@ -327,6 +388,13 @@ fn handle_control_request(
         return;
     }
     if request.method() == &Method::Get && request.url() == "/v1/status" {
+        if let Some((status_code, code, message)) = status_request_refusal(
+            header_value(&request, "Host"),
+            header_value(&request, "Origin"),
+        ) {
+            respond_error(request, status_code, code, message);
+            return;
+        }
         let surface_width_pixels = window_metrics.surface_width_pixels.load(Ordering::Acquire);
         let surface_height_pixels = window_metrics.surface_height_pixels.load(Ordering::Acquire);
         let scale_factor = f64::from_bits(window_metrics.scale_factor_bits.load(Ordering::Acquire));
@@ -492,8 +560,14 @@ fn handle_control_request(
         return;
     }
     let (reply, reply_receiver) = sync_channel(1);
-    match request_sender.try_send(ControlRequest { batch, reply }) {
-        Ok(()) => {}
+    let cancelled = Arc::new(AtomicBool::new(false));
+    match request_sender.try_send(ControlRequest {
+        batch,
+        reply,
+        cancelled: Arc::clone(&cancelled),
+    }) {
+        // The window polls for requests only coarsely while idle; wake it now.
+        Ok(()) => crate::wake_ui(),
         Err(TrySendError::Full(_)) => {
             respond_error(request, 429, "busy", "Another control batch is waiting");
             return;
@@ -522,9 +596,13 @@ fn handle_control_request(
                 "The RGV command executor became unavailable",
             ),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) if stop.load(Ordering::Acquire) => {
+                cancel_control_batch(&cancelled);
                 respond_error(request, 503, "unavailable", "RGV is shutting down");
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
+                // Nobody will read the result: stop the batch instead of letting the rest of
+                // it change the workspace unobserved.
+                cancel_control_batch(&cancelled);
                 respond_error(
                     request,
                     504,
@@ -536,6 +614,11 @@ fn handle_control_request(
         }
         break;
     }
+}
+
+fn cancel_control_batch(cancelled: &AtomicBool) {
+    cancelled.store(true, Ordering::Release);
+    crate::wake_ui();
 }
 
 fn request_is_authorized(request: &Request, secret: &str) -> bool {
@@ -633,6 +716,73 @@ mod tests {
                 body.len()
             ),
         )
+    }
+
+    #[test]
+    fn status_requires_a_loopback_host_and_rejects_browser_origins() {
+        assert_eq!(status_request_refusal(Some("127.0.0.1:60151"), None), None);
+        assert_eq!(status_request_refusal(Some("127.0.0.1"), None), None);
+        assert_eq!(status_request_refusal(Some("localhost:60151"), None), None);
+        assert_eq!(status_request_refusal(Some("LOCALHOST"), None), None);
+        assert_eq!(status_request_refusal(Some("[::1]:60151"), None), None);
+        assert_eq!(status_request_refusal(Some("[::1]"), None), None);
+        for rebinding in [
+            "attacker.example",
+            "attacker.example:60151",
+            "127.0.0.1.attacker.example",
+            "localhost.attacker.example:80",
+            "192.168.1.10:60151",
+            "[::1]evil",
+            "127.0.0.1:abc",
+            "",
+        ] {
+            assert_eq!(
+                status_request_refusal(Some(rebinding), None).map(|refusal| refusal.0),
+                Some(403),
+                "{rebinding}"
+            );
+        }
+        assert_eq!(
+            status_request_refusal(None, None).map(|refusal| refusal.0),
+            Some(400)
+        );
+        assert_eq!(
+            status_request_refusal(Some("127.0.0.1"), Some("https://attacker.example"))
+                .map(|refusal| refusal.1),
+            Some("forbidden_origin")
+        );
+        assert_eq!(
+            status_request_refusal(Some("127.0.0.1"), Some("null")).map(|refusal| refusal.0),
+            Some(403),
+            "sandboxed pages send a null origin"
+        );
+    }
+
+    #[test]
+    fn status_endpoint_refuses_rebound_hosts_and_origins_over_http() {
+        let root = tempfile::tempdir().unwrap();
+        let mut service = ControlService::start(
+            0,
+            root.path().to_owned(),
+            TEST_SECRET.to_owned(),
+            test_status(),
+        )
+        .unwrap();
+        let rebound = send_request(
+            service.address(),
+            "GET /v1/status HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n",
+        );
+        assert!(rebound.starts_with("HTTP/1.1 403"), "{rebound}");
+        assert!(rebound.contains("forbidden_host"));
+        assert!(!rebound.contains("application_instance_id"));
+        let browser = send_request(
+            service.address(),
+            "GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://attacker.example\r\nConnection: close\r\n\r\n",
+        );
+        assert!(browser.starts_with("HTTP/1.1 403"), "{browser}");
+        assert!(browser.contains("forbidden_origin"));
+        assert!(!browser.contains("application_instance_id"));
+        service.shutdown();
     }
 
     #[test]

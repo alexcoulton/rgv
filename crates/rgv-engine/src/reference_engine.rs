@@ -16,7 +16,7 @@ use rgv_hts::{
 
 use crate::{
     EngineQueueError,
-    mailbox::{CoalescingReceiver, CoalescingSender, bounded_coalescing},
+    mailbox::{CoalescingReceiver, CoalescingSender, bounded_coalescing_to_ui, run_thread_root},
 };
 
 /// Maximum number of bases fetched by one underlying FASTA operation.
@@ -25,6 +25,14 @@ use crate::{
 /// and checks cancellation between them, so consumers still receive one atomic slice without a
 /// broad horizon becoming one uninterruptible local or remote source operation.
 pub const MAX_REFERENCE_QUERY_BASES: u64 = 1_000_000;
+
+/// Maximum number of bases one logical reference slice may hold.
+///
+/// A slice is one contiguous in-memory allocation published to every consumer of that panel, so
+/// its size must not be whatever interval a caller happens to compute. The bound is far above
+/// any horizon at which individual bases or reads are drawn; a wider request is refused with an
+/// explicit error before anything is reserved or fetched.
+pub const MAX_REFERENCE_SLICE_BASES: u64 = 128 * MAX_REFERENCE_QUERY_BASES;
 
 /// Complete identity of one reference query. Panel generation alone is not sufficient because
 /// one scene-camera generation may request several successive buffered horizons. Carrying the
@@ -118,12 +126,31 @@ impl ReferenceEngine {
     pub fn spawn(queue_capacity: usize) -> Self {
         let capacity = queue_capacity.max(1);
         let (input_tx, input_rx) = bounded(capacity);
-        let (output_tx, output_rx) = bounded_coalescing(capacity);
+        let (output_tx, output_rx) = bounded_coalescing_to_ui(capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
         let worker = thread::Builder::new()
             .name("rgv-reference-actor".to_owned())
-            .spawn(move || worker_loop(&input_rx, &output_tx, &worker_shutdown))
+            .spawn(move || {
+                run_thread_root(
+                    || worker_loop(&input_rx, &output_tx, &worker_shutdown),
+                    |message| {
+                        tracing::error!(message, "reference actor panicked");
+                        // `query: None` is this actor's terminal failure form: the reference is
+                        // no longer usable and the owner retires the engine.
+                        send_event(
+                            &output_tx,
+                            ReferenceEngineEvent::Error {
+                                query: None,
+                                message: format!(
+                                    "the reference engine stopped after an internal error: \
+                                     {message}"
+                                ),
+                            },
+                        );
+                    },
+                );
+            })
             .expect("failed to spawn RGV reference actor");
         Self {
             input: Some(input_tx),
@@ -322,6 +349,12 @@ fn fetch_reference_query(
     query: ReferenceQueryIdentity,
     shutdown: &AtomicBool,
 ) -> ReferenceQueryFetch {
+    if interval.len() > MAX_REFERENCE_SLICE_BASES {
+        return ReferenceQueryFetch::Failed(format!(
+            "reference query of {} bases exceeds the {MAX_REFERENCE_SLICE_BASES}-base slice limit",
+            interval.len()
+        ));
+    }
     let expected_bases = match usize::try_from(interval.len()) {
         Ok(expected) => expected,
         Err(_) => {
@@ -692,6 +725,78 @@ mod tests {
                 } if query == expected
             ));
         }
+    }
+
+    #[test]
+    fn a_query_wider_than_the_slice_limit_is_refused_before_any_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genome.fa");
+        fs::write(&path, b">chr1\nACGTACGT\n").unwrap();
+        fs::write(path.with_extension("fa.fai"), b"chr1\t8\t6\t8\t9\n").unwrap();
+        let engine = ReferenceEngine::spawn(4);
+        engine.try_open(path).unwrap();
+        let revision = loop {
+            if let Some(ReferenceEngineEvent::Opened { revision, .. }) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break revision;
+            }
+        };
+        let clock = GenerationClock::default();
+        let query = |end| {
+            ReferenceQueryIdentity::new(
+                PanelGeneration::new(PanelId::new(33), clock.current()),
+                revision,
+                GenomicInterval::new(ContigId::new(0), 0, end).unwrap(),
+            )
+        };
+        // A corrupt or absurd interval must not be turned into a multi-terabyte reservation.
+        let oversized = query(u64::MAX);
+        let just_over = query(MAX_REFERENCE_SLICE_BASES + 1);
+        for refused in [oversized, just_over] {
+            engine
+                .try_query(refused, clock.clone(), "chr1".to_owned())
+                .unwrap();
+            let event = loop {
+                if let Some(event) = engine
+                    .output
+                    .receive_timeout(Duration::from_secs(2))
+                    .unwrap()
+                {
+                    break event;
+                }
+            };
+            let ReferenceEngineEvent::Error {
+                query: Some(failed),
+                message,
+            } = event
+            else {
+                panic!("an oversized reference query must fail with its identity");
+            };
+            assert_eq!(failed, refused);
+            assert!(message.contains("slice limit"), "unexpected message {message}");
+        }
+
+        // The limit itself is not a behaviour change for ordinary queries.
+        let ordinary = query(8);
+        engine
+            .try_query(ordinary, clock, "chr1".to_owned())
+            .unwrap();
+        let event = loop {
+            if let Some(event) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                break event;
+            }
+        };
+        assert!(matches!(
+            event,
+            ReferenceEngineEvent::QueryCompleted { query, .. } if query == ordinary
+        ));
     }
 
     #[test]

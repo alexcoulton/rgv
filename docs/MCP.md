@@ -116,7 +116,7 @@ host configuration details. This example passes only the protected file's path; 
 | Tool | Effect |
 |---|---|
 | `rgv_status` | Reports reachability, versions, compatibility, and non-sensitive capabilities. |
-| `rgv_get_workspace` | Returns bounded genome, ordered panel, track, readiness, and selection state. |
+| `rgv_get_workspace` | Returns bounded genome, ordered panel, track, readiness, and selection state. Performance telemetry is included only with `include_telemetry: true`. |
 | `rgv_get_selection` | Returns bounded structured evidence for the semantic selection. |
 | `rgv_get_interaction_trace` | Returns the bounded input-to-present timeline for the most recent physical vertical-scrollbar gesture. |
 | `rgv_clear_selection` | Clears all selection state and closes the inspector. |
@@ -138,9 +138,9 @@ host configuration details. This example passes only the protected file's path; 
 | `rgv_sort_alignments` | Applies a typed sort mode and direction. |
 | `rgv_filter_alignments` | Applies RGV's validated alignment-filter expression. |
 | `rgv_select` | Selects a panel, track, or zero-based genomic position. |
-| `rgv_capture_view` | Waits if requested and returns a bounded PNG as MCP image content. |
-| `rgv_capture_window` | Captures the complete native RGV client area without activating it. |
-| `rgv_export` | Writes a structured export under the root and inlines only small UTF-8 results. |
+| `rgv_capture_view` | Waits if requested and returns a bounded PNG as MCP image content, downscaled to `max_width` (default 1600 px). |
+| `rgv_capture_window` | Captures the complete native RGV client area without activating it, downscaled to `max_width` (default 1600 px). |
+| `rgv_export` | Writes a structured export under the root and inlines only small UTF-8 results, with read names pseudonymized unless `include_read_names: true`. |
 | `rgv_save_workspace` | Saves an RGV project under the root. |
 | `rgv_open_workspace` | Explicitly replaces the window with a root-confined saved project. |
 | `rgv_execute_batch` | Advanced ordered escape hatch, limited to 100 validated commands. |
@@ -154,7 +154,23 @@ filter reports additionally expose `no_op`; an empty filter expression is the ex
 for clearing an alignment filter. This makes an applied clamp or idempotent call distinguishable
 from a mutation that changed the viewer.
 
-Automation schema version 4 exposes the normalized presentation model and committed workspace
+Every argument in the generated tool schemas carries a description stating its unit and, for
+genomic coordinates, whether it is zero-based or one-based and half-open or inclusive.
+
+### Schema compatibility
+
+`rgv-mcp` accepts a viewer whose `/v1/status` reports an automation schema version (and, when
+present, a control schema version) inside the adapter's supported range. That range is
+`MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION..=MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION` in
+`apps/rgv-mcp/src/server.rs`; in this build both bounds are **6**, the current
+`AUTOMATION_SCHEMA_VERSION`. Versions below 6 are not supported because schema 6 removed and
+reshaped workspace-snapshot fields, and versions above the build's maximum are rejected because
+their response shapes are unknown to it. `rgv_status` returns the range as
+`supported_schema_versions`; a viewer outside it fails with `unsupported_version` and a message
+naming both the reported version and the supported range. Generated batches are stamped with the
+minimum supported version, which every supported viewer accepts.
+
+The automation schema exposes the normalized presentation model and committed workspace
 geometry structurally. The `workspace_layout` field reports one revision for the shared workspace,
 adaptive genome-context rows, track viewport, gutter, and each panel's header, canvas, and scrollbar
 rectangles together with cytoband availability. It also records the exact Properties rectangle and
@@ -189,6 +205,23 @@ or moving the live camera. PNG and SVG project the captured committed alignment 
 `rgv_capture_window` remains the complete native client area, including the application shell and
 Properties panel.
 
+Both capture tools accept `max_width` (pixels, 64 to 16384, default 1600). A capture wider than
+that is downscaled before it is inlined, preserving the aspect ratio; a narrower capture is never
+enlarged. The result's `width`/`height` describe the inlined PNG, `source_width`/`source_height`
+the viewer's original capture, and `downscaled` whether they differ, so image pixels can be mapped
+back to the reported panel geometry by the ratio `source_width / width`. Pass a larger `max_width`
+when full resolution is needed. The workspace state associated with a capture is reported once, as
+the top-level `panels`, `loci`, `genome`, and revision fields; the embedded command report does not
+repeat the workspace snapshot.
+
+Performance telemetry is omitted by default because it dominates the payload and carries no
+genomic meaning. Two kinds exist. The command report's `telemetry` object (frame timings, GPU
+counters, per-navigation timings, and environment) is returned by `rgv_capture_view`,
+`rgv_capture_window`, and `rgv_execute_batch` only when called with `include_telemetry: true`;
+the other tools never return it. The workspace snapshot's alignment-scene cache accounting and
+diagnostic counters (every top-level `alignment_scene_*` field) are returned by
+`rgv_get_workspace` only with `include_telemetry: true`.
+
 `rgv_get_interaction_trace` is observational. Drag the vertical scrollbar in the live window, then
 call the tool to inspect the first 500 ms of the gesture. The trace separates pointer receipt,
 egui handling, display clipping, renderer preparation, CPU/GPU capacity growth, upload volume,
@@ -200,7 +233,8 @@ coordinates.
 - Control responses are capped at 80 MiB.
 - Workspace snapshots contain at most 16 panels and 1,024 tracks; selection snapshots contain at
   most 128 fields, with explicit truncation flags.
-- Captured PNG files are capped at 64 MiB and removed after being read.
+- Captured PNG files are capped at 64 MiB on disk, downscaled to `max_width` before inlining, and
+  removed on every outcome of the capture call, including failures.
 - `rgv_capture_window` renders the complete application client area—including menus, navigation,
   tracks, status, and inspectors—to a private GPU target owned by the authenticated RGV process.
   It never activates the application and remains current when the OS window is obscured or
@@ -209,10 +243,22 @@ coordinates.
 - Workspace and selection inspection omit source paths, credentials, signed URLs, read names,
   read sequences, and arbitrary alignment tags.
 - Exact read names may be supplied as sensitive `rgv_find_alignments` input. They are matched only
-  in the desktop process, redacted if a batch is serialized, never echoed in results, and replaced
-  by random opaque handles that expire when the backing query changes.
-- Tool reports recursively redact path-, URL-, and source-named fields. The control secret is never
-  logged or returned.
+  in the desktop process, redacted if a batch is serialized, never echoed in search or selection
+  results, and replaced by random opaque handles that expire when the backing query changes.
+- `rgv_export` is the one tool whose purpose is to write record-level evidence. The file it writes
+  under the control root always contains the original read names (the `read_name` column of
+  `alignments`, `filtered_alignments`, and `eligible_alignments`, and the `Read` row of
+  `selected_evidence`). The copy inlined into the tool result as `inline_text` does **not**: by
+  default each read name is replaced by an export-local pseudonym (`read_1`, `read_2`, ... in
+  first-appearance order, so mates and supplementary segments of one template still share an
+  identity) and selected-evidence read identity is replaced by `[redacted]`. `inline_read_names`
+  reports `pseudonymized`, `included`, or `not_present`. Pass `include_read_names: true` to inline
+  the original names. Selected-evidence exports still inline the read sequence, CIGAR, and
+  auxiliary tags of the one selected record; that is their documented purpose.
+- Tool reports recursively redact path-, URL-, and source-named fields. Viewer diagnostics
+  (`message` fields and error messages) are passed through with absolute filesystem paths reduced
+  to `[path]/<file name>`, URLs reduced to scheme and host, and bearer tokens and secret-named
+  `key=value` pairs removed. The control secret is never logged or returned.
 - Local reads and writes stay under `--control-root`. Absolute/traversing artifact arguments and
   symbolic-link escapes are rejected.
 - stdout is reserved for MCP protocol frames. Diagnostics go to stderr.
@@ -221,7 +267,10 @@ No telemetry or genomic content is sent outside the local `rgv-mcp` and `rgv-des
 
 ## Errors and recovery
 
-Tool failures contain structured `error.code` and `error.message` fields. Stable adapter codes
+Tool failures contain structured `error.code` and `error.message` fields. `error.message` and each
+`report.results[].message` carry the viewer's own diagnostic (for example
+`RGV command load_track failed: track source [path]/sample.bam does not exist or is not a file`),
+redacted as described under "Bounds and privacy" and bounded to 4 KiB. Stable adapter codes
 include `unavailable`, `unauthorized`, `unsupported_version`, `invalid_input`, `invalid_batch`,
 `forbidden_command`, `destructive_confirmation_required`, `invalid_response`,
 `response_too_large`, `state_reobservation_failed`, and `artifact_error`. Viewer failures preserve the lower-case shared error
@@ -238,7 +287,8 @@ Selection, setting, history, review, relationship, and persistence failures addi
 - `unavailable`: start RGV with matching control options, then retry; the MCP server need not be
   restarted.
 - `unauthorized`: verify that both processes read the same protected secret file.
-- `unsupported_version`: rebuild both binaries from the same release.
+- `unsupported_version`: the viewer's schema version is outside the adapter's supported range
+  (see "Schema compatibility"); use `rgv-desktop` and `rgv-mcp` builds from compatible releases.
 - `invalid_state` or `resource_not_found`: call `rgv_get_workspace`, correct the ID/resource, and
   retry.
 - `timeout`: inspect workspace state before retrying. Cancellation or timeout does not roll back a

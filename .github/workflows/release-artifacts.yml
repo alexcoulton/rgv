@@ -14,7 +14,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        shell: bash
+        run: rustup show active-toolchain || rustup toolchain install
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install --yes libfontconfig1-dev libxkbcommon-dev libwayland-dev

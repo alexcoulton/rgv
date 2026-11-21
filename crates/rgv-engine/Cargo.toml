@@ -8,7 +8,6 @@ publish = false
 
 [dependencies]
 crossbeam-channel.workspace = true
-lru.workspace = true
 rgv-core = { version = "0.1.0", path = "../rgv-core" }
 rgv-alignment-scene = { version = "0.1.0", path = "../rgv-alignment-scene" }
 rgv-hts = { version = "0.1.0", path = "../rgv-hts" }

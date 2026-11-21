@@ -14,6 +14,39 @@ bounds, and troubleshooting are documented in [Controlling RGV from an MCP agent
 
 ## Opening data
 
+**Hosted genomes.** **Genomes → Hosted genomes** lists the genomes published for IGV (human,
+mouse and many others). Choosing one loads its reference sequence, chromosome ideogram, chromosome
+aliases (so a BAM using `1` displays against a `chr1` reference) and default gene track. The
+reference is read on demand over the network; the small resources are saved locally the first
+time, so the same genome opens offline afterwards. `--genome hg38` does the same at launch, and
+also accepts the path or URL of an IGV genome JSON file. Such a file can be opened with
+**Genomes → Open genome configuration** or dropped onto the window. References may be FASTA with
+a `.fai`, or UCSC `.2bit`. This feature has automated tests only and has not yet been checked
+against the live hosting.
+
+A small remote BED, GFF3, GTF, genePred, refFlat, narrowPeak, broadPeak or PSL file (up to
+256 MiB) can be opened by URL; it is downloaded whole rather than read by range request.
+
+**Built-in gene landmarks.** When a landmark catalogue is installed and the loaded reference is
+positively matched to one of its assemblies, RGV adds a **Genes** track automatically, uses the
+bundle's gene-name index for symbol search, and can take cytobands and chromosome aliases from the
+same bundle. The **Genomes** menu shows the match as a `Landmarks: …` line (status, evidence and
+reason), or an error line when no catalogue was found. If you remove the automatic Genes track,
+**Genomes → Restore default genes** brings it back; **Genomes → Open landmark resource folder**
+opens the catalogue directory.
+
+RGV looks for a directory containing `catalog.json` in this order: `--landmark-resource-root`,
+the `RGV_LANDMARK_RESOURCE_ROOT` environment variable, then
+`benchmark-data/large-public-alignments/landmarks/igv` and `resources/landmarks` relative to the
+working directory, then `landmarks`, `resources/landmarks` and `../Resources/landmarks` beside the
+executable. The catalogue is **not tracked in Git and the packaging scripts do not currently copy
+it into the staged application**, so on a fresh checkout or packaged build there is no automatic
+Genes track until you build the bundles (hg38, hg19, mm10, mm39 and hs1; see
+[Curated gene landmark bundles](LANDMARK_BUNDLES.md)) or point RGV at an existing catalogue.
+Without one, the Genomes menu reports "No built-in landmark catalogue was found; automatic Genes
+tracks are unavailable" and everything else works as usual. Hosted genomes (above) supply their
+own default gene track and do not depend on the landmark catalogue.
+
 Use **File → Open BAM/CRAM** for an alignment source, **Genomes → Open FASTA** for an indexed
 reference genome, and **Tracks → Add track** for annotations, variants, or signal. Use
 **File → Open URL** for remote BAM/CRAM, a remote FASTA, or an indexed remote VCF/BCF, BigWig, TDF,
@@ -354,17 +387,71 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   supplementary alignments by default. The gutter, diagnostics, exports, and MCP snapshots report
   exclusions; saved projects retain their explicit choices.
 
-RGV never presents a sampled individual-read stack. The configurable **Complete read limit** is
-50,000 by default and can be set from 1,000 to 250,000 in alignment-track properties. If every
-eligible read in the exact viewport fits within the effective limit, RGV presents all of them. If
-the population exceeds the limit, RGV presents no individual reads, reports the exact eligible
-count and effective limit, and asks you to zoom in or raise the setting. Raising the limit can
-increase memory, query/layout time, primitive counts, and GPU work. Coverage and other aggregates
-remain available when they were computed from every eligible source record.
+Each alignment track has a **Read display** setting in its properties:
+
+- **Downsampled** is the default for new tracks. At most 100 reads whose alignments start in each
+  50-base window are given rows; both numbers are adjustable. The reads kept are those with the
+  smallest stable hash of the read name, so the subset does not depend on load order, does not
+  reshuffle while you pan, and mates share one priority. When any read is left out, the track
+  label states how many are shown, for example `Downsampled: 4,210 of 156,152 reads shown`.
+- **Complete** shows every eligible read. The configurable **Complete read limit** is 50,000 by
+  default. If the eligible population in the exact viewport exceeds the effective limit, RGV
+  presents no individual reads, reports the exact eligible count and limit, and asks you to zoom
+  in or raise the setting. Raising the limit increases memory, layout time, and GPU work.
+
+Coverage, alleles, junctions, pair statistics, and modification summaries are computed from every
+eligible read in both modes; downsampling changes only which reads are drawn as rows. Navigation
+to a mate or supplementary segment can therefore select a read that is not drawn. Projects saved
+before this setting existed open in Complete mode so that they reproduce what was saved.
 
 RGV currently computes coverage from the explicitly loaded alignment source. It does not discover
 or substitute a precomputed coverage file by filename convention; support for such a source will
 require an explicit track association so the provenance cannot be ambiguous.
+
+### Read context menu: arranging, filtering, and highlighting
+
+Secondary-click (right-click) inside an alignment read lane to open the read menu. It acts on the
+alignment track under the pointer and, for the "clicked position" entries, on the reference
+position under the pointer.
+
+**Arrange reads → Sort by** offers Start position, Strand, First-of-pair strand, Mapping quality,
+Read name, Read group, Haplotype, Aligned length, Left clip, Right clip, Template length, Pair
+orientation, Mate contig, Pair status, Read order, and Base at clicked position.
+**Arrange reads → Group by** offers None, Strand, Read group, Haplotype, Chimeric, Supplementary,
+Left clip, Right clip, Pair orientation, Unexpected pair, Mate contig, Read order, First-of-pair
+strand, Base at clicked position, and Insertion at clicked position. Sort and group order can
+each be reversed, and the same submenu switches Stable/Compact stacking, **View as pairs**, and
+**Reset arrangement / re-pack**. Sorting or grouping by an arbitrary two-character SAM tag is set
+in the track settings rather than in this menu.
+
+**Filter reads** applies quick predicates. Every active condition must match (logical AND); the
+menu title shows the number of active filters and the submenu lists them, with a
+"*matching* of *eligible*" count when it is known. The quick predicates are:
+
+- Contains substitution, Contains insertion, Contains deletion, Contains any indel, Contains soft
+  clipping, Contains splice;
+- Duplicate, Secondary, Supplementary, MAPQ at least 30;
+- Insertion at clicked position, Deletion at clicked position, Substitution at clicked position.
+
+The substitution predicates compare read bases with the reference and are refused with
+"Substitution predicates require a matching reference FASTA" when none is loaded.
+**Clear all filters** removes these predicates and also resets the track's minimum MAPQ,
+secondary/supplementary switches, and SAM-tag predicates.
+
+**Highlight reads** offers the same ten non-positional predicates but marks matching reads
+instead of hiding the others; **Clear highlights** removes them.
+
+Filters and highlights are stored per alignment track in the project as `alignment_view_filter`
+and `alignment_highlight_filter`. The stored model is richer than the menu: a predicate may be a
+mapping-quality range, a SAM flag test (duplicate, secondary, supplementary, failed QC, paired,
+proper pair, mate mapped, reverse strand), a template-length range, a mate contig, a SAM-tag
+comparison (exists, equal, not equal, greater, greater-or-equal, less, less-or-equal), a CIGAR
+event (insertion, deletion, indel, soft clip, hard clip, reference skip) with optional length
+bounds, an aligned-length range, or a substitution with an optional observed base and count
+bounds. CIGAR-event and substitution predicates can be scoped anywhere in the read, to one
+position, or to an interval. Predicates beyond the quick entries above have no desktop editor;
+they are reachable only through automation or a hand-edited project file. OR and NOT are not
+supported.
 
 ### Multiple alignment tracks
 
@@ -896,7 +983,16 @@ projection and encoding run in a budgeted worker. Full-panel export succeeds onl
 complete, unscrolled content is already resident and fits the captured canvas (at most 16,384
 logical pixels high). Requests requiring off-screen pages are explicitly refused, without changing
 the live layout or silently exporting partial evidence. Manual PNG uses the same visible-workspace
-composition. SVG
+composition.
+
+**Where SVG export is available.** The desktop menu offers PNG only (**File → Export PNG…**,
+Ctrl/Cmd+E); there is no menu item for an SVG of the workspace. Workspace and panel SVG is
+produced only by the automation `snapshot` command with `"format": "svg"`, as in the example
+above — through `--batch`, the opt-in local control service, or an MCP client that sends the same
+command. The one interactive SVG export is **Export Sashimi SVG…** in the selected-junction
+inspector, which writes the Sashimi plot only (see [Splice junctions](#splice-junctions)).
+
+SVG
 metadata records the RGV version, genome, loci, visible stable track IDs and names without
 embedding source URLs, credentials, read names, or sequence. Structured commands export visible
 active-panel alignments, pileup bins, modified-base series, junctions, variants/genotypes,
@@ -929,6 +1025,14 @@ rgv-desktop --control-port 60151 \
   --control-secret-file rgv-control.secret \
   --control-root /path/to/review-workspace
 ```
+
+**Port 60151 is also IGV Desktop's default batch-command port.** RGV has no default listening
+port — you always choose one with `--control-port` — but the examples in this guide use 60151 and
+the `rgv-mcp` adapter's default control URL is `http://127.0.0.1:60151`. If IGV is running with
+its port enabled on the same machine, one of the two will fail to bind, or a client meant for one
+will reach the other. The protocols are not compatible: RGV speaks authenticated HTTP/JSON, not
+IGV's plain-text batch commands. Choose a different port (or `0` for a free one) when both
+applications are in use, and configure the MCP adapter's control URL to match.
 
 An authenticated client sends the same JSON object accepted by `--batch` to
 `POST http://127.0.0.1:60151/v1/batches` with `Content-Type: application/json` and

@@ -2,6 +2,16 @@
 
 Status date: 23 August 2026
 
+> **Stale — not re-verified (note added 20 November 2026).** This audit predates the
+> unified-alignment-scene rewrite and the later menu, URL-dialog, hosted-genome and context-menu
+> changes. The entry points and "Audit" results below describe the application as it was on
+> 23 August 2026 and have not been checked against the current code; treat every row as
+> unverified. Known differences include hosted genomes and IGV genome JSON (now under
+> **Genomes**), remote text annotations through **File → Open URL**, and the read context menu.
+> For current behaviour use [`USER_GUIDE.md`](USER_GUIDE.md) and
+> [`FORMAT_SUPPORT.md`](FORMAT_SUPPORT.md); for known discrepancies see
+> `audits/COMPREHENSIVE_REVIEW_2026-11-20.md` (DOC-8).
+
 This audit checks that the major workflows in `plans/RGV_IGV_PARITY_ROADMAP.md` are reachable from the
 native desktop application. It is intentionally about product access and wiring, not broad manual
 acceptance or performance tuning. `plans/RGV_BETA_EXECUTION_PLAN.md` defines the current execution order.

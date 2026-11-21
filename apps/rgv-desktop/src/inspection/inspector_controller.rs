@@ -82,6 +82,51 @@ fn alignment_component_event(
     }
 }
 
+/// Wording shown in the read inspector, in place of Rust enum variant names.
+pub(crate) const fn pair_classification_label(value: rgv_hts::PairClassification) -> &'static str {
+    use rgv_hts::PairClassification as Pair;
+    match value {
+        Pair::Unpaired => "Unpaired read",
+        Pair::ReadUnmapped => "Read unmapped",
+        Pair::MateUnmapped => "Mate unmapped",
+        Pair::MateMissing => "Mate not loaded",
+        Pair::InterContig => "Mate on another contig",
+        Pair::DiscordantOrientation => "Discordant orientation",
+        Pair::DiscordantTemplateLengthShort => "Discordant: template shorter than expected",
+        Pair::DiscordantTemplateLengthLong => "Discordant: template longer than expected",
+        Pair::Proper => "Proper pair",
+        Pair::Concordant => "Concordant pair",
+    }
+}
+
+pub(crate) const fn pair_orientation_label(value: rgv_hts::PairOrientation) -> &'static str {
+    match value {
+        rgv_hts::PairOrientation::Inward => "Inward (forward–reverse)",
+        rgv_hts::PairOrientation::Outward => "Outward (reverse–forward)",
+        rgv_hts::PairOrientation::SameStrand => "Same strand",
+        rgv_hts::PairOrientation::Unknown => "Unknown",
+    }
+}
+
+pub(crate) const fn read_order_label(value: rgv_hts::ReadOrder) -> &'static str {
+    match value {
+        rgv_hts::ReadOrder::First => "First in template",
+        rgv_hts::ReadOrder::Last => "Last in template",
+        rgv_hts::ReadOrder::Unknown => "Unknown",
+        rgv_hts::ReadOrder::Ambiguous => "Ambiguous (both first and last)",
+    }
+}
+
+pub(crate) const fn mate_visibility_label(value: rgv_hts::MateVisibility) -> &'static str {
+    match value {
+        rgv_hts::MateVisibility::Missing => "Not loaded",
+        rgv_hts::MateVisibility::Unmapped => "Unmapped",
+        rgv_hts::MateVisibility::OtherContig => "On another contig",
+        rgv_hts::MateVisibility::Visible => "In view",
+        rgv_hts::MateVisibility::OutOfView => "Outside the view",
+    }
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn inspector_snapshot(&self) -> Option<InspectorSnapshot> {
@@ -212,16 +257,19 @@ impl Viewer {
             ("Expected template length".to_owned(), pair_bounds_label),
             (
                 "Pair state".to_owned(),
-                format!("{:?}", pair.classification),
+                pair_classification_label(pair.classification).to_owned(),
             ),
             (
                 "Pair orientation".to_owned(),
-                format!("{:?}", pair.orientation),
+                pair_orientation_label(pair.orientation).to_owned(),
             ),
-            ("Read order".to_owned(), format!("{:?}", pair.read_order)),
+            (
+                "Read order".to_owned(),
+                read_order_label(pair.read_order).to_owned(),
+            ),
             (
                 "Mate visibility".to_owned(),
-                format!("{:?}", pair.mate_visibility),
+                mate_visibility_label(pair.mate_visibility).to_owned(),
             ),
             ("Sequence".to_owned(), sequence),
             (
@@ -1032,6 +1080,36 @@ impl Viewer {
 #[cfg(test)]
 mod scene_inspection_tests {
     use super::*;
+
+    #[test]
+    fn pair_fields_use_reader_facing_wording_not_enum_names() {
+        use rgv_hts::{MateVisibility, PairClassification, PairOrientation, ReadOrder};
+        let labels = [
+            pair_classification_label(PairClassification::DiscordantTemplateLengthLong),
+            pair_classification_label(PairClassification::MateMissing),
+            pair_classification_label(PairClassification::InterContig),
+            pair_orientation_label(PairOrientation::SameStrand),
+            read_order_label(ReadOrder::First),
+            mate_visibility_label(MateVisibility::OutOfView),
+            mate_visibility_label(MateVisibility::OtherContig),
+        ];
+        for label in labels {
+            assert!(label.contains(' '), "{label} is still a bare identifier");
+            assert!(
+                !label.chars().skip(1).any(char::is_uppercase),
+                "{label} still looks like a CamelCase variant name"
+            );
+        }
+        assert_eq!(
+            pair_classification_label(PairClassification::Proper),
+            "Proper pair"
+        );
+        assert_eq!(
+            mate_visibility_label(MateVisibility::OutOfView),
+            "Outside the view"
+        );
+    }
+
 
     fn record() -> AlignmentRecord {
         AlignmentRecord {

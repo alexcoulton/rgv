@@ -37,28 +37,39 @@ impl Viewer {
     }
 
     pub(crate) fn handle_dropped_file(&mut self, path: &Path) {
-        let extension = path
-            .extension()
-            .map(|value| value.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        match extension.as_str() {
-            "bam" | "cram" => self.open_alignment_source(path),
-            "fa" | "fasta" | "fna" => self.open_reference_source(path),
-            "rgvgenome" => {
+        match classify_dropped_file(path) {
+            DroppedFileKind::Alignment => self.open_alignment_source(path),
+            DroppedFileKind::Reference => self.open_reference_source(path),
+            DroppedFileKind::GenomeConfiguration => {
                 if let Err(error) = self.open_genome_configuration(path) {
-                    self.data_status = error.to_string();
+                    self.report_error(error.to_string());
                 }
             }
-            "json" if GenomeConfiguration::read(path).is_ok() => {
-                if let Err(error) = self.open_genome_configuration(path) {
-                    self.data_status = error.to_string();
+            DroppedFileKind::Json => {
+                // One read and one parse decide what the document is; it is then opened once.
+                match std::fs::read_to_string(path).map(|text| classify_dropped_json(&text)) {
+                    Ok(DroppedJsonKind::IgvGenome) => {
+                        self.start_genome_load(path.to_string_lossy().into_owned());
+                    }
+                    Ok(DroppedJsonKind::GenomeConfiguration) => {
+                        if let Err(error) = self.open_genome_configuration(path) {
+                            self.report_error(error.to_string());
+                        }
+                    }
+                    Ok(DroppedJsonKind::Session) => {
+                        self.request_session_load(path.to_path_buf(), SessionLoadKind::Native);
+                    }
+                    Err(error) => {
+                        self.report_error(format!("Could not open {}: {error}", path.display()));
+                    }
                 }
             }
-            "json" => self.start_session_load(path.to_path_buf(), SessionLoadKind::Native),
-            "xml" => self.start_session_load(path.to_path_buf(), SessionLoadKind::IgvImport),
-            _ => {
+            DroppedFileKind::IgvSession => {
+                self.request_session_load(path.to_path_buf(), SessionLoadKind::IgvImport);
+            }
+            DroppedFileKind::Track => {
                 if let Err(error) = self.add_track_source(path) {
-                    self.data_status = error.to_string();
+                    self.report_error(error.to_string());
                 }
             }
         }
@@ -86,20 +97,7 @@ impl Viewer {
         name: String,
         format: Option<TrackFormat>,
     ) -> Result<TrackId> {
-        let id = TrackId::new(
-            self.tracks
-                .tracks()
-                .iter()
-                .map(|track| track.id.get())
-                .chain(
-                    self.alignment_tracks
-                        .iter()
-                        .map(|track| track.config.id.get()),
-                )
-                .max()
-                .unwrap_or_default()
-                .saturating_add(1),
-        );
+        let id = self.allocate_track_id();
         let mut config = TrackConfig::new(id, name, track_kind, track_source(path));
         config.format = format;
         self.add_preconfigured_track_source(path, kind, config)
@@ -180,18 +178,7 @@ impl Viewer {
         let path = source_path(&parent.source);
         let source_label = parent.source.redacted_label();
         let next_id = self
-            .tracks
-            .tracks()
-            .iter()
-            .map(|track| track.id.get())
-            .chain(
-                self.alignment_tracks
-                    .iter()
-                    .map(|track| track.config.id.get()),
-            )
-            .max()
-            .unwrap_or_default()
-            .checked_add(1)
+            .peek_track_id()
             .ok_or_else(|| anyhow::anyhow!("TDF channel track ID space is exhausted"))?;
         let expansion =
             build_tdf_channel_expansion(&parent, &path, track_names, selected_index, next_id)?;
@@ -207,6 +194,9 @@ impl Viewer {
         parent.format = Some(TrackFormat::TdfChannel {
             index: selected_index,
         });
+        if let Some(largest) = expansion.children.iter().map(|track| track.id.get()).max() {
+            self.reserve_track_ids_through(largest);
+        }
         self.tracks.insert_after(parent_id, expansion.children);
         if selected_index > 0 {
             self.tracks

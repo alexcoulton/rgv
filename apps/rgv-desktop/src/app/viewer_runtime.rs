@@ -49,6 +49,256 @@ fn alignment_track_configs_for_launch(
     configured_tracks
 }
 
+/// Health record for the process's GPU device. `Viewer` owns exactly one device at a time; the
+/// record is process-wide so the wgpu callbacks, which outlive any borrow of the viewer, can
+/// reach it. Each (re)created device is registered with [`rgv_render::GpuDeviceHealth::watch`].
+static GPU_DEVICE_HEALTH: std::sync::LazyLock<Arc<rgv_render::GpuDeviceHealth>> =
+    std::sync::LazyLock::new(|| Arc::new(rgv_render::GpuDeviceHealth::new()));
+
+/// Bookkeeping for device recovery and error reporting, so a persistently failing GPU neither
+/// spins the event loop nor floods the notification log.
+#[derive(Debug, Default)]
+struct GpuRecoveryState {
+    last_attempt: Option<Instant>,
+    loss_reported: bool,
+    uncaptured_errors_reported: u32,
+}
+
+static GPU_RECOVERY_STATE: std::sync::Mutex<GpuRecoveryState> =
+    std::sync::Mutex::new(GpuRecoveryState {
+        last_attempt: None,
+        loss_reported: false,
+        uncaptured_errors_reported: 0,
+    });
+
+/// Minimum spacing between attempts to recreate a lost GPU device.
+const GPU_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Uncaptured GPU errors shown to the user per device; all of them are always logged.
+const MAX_REPORTED_UNCAPTURED_GPU_ERRORS: u32 = 3;
+
+/// Whether enough time has passed since the previous recovery attempt to try again.
+fn gpu_recovery_attempt_is_due(last_attempt: Option<Instant>, now: Instant) -> bool {
+    last_attempt.is_none_or(|last| now.saturating_duration_since(last) >= GPU_RECOVERY_RETRY_INTERVAL)
+}
+
+/// One step of the adapter fallback chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdapterRequest {
+    power_preference: wgpu::PowerPreference,
+    force_fallback_adapter: bool,
+}
+
+/// The adapters to try, in order: the requested power preference (`WGPU_POWER_PREF`, otherwise
+/// high performance), then the other hardware class, then whatever the backend offers, and
+/// finally a software rasteriser. A discrete GPU is preferred but never required, so RGV still
+/// starts on integrated graphics, remote desktops and login nodes that only expose llvmpipe,
+/// lavapipe or WARP.
+fn adapter_request_plan(requested: Option<wgpu::PowerPreference>) -> Vec<AdapterRequest> {
+    let preferred = requested.unwrap_or(wgpu::PowerPreference::HighPerformance);
+    let alternative = match preferred {
+        wgpu::PowerPreference::HighPerformance => wgpu::PowerPreference::LowPower,
+        wgpu::PowerPreference::LowPower | wgpu::PowerPreference::None => {
+            wgpu::PowerPreference::HighPerformance
+        }
+    };
+    let mut plan = Vec::with_capacity(4);
+    for power_preference in [preferred, alternative, wgpu::PowerPreference::None] {
+        let request = AdapterRequest {
+            power_preference,
+            force_fallback_adapter: false,
+        };
+        if !plan.contains(&request) {
+            plan.push(request);
+        }
+    }
+    plan.push(AdapterRequest {
+        power_preference: wgpu::PowerPreference::None,
+        force_fallback_adapter: true,
+    });
+    plan
+}
+
+/// Limits requested from an adapter: WebGPU's downlevel defaults, which every renderer here fits
+/// inside (one dynamic uniform binding of well under 16 KiB, at most eight vertex attributes, no
+/// storage buffers or compute), with the adapter's own texture resolution so large windows and
+/// the egui font atlas are not artificially capped at 2048 pixels. `Limits::default()` asks for
+/// more than software and older integrated adapters provide and made device creation fail there.
+fn required_gpu_limits(adapter_limits: wgpu::Limits) -> wgpu::Limits {
+    wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits)
+}
+
+/// Surface-format policy.
+///
+/// RGV renders to a non-sRGB 8-bit target (`Bgra8Unorm` or `Rgba8Unorm`) whenever the surface
+/// offers one:
+///
+/// * every colour in the renderers' shaders and palettes is authored as a display-referred
+///   (sRGB-encoded) value and written to the target unchanged, exactly as the CPU PNG/SVG export
+///   writes the same numbers; an sRGB target would treat them as linear light and encode them
+///   again, so the window would be visibly lighter than the export of the same view;
+/// * alpha blending then happens on encoded values, which is what egui expects, and egui-wgpu
+///   itself prefers these formats (`egui_wgpu::preferred_framebuffer_format`), using its
+///   gamma-framebuffer fragment path for them.
+///
+/// `Surface::get_default_config` simply takes the backend's first format, which is sRGB on some
+/// backends and not on others, so the same build looked different per platform. If no non-sRGB
+/// 8-bit format exists the sRGB 8-bit ones are accepted (lighter colours, still correct
+/// captures), and only then whatever the surface lists first.
+fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    // Within each class the surface's own ordering, which is its preference, is kept.
+    let first_of = |class: [wgpu::TextureFormat; 2]| {
+        formats.iter().copied().find(|format| class.contains(format))
+    };
+    first_of([
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ])
+    .or_else(|| {
+        first_of([
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        ])
+    })
+    .or_else(|| formats.first().copied())
+}
+
+/// A surface with the device chosen for it. The surface is not configured yet.
+struct GpuContext {
+    surface: wgpu::Surface<'static>,
+    adapter_info: wgpu::AdapterInfo,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface_config: wgpu::SurfaceConfiguration,
+}
+
+/// Requests every adapter in the fallback chain that can present to `surface`, most preferred
+/// first, recording why each unavailable one was skipped. `WGPU_ADAPTER_NAME`, when set, names
+/// the first candidate.
+async fn gpu_adapter_candidates(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface<'static>,
+    failures: &mut Vec<String>,
+) -> Vec<wgpu::Adapter> {
+    let mut candidates = Vec::new();
+    if std::env::var_os("WGPU_ADAPTER_NAME").is_some() {
+        match wgpu::util::initialize_adapter_from_env(instance, Some(surface)).await {
+            Ok(adapter) => candidates.push(adapter),
+            Err(error) => failures.push(format!("WGPU_ADAPTER_NAME: {error}")),
+        }
+    }
+    for request in adapter_request_plan(wgpu::PowerPreference::from_env()) {
+        match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: request.power_preference,
+                force_fallback_adapter: request.force_fallback_adapter,
+                compatible_surface: Some(surface),
+            })
+            .await
+        {
+            Ok(adapter) => candidates.push(adapter),
+            Err(error) => failures.push(format!(
+                "{:?}{}: {error}",
+                request.power_preference,
+                if request.force_fallback_adapter {
+                    " (software fallback)"
+                } else {
+                    ""
+                }
+            )),
+        }
+    }
+    candidates
+}
+
+/// Creates the surface for `window` and the first adapter and device in the fallback chain that
+/// can present to it. Honours `WGPU_BACKEND` (and wgpu's other instance variables),
+/// `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF`. The returned device is already watched by
+/// [`GPU_DEVICE_HEALTH`].
+async fn create_gpu_context(window: &Arc<Window>, size: PhysicalSize<u32>) -> Result<GpuContext> {
+    let instance =
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let surface = instance
+        .create_surface(Arc::clone(window))
+        .context("failed to create GPU surface")?;
+
+    let mut failures = Vec::new();
+    let candidates = gpu_adapter_candidates(&instance, &surface, &mut failures).await;
+
+    let mut tried = Vec::<wgpu::AdapterInfo>::new();
+    for adapter in candidates {
+        let info = adapter.get_info();
+        // Different requests frequently resolve to the same adapter.
+        if tried.iter().any(|previous| {
+            previous.backend == info.backend
+                && previous.vendor == info.vendor
+                && previous.device == info.device
+                && previous.name == info.name
+        }) {
+            continue;
+        }
+        let description = format!("{} ({:?})", info.name, info.backend);
+        let capabilities = surface.get_capabilities(&adapter);
+        let Some(format) = choose_surface_format(&capabilities.formats) else {
+            failures.push(format!("{description}: cannot present to this window"));
+            tried.push(info);
+            continue;
+        };
+        let Some(mut surface_config) =
+            surface.get_default_config(&adapter, size.width.max(1), size.height.max(1))
+        else {
+            failures.push(format!("{description}: no supported surface configuration"));
+            tried.push(info);
+            continue;
+        };
+        surface_config.format = format;
+        surface_config.present_mode = wgpu::PresentMode::AutoVsync;
+        surface_config.desired_maximum_frame_latency = 2;
+        match adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("RGV GPU device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: required_gpu_limits(adapter.limits()),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                memory_hints: wgpu::MemoryHints::Performance,
+                trace: wgpu::Trace::Off,
+            })
+            .await
+        {
+            Ok((device, queue)) => {
+                tracing::info!(
+                    name = info.name,
+                    backend = ?info.backend,
+                    device_type = ?info.device_type,
+                    surface_format = ?format,
+                    "selected GPU adapter"
+                );
+                GPU_DEVICE_HEALTH.watch(&device);
+                return Ok(GpuContext {
+                    surface,
+                    adapter_info: info,
+                    device,
+                    queue,
+                    surface_config,
+                });
+            }
+            Err(error) => {
+                failures.push(format!("{description}: {error}"));
+                tried.push(info);
+            }
+        }
+    }
+    anyhow::bail!(
+        "no usable GPU adapter was found for this display. RGV needs Vulkan, Metal, Direct3D 12 \
+         or OpenGL; a software rasteriser such as Mesa lavapipe/llvmpipe is sufficient. Set \
+         WGPU_BACKEND (vulkan, metal, dx12 or gl) to force a backend. Tried: {}",
+        if failures.is_empty() {
+            "no adapters were offered".to_owned()
+        } else {
+            failures.join("; ")
+        }
+    )
+}
+
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn new(
@@ -58,40 +308,13 @@ impl Viewer {
     ) -> Result<Self> {
         let application_instance_id = uuid::Uuid::new_v4().to_string();
         let size = window.inner_size();
-        let instance = wgpu::Instance::default();
-        let surface = instance
-            .create_surface(Arc::clone(&window))
-            .context("failed to create GPU surface")?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-            })
-            .await
-            .context("no compatible GPU adapter was found")?;
-        let adapter_info = adapter.get_info();
-        tracing::info!(
-            name = adapter_info.name,
-            backend = ?adapter_info.backend,
-            "selected GPU adapter"
-        );
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("RGV GPU device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .context("failed to create GPU device")?;
-        let mut surface_config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .context("GPU surface has no supported configuration")?;
-        surface_config.present_mode = wgpu::PresentMode::AutoVsync;
-        surface_config.desired_maximum_frame_latency = 2;
+        let GpuContext {
+            surface,
+            adapter_info,
+            device,
+            queue,
+            surface_config,
+        } = create_gpu_context(&window, size).await?;
         surface.configure(&device, &surface_config);
 
         let rectangle_renderer = RectangleRenderer::new(&device, surface_config.format);
@@ -653,6 +876,8 @@ impl Viewer {
             session_save_tasks: Vec::new(),
             session_load_tasks: Vec::new(),
             workspace_list_import_tasks: Vec::new(),
+            genome_tasks: Vec::new(),
+            hosted_genomes: crate::workspace::genomes::HostedGenomes::default(),
             promoted_read: None,
             synthetic,
             workspace_alignment_limit,
@@ -762,6 +987,126 @@ impl Viewer {
         }
     }
 
+    /// Checks the GPU device before a frame is submitted and returns whether the frame may be
+    /// rendered. Uncaptured wgpu errors are logged and surfaced instead of aborting the process.
+    /// If the device was lost, a replacement device, surface and set of renderers is created (at
+    /// most once per [`GPU_RECOVERY_RETRY_INTERVAL`]); the frame in hand is dropped either way,
+    /// because it was laid out against the lost device, and a fresh one is requested after a
+    /// successful recovery. While recovery keeps failing the window simply stops updating and
+    /// the failure is shown once in the status line and notification log.
+    pub(crate) fn ensure_gpu_device(&mut self) -> bool {
+        let health = &*GPU_DEVICE_HEALTH;
+        if let Some(error) = health.take_last_error() {
+            tracing::error!(%error, "uncaptured GPU error");
+            let report = {
+                let mut state = GPU_RECOVERY_STATE
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let report = state.uncaptured_errors_reported < MAX_REPORTED_UNCAPTURED_GPU_ERRORS;
+                state.uncaptured_errors_reported =
+                    state.uncaptured_errors_reported.saturating_add(1);
+                report
+            };
+            if report && !health.is_lost() {
+                self.report_error(format!("GPU error: {error}"));
+            }
+        }
+        if !health.is_lost() {
+            return true;
+        }
+        let now = Instant::now();
+        let (due, first_report) = {
+            let mut state = GPU_RECOVERY_STATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = gpu_recovery_attempt_is_due(state.last_attempt, now);
+            if due {
+                state.last_attempt = Some(now);
+            }
+            let first_report = !state.loss_reported;
+            state.loss_reported = true;
+            (due, first_report)
+        };
+        let cause = health
+            .loss()
+            .map_or_else(|| "unknown cause".to_owned(), |loss| loss.message);
+        if first_report {
+            tracing::error!(%cause, "GPU device lost");
+        }
+        if !due {
+            return false;
+        }
+        match self.recover_gpu_device() {
+            Ok(()) => {
+                {
+                    let mut state = GPU_RECOVERY_STATE
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *state = GpuRecoveryState::default();
+                }
+                tracing::warn!(%cause, "GPU device was lost and has been recreated");
+                self.report_error(format!(
+                    "The GPU device was lost ({cause}) and has been recreated."
+                ));
+                self.mark_display_dirty("explicit display invalidation");
+                self.window.request_redraw();
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not recreate the lost GPU device");
+                if first_report {
+                    self.report_error(format!(
+                        "The GPU device was lost ({cause}) and could not be recreated: {error:#}.                          Rendering is paused; RGV retries when the window is next redrawn."
+                    ));
+                }
+            }
+        }
+        false
+    }
+
+    /// Replaces the lost device with a new one and rebuilds everything derived from it. Semantic
+    /// scenes, sessions and selections are untouched; GPU pages are admitted again on demand.
+    fn recover_gpu_device(&mut self) -> Result<()> {
+        let GpuContext {
+            surface,
+            adapter_info: _,
+            device,
+            queue,
+            mut surface_config,
+        } = pollster::block_on(create_gpu_context(&self.window, self.window.inner_size()))?;
+        let format = surface_config.format;
+        if self.surface_config.width > 0 && self.surface_config.height > 0 {
+            surface_config.width = self.surface_config.width;
+            surface_config.height = self.surface_config.height;
+        }
+
+        // Nothing captured against the lost device may be replayed.
+        self.alignment_presented_epoch = None;
+        self.alignment_gpu_residency_bundle = None;
+        self.alignment_gpu_prefetch.clear();
+        self.alignment_gpu_publication_retry = None;
+        self.alignment_capacity_reclaim = None;
+        self.alignment_gpu_speculation_gate.reset();
+        self.alignment_gpu_renderer.rebuild_for_device(&device, format);
+        self.alignment_summary_gpu_renderer
+            .rebuild_for_device(&device, format);
+        self.context_scene_gpu_renderer = ContextSceneGpuRenderer::new(&device, format);
+        self.context_scene_gpu_frame = ContextSceneGpuFrame::default();
+        self.rectangle_renderer = RectangleRenderer::new(&device, format);
+        self.egui_renderer = egui_wgpu::Renderer::new(&device, format, RendererOptions::default());
+        // The new egui renderer has none of the textures egui believes it already delivered.
+        // Rebuilding the font atlas makes the next frame resend it in full.
+        self.egui_context.set_fonts(egui::FontDefinitions::default());
+
+        // Drop the old surface (and its swapchain) before configuring the replacement: a window
+        // can back only one live swapchain on some backends.
+        self.surface = surface;
+        self.device = device;
+        self.queue = queue;
+        self.surface_config = surface_config;
+        self.reconfigure_surface();
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_composed_frame_target(
         &self,
@@ -772,6 +1117,10 @@ impl Viewer {
         scale_factor: f32,
     ) -> Vec<AlignmentRendererFailure> {
         let mut failures = Vec::new();
+        // Both the surface and the capture texture are created at the configured surface size.
+        // Captured scissors are intersected with it at replay time (REND-12): a frame captured
+        // before a resize must not carry a scissor outside the attachment into the pass.
+        let target_size = [self.surface_config.width, self.surface_config.height];
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("RGV genomic canvas"),
@@ -796,11 +1145,17 @@ impl Viewer {
                 self.surface_config.width,
                 self.surface_config.height,
             );
-            if scissor.width > 0 && scissor.height > 0 {
-                pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
+            if let Some([x, y, width, height]) = rgv_render::clamp_scissor_to_target(
+                [scissor.x, scissor.y, scissor.width, scissor.height],
+                target_size,
+            ) {
+                pass.set_scissor_rect(x, y, width, height);
                 self.rectangle_renderer.render(&mut pass);
-                self.context_scene_gpu_renderer
-                    .render(&mut pass, &self.context_scene_gpu_frame);
+                self.context_scene_gpu_renderer.render_within(
+                    &mut pass,
+                    &self.context_scene_gpu_frame,
+                    target_size,
+                );
             }
             if let Some(bundle) = self
                 .alignment_presented_epoch
@@ -812,7 +1167,9 @@ impl Viewer {
                 )
             {
                 if let Some(frame) = &bundle.summaries
-                    && let Err(error) = self.alignment_summary_gpu_renderer.render(&mut pass, frame)
+                    && let Err(error) = self
+                        .alignment_summary_gpu_renderer
+                        .render_within(&mut pass, frame, target_size)
                 {
                     tracing::error!(
                         %error,
@@ -824,7 +1181,9 @@ impl Viewer {
                     });
                 }
                 if let Some(frame) = &bundle.reads
-                    && let Err(error) = self.alignment_gpu_renderer.render(&mut pass, frame)
+                    && let Err(error) = self
+                        .alignment_gpu_renderer
+                        .render_within(&mut pass, frame, target_size)
                 {
                     tracing::error!(%error, "could not render unified alignment scene frame");
                     failures.push(AlignmentRendererFailure {
@@ -865,6 +1224,11 @@ impl Viewer {
         let tessellation_started = Instant::now();
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
+        if !self.ensure_gpu_device() {
+            // The device was lost (and possibly just recreated): this frame's tessellation and
+            // prepared buffers belong to the old device, so it is dropped, not presented.
+            return;
+        }
         let paint_jobs = self
             .egui_context
             .tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -1360,7 +1724,120 @@ mod launch_tests {
 
 #[cfg(test)]
 mod capture_tests {
-    use super::{decoded_capture_pixels, frame_target_plan};
+    use std::time::Instant;
+
+    use super::{
+        GPU_RECOVERY_RETRY_INTERVAL, adapter_request_plan, choose_surface_format,
+        decoded_capture_pixels, frame_target_plan, gpu_recovery_attempt_is_due,
+        required_gpu_limits,
+    };
+
+    #[test]
+    fn adapter_fallback_chain_ends_with_the_software_rasteriser() {
+        use wgpu::PowerPreference::{HighPerformance, LowPower, None as Unspecified};
+        let plan = |requested| {
+            adapter_request_plan(requested)
+                .into_iter()
+                .map(|request| (request.power_preference, request.force_fallback_adapter))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            plan(None),
+            vec![
+                (HighPerformance, false),
+                (LowPower, false),
+                (Unspecified, false),
+                (Unspecified, true),
+            ]
+        );
+        assert_eq!(plan(Some(HighPerformance)), plan(None));
+        assert_eq!(
+            plan(Some(LowPower)),
+            vec![
+                (LowPower, false),
+                (HighPerformance, false),
+                (Unspecified, false),
+                (Unspecified, true),
+            ]
+        );
+        assert_eq!(
+            plan(Some(Unspecified)),
+            vec![
+                (Unspecified, false),
+                (HighPerformance, false),
+                (Unspecified, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn required_limits_are_downlevel_with_the_adapters_texture_resolution() {
+        let adapter = wgpu::Limits {
+            max_texture_dimension_2d: 16_384,
+            ..wgpu::Limits::downlevel_defaults()
+        };
+        let required = required_gpu_limits(adapter);
+        assert_eq!(required.max_texture_dimension_2d, 16_384);
+        let downlevel = wgpu::Limits::downlevel_defaults();
+        assert_eq!(
+            required.max_uniform_buffer_binding_size,
+            downlevel.max_uniform_buffer_binding_size
+        );
+        assert_eq!(
+            required.max_storage_buffers_per_shader_stage,
+            downlevel.max_storage_buffers_per_shader_stage
+        );
+        // A software adapter that only offers the downlevel limits satisfies the request.
+        assert!(required_gpu_limits(downlevel.clone()).check_limits(&downlevel));
+    }
+
+    #[test]
+    fn surface_format_policy_prefers_non_srgb_eight_bit_targets() {
+        use wgpu::TextureFormat::{
+            Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm, Rgba8UnormSrgb, Rgba16Float,
+        };
+        // Metal and Vulkan commonly list the sRGB format first.
+        assert_eq!(
+            choose_surface_format(&[Bgra8UnormSrgb, Bgra8Unorm, Rgba16Float]),
+            Some(Bgra8Unorm)
+        );
+        assert_eq!(
+            choose_surface_format(&[Rgba8UnormSrgb, Rgba8Unorm]),
+            Some(Rgba8Unorm)
+        );
+        assert_eq!(
+            choose_surface_format(&[Rgba16Float, Rgba8UnormSrgb, Bgra8UnormSrgb]),
+            Some(Rgba8UnormSrgb)
+        );
+        assert_eq!(choose_surface_format(&[Rgba16Float]), Some(Rgba16Float));
+        assert_eq!(choose_surface_format(&[]), None);
+        // The policy agrees with egui-wgpu whenever a non-sRGB 8-bit format is offered.
+        for formats in [
+            vec![Bgra8UnormSrgb, Bgra8Unorm],
+            vec![Rgba8Unorm, Bgra8Unorm],
+            vec![Rgba16Float, Rgba8Unorm],
+        ] {
+            assert_eq!(
+                choose_surface_format(&formats),
+                egui_wgpu::preferred_framebuffer_format(&formats).ok()
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_recovery_attempts_are_rate_limited() {
+        let now = Instant::now();
+        assert!(gpu_recovery_attempt_is_due(None, now));
+        assert!(!gpu_recovery_attempt_is_due(Some(now), now));
+        assert!(!gpu_recovery_attempt_is_due(
+            Some(now),
+            now + GPU_RECOVERY_RETRY_INTERVAL / 2
+        ));
+        assert!(gpu_recovery_attempt_is_due(
+            Some(now),
+            now + GPU_RECOVERY_RETRY_INTERVAL
+        ));
+    }
 
     #[test]
     fn native_capture_adds_a_target_without_replacing_the_presented_surface() {

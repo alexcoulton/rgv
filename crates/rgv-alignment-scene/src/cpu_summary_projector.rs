@@ -942,6 +942,12 @@ fn project_junctions(
         if width <= 0.0 {
             continue;
         }
+        // Arcs are parameterised over the junction's full, unclamped span (mirror of
+        // `junction_vertex` in `alignment_summary.wgsl`), so their bounds may extend beyond the
+        // camera clip and consumers must clip them to the lane. Clamping the span instead would
+        // squeeze the parabola into the visible part and make an off-screen end appear to land
+        // on the viewport edge. Markers and labels stay anchored to the visible span.
+        let (arc_x, arc_width) = horizontal_unclamped(camera, junction.start, junction.end);
         let baseline = camera.clip.y + (f64::from(row) + 0.5) * band_height;
         for (depth, strand, up) in [
             (
@@ -970,9 +976,9 @@ fn project_junctions(
             let height = (band_height * 0.45 * (0.18 + 0.82 * fraction)).max(3.0);
             push(
                 frame,
-                x,
+                arc_x,
                 if up { baseline - height } else { baseline },
-                width,
+                arc_width,
                 height,
                 if up {
                     CpuSummaryPrimitiveShape::JunctionArcUp
@@ -1432,6 +1438,12 @@ fn cpu_summary_retained_bytes(primitives: usize) -> usize {
 fn horizontal(camera: CpuSummaryCamera, start: u64, end: u64) -> (f64, f64) {
     let start = start.max(camera.interval().start());
     let end = end.min(camera.interval().end());
+    let x = camera.x(start);
+    (x, (camera.x(end) - x).max(1.0))
+}
+
+/// Projects a genomic span without clamping it to the camera interval.
+fn horizontal_unclamped(camera: CpuSummaryCamera, start: u64, end: u64) -> (f64, f64) {
     let x = camera.x(start);
     (x, (camera.x(end) - x).max(1.0))
 }
@@ -2061,6 +2073,45 @@ mod tests {
             },
         ));
         assert!(weighted.is_empty());
+    }
+
+    #[test]
+    fn cpu_summary_unclamped_span_keeps_off_screen_junction_ends_off_screen() {
+        // 100 bases across 256 points.
+        let interval = GenomicInterval::new(ContigId::new(0), 1_000, 1_100).unwrap();
+        let camera = CpuSummaryCamera::new(interval, camera_clip()).unwrap();
+        let clip = camera.clip();
+        let points_per_base = clip.width / 100.0;
+
+        // Wholly visible: identical to the clamped projection.
+        assert_eq!(
+            horizontal_unclamped(camera, 1_010, 1_050),
+            horizontal(camera, 1_010, 1_050)
+        );
+
+        // Starts 50 bases left of the pane and ends 50 bases inside it. The clamped span used
+        // for bars collapses onto the pane; the arc span keeps its true start and width, so the
+        // pane edge sits at the middle of the arc.
+        let (clamped_x, clamped_width) = horizontal(camera, 950, 1_050);
+        assert!((clamped_x - clip.x).abs() < 1.0e-9);
+        assert!((clamped_width - 50.0 * points_per_base).abs() < 1.0e-9);
+        let (x, width) = horizontal_unclamped(camera, 950, 1_050);
+        assert!((x - (clip.x - 50.0 * points_per_base)).abs() < 1.0e-9);
+        assert!((width - 100.0 * points_per_base).abs() < 1.0e-9);
+        assert!(((clip.x - x) / width - 0.5).abs() < 1.0e-9);
+
+        // Both ends off-screen: the arc spans the whole pane and beyond on both sides.
+        let (x, width) = horizontal_unclamped(camera, 900, 1_300);
+        assert!(x < clip.x && x + width > clip.x + clip.width);
+        assert!((width - 400.0 * points_per_base).abs() < 1.0e-9);
+
+        // Sub-point junctions keep the one-point minimum.
+        let wide = CpuSummaryCamera::new(
+            GenomicInterval::new(ContigId::new(0), 0, 1_000_000).unwrap(),
+            camera_clip(),
+        )
+        .unwrap();
+        assert!((horizontal_unclamped(wide, 500, 510).1 - 1.0).abs() < 1.0e-9);
     }
 
     fn junction_label(

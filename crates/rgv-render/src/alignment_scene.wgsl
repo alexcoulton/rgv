@@ -112,18 +112,23 @@ fn project_instance(
     let row_top = camera.clip_origin.y
         + (row - camera.row_scroll) * camera.row_height
         + (camera.row_height - camera.read_height) * 0.5;
+    // Minimum-size policy (mirrored by `project_alignment_gpu_instance` and the CPU projector's
+    // `project_primitive`): every shape keeps at least one point, which is at least one physical
+    // pixel at any scale factor, in both axes. Without it sub-pixel mismatches shimmer as the
+    // camera pans and whole rows vanish once rows are shorter than a pixel.
     var top = row_top;
-    var height = camera.read_height;
+    var height = max(camera.read_height, 1.0);
 
     if shape == 1u {
         top = row_top + camera.read_height * 0.45;
         height = max(camera.read_height * 0.10, 1.0);
-    } else if shape == 2u {
+    }
+    if shape == 2u {
         let original_width = right - left;
         let marker_width = max(original_width, 1.5);
         left -= (marker_width - original_width) * 0.5;
         right = left + marker_width;
-    } else if shape == 3u || shape == 4u {
+    } else {
         right = max(right, left + 1.0);
     }
 

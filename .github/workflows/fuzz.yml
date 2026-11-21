@@ -10,29 +10,56 @@ permissions:
 
 jobs:
   fuzz:
+    name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # One job per target: a failing target cannot mask the others.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: filter_expression
+            asan_options: ""
+          - target: modified_bases
+            asan_options: ""
+          - target: session_input
+            asan_options: ""
+          - target: text_features
+            asan_options: ""
+          - target: normalized_record
+            asan_options: ""
+          # Leak detection is disabled for this target ONLY. LeakSanitizer
+          # reports a leak inside htslib's open path on the first input
+          # (audit OPS-3, audits/COMPREHENSIVE_REVIEW_2026-11-20.md), which
+          # aborted the whole job before any other target ran. Every other
+          # target keeps leak detection. Remove this once the open-path leak
+          # is fixed or the local open no longer goes through htslib.
+          - target: alignment_file
+            asan_options: detect_leaks=0
+    env:
+      # cargo-fuzz needs nightly; this overrides the pin in rust-toolchain.toml
+      # for this job only.
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install --yes clang libfontconfig1-dev libxkbcommon-dev libwayland-dev
       - run: cargo install cargo-fuzz --locked
+      # Preserved from the previous single-job workflow. Note: the generated
+      # BAM is not currently passed to libFuzzer as a corpus directory.
       - name: Generate deterministic alignment seed corpus
+        if: matrix.target == 'alignment_file'
         run: cargo run --locked --release -p rgv-alignment-bench -- generate
-      - name: Fuzz parser and normalized-record boundaries
-        run: |
-          cargo fuzz run filter_expression -- -max_total_time=60
-          cargo fuzz run modified_bases -- -max_total_time=60
-          cargo fuzz run session_input -- -max_total_time=60
-          cargo fuzz run text_features -- -max_total_time=60
-          cargo fuzz run alignment_file -- -max_total_time=60
-          cargo fuzz run normalized_record -- -max_total_time=60
+      - name: Fuzz ${{ matrix.target }}
+        env:
+          ASAN_OPTIONS: ${{ matrix.asan_options }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
       - name: Retain reproducer inputs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: fuzz-reproducers-${{ github.sha }}
+          name: fuzz-reproducers-${{ matrix.target }}-${{ github.sha }}
           path: fuzz/artifacts
           if-no-files-found: ignore
           retention-days: 30

@@ -10,6 +10,7 @@ use rust_htslib::faidx;
 use crate::{
     AlignmentError, HttpRangeConfig, HttpRangeReader, RemoteCancellation, RemoteIoStats,
     RemoteTransferBudget, associated_remote_url, read_remote_object_bounded,
+    two_bit::TwoBitReference,
 };
 
 const MAX_REMOTE_FASTA_INDEX_BYTES: usize = 16 * 1024 * 1024;
@@ -20,6 +21,10 @@ const MAX_REMOTE_FASTA_INDEX_LINE_BYTES: usize = 1024 * 1024;
 pub struct FastaOpenOptions {
     pub remote_index_url: Option<String>,
     pub remote_range: HttpRangeConfig,
+    /// Optional UCSC `chrom.sizes` table (local path or URL) for a `.2bit` reference. It supplies
+    /// every sequence length in one read; without it each length is read from its own record,
+    /// which is slow for a remote file with many sequences.
+    pub chrom_sizes: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,6 +51,7 @@ pub struct FastaReference {
 enum FastaReader {
     Local(faidx::Reader),
     Remote(Box<RemoteFastaReference>),
+    TwoBit(Box<TwoBitReference>),
 }
 
 #[derive(Clone, Debug)]
@@ -74,7 +80,11 @@ impl FastaReference {
     ) -> Result<Self, AlignmentError> {
         let path = path.as_ref();
         let raw = path.to_string_lossy();
-        if raw.starts_with("http://") || raw.starts_with("https://") {
+        let is_remote = raw.starts_with("http://") || raw.starts_with("https://");
+        if location_has_extension(&raw, is_remote, "2bit") {
+            return Self::open_two_bit(&raw, is_remote, options);
+        }
+        if is_remote {
             let remote = RemoteFastaReference::open(&raw, options)?;
             let dictionary = ReferenceDictionary::from_contigs(
                 remote
@@ -103,6 +113,61 @@ impl FastaReference {
                 dictionary,
             })
         }
+    }
+
+    fn open_two_bit(
+        location: &str,
+        is_remote: bool,
+        options: &FastaOpenOptions,
+    ) -> Result<Self, AlignmentError> {
+        let reader: Box<dyn crate::two_bit::ReadSeek> = if is_remote {
+            Box::new(HttpRangeReader::open(
+                location,
+                options.remote_range.clone(),
+            )?)
+        } else {
+            Box::new(std::io::BufReader::new(std::fs::File::open(location)?))
+        };
+        let two_bit = TwoBitReference::open(reader)?;
+        // The reference's companion slot (the FASTA index for a FASTA) carries the sizes table
+        // for a 2bit, so sessions and launch options need no separate setting.
+        let known_sizes = options
+            .chrom_sizes
+            .as_deref()
+            .or(options.remote_index_url.as_deref())
+            .and_then(|sizes| {
+                // An unreadable or stale table only costs speed: lengths are then read from the
+                // sequence records themselves.
+                let bytes = if sizes.starts_with("http://") || sizes.starts_with("https://") {
+                    read_remote_object_bounded(
+                        sizes,
+                        options.remote_range.clone(),
+                        MAX_REMOTE_FASTA_INDEX_BYTES,
+                    )
+                    .ok()?
+                    .0
+                } else {
+                    std::fs::read(sizes).ok()?
+                };
+                crate::two_bit::parse_chrom_sizes(&bytes).ok()
+            })
+            .map(|sizes| {
+                sizes
+                    .into_iter()
+                    .collect::<std::collections::HashMap<_, _>>()
+            });
+        let mut contigs = Vec::new();
+        for name in two_bit.sequence_names() {
+            let length = match known_sizes.as_ref().and_then(|sizes| sizes.get(name)) {
+                Some(length) => *length,
+                None => two_bit.sequence_length(name)?,
+            };
+            contigs.push((name.to_owned(), length));
+        }
+        Ok(Self {
+            dictionary: ReferenceDictionary::from_contigs(contigs),
+            reader: FastaReader::TwoBit(Box::new(two_bit)),
+        })
     }
 
     pub fn reference_dictionary(&self) -> &ReferenceDictionary {
@@ -145,7 +210,7 @@ impl FastaReference {
 
     pub fn remote_io_stats(&self) -> Option<RemoteIoStats> {
         match &self.reader {
-            FastaReader::Local(_) => None,
+            FastaReader::Local(_) | FastaReader::TwoBit(_) => None,
             FastaReader::Remote(remote) => Some(remote.remote_io_stats()),
         }
     }
@@ -181,8 +246,21 @@ impl FastaReference {
                 Ok(reader.fetch_seq(contig_name, start, inclusive_end)?)
             }
             FastaReader::Remote(remote) => remote.fetch(contig_name, start, end),
+            FastaReader::TwoBit(two_bit) => two_bit.fetch(contig_name, start, end),
         }
     }
+}
+
+/// Whether a local path or URL (ignoring its query string and fragment) ends in `extension`.
+fn location_has_extension(location: &str, is_remote: bool, extension: &str) -> bool {
+    let path = if is_remote {
+        location.split(['?', '#']).next().unwrap_or(location)
+    } else {
+        location
+    };
+    Path::new(path)
+        .extension()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(extension))
 }
 
 impl RemoteFastaReference {
@@ -275,6 +353,9 @@ fn parse_fasta_index(bytes: &[u8]) -> Result<Vec<FastaIndexEntry>, AlignmentErro
     let text = std::str::from_utf8(bytes)
         .map_err(|_| AlignmentError::InvalidFastaIndex("index is not UTF-8".to_owned()))?;
     let mut entries = Vec::new();
+    // Hashed membership: scanning `entries` for every line is quadratic on assemblies with
+    // hundreds of thousands of scaffolds.
+    let mut names = std::collections::HashSet::new();
     for (line_index, line) in text.lines().enumerate() {
         if line.is_empty() {
             continue;
@@ -318,10 +399,7 @@ fn parse_fasta_index(bytes: &[u8]) -> Result<Vec<FastaIndexEntry>, AlignmentErro
                 line_index + 1
             )));
         }
-        if entries
-            .iter()
-            .any(|entry: &FastaIndexEntry| entry.name == name)
-        {
+        if !names.insert(name) {
             return Err(AlignmentError::InvalidFastaIndex(format!(
                 "duplicate contig {name}"
             )));
@@ -359,6 +437,56 @@ mod tests {
     use tiny_http::{Header, Response, Server, StatusCode};
 
     use super::*;
+
+    #[test]
+    fn two_bit_references_open_behind_the_fasta_interface() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("genome.2bit");
+        let sequences = [
+            ("chr1", "ACGTNNNNACGTACGTTTGACCA"),
+            ("chrM", "GATTACAGATTACA"),
+        ];
+        fs::write(
+            &path,
+            crate::two_bit::tests::encode_two_bit(&sequences, false),
+        )
+        .unwrap();
+
+        let reference = FastaReference::open(&path).unwrap();
+        let dictionary = reference.reference_dictionary();
+        assert_eq!(dictionary.len(), 2);
+        assert_eq!(dictionary.get(ContigId::new(0)).unwrap().name(), "chr1");
+        assert_eq!(dictionary.get(ContigId::new(0)).unwrap().length(), 23);
+        assert_eq!(dictionary.get(ContigId::new(1)).unwrap().length(), 14);
+        let interval = GenomicInterval::new(ContigId::new(0), 2, 10).unwrap();
+        assert_eq!(reference.fetch(interval).unwrap(), b"GTNNNNAC");
+        let slice = reference
+            .fetch_slice_by_name(
+                "chrM",
+                GenomicInterval::new(ContigId::new(1), 0, 7).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(slice.bases, b"GATTACA");
+        assert!(reference.remote_io_stats().is_none());
+
+        // A chromosome-sizes table supplies lengths without touching each sequence record.
+        let sizes = directory.path().join("genome.chrom.sizes");
+        fs::write(&sizes, "chr1\t23\nchrM\t14\n").unwrap();
+        let with_sizes = FastaReference::open_with_options(
+            &path,
+            &FastaOpenOptions {
+                chrom_sizes: Some(sizes.to_string_lossy().into_owned()),
+                ..FastaOpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            with_sizes.reference_dictionary(),
+            reference.reference_dictionary()
+        );
+        assert_eq!(with_sizes.fetch(interval).unwrap(), b"GTNNNNAC");
+    }
 
     #[test]
     fn named_fetch_preserves_the_alignment_contig_id() {
@@ -459,6 +587,26 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn fasta_index_duplicate_check_scales_to_scaffold_level_assemblies() {
+        use std::fmt::Write as _;
+
+        // 200,000 scaffolds: a pairwise name comparison would need 2 * 10^10 string compares.
+        let mut index = String::new();
+        for scaffold in 0..200_000_u64 {
+            writeln!(index, "scaffold_{scaffold}\t8\t{}\t8\t9", scaffold * 9 + 12).unwrap();
+        }
+        let entries = parse_fasta_index(index.as_bytes()).unwrap();
+        assert_eq!(entries.len(), 200_000);
+        assert_eq!(entries[199_999].name, "scaffold_199999");
+        // A repeat of the very first name is still found at the very end.
+        index.push_str("scaffold_0\t8\t5\t8\t9\n");
+        assert!(matches!(
+            parse_fasta_index(index.as_bytes()),
+            Err(AlignmentError::InvalidFastaIndex(message)) if message == "duplicate contig scaffold_0"
+        ));
     }
 
     #[test]

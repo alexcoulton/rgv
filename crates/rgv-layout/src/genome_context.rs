@@ -37,21 +37,28 @@ pub fn layout_coordinate_ruler(
     let major_step = nice_integer_step(requested_step);
     let minor_step = (major_step / options.minor_divisions.max(1)).max(1);
     let interval = viewport.interval();
-    let first = interval.start().div_ceil(minor_step) * minor_step;
+    // Ticks mark the bases whose displayed (one-based) coordinate is a round
+    // number, so the ruler reads 87,000 / 87,500 rather than 87,001 / 87,501.
+    // `position` stays zero-based: it is the base the label names.
     let mut ticks = Vec::new();
-    let mut position = first;
-    while position < interval.end() && ticks.len() < 10_000 {
-        let major = position.is_multiple_of(major_step);
+    let mut displayed = interval
+        .start()
+        .saturating_add(1)
+        .div_ceil(minor_step)
+        .saturating_mul(minor_step);
+    while displayed <= interval.end() && ticks.len() < 10_000 {
+        let position = displayed - 1;
+        let major = displayed.is_multiple_of(major_step);
         ticks.push(RulerTick {
             position,
             x: viewport.pixel_at_genomic(position) as f32,
             major,
-            label: major.then(|| format_genomic_position(position.saturating_add(1))),
+            label: major.then(|| format_genomic_position(displayed)),
         });
-        let Some(next) = position.checked_add(minor_step) else {
+        let Some(next) = displayed.checked_add(minor_step) else {
             break;
         };
-        position = next;
+        displayed = next;
     }
     CoordinateRulerLayout {
         ticks,
@@ -295,6 +302,58 @@ mod tests {
         assert!(major.len() >= 3);
         assert!(major.windows(2).all(|pair| pair[1].x - pair[0].x >= 100.0));
         assert_eq!(layout.span_label, "4,922 bp");
+    }
+
+    #[test]
+    fn ruler_labels_round_one_based_coordinates_at_the_base_they_name() {
+        let interval = GenomicInterval::new(ContigId::new(0), 86_838, 91_760).unwrap();
+        let viewport = Viewport::new(interval, 1_800.0).unwrap();
+        let layout = layout_coordinate_ruler(viewport, CoordinateRulerOptions::default());
+        let labels = layout
+            .ticks
+            .iter()
+            .filter_map(|tick| tick.label.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                "87,000", "87,500", "88,000", "88,500", "89,000", "89,500", "90,000", "90,500",
+                "91,000", "91,500"
+            ]
+        );
+        for tick in &layout.ticks {
+            assert!(interval.contains(tick.position));
+            assert_eq!((tick.position + 1) % 100, 0);
+            assert!((f64::from(tick.x) - viewport.pixel_at_genomic(tick.position)).abs() < 1e-3);
+        }
+
+        // The first and last visible bases are labelled when they are round.
+        let edges = GenomicInterval::new(ContigId::new(0), 999, 2_000).unwrap();
+        let layout = layout_coordinate_ruler(
+            Viewport::new(edges, 400.0).unwrap(),
+            CoordinateRulerOptions::default(),
+        );
+        let labelled = layout
+            .ticks
+            .iter()
+            .filter_map(|tick| tick.label.as_deref().map(|label| (tick.position, label)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labelled,
+            [(999, "1,000"), (1_499, "1,500"), (1_999, "2,000")]
+        );
+
+        // Exact above 2^32.
+        let start = 5_000_000_000_u64;
+        let large = GenomicInterval::new(ContigId::new(0), start + 37, start + 1_037).unwrap();
+        let layout = layout_coordinate_ruler(
+            Viewport::new(large, 1_000.0).unwrap(),
+            CoordinateRulerOptions::default(),
+        );
+        let first = layout.ticks.iter().find(|tick| tick.major).unwrap();
+        assert_eq!(first.label.as_deref(), Some("5,000,000,200"));
+        assert_eq!(first.position, start + 199);
+        assert!((first.x - 162.0).abs() < 1e-3);
     }
 
     #[test]

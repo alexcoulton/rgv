@@ -61,6 +61,15 @@ same signed artifact before replacing anything, preserve the prior binary for ro
 with elevated privileges outside the installer, and honor an explicit disabled-by-default update
 check setting. Session-schema compatibility is independent of application updates.
 
+## Build profiles
+
+`cargo build --release` uses thin LTO, one codegen unit, and strips debug information; it writes
+to `target/release/` and is what the development-artifact workflow stages. The signed-release
+workflow (`.github/workflows/release.yml`) builds with `--profile dist`, which inherits `release`
+and switches to fat LTO; its binaries are in `target/dist/`. Both keep `panic = "unwind"`. The
+`dist` profile was added on 20 November 2026 and has not yet been exercised by a tagged release.
+All workflows install the toolchain pinned in `rust-toolchain.toml`.
+
 ## Release checklist
 
 1. Lock the release version and supported session schema in the changelog.

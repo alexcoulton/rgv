@@ -81,15 +81,10 @@ impl ExactModificationSummaryTile {
         let bins = usize::try_from(interval.len())
             .map_err(|_| ExactModificationSummaryError::TileTooWide(interval.len()))?;
         let selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
-        let per_series = size_of::<ModificationSeries>().saturating_add(
-            bins.saturating_mul(2)
-                .saturating_mul(size_of::<ModificationBin>()),
-        );
-        let maximum_bytes = size_of::<Self>().saturating_add(
-            MAX_MODIFICATION_SERIES
-                .saturating_mul(2)
-                .saturating_mul(per_series),
-        );
+        // Every series owns one dense bin per tile base, so reserve for the series the selected
+        // records can actually open rather than always for the declared maximum.
+        let maximum_series = maximum_series(&selection)?;
+        let maximum_bytes = maximum_retained_bytes(maximum_series, bins);
         let mut reservation = ledger.reserve(
             AllocationClass::ExactSummary,
             maximum_bytes,
@@ -194,6 +189,50 @@ impl ExactModificationSummaryTile {
     pub fn estimated_bytes(&self) -> usize {
         size_of::<Self>().saturating_add(summary_retained_bytes(&self.summary))
     }
+}
+
+/// Retained bytes for `series` dense series of `bins` bins, with one doubling of slack for the
+/// series vector while it grows.
+fn maximum_retained_bytes(series: usize, bins: usize) -> usize {
+    let per_series = size_of::<ModificationSeries>()
+        .saturating_add(bins.saturating_mul(size_of::<ModificationBin>()));
+    size_of::<ExactModificationSummaryTile>()
+        .saturating_add(series.saturating_mul(2).saturating_mul(per_series))
+}
+
+/// Upper bound on the distinct modification series the selected records can open, read from the
+/// `MM` group headers and `HP` haplotype without locating a single call. The builder itself never
+/// retains more than [`MAX_MODIFICATION_SERIES`], so the scan stops once that many are possible.
+fn maximum_series(
+    selection: &crate::EvidenceSelection,
+) -> Result<usize, ExactModificationSummaryError> {
+    // Keys are deliberately finer than the builder's (exact header text, undecoded haplotype
+    // value): over-counting keeps the bound safe, merging distinct series would not.
+    let mut groups = std::collections::BTreeSet::<(String, Option<String>)>::new();
+    let mut series = 0_usize;
+    for index in 0..selection.len() {
+        let mm_upper = selection.auxiliary_field(index, *b"MM")?;
+        let mm_lower = selection.auxiliary_field(index, *b"Mm")?;
+        let Some(AuxValue::String(mm)) = auxiliary_value(mm_upper.as_ref().or(mm_lower.as_ref()))
+        else {
+            continue;
+        };
+        let haplotype = selection
+            .auxiliary_field(index, *b"HP")?
+            .map(|field| format!("{:?}", field.value));
+        for group in mm.split(';').filter(|group| !group.is_empty()) {
+            let header = group.split_once(',').map_or(group, |(header, _)| header);
+            if groups.insert((header.to_owned(), haplotype.clone())) {
+                // One series per modification code; every header byte after the canonical base
+                // and strand is at most one code.
+                series = series.saturating_add(header.len().saturating_sub(2).max(1));
+                if series >= MAX_MODIFICATION_SERIES {
+                    return Ok(MAX_MODIFICATION_SERIES);
+                }
+            }
+        }
+    }
+    Ok(series)
 }
 
 fn auxiliary_value(field: Option<&AuxField>) -> Option<&AuxValue> {
@@ -420,5 +459,35 @@ mod tests {
             summary.allocation().snapshot().unwrap().charged_capacity,
             summary.estimated_bytes()
         );
+    }
+
+    #[test]
+    fn reservation_follows_the_series_the_selected_records_can_open() {
+        // Reserving the declared maximum (32 series, doubled twice) asked for ~0.4 MiB retained
+        // and ~0.8 MiB of scratch for this single-series, 100-base tile.
+        let ledger = AllocationLedger::new_with_transient_budget(8 << 20, 0, 64 << 10);
+        let root = evidence(&ledger);
+        let tile = CanonicalGenomicTile::new(ContigId::new(0), 0, NonZeroU64::new(100).unwrap());
+        let selection = root.select(tile.interval(100).unwrap()).unwrap();
+        assert_eq!(maximum_series(&selection).unwrap(), 1);
+        drop(selection);
+        let summary = ExactModificationSummaryTile::build(
+            &root,
+            tile,
+            100,
+            ModificationSummaryContract,
+            &ledger,
+            ReservationKind::Normal,
+            3,
+        )
+        .unwrap();
+
+        // Reservation >= actual, and no longer sized for series nothing can open.
+        let reserved = maximum_retained_bytes(1, 100);
+        assert!(summary.estimated_bytes() <= reserved);
+        assert!(reserved * 8 < maximum_retained_bytes(MAX_MODIFICATION_SERIES, 100));
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.transient, 0);
+        assert!(snapshot.transient_high_water <= 64 << 10);
     }
 }

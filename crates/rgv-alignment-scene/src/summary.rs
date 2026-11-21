@@ -73,24 +73,16 @@ impl ExactDepthSummaryTile {
     ) -> Result<Arc<Self>, ExactDepthSummaryError> {
         let interval = tile.interval(contig_length)?;
         let selection = evidence.select_with_reservation_kind(interval, reservation_kind)?;
+        // Only aligned operations inside this tile can open or close a depth run. Counting a
+        // long read's whole CIGAR charged every tile it touched for the entire read.
         let aligned_operations = (0..selection.len()).fold(0_usize, |total, index| {
-            let operations = selection.record_view(index).map_or(0, |record| {
-                record
-                    .cigar()
-                    .iter()
-                    .filter(|operation| {
-                        matches!(
-                            operation.kind,
-                            CigarOpKind::Match
-                                | CigarOpKind::SequenceMatch
-                                | CigarOpKind::SequenceMismatch
-                        )
-                    })
-                    .count()
-            });
-            total.saturating_add(operations)
+            total.saturating_add(
+                selection
+                    .record_view(index)
+                    .map_or(0, |record| aligned_operations_in_tile(record, interval)),
+            )
         });
-        let maximum_bytes = maximum_retained_bytes(aligned_operations);
+        let maximum_bytes = maximum_retained_bytes(aligned_operations, interval.len());
         let mut reservation = ledger.reserve(
             AllocationClass::ExactSummary,
             maximum_bytes,
@@ -124,12 +116,19 @@ impl ExactDepthSummaryTile {
             let mut reference_position = record.start();
             let mut aligned_segments = Vec::<(u64, u64)>::new();
             for operation in record.cigar() {
+                if reference_position >= interval.end() {
+                    // Nothing further along this read can reach the tile.
+                    break;
+                }
                 let end = reference_position.saturating_add(u64::from(operation.len));
                 match operation.kind {
                     CigarOpKind::Match
                     | CigarOpKind::SequenceMatch
                     | CigarOpKind::SequenceMismatch => {
-                        if let Some((_, merged_end)) = aligned_segments.last_mut()
+                        if end <= interval.start() {
+                            // Entirely left of the tile: contributes no depth here, so it is
+                            // neither retained nor charged.
+                        } else if let Some((_, merged_end)) = aligned_segments.last_mut()
                             && reference_position <= *merged_end
                         {
                             *merged_end = (*merged_end).max(end);
@@ -255,8 +254,41 @@ impl ExactDepthSummaryTile {
     }
 }
 
-fn maximum_retained_bytes(aligned_operations: usize) -> usize {
-    let maximum_runs = aligned_operations.saturating_mul(4);
+/// Aligned (`M`/`=`/`X`) operations of `record` with at least one base inside `tile`.
+fn aligned_operations_in_tile(
+    record: rgv_hts::AlignmentRecordView<'_>,
+    tile: rgv_core::GenomicInterval,
+) -> usize {
+    let mut count = 0_usize;
+    let mut reference_position = record.start();
+    for operation in record.cigar() {
+        if reference_position >= tile.end() {
+            break;
+        }
+        let end = reference_position.saturating_add(u64::from(operation.len));
+        match operation.kind {
+            CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
+                if end > tile.start() && reference_position < end {
+                    count = count.saturating_add(1);
+                }
+                reference_position = end;
+            }
+            CigarOpKind::Deletion | CigarOpKind::ReferenceSkip => reference_position = end,
+            CigarOpKind::Insertion
+            | CigarOpKind::SoftClip
+            | CigarOpKind::HardClip
+            | CigarOpKind::Padding => {}
+        }
+    }
+    count
+}
+
+/// Each aligned operation in the tile adds at most two unmasked pieces, hence four run
+/// boundaries; a tile can never hold more runs than it has bases.
+fn maximum_retained_bytes(aligned_operations: usize, tile_bases: u64) -> usize {
+    let maximum_runs = aligned_operations
+        .saturating_mul(4)
+        .min(usize::try_from(tile_bases).unwrap_or(usize::MAX));
     let run_capacity = maximum_runs
         .checked_next_power_of_two()
         .unwrap_or(usize::MAX);
@@ -472,6 +504,76 @@ mod tests {
             Some(1)
         );
         assert_eq!(summary.eligible_records(), 2);
+    }
+
+    #[test]
+    fn depth_reservation_counts_only_aligned_operations_inside_the_tile() {
+        let ledger = AllocationLedger::new(4 << 20, 0);
+        // Forty 4-base exons, ten bases apart: [0,4), [10,14), ... [390,394).
+        let mut cigar = Vec::new();
+        for exon in 0..40 {
+            if exon > 0 {
+                cigar.push((CigarOpKind::ReferenceSkip, 6));
+            }
+            cigar.push((CigarOpKind::Match, 2));
+            cigar.push((CigarOpKind::Insertion, 1));
+            cigar.push((CigarOpKind::SequenceMatch, 2));
+        }
+        let root = evidence(&[record(b"exons", 0, &cigar, 0, None)], &ledger);
+        let whole = GenomicInterval::new(ContigId::new(0), 0, 400).unwrap();
+        let selection = root.select(whole).unwrap();
+        let view = selection.record_view(0).unwrap();
+        assert_eq!(aligned_operations_in_tile(view, whole), 80);
+        assert_eq!(
+            aligned_operations_in_tile(
+                view,
+                GenomicInterval::new(ContigId::new(0), 100, 150).unwrap()
+            ),
+            10
+        );
+        // A tile wholly inside one intron reserves for nothing.
+        assert_eq!(
+            aligned_operations_in_tile(view, GenomicInterval::new(ContigId::new(0), 5, 9).unwrap()),
+            0
+        );
+
+        for tile_bases in [1_u64, 3, 7, 50, 64, 400] {
+            for coordinate in 0..400_u64.div_ceil(tile_bases) {
+                let summary = ExactDepthSummaryTile::build(
+                    &root,
+                    CanonicalGenomicTile::new(
+                        ContigId::new(0),
+                        coordinate,
+                        NonZeroU64::new(tile_bases).unwrap(),
+                    ),
+                    400,
+                    DepthSummaryContract::new(OverlappingMatePolicy::CountBoth),
+                    &ledger,
+                    ReservationKind::Normal,
+                    3,
+                )
+                .unwrap();
+                let interval = summary.depth().interval();
+                // Reservation >= actual, with the reservation taken from this tile alone.
+                let reserved = maximum_retained_bytes(
+                    aligned_operations_in_tile(view, interval),
+                    interval.len(),
+                );
+                assert!(summary.estimated_bytes() <= reserved);
+                assert!(reserved <= maximum_retained_bytes(80, 400));
+                // Clipping the walk to the tile must not change a single base of depth.
+                for position in interval.start()..interval.end() {
+                    let depth = summary
+                        .depth()
+                        .runs()
+                        .iter()
+                        .find(|run| run.start <= position && position < run.end)
+                        .map_or(0, |run| run.depth);
+                    let expected = u32::from(position < 394 && position % 10 < 4);
+                    assert_eq!(depth, expected, "position {position}, tile {tile_bases}");
+                }
+            }
+        }
     }
 
     #[test]

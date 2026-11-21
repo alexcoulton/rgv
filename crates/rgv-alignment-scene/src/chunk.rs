@@ -1,6 +1,10 @@
-use std::{collections::HashSet, mem::size_of, sync::Arc};
+use std::{
+    collections::HashSet,
+    mem::size_of,
+    sync::{Arc, OnceLock},
+};
 
-use rgv_hts::{AlignmentBatch, AlignmentSourcePosition};
+use rgv_hts::{AlignmentBatch, AlignmentOverlapIndex, AlignmentSourcePosition};
 use thiserror::Error;
 
 use crate::{AlignmentHandle, AlignmentSourceRevision, ContractFingerprint};
@@ -47,6 +51,9 @@ pub struct CanonicalRecordChunk {
     record_contract: ContractFingerprint,
     batch: Arc<AlignmentBatch>,
     handles: Arc<[AlignmentHandle]>,
+    /// Genomic overlap index over `batch`, built on first use and shared by every clone. Sizing
+    /// a chunk for its ledger reservation and then admitting it used to build the index twice.
+    overlap: Arc<OnceLock<AlignmentOverlapIndex>>,
 }
 
 impl CanonicalRecordChunk {
@@ -85,7 +92,15 @@ impl CanonicalRecordChunk {
             record_contract,
             batch,
             handles: handles.into(),
+            overlap: Arc::new(OnceLock::new()),
         })
+    }
+
+    /// The chunk's genomic overlap index. It is charged separately from
+    /// [`Self::estimated_bytes`] by the owning [`crate::EvidenceChunk`].
+    pub(crate) fn overlap_index(&self) -> &AlignmentOverlapIndex {
+        self.overlap
+            .get_or_init(|| AlignmentOverlapIndex::new(&self.batch))
     }
 
     #[must_use]

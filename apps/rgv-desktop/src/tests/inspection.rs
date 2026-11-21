@@ -128,38 +128,29 @@ fn junction_annotation_requires_adjacent_exons_from_the_same_transcript() {
 #[test]
 fn rna_exports_preserve_filters_annotation_scaling_and_bounds() {
     let interval = GenomicInterval::new(ContigId::new(0), 100, 400).unwrap();
-    let query = Arc::new(AlignmentQuery {
-        interval,
-        header: Arc::default(),
-        batch: rgv_hts::AlignmentBatch::default(),
-        pileup: rgv_hts::PileupSummary::default(),
-        junctions: rgv_hts::JunctionSummary {
-            junctions: vec![rgv_hts::JunctionEvidence {
-                start: 200,
-                end: 300,
-                depth: 10,
-                minimum_left_flank: 12,
-                minimum_right_flank: 14,
-                positive_depth: 10,
-                tagged_positive_depth: 10,
-                ..rgv_hts::JunctionEvidence::default()
-            }],
-            provenance: rgv_hts::JunctionProvenance {
-                eligible_records: 20,
-                spliced_records: 10,
-                supporting_spliced_records: 10,
-                junction_observations_examined: 10,
-                junction_observations_retained: 10,
-                minimum_flank: 8,
-                normalization_mapped_records: Some(1_000_000),
-                all_eligible_records: true,
-                ..rgv_hts::JunctionProvenance::default()
-            },
+    let junctions = rgv_hts::JunctionSummary {
+        junctions: vec![rgv_hts::JunctionEvidence {
+            start: 200,
+            end: 300,
+            depth: 10,
+            minimum_left_flank: 12,
+            minimum_right_flank: 14,
+            positive_depth: 10,
+            tagged_positive_depth: 10,
+            ..rgv_hts::JunctionEvidence::default()
+        }],
+        provenance: rgv_hts::JunctionProvenance {
+            eligible_records: 20,
+            spliced_records: 10,
+            supporting_spliced_records: 10,
+            junction_observations_examined: 10,
+            junction_observations_retained: 10,
+            minimum_flank: 8,
+            normalization_mapped_records: Some(1_000_000),
+            all_eligible_records: true,
+            ..rgv_hts::JunctionProvenance::default()
         },
-        pairs: rgv_hts::PairSummary::default(),
-        reference: None,
-        stats: QueryStats::default(),
-    });
+    };
     let filters = SessionFilters {
         minimum_junction_depth: 5,
         minimum_junction_flank: 8,
@@ -171,7 +162,7 @@ fn rna_exports_preserve_filters_annotation_scaling_and_bounds() {
     let track = SashimiExportTrack {
         id: TrackId::new(1),
         name: "RNA sample".to_owned(),
-        junctions: query.junctions.clone(),
+        junctions,
         filters,
     };
     let annotations = JunctionAnnotationContext {
@@ -870,7 +861,11 @@ fn run_marker_detects_unclean_exit_and_clears_on_finish() {
     let mut recovered = RunMarker::start(&settings);
     assert!(recovered.previous_unclean_exit());
     recovered.finish();
-    assert!(!directory.path().join("rgv-running.marker").exists());
+    assert_eq!(
+        std::fs::read_dir(directory.path()).unwrap().count(),
+        0,
+        "the per-process marker is removed on a clean exit"
+    );
 }
 
 #[test]
@@ -890,6 +885,7 @@ fn autosave_names_are_stable_and_retention_is_scoped_per_project() {
         let (path, prefix) = autosave_snapshot_path(
             &settings,
             Some(&first_project),
+            "instance",
             UNIX_EPOCH + Duration::from_millis(millisecond),
         );
         assert_eq!(prefix, first_prefix);
@@ -898,6 +894,7 @@ fn autosave_names_are_stable_and_retention_is_scoped_per_project() {
     let (other, _) = autosave_snapshot_path(
         &settings,
         Some(&second_project),
+        "instance",
         UNIX_EPOCH + Duration::from_millis(1),
     );
     std::fs::write(&other, b"other").unwrap();

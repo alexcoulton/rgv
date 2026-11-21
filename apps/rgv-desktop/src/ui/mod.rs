@@ -20,7 +20,7 @@ pub(crate) use diagnostics::{
 };
 pub use menu::{SEARCHABLE_COMMANDS, UiCommand, command_matches};
 pub use navigation::{GenomeOverviewData, OverviewInteraction, paint_genome_context};
-pub use status::status_bar;
+pub use status::status_bar_with_badge;
 pub use tracks::{
     AlignmentSubtrack, PaneItemLayout, PaneLayoutSnapshot, ScrollbarInteraction, ScrollbarOverview,
     ScrollbarOverviewBin, TRACK_HEADER_HEIGHT, TRACK_SECTION_HEADER_HEIGHT, TrackFrame,

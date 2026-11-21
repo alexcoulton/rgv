@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -89,12 +89,51 @@ impl DesktopSettings {
         Self::from_json(&std::fs::read_to_string(path)?)
     }
 
+    /// Reads settings, falling back to defaults without losing a damaged file.
+    ///
+    /// A missing file yields defaults. A file that cannot be read as valid
+    /// settings (truncated by a crash, hand-edited, or from a newer RGV) is
+    /// copied beside itself as `<name>.corrupt` and reported, so the caller
+    /// can tell the user their preferences were reset and where the old file
+    /// went instead of silently overwriting it on the next save.
+    pub fn read_or_recover(path: impl AsRef<Path>) -> (Self, Option<SettingsRecovery>) {
+        let path = path.as_ref();
+        match Self::read(path) {
+            Ok(settings) => (settings, None),
+            Err(SettingsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                (Self::default(), None)
+            }
+            Err(error) => {
+                let preserved_at = preserve_corrupt_settings(path);
+                (
+                    Self::default(),
+                    Some(SettingsRecovery {
+                        error: error.to_string(),
+                        preserved_at,
+                    }),
+                )
+            }
+        }
+    }
+
+    /// Atomically replaces the settings file: the complete JSON is flushed to
+    /// a temporary file in the same directory and renamed over the target, so
+    /// a crash or a full disk mid-save cannot leave a truncated file. An
+    /// existing file that is not valid settings is first preserved as
+    /// `<name>.corrupt` rather than being silently replaced.
     pub fn write(&self, path: impl AsRef<Path>) -> Result<(), SettingsError> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
+        let json = self.to_json()?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, self.to_json()?)?;
+        if matches!(Self::read(path), Err(error) if !error.is_not_found()) {
+            preserve_corrupt_settings(path);
+        }
+        crate::session::atomic_write(path, json.as_bytes())?;
         Ok(())
     }
 
@@ -158,6 +197,29 @@ impl DesktopSettings {
     }
 }
 
+/// Why settings fell back to defaults, and where the unreadable file went.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SettingsRecovery {
+    /// Why the file was rejected.
+    pub error: String,
+    /// The preserved copy, or `None` if it could not be written.
+    pub preserved_at: Option<PathBuf>,
+}
+
+/// Best-effort copy of an unreadable settings file to `<name>.corrupt`.
+fn preserve_corrupt_settings(path: &Path) -> Option<PathBuf> {
+    let mut name = path.file_name()?.to_owned();
+    name.push(".corrupt");
+    let preserved = path.with_file_name(name);
+    std::fs::copy(path, &preserved).ok().map(|_| preserved)
+}
+
+impl SettingsError {
+    fn is_not_found(&self) -> bool {
+        matches!(self, Self::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
+    }
+}
+
 fn remember_string(items: &mut Vec<String>, item: &str) {
     let item = item.trim().to_owned();
     if item.is_empty() {
@@ -191,6 +253,74 @@ pub enum SettingsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_writes_are_atomic_and_leave_no_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested").join("settings.json");
+        let mut settings = DesktopSettings::default();
+        settings.write(&path).unwrap();
+        settings.cache_budget_mib = 1_024;
+        settings.remember_locus("chr1:1-100");
+        settings.write(&path).unwrap();
+        assert_eq!(DesktopSettings::read(&path).unwrap(), settings);
+        let names = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, [std::ffi::OsString::from("settings.json")]);
+
+        // An invalid document never reaches the disk or disturbs the last good file.
+        let mut invalid = settings.clone();
+        invalid.cache_budget_mib = 0;
+        assert!(invalid.write(&path).is_err());
+        assert_eq!(DesktopSettings::read(&path).unwrap(), settings);
+
+        // A failed replacement (the target is a directory) leaves no debris.
+        let blocked = directory.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(settings.write(&blocked).is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn corrupt_settings_are_preserved_instead_of_silently_reset() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let corrupt = directory.path().join("settings.json.corrupt");
+
+        assert_eq!(
+            DesktopSettings::read_or_recover(&path),
+            (DesktopSettings::default(), None)
+        );
+        assert!(!corrupt.exists());
+
+        // A truncated file, as left by an interrupted non-atomic write.
+        let truncated = "{\n  \"schema_version\": 1,\n  \"recent_loci\": [\"chr7:1";
+        std::fs::write(&path, truncated).unwrap();
+        let (settings, recovery) = DesktopSettings::read_or_recover(&path);
+        assert_eq!(settings, DesktopSettings::default());
+        let recovery = recovery.unwrap();
+        assert_eq!(recovery.preserved_at.as_deref(), Some(corrupt.as_path()));
+        assert!(!recovery.error.is_empty());
+        assert_eq!(std::fs::read_to_string(&corrupt).unwrap(), truncated);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), truncated);
+
+        // A caller that only falls back to defaults and later saves still
+        // keeps the damaged file.
+        std::fs::remove_file(&corrupt).unwrap();
+        DesktopSettings::default().write(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&corrupt).unwrap(), truncated);
+        assert_eq!(
+            DesktopSettings::read_or_recover(&path),
+            (DesktopSettings::default(), None)
+        );
+
+        // Replacing a healthy file does not manufacture a `.corrupt` copy.
+        std::fs::remove_file(&corrupt).unwrap();
+        DesktopSettings::default().write(&path).unwrap();
+        assert!(!corrupt.exists());
+    }
 
     #[test]
     fn recent_items_are_deduplicated_bounded_and_newest_first() {

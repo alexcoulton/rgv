@@ -386,20 +386,7 @@ impl Viewer {
             let asset = bundle
                 .asset(LandmarkAssetRole::RepresentativeGenes)
                 .context("representative gene asset is absent")?;
-            let next_id = TrackId::new(
-                self.tracks
-                    .tracks()
-                    .iter()
-                    .map(|track| track.id.get())
-                    .chain(
-                        self.alignment_tracks
-                            .iter()
-                            .map(|track| track.config.id.get()),
-                    )
-                    .max()
-                    .unwrap_or_default()
-                    .saturating_add(1),
-            );
+            let next_id = self.allocate_track_id();
             let mut config = TrackConfig::new(
                 next_id,
                 "Genes".to_owned(),
@@ -586,20 +573,7 @@ impl Viewer {
             rgv_core::LandmarkAssetFormat::GenePredExtGzip => (TrackSpecKind::GenePred, None),
             _ => anyhow::bail!("detailed transcript asset has an incompatible format"),
         };
-        let next_id = TrackId::new(
-            self.tracks
-                .tracks()
-                .iter()
-                .map(|track| track.id.get())
-                .chain(
-                    self.alignment_tracks
-                        .iter()
-                        .map(|track| track.config.id.get()),
-                )
-                .max()
-                .unwrap_or_default()
-                .saturating_add(1),
-        );
+        let next_id = self.allocate_track_id();
         let mut config = TrackConfig::new(
             next_id,
             format!("All transcripts · {}", bundle.provider),

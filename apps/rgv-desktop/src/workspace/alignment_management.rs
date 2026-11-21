@@ -5169,8 +5169,7 @@ impl Viewer {
             );
             let complete_read_limit = self.alignment_tracks[track_index]
                 .config
-                .maximum_alignments
-                .max(1);
+                .effective_complete_read_limit();
             let mut queue_error = None;
             let must_insert = existing_owner.is_none() || existing_contig != Some(contig);
             let owner = if must_insert {
@@ -5413,15 +5412,8 @@ impl Viewer {
             .iter()
             .map(|track| track.config.clone())
             .collect::<Vec<_>>();
-        let next_id = configs
-            .iter()
-            .map(|track| track.id.get())
-            .chain(self.tracks.tracks().iter().map(|track| track.id.get()))
-            .max()
-            .unwrap_or_default()
-            .saturating_add(1);
-        let mut config =
-            SessionAlignmentTrack::new(TrackId::new(next_id), opened_name.to_owned(), source);
+        let next_id = self.allocate_track_id();
+        let mut config = SessionAlignmentTrack::new(next_id, opened_name.to_owned(), source);
         config.remote_index_url = remote_index_url;
         config.maximum_alignments = config
             .maximum_alignments
@@ -5626,48 +5618,20 @@ impl Viewer {
         self.mark_display_dirty("explicit display invalidation");
     }
 
+    /// Opens an RGV genome configuration, or an IGV genome description (loaded in the
+    /// background because its resources may need downloading).
     pub(crate) fn open_genome_configuration(&mut self, path: &Path) -> Result<()> {
-        let configuration = GenomeConfiguration::read(path)?;
-        let cytoband_path = match &configuration.cytobands {
-            Some(TrackSource::Local { path }) => Some(PathBuf::from(path)),
-            Some(TrackSource::Remote { .. }) => {
-                anyhow::bail!("remote cytoband files are not yet supported")
+        let configuration = match GenomeConfiguration::read(path) {
+            Ok(configuration) => configuration,
+            Err(error) => {
+                if crate::workspace::genomes::is_igv_genome_description(path) {
+                    self.start_genome_load(path.to_string_lossy().into_owned());
+                    return Ok(());
+                }
+                return Err(error.into());
             }
-            None => None,
         };
-        let annotations = configuration
-            .default_annotations
-            .iter()
-            .map(|annotation| {
-                track_spec_kind(annotation.kind, &annotation.source, annotation.format)
-                    .map(|kind| {
-                        (
-                            source_path(&annotation.source),
-                            kind,
-                            annotation.kind,
-                            annotation.name.clone(),
-                            annotation.format,
-                        )
-                    })
-                    .with_context(|| format!("unsupported default annotation {}", annotation.name))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        self.assembly_name.clone_from(&configuration.name);
-        self.assembly_identity
-            .clone_from(&configuration.assembly_identity);
-        self.assembly
-            .identity
-            .clone_from(&configuration.assembly_identity);
-        self.assembly.default_annotation_count = configuration.default_annotations.len();
-        self.contig_aliases
-            .clone_from(&configuration.contig_aliases);
-        self.cytoband_path = cytoband_path;
-        let reference = source_path(&configuration.reference);
-        self.open_reference_source(&reference);
-        for (annotation_path, kind, track_kind, name, format) in annotations {
-            self.add_configured_track_source(&annotation_path, kind, track_kind, name, format)?;
-        }
+        self.apply_genome_configuration(&configuration)?;
         self.data_status = format!("Opening genome configuration {}…", path.display());
         Ok(())
     }

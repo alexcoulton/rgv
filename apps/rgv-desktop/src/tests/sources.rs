@@ -160,7 +160,7 @@ fn remote_source_editor_validates_alignment_companions_without_losing_signed_url
 }
 
 #[test]
-fn remote_source_editor_accepts_only_range_indexed_auxiliary_formats() {
+fn remote_source_editor_accepts_range_indexed_and_small_text_auxiliary_formats() {
     for path in [
         "calls.vcf.gz?signature=private",
         "calls.bcf",
@@ -169,6 +169,9 @@ fn remote_source_editor_accepts_only_range_indexed_auxiliary_formats() {
         "features.bigBed",
         "genes.bigGenePred",
         "peaks.bigNarrowPeak",
+        // Text annotations are downloaded whole rather than read by range request.
+        "features.bed.gz",
+        "genes.gtf",
     ] {
         let editor = RemoteSourceEditor {
             kind: RemoteSourceKind::IndexedTrack,
@@ -177,7 +180,7 @@ fn remote_source_editor_accepts_only_range_indexed_auxiliary_formats() {
         };
         assert!(validate_remote_source_editor(&editor).is_ok(), "{path}");
     }
-    for path in ["features.bed.gz", "signal.bedGraph"] {
+    for path in ["signal.bedGraph", "notes.txt"] {
         let editor = RemoteSourceEditor {
             kind: RemoteSourceKind::IndexedTrack,
             source_url: format!("https://example.test/{path}"),
@@ -582,4 +585,207 @@ fn quantitative_inspector_exposes_tdf_channel_and_resolution() {
             && matches!(field.value, InspectorValue::Missing { .. })
             && matches!(field.provenance, InspectorProvenance::Missing(_))
     }));
+}
+
+#[test]
+fn igv_genomes_are_recognised_filtered_and_accepted_at_launch() {
+    use crate::workspace::genomes::{HostedGenomes, is_igv_genome_description};
+
+    let directory = tempfile::tempdir().unwrap();
+    let igv = directory.path().join("hg38.json");
+    std::fs::write(&igv, r#"{"id":"hg38","twoBitURL":"hg38.2bit"}"#).unwrap();
+    let other = directory.path().join("session.json");
+    std::fs::write(&other, r#"{"schema_version":1}"#).unwrap();
+    assert!(is_igv_genome_description(&igv));
+    assert!(!is_igv_genome_description(&other));
+    assert!(!is_igv_genome_description(
+        &directory.path().join("absent.json")
+    ));
+
+    let entries = rgv_core::parse_igv_genome_list(
+        "Human (GRCh38/hg38)\thttps://x/hg38.json\thg38\n\
+         Mouse (GRCm39/mm39)\thttps://x/mm39.json\tmm39\n",
+    );
+    let ids = |filter: &str| {
+        HostedGenomes::matching(&entries, filter)
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(""), ["hg38", "mm39"]);
+    assert_eq!(ids(" MOUSE "), ["mm39"]);
+    assert_eq!(ids("hg"), ["hg38"]);
+    assert!(ids("zebrafish").is_empty());
+
+    let options = LaunchOptions::try_parse_from(["rgv-desktop", "--genome", "hg38"]).unwrap();
+    assert_eq!(options.genome.as_deref(), Some("hg38"));
+    assert!(
+        LaunchOptions::try_parse_from([
+            "rgv-desktop",
+            "--genome",
+            "hg38",
+            "--genome-config",
+            "genome.json"
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn alignment_sources_are_recognised_as_cram_by_path_or_url() {
+    use crate::workspace::alignments::alignment_source_is_cram;
+
+    assert!(alignment_source_is_cram("/data/sample.CRAM"));
+    assert!(alignment_source_is_cram(
+        "https://example.org/sample.cram?X-Amz-Signature=abc.bam"
+    ));
+    assert!(!alignment_source_is_cram("/data/sample.bam"));
+    assert!(!alignment_source_is_cram(
+        "https://example.org/sample.bam?name=x.cram"
+    ));
+}
+
+#[test]
+fn imported_igv_sessions_take_their_reference_from_the_named_genome() {
+    use crate::workspace::genomes::apply_genome_to_imported_session;
+
+    let xml = r#"<Session genome="hg38" locus="chr1:100-200" version="8">
+        <Resources><Resource path="reads.bam"/></Resources></Session>"#;
+    let imported = SessionDocument::import_igv_with_report(xml).unwrap();
+    let (mut document, mut report) = (imported.document, imported.report);
+    assert!(document.reference.is_none());
+    assert_eq!(document.genome_name.as_deref(), Some("hg38"));
+    assert!(
+        report
+            .approximated
+            .iter()
+            .any(|notice| notice.starts_with("Session.genome identifier"))
+    );
+
+    let configuration = GenomeConfiguration {
+        schema_version: rgv_core::GENOME_CONFIGURATION_SCHEMA_VERSION,
+        name: "Human (GRCh38/hg38)".to_owned(),
+        assembly_identity: None,
+        reference: TrackSource::Remote {
+            url: "https://example.org/hg38.2bit".to_owned(),
+        },
+        reference_index: Some("/cache/hg38.chrom.sizes".to_owned()),
+        cytobands: Some(TrackSource::Local {
+            path: "/cache/cytobands.txt".to_owned(),
+        }),
+        contig_aliases: ContigAliases::from([("1".to_owned(), "chr1".to_owned())]),
+        default_annotations: Vec::new(),
+        asset_provenance: Vec::new(),
+    };
+    apply_genome_to_imported_session(&mut document, &mut report, &configuration);
+    assert_eq!(document.reference, Some(configuration.reference.clone()));
+    assert_eq!(
+        document.remote_reference_index_url.as_deref(),
+        Some("/cache/hg38.chrom.sizes")
+    );
+    assert_eq!(document.cytobands, configuration.cytobands);
+    assert_eq!(
+        document.contig_aliases.get("1").map(String::as_str),
+        Some("chr1")
+    );
+    assert_eq!(document.genome_name.as_deref(), Some("Human (GRCh38/hg38)"));
+    assert!(
+        !report
+            .approximated
+            .iter()
+            .any(|notice| notice.starts_with("Session.genome identifier"))
+    );
+    assert!(
+        report
+            .imported
+            .iter()
+            .any(|notice| notice.contains("hosted genome"))
+    );
+}
+
+#[test]
+fn dropped_files_are_classified_by_the_shared_source_table() {
+    let kind = |name: &str| classify_dropped_file(Path::new(name));
+    assert_eq!(kind("reads.bam"), DroppedFileKind::Alignment);
+    assert_eq!(kind("READS.CRAM"), DroppedFileKind::Alignment);
+    assert_eq!(kind("genome.fa"), DroppedFileKind::Reference);
+    assert_eq!(kind("genome.2bit"), DroppedFileKind::Reference);
+    assert_eq!(
+        kind("genome.fa.gz"),
+        classify_genomic_source("genome.fa.gz").map_or(DroppedFileKind::Track, |classified| {
+            if classified.format == GenomicSourceFormat::Fasta {
+                DroppedFileKind::Reference
+            } else {
+                DroppedFileKind::Track
+            }
+        }),
+        "compressed spellings follow the shared table, not a private one"
+    );
+    assert_eq!(kind("hg38.rgvgenome"), DroppedFileKind::GenomeConfiguration);
+    assert_eq!(kind("project.json"), DroppedFileKind::Json);
+    assert_eq!(kind("session.xml"), DroppedFileKind::IgvSession);
+    assert_eq!(kind("calls.vcf.gz"), DroppedFileKind::Track);
+    assert_eq!(kind("notes.txt"), DroppedFileKind::Track);
+}
+
+#[test]
+fn dropped_json_is_identified_from_one_parse() {
+    assert_eq!(
+        classify_dropped_json(r#"{"id":"hg38","fastaURL":"https://example.org/hg38.fa"}"#),
+        DroppedJsonKind::IgvGenome
+    );
+    assert_eq!(
+        classify_dropped_json(r#"{"name":"mm39","twoBitURL":"mm39.2bit"}"#),
+        DroppedJsonKind::IgvGenome
+    );
+    assert_eq!(
+        classify_dropped_json(
+            r#"{"schema_version":1,"name":"hg38","reference":{"kind":"local","path":"a.fa"}}"#
+        ),
+        DroppedJsonKind::GenomeConfiguration
+    );
+    let session = SessionDocument::new(SessionLocus {
+        contig: "chr1".into(),
+        start: 0,
+        end: 100,
+    })
+    .to_json()
+    .unwrap();
+    assert_eq!(classify_dropped_json(&session), DroppedJsonKind::Session);
+    // Unparseable or unexpected documents go to the session loader, which reports the error.
+    assert_eq!(classify_dropped_json("not json"), DroppedJsonKind::Session);
+    assert_eq!(classify_dropped_json("[1,2]"), DroppedJsonKind::Session);
+    assert_eq!(
+        classify_dropped_json(r#"{"fastaURL":"  "}"#),
+        DroppedJsonKind::Session
+    );
+}
+
+#[test]
+fn unusable_cytobands_are_reported_instead_of_only_logged() {
+    let dictionary = || {
+        ReferenceDictionary::from_contigs([("chr1".to_owned(), 1_000)])
+    };
+    let directory = tempfile::tempdir().unwrap();
+
+    let (assembly, failure) = load_assembly_reporting("test", dictionary(), None);
+    assert!(failure.is_none());
+    assert!(!assembly.has_cytobands());
+
+    let missing = directory.path().join("missing.txt");
+    let (assembly, failure) = load_assembly_reporting("test", dictionary(), Some(&missing));
+    assert!(!assembly.has_cytobands(), "the plain ideogram is the fallback");
+    let failure = failure.expect("a missing cytoband file is reported");
+    assert!(failure.contains("Could not load cytobands"));
+    assert!(failure.contains("missing.txt"));
+
+    let malformed = directory.path().join("bands.txt");
+    std::fs::write(&malformed, "chr1\tnot-a-number\t100\tp1\tgneg\n").unwrap();
+    let (_, failure) = load_assembly_reporting("test", dictionary(), Some(&malformed));
+    assert!(failure.is_some(), "a malformed cytoband file is reported");
+
+    let valid = directory.path().join("valid.txt");
+    std::fs::write(&valid, "chr1\t0\t500\tp1\tgneg\nchr1\t500\t1000\tq1\tgpos50\n").unwrap();
+    let (assembly, failure) = load_assembly_reporting("test", dictionary(), Some(&valid));
+    assert_eq!(failure, None);
+    assert!(assembly.has_cytobands());
 }

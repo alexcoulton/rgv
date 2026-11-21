@@ -1,5 +1,10 @@
 use std::{
-    cmp::Reverse, collections::BinaryHeap, mem::size_of, num::NonZeroUsize, ops::Range, sync::Arc,
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet},
+    mem::size_of,
+    num::NonZeroUsize,
+    ops::Range,
+    sync::Arc,
 };
 
 use rgv_core::{
@@ -16,6 +21,7 @@ use crate::{
     RowAtlasRevision, RowCoordinateSpaceRevision,
     fingerprint::StableHasher,
     row_oracle::{AlignmentRowGroup, OracleRowExtent, RowOracleError, build_row_oracle},
+    sampling::{SamplingCandidate, retained_by_sampling, sampling_priority, sampling_window},
 };
 
 /// One immutable row assignment addressed by physical source identity.
@@ -778,6 +784,8 @@ pub struct AlignmentRowAtlas {
     connectors: Arc<[AlignmentRowConnector]>,
     activity_index: Arc<RowActivityIndex>,
     record_count: usize,
+    /// Eligible reads considered for rows, including any declined by read sampling.
+    eligible_record_count: usize,
     assignment_fingerprint: ContractFingerprint,
     metadata_allocation: AllocationLease,
 }
@@ -816,6 +824,7 @@ impl AlignmentRowAtlas {
             reservation_kind,
         )?;
         let record_count = oracle.assignments.len();
+        let eligible_record_count = oracle.eligible_records;
         let records = oracle
             .assignments
             .into_iter()
@@ -859,6 +868,7 @@ impl AlignmentRowAtlas {
             groups,
             connectors,
             record_count,
+            eligible_record_count,
             metadata_reservation,
             publication_revision,
         )
@@ -921,15 +931,17 @@ impl AlignmentRowAtlas {
         if target.start() < self.interval.start() {
             let left = GenomicInterval::new(target.contig(), target.start(), self.interval.start())
                 .map_err(|_| AlignmentRowAtlasError::InvalidExtensionInterval)?;
-            self.collect_novel(evidence, left, &mut novel)?;
+            self.collect_novel(evidence, left, target, &mut novel)?;
         }
         if target.end() > self.interval.end() {
             let right = GenomicInterval::new(target.contig(), self.interval.end(), target.end())
                 .map_err(|_| AlignmentRowAtlasError::InvalidExtensionInterval)?;
-            self.collect_novel(evidence, right, &mut novel)?;
+            self.collect_novel(evidence, right, target, &mut novel)?;
         }
         novel.sort_unstable_by_key(|record| (record.start, record.end, record.handle));
         novel.dedup_by_key(|record| record.handle);
+        let eligible_record_count = self.eligible_record_count.saturating_add(novel.len());
+        let novel = self.sample_novel(novel);
         for record in &novel {
             if record.start < self.interval.end() && record.end > self.interval.start() {
                 return Err(AlignmentRowAtlasError::NovelRecordInsideIncumbent {
@@ -967,6 +979,7 @@ impl AlignmentRowAtlas {
             vec![AlignmentRowGroup::all(row_count)],
             Vec::new(),
             self.record_count.saturating_add(novel.len()),
+            eligible_record_count,
             metadata_reservation,
             publication_revision,
         )
@@ -987,6 +1000,7 @@ impl AlignmentRowAtlas {
         mut groups: Vec<AlignmentRowGroup>,
         mut connectors: Vec<AlignmentRowConnector>,
         record_count: usize,
+        eligible_record_count: usize,
         mut metadata_reservation: AllocationReservation,
         publication_revision: u64,
     ) -> Result<Arc<Self>, AlignmentRowAtlasError> {
@@ -1017,6 +1031,7 @@ impl AlignmentRowAtlas {
             connectors: connectors.into(),
             activity_index,
             record_count,
+            eligible_record_count,
             assignment_fingerprint,
             metadata_allocation,
         }))
@@ -1049,9 +1064,14 @@ impl AlignmentRowAtlas {
         &self,
         evidence: &Arc<EvidenceRoot>,
         interval: GenomicInterval,
+        extension: GenomicInterval,
         target: &mut Vec<RowInput>,
     ) -> Result<(), AlignmentRowAtlasError> {
+        let sampled = self.layout_contract.sampling.is_downsampled();
         let selection = evidence.select(interval)?;
+        // Novel reads whose mate may overlap the incumbent interval: (position in `target`,
+        // template priority, mate start). Such a mate was already given or declined a row.
+        let mut incumbent_mates = Vec::<(usize, u64, u64)>::new();
         for (index, reference) in selection.records().iter().enumerate() {
             if self.record(reference.handle).is_some() {
                 continue;
@@ -1059,13 +1079,122 @@ impl AlignmentRowAtlas {
             let view = selection
                 .record_view(index)
                 .ok_or(AlignmentRowAtlasError::InvalidEvidenceRecord)?;
+            // A read overlapping the incumbent interval which holds no row was already declined
+            // by sampling. That decision is final for this row-coordinate space.
+            if sampled && view.start() < self.interval.end() && view.end() > self.interval.start() {
+                continue;
+            }
+            let priority = if sampled {
+                sampling_priority(view.read_name())
+            } else {
+                0
+            };
+            if sampled
+                && view.flags().is_paired()
+                && view.mate_contig() == Some(self.interval.contig())
+                && let Some(mate_start) = view.mate_start()
+                && mate_start < self.interval.end()
+            {
+                incumbent_mates.push((target.len(), priority, mate_start));
+            }
             target.push(RowInput {
                 handle: reference.handle,
                 start: view.start(),
                 end: view.end(),
+                priority,
+                decided: None,
             });
         }
+        self.resolve_incumbent_mate_decisions(evidence, extension, &incumbent_mates, target)
+    }
+
+    /// Carries the incumbent atlas's sampling decision across an extension seam. A novel read
+    /// whose mate already holds a row must receive one too, and one whose mate was declined must
+    /// stay out; otherwise extending a downsampled atlas shows pairs with one mate missing.
+    fn resolve_incumbent_mate_decisions(
+        &self,
+        evidence: &Arc<EvidenceRoot>,
+        extension: GenomicInterval,
+        incumbent_mates: &[(usize, u64, u64)],
+        target: &mut [RowInput],
+    ) -> Result<(), AlignmentRowAtlasError> {
+        let (Some(first), Some(last)) = (
+            incumbent_mates.iter().map(|(_, _, start)| *start).min(),
+            incumbent_mates.iter().map(|(_, _, start)| *start).max(),
+        ) else {
+            return Ok(());
+        };
+        // One selection over the band of mate starts finds every such mate. A mate starting
+        // left of the certified extension can only reach the incumbent by spanning the
+        // extension's first base, so clamping the band there still selects it.
+        let band_start = first.max(extension.start());
+        let band_end = last
+            .saturating_add(1)
+            .min(self.interval.end())
+            .max(band_start.saturating_add(1));
+        let band = GenomicInterval::new(self.interval.contig(), band_start, band_end)
+            .map_err(|_| AlignmentRowAtlasError::InvalidExtensionInterval)?;
+        let wanted = incumbent_mates
+            .iter()
+            .map(|(_, priority, start)| (*priority, *start))
+            .collect::<HashSet<_>>();
+        let selection = evidence.select(band)?;
+        let mut decisions = HashMap::<(u64, u64), bool>::with_capacity(wanted.len());
+        for (index, reference) in selection.records().iter().enumerate() {
+            let view = selection
+                .record_view(index)
+                .ok_or(AlignmentRowAtlasError::InvalidEvidenceRecord)?;
+            if view.start() >= self.interval.end() || view.end() <= self.interval.start() {
+                // Not an incumbent read: it is novel too and is sampled with its mate.
+                continue;
+            }
+            let key = (sampling_priority(view.read_name()), view.start());
+            if wanted.contains(&key) {
+                *decisions.entry(key).or_default() |= self.record(reference.handle).is_some();
+            }
+        }
+        for (position, priority, mate_start) in incumbent_mates {
+            target[*position].decided = decisions.get(&(*priority, *mate_start)).copied();
+        }
         Ok(())
+    }
+
+    /// Applies the layout's read sampling to extension candidates. Incumbent rows keep their
+    /// place and consume the capacity of the sampling windows they start in.
+    fn sample_novel(&self, novel: Vec<RowInput>) -> Vec<RowInput> {
+        let sampling = self.layout_contract.sampling;
+        if !sampling.is_downsampled() || novel.is_empty() {
+            return novel;
+        }
+        let mut occupied = novel
+            .iter()
+            .filter_map(|record| sampling_window(sampling, record.start))
+            .map(|window| (window, 0_u32))
+            .collect::<HashMap<_, _>>();
+        for layer in self.layers.iter() {
+            for record in layer.records.iter() {
+                if let Some(count) = sampling_window(sampling, record.start)
+                    .and_then(|window| occupied.get_mut(&window))
+                {
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
+        let candidates = novel
+            .iter()
+            .map(|record| SamplingCandidate {
+                handle: record.handle,
+                start: record.start,
+                priority: record.priority,
+                decided: record.decided,
+            })
+            .collect::<Vec<_>>();
+        let retained = retained_by_sampling(sampling, &candidates, &occupied);
+        novel
+            .into_iter()
+            .zip(retained)
+            .filter_map(|(record, retained)| retained.then_some(record))
+            .collect()
     }
 
     #[must_use]
@@ -1127,6 +1256,17 @@ impl AlignmentRowAtlas {
     #[must_use]
     pub const fn record_count(&self) -> usize {
         self.record_count
+    }
+
+    /// Reads holding rows and eligible reads considered, when read sampling declined at least
+    /// one read. `None` means every eligible read in the atlas interval holds a row.
+    #[must_use]
+    pub const fn downsampled_read_counts(&self) -> Option<(usize, usize)> {
+        if self.record_count < self.eligible_record_count {
+            Some((self.record_count, self.eligible_record_count))
+        } else {
+            None
+        }
     }
 
     #[must_use]
@@ -1402,6 +1542,10 @@ struct RowInput {
     handle: AlignmentHandle,
     start: u64,
     end: u64,
+    /// Sampling priority; zero when the layout is not downsampled.
+    priority: u64,
+    /// Sampling decision inherited from a mate inside the incumbent atlas, when there is one.
+    decided: Option<bool>,
 }
 
 fn assign_extension_rows(
@@ -1713,6 +1857,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: crate::ReadSampling::Complete,
         }
     }
 
@@ -2705,5 +2850,161 @@ mod tests {
                 RowOracleError::AuxiliaryPayloadRequired(tag)
             )) if tag == *b"RG"
         ));
+    }
+
+    fn downsampled(window: u32, maximum: u32) -> LayoutContract {
+        LayoutContract {
+            sampling: crate::ReadSampling::Downsampled {
+                window_bases: std::num::NonZeroU32::new(window).unwrap(),
+                maximum_reads: std::num::NonZeroU32::new(maximum).unwrap(),
+            },
+            ..contract(ReadStackingMode::Stable)
+        }
+    }
+
+    #[test]
+    fn downsampled_atlas_caps_each_window_and_is_reproducible() {
+        let ledger = AllocationLedger::new(8 << 20, 0);
+        let names = (0..12)
+            .map(|index| format!("deep-{index}").into_bytes())
+            .collect::<Vec<_>>();
+        let mut records = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_slice(), 100 + index as u64, 180, index as u64 + 1))
+            .collect::<Vec<_>>();
+        records.push((b"sparse", 210, 260, 40));
+        let chunk = evidence_chunk(&ledger, &records);
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 400).unwrap();
+        let evidence = evidence_root(&ledger, chunk, interval, 10);
+        let build = |revision_value| {
+            AlignmentRowAtlas::build(
+                revision(revision_value),
+                &evidence,
+                interval,
+                downsampled(50, 3),
+                &ledger,
+                ReservationKind::Normal,
+                revision_value,
+            )
+            .unwrap()
+        };
+        let first = build(20);
+        let second = build(21);
+        let kept = |atlas: &AlignmentRowAtlas| {
+            evidence
+                .select(interval)
+                .unwrap()
+                .records()
+                .iter()
+                .filter_map(|record| atlas.record(record.handle).map(|_| record.handle))
+                .collect::<Vec<_>>()
+        };
+        // Twelve reads start in window 2 (100..150); one read starts in window 4.
+        assert_eq!(first.record_count, 4);
+        assert_eq!(first.downsampled_read_counts(), Some((4, 13)));
+        assert_eq!(kept(&first), kept(&second));
+        assert_eq!(evidence.select(interval).unwrap().records().len(), 13);
+
+        let complete = AlignmentRowAtlas::build(
+            revision(22),
+            &evidence,
+            interval,
+            contract(ReadStackingMode::Stable),
+            &ledger,
+            ReservationKind::Normal,
+            22,
+        )
+        .unwrap();
+        assert_eq!(complete.record_count, 13);
+        assert_eq!(complete.downsampled_read_counts(), None);
+    }
+
+    #[test]
+    fn downsampled_extension_keeps_incumbents_and_never_readmits_declined_reads() {
+        let ledger = AllocationLedger::new(8 << 20, 0);
+        let names = (0..10)
+            .map(|index| format!("edge-{index}").into_bytes())
+            .collect::<Vec<_>>();
+        // Ten reads start in window 0 and reach into the incumbent interval; four more start in
+        // the same window but end before it, and are first seen by the left extension.
+        let mut records = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_slice(), 30 + index as u64, 70, index as u64 + 1))
+            .collect::<Vec<_>>();
+        records.extend([
+            (b"novel-a".as_slice(), 2, 20, 20),
+            (b"novel-b".as_slice(), 4, 22, 21),
+            (b"novel-c".as_slice(), 6, 24, 22),
+            (b"novel-d".as_slice(), 8, 26, 23),
+        ]);
+        let chunk = evidence_chunk(&ledger, &records);
+        let narrow_interval = GenomicInterval::new(ContigId::new(0), 50, 120).unwrap();
+        let wide_interval = GenomicInterval::new(ContigId::new(0), 0, 120).unwrap();
+        let narrow = evidence_root(&ledger, Arc::clone(&chunk), narrow_interval, 10);
+        let wide = evidence_root(&ledger, chunk, wide_interval, 11);
+        let incumbent = AlignmentRowAtlas::build(
+            revision(20),
+            &narrow,
+            narrow_interval,
+            downsampled(50, 4),
+            &ledger,
+            ReservationKind::Normal,
+            20,
+        )
+        .unwrap();
+        assert_eq!(incumbent.record_count, 4);
+        let incumbent_rows = narrow
+            .select(narrow_interval)
+            .unwrap()
+            .records()
+            .iter()
+            .filter_map(|record| {
+                incumbent
+                    .record(record.handle)
+                    .map(|hit| (record.handle, hit.record.row()))
+            })
+            .collect::<Vec<_>>();
+        let extended = incumbent
+            .extend(
+                revision(21),
+                &wide,
+                wide_interval,
+                &ledger,
+                ReservationKind::Normal,
+                21,
+            )
+            .unwrap();
+        // The window was already full, so no novel read is admitted and no declined read returns.
+        assert_eq!(extended.record_count, 4);
+        for (handle, row) in incumbent_rows {
+            assert_eq!(extended.record(handle).unwrap().record.row(), row);
+        }
+
+        let roomy = AlignmentRowAtlas::build(
+            revision(22),
+            &narrow,
+            narrow_interval,
+            downsampled(50, 12),
+            &ledger,
+            ReservationKind::Normal,
+            22,
+        )
+        .unwrap();
+        assert_eq!(roomy.record_count, 10);
+        let roomy_extended = roomy
+            .extend(
+                revision(23),
+                &wide,
+                wide_interval,
+                &ledger,
+                ReservationKind::Normal,
+                23,
+            )
+            .unwrap();
+        // Two places remain in the window; two of the four novel reads take them.
+        assert_eq!(roomy_extended.record_count, 12);
+        assert_eq!(roomy_extended.downsampled_read_counts(), Some((12, 14)));
     }
 }

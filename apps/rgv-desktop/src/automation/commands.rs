@@ -242,6 +242,9 @@ pub(crate) fn automation_viewport_after_operation(
     })
 }
 
+/// Longest a batch waits for a snapshot, export or save worker before failing the command.
+pub(crate) const AUTOMATION_FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+
 impl Viewer {
     pub(crate) fn automation_navigation_state(
         &self,
@@ -438,6 +441,17 @@ impl Viewer {
         if runner.finished {
             return;
         }
+        if runner.cancel_if_requested() {
+            self.detach_automation_file_tasks();
+            self.report_error(
+                "Local-control batch cancelled: its request timed out before it completed",
+            );
+            self.mark_display_dirty("explicit display invalidation");
+            return;
+        }
+        let Some(runner) = self.automation.as_mut() else {
+            return;
+        };
         if runner
             .report_worker
             .as_ref()
@@ -498,7 +512,25 @@ impl Viewer {
                 }
                 return;
             }
-            Some(AutomationWait::File { .. }) => return,
+            Some(AutomationWait::File {
+                command_index,
+                deadline,
+            }) => {
+                if now >= deadline {
+                    // The worker may still finish later; its result must not be attributed to
+                    // a later command or applied after the failure was reported.
+                    self.detach_automation_file_tasks();
+                    self.finish_automation_command(
+                        command_index,
+                        Err((
+                            AutomationErrorCode::Timeout,
+                            "The file operation did not complete before its deadline; a late result will be ignored"
+                                .to_owned(),
+                        )),
+                    );
+                }
+                return;
+            }
             Some(AutomationWait::Reference {
                 command_index,
                 deadline,
@@ -702,6 +734,24 @@ impl Viewer {
         }
     }
 
+    /// Disowns every file worker started by the automation batch, so a result that arrives
+    /// after the batch gave up on it is neither reported nor (for a project open) applied.
+    pub(crate) fn detach_automation_file_tasks(&mut self) {
+        for task in &mut self.session_save_tasks {
+            task.automation_command = None;
+        }
+        for task in &mut self.export_tasks {
+            task.automation_command = None;
+        }
+        for task in &mut self.session_load_tasks {
+            if task.automation_command.take().is_some() {
+                task.deadline = None;
+                self.document_state.cancel_load(task.ticket);
+            }
+        }
+        self.pending_native_window_capture = None;
+    }
+
     pub(crate) fn maybe_start_control_request(&mut self) {
         if self
             .automation
@@ -748,7 +798,7 @@ impl Viewer {
         if !runner.finish_command(command_index, outcome) {
             let waiting_index = runner.waiting.as_ref().map(|waiting| match waiting {
                 AutomationWait::Settled { command_index, .. }
-                | AutomationWait::File { command_index }
+                | AutomationWait::File { command_index, .. }
                 | AutomationWait::Reference { command_index, .. }
                 | AutomationWait::AlignmentTrack { command_index, .. }
                 | AutomationWait::AuxiliaryTrack { command_index, .. }
@@ -842,7 +892,7 @@ impl Viewer {
         }
         let active = runner.waiting.as_ref().map(|waiting| match waiting {
             AutomationWait::Settled { command_index, .. }
-            | AutomationWait::File { command_index }
+            | AutomationWait::File { command_index, .. }
             | AutomationWait::Reference { command_index, .. }
             | AutomationWait::AlignmentTrack { command_index, .. }
             | AutomationWait::AuxiliaryTrack { command_index, .. }
@@ -1190,7 +1240,14 @@ impl Viewer {
                     Some(now + Duration::from_millis(timeout_millis)),
                     save_destination,
                 ) {
-                    Ok(()) => AutomationExecution::Wait(AutomationWait::File { command_index }),
+                    // The load task enforces the declared timeout itself; this backstop only
+                    // covers a worker that never reports.
+                    Ok(()) => AutomationExecution::Wait(AutomationWait::File {
+                        command_index,
+                        deadline: now
+                            + Duration::from_millis(timeout_millis)
+                            + AUTOMATION_FILE_WAIT_TIMEOUT,
+                    }),
                     Err(error) => automation_failure(AutomationErrorCode::Io, error),
                 }
             }
@@ -1695,7 +1752,10 @@ impl Viewer {
                 scope,
                 format,
             ) {
-                Ok(()) => AutomationExecution::Wait(AutomationWait::File { command_index }),
+                Ok(()) => AutomationExecution::Wait(AutomationWait::File {
+                    command_index,
+                    deadline: now + AUTOMATION_FILE_WAIT_TIMEOUT,
+                }),
                 Err(error) => automation_failure(AutomationErrorCode::Io, error),
             },
             AutomationCommand::Export { path, kind } => {
@@ -1718,7 +1778,10 @@ impl Viewer {
                     }
                 }
                 match self.start_automation_export(command_index, PathBuf::from(path), kind) {
-                    Ok(()) => AutomationExecution::Wait(AutomationWait::File { command_index }),
+                    Ok(()) => AutomationExecution::Wait(AutomationWait::File {
+                    command_index,
+                    deadline: now + AUTOMATION_FILE_WAIT_TIMEOUT,
+                }),
                     Err(error) if error.to_string().starts_with("complete reads unavailable") => {
                         automation_failure(AutomationErrorCode::TooDense, error)
                     }
@@ -1729,7 +1792,10 @@ impl Viewer {
             }
             AutomationCommand::Save { path } => {
                 match self.start_automation_session_save(command_index, PathBuf::from(path)) {
-                    Ok(()) => AutomationExecution::Wait(AutomationWait::File { command_index }),
+                    Ok(()) => AutomationExecution::Wait(AutomationWait::File {
+                    command_index,
+                    deadline: now + AUTOMATION_FILE_WAIT_TIMEOUT,
+                }),
                     Err(error) => automation_failure(AutomationErrorCode::Io, error),
                 }
             }
@@ -4103,6 +4169,7 @@ impl Viewer {
             "panel {} was not found",
             panel_id.get()
         );
+        self.commit_navigation_gesture();
         let interval = match action {
             AutomationHistoryNavigation::Back => self.panels.active_mut().navigation_history.back(),
             AutomationHistoryNavigation::Forward => {

@@ -1,6 +1,7 @@
 use super::super::*;
 
 #[allow(clippy::struct_excessive_bools)]
+#[derive(Default)]
 pub(crate) struct WorkspaceDialogDraft {
     pub(crate) metadata_open: bool,
     pub(crate) regions_open: bool,
@@ -374,7 +375,7 @@ pub(crate) fn show_workspace_dialogs(ui: &mut egui::Ui, draft: &mut WorkspaceDia
         egui::Window::new("Regions of interest")
             .open(&mut draft.regions_open)
             .default_width(520.0)
-            .vscroll(true)
+            .default_height(420.0)
             .show(ui.ctx(), |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -400,50 +401,71 @@ pub(crate) fn show_workspace_dialogs(ui: &mut egui::Ui, draft: &mut WorkspaceDia
                         draft.regions.len()
                     ));
                 });
-                for region in &mut draft.regions {
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        let name_label = ui.label("Name");
-                        ui.text_edit_singleline(&mut region.name)
-                            .labelled_by(name_label.id);
-                        let mut color = egui::Color32::from_rgba_unmultiplied(
-                            region.color[0],
-                            region.color[1],
-                            region.color[2],
-                            region.color[3],
-                        );
-                        let color_button = ui.color_edit_button_srgba(&mut color);
-                        color_button.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::ColorButton,
-                                true,
-                                format!("Colour for region {}", region.name),
-                            )
-                        });
-                        if color_button.changed() {
-                            region.color = color.to_array();
-                        }
-                        if ui.button("Go").clicked() {
-                            draft.managed_locus_requested = Some(format!(
-                                "{}:{}-{}",
-                                region.locus.contig,
-                                region.locus.start.saturating_add(1),
-                                region.locus.end
-                            ));
-                        }
-                        if ui.button("Use current view").clicked() {
-                            draft.region_to_relocate = Some(region.id);
-                        }
-                        if ui.button("Delete").clicked() {
-                            draft.region_to_delete = Some(region.id);
+                // The list may hold 100,000 regions: only the rows in view are laid out.
+                let row_height = list_row_height(ui, 1, 1, 0);
+                let mut managed_locus_requested = None;
+                let mut region_to_relocate = None;
+                let mut region_to_delete = None;
+                let regions = &mut draft.regions;
+                egui::ScrollArea::vertical()
+                    .id_salt("regions-of-interest-list")
+                    .auto_shrink(false)
+                    .show_rows(ui, row_height, regions.len(), |ui, rows| {
+                        for region in &mut regions[rows] {
+                            fixed_height_row(ui, row_height, |ui| {
+                                ui.horizontal(|ui| {
+                                    let name_label = ui.label("Name");
+                                    ui.text_edit_singleline(&mut region.name)
+                                        .labelled_by(name_label.id);
+                                    let mut color = egui::Color32::from_rgba_unmultiplied(
+                                        region.color[0],
+                                        region.color[1],
+                                        region.color[2],
+                                        region.color[3],
+                                    );
+                                    let color_button = ui.color_edit_button_srgba(&mut color);
+                                    color_button.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::ColorButton,
+                                            true,
+                                            format!("Colour for region {}", region.name),
+                                        )
+                                    });
+                                    if color_button.changed() {
+                                        region.color = color.to_array();
+                                    }
+                                    if ui.button("Go").clicked() {
+                                        managed_locus_requested = Some(format!(
+                                            "{}:{}-{}",
+                                            region.locus.contig,
+                                            region.locus.start.saturating_add(1),
+                                            region.locus.end
+                                        ));
+                                    }
+                                    if ui.button("Use current view").clicked() {
+                                        region_to_relocate = Some(region.id);
+                                    }
+                                    if ui.button("Delete").clicked() {
+                                        region_to_delete = Some(region.id);
+                                    }
+                                });
+                                ui.label(format!(
+                                    "{}:{}-{}",
+                                    region.locus.contig,
+                                    region.locus.start.saturating_add(1),
+                                    region.locus.end
+                                ));
+                            });
                         }
                     });
-                    ui.label(format!(
-                        "{}:{}-{}",
-                        region.locus.contig,
-                        region.locus.start.saturating_add(1),
-                        region.locus.end
-                    ));
+                if managed_locus_requested.is_some() {
+                    draft.managed_locus_requested = managed_locus_requested;
+                }
+                if region_to_relocate.is_some() {
+                    draft.region_to_relocate = region_to_relocate;
+                }
+                if region_to_delete.is_some() {
+                    draft.region_to_delete = region_to_delete;
                 }
             });
     }
@@ -451,7 +473,7 @@ pub(crate) fn show_workspace_dialogs(ui: &mut egui::Ui, draft: &mut WorkspaceDia
         egui::Window::new("Review queue")
             .open(&mut draft.review_open)
             .default_width(620.0)
-            .vscroll(true)
+            .default_height(480.0)
             .show(ui.ctx(), |ui| {
                 ui.horizontal(|ui| {
                     if ui
@@ -515,72 +537,265 @@ pub(crate) fn show_workspace_dialogs(ui: &mut egui::Ui, draft: &mut WorkspaceDia
                             }
                         });
                 });
-                for item in draft.review_items.iter_mut().filter(|item| {
-                    draft
-                        .review_status_filter
-                        .is_none_or(|status| item.status == status)
-                }) {
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        let label = ui.label("Label");
-                        ui.text_edit_singleline(&mut item.label)
-                            .labelled_by(label.id);
-                        let status = egui::ComboBox::from_id_salt(("review-status", item.id))
-                            .selected_text(review_status_label(item.status))
-                            .show_ui(ui, |ui| {
-                                for status in [
-                                    ReviewStatus::Pending,
-                                    ReviewStatus::InProgress,
-                                    ReviewStatus::Complete,
-                                    ReviewStatus::Skipped,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut item.status,
-                                        status,
-                                        review_status_label(status),
-                                    );
-                                }
-                            });
-                        status.response.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::ComboBox,
-                                true,
-                                format!("Review status; {}", review_status_label(item.status)),
-                            )
-                        });
-                        if ui.button("Go").clicked() {
-                            draft.managed_locus_requested = Some(format!(
-                                "{}:{}-{}",
-                                item.locus.contig,
-                                item.locus.start.saturating_add(1),
-                                item.locus.end
-                            ));
-                        }
-                        if ui.button("Use current view").clicked() {
-                            draft.review_to_relocate = Some(item.id);
-                        }
-                        if ui.button("Delete").clicked() {
-                            draft.review_to_delete = Some(item.id);
-                        }
-                    });
-                    ui.monospace(session_locus_text(&item.locus));
-                    ui.horizontal(|ui| {
-                        let label = ui.label("Assigned to");
-                        let assignment = item.assignment.get_or_insert_default();
-                        ui.text_edit_singleline(assignment).labelled_by(label.id);
-                        if assignment.trim().is_empty() {
-                            item.assignment = None;
-                        }
-                    });
-                    let notes_label = ui.label("Notes");
-                    ui.text_edit_multiline(&mut item.notes)
-                        .labelled_by(notes_label.id);
-                }
-                ui.separator();
                 ui.label(format!(
                     "{} / {MAXIMUM_REVIEW_ITEMS} review items",
                     draft.review_items.len()
                 ));
+                // Up to 100,000 items: only the rows in view are laid out.
+                let visible = filtered_review_indices(&draft.review_items, draft.review_status_filter);
+                let notes_height = 2.0 * ui.text_style_height(&egui::TextStyle::Body) + 10.0;
+                let row_height = list_row_height(ui, 2, 2, 0) + notes_height;
+                let mut managed_locus_requested = None;
+                let mut review_to_relocate = None;
+                let mut review_to_delete = None;
+                let items = &mut draft.review_items;
+                egui::ScrollArea::vertical()
+                    .id_salt("review-queue-list")
+                    .auto_shrink(false)
+                    .show_rows(ui, row_height, visible.len(), |ui, rows| {
+                        for &index in &visible[rows] {
+                            let item = &mut items[index];
+                            fixed_height_row(ui, row_height, |ui| {
+                                ui.horizontal(|ui| {
+                                    let label = ui.label("Label");
+                                    ui.text_edit_singleline(&mut item.label)
+                                        .labelled_by(label.id);
+                                    let status =
+                                        egui::ComboBox::from_id_salt(("review-status", item.id))
+                                            .selected_text(review_status_label(item.status))
+                                            .show_ui(ui, |ui| {
+                                                for status in [
+                                                    ReviewStatus::Pending,
+                                                    ReviewStatus::InProgress,
+                                                    ReviewStatus::Complete,
+                                                    ReviewStatus::Skipped,
+                                                ] {
+                                                    ui.selectable_value(
+                                                        &mut item.status,
+                                                        status,
+                                                        review_status_label(status),
+                                                    );
+                                                }
+                                            });
+                                    status.response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::WidgetType::ComboBox,
+                                            true,
+                                            format!(
+                                                "Review status; {}",
+                                                review_status_label(item.status)
+                                            ),
+                                        )
+                                    });
+                                    if ui.button("Go").clicked() {
+                                        managed_locus_requested = Some(format!(
+                                            "{}:{}-{}",
+                                            item.locus.contig,
+                                            item.locus.start.saturating_add(1),
+                                            item.locus.end
+                                        ));
+                                    }
+                                    if ui.button("Use current view").clicked() {
+                                        review_to_relocate = Some(item.id);
+                                    }
+                                    if ui.button("Delete").clicked() {
+                                        review_to_delete = Some(item.id);
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.monospace(session_locus_text(&item.locus));
+                                    let label = ui.label("Assigned to");
+                                    let assignment = item.assignment.get_or_insert_default();
+                                    ui.text_edit_singleline(assignment).labelled_by(label.id);
+                                    if assignment.trim().is_empty() {
+                                        item.assignment = None;
+                                    }
+                                });
+                                // Notes of any length scroll inside a fixed-height box so every
+                                // row has the same height.
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("review-notes", item.id))
+                                    .max_height(notes_height)
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut item.notes)
+                                                .desired_rows(2)
+                                                .desired_width(f32::INFINITY)
+                                                .hint_text("Notes"),
+                                        )
+                                        .widget_info(|| {
+                                            egui::WidgetInfo::labeled(
+                                                egui::WidgetType::TextEdit,
+                                                true,
+                                                "Notes",
+                                            )
+                                        });
+                                    });
+                            });
+                        }
+                    });
+                if managed_locus_requested.is_some() {
+                    draft.managed_locus_requested = managed_locus_requested;
+                }
+                if review_to_relocate.is_some() {
+                    draft.review_to_relocate = review_to_relocate;
+                }
+                if review_to_delete.is_some() {
+                    draft.review_to_delete = review_to_delete;
+                }
             });
+    }
+}
+
+/// Indices of the review items shown under `filter`, in list order.
+pub(crate) fn filtered_review_indices(
+    items: &[ReviewItem],
+    filter: Option<ReviewStatus>,
+) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| filter.is_none_or(|status| item.status == status))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Height of one virtualised list row holding `control_lines` rows of widgets and `text_lines`
+/// rows of plain text, plus `extra` points.
+fn list_row_height(ui: &egui::Ui, control_lines: u8, text_lines: u8, extra: u8) -> f32 {
+    let spacing = ui.spacing();
+    let controls = spacing.interact_size.y.max(ui.text_style_height(&egui::TextStyle::Body) + 6.0);
+    f32::from(control_lines) * controls
+        + f32::from(text_lines) * ui.text_style_height(&egui::TextStyle::Body)
+        + f32::from(control_lines + text_lines) * spacing.item_spacing.y
+        + f32::from(extra)
+        + 6.0
+}
+
+/// Lays `contents` out in exactly `height` points so `ScrollArea::show_rows` can skip rows that
+/// are out of view. A rule separates the row from the one above it.
+fn fixed_height_row(ui: &mut egui::Ui, height: f32, contents: impl FnOnce(&mut egui::Ui)) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    ui.painter().hline(
+        rect.x_range(),
+        rect.top(),
+        ui.visuals().widgets.noninteractive.bg_stroke,
+    );
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(0.0, 3.0)))
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    row.set_clip_rect(rect.intersect(ui.clip_rect()));
+    contents(&mut row);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(id: u64) -> RegionOfInterest {
+        RegionOfInterest {
+            id,
+            name: format!("Region {id}"),
+            locus: SessionLocus {
+                contig: "chr1".to_owned(),
+                start: id * 100,
+                end: id * 100 + 50,
+            },
+            color: [45, 92, 175, 48],
+        }
+    }
+
+    fn review(id: u64, status: ReviewStatus) -> ReviewItem {
+        ReviewItem {
+            id,
+            label: format!("Item {id}"),
+            locus: SessionLocus {
+                contig: "chr1".to_owned(),
+                start: id * 100,
+                end: id * 100 + 50,
+            },
+            status,
+            notes: String::new(),
+            assignment: None,
+        }
+    }
+
+    /// Number of widgets laid out when the dialogs are shown for a few frames.
+    fn laid_out_nodes(draft: &mut WorkspaceDialogDraft) -> usize {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut nodes = 0;
+        for _ in 0..3 {
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 800.0),
+                    )),
+                    ..egui::RawInput::default()
+                },
+                |ui| show_workspace_dialogs(ui, draft),
+            );
+            if let Some(update) = output.platform_output.accesskit_update {
+                nodes = nodes.max(update.nodes.len());
+            }
+        }
+        nodes
+    }
+
+    #[test]
+    fn region_list_lays_out_only_the_rows_in_view() {
+        let mut small = WorkspaceDialogDraft {
+            regions_open: true,
+            regions: (1..=3).map(region).collect(),
+            ..WorkspaceDialogDraft::default()
+        };
+        let small_nodes = laid_out_nodes(&mut small);
+        let mut large = WorkspaceDialogDraft {
+            regions_open: true,
+            regions: (1..=100_000).map(region).collect(),
+            ..WorkspaceDialogDraft::default()
+        };
+        let large_nodes = laid_out_nodes(&mut large);
+        assert!(small_nodes > 0);
+        assert!(
+            large_nodes < small_nodes + 400,
+            "100,000 regions laid out {large_nodes} widgets (3 regions: {small_nodes})"
+        );
+        assert_eq!(large.regions.len(), 100_000, "rows out of view are untouched");
+    }
+
+    #[test]
+    fn review_queue_lays_out_only_the_rows_in_view() {
+        let mut large = WorkspaceDialogDraft {
+            review_open: true,
+            review_items: (1..=100_000)
+                .map(|id| review(id, ReviewStatus::Pending))
+                .collect(),
+            ..WorkspaceDialogDraft::default()
+        };
+        let nodes = laid_out_nodes(&mut large);
+        assert!(nodes > 0);
+        assert!(nodes < 1_000, "100,000 review items laid out {nodes} widgets");
+    }
+
+    #[test]
+    fn review_filter_selects_matching_items_in_order() {
+        let items = vec![
+            review(1, ReviewStatus::Pending),
+            review(2, ReviewStatus::Complete),
+            review(3, ReviewStatus::Pending),
+        ];
+        assert_eq!(filtered_review_indices(&items, None), vec![0, 1, 2]);
+        assert_eq!(
+            filtered_review_indices(&items, Some(ReviewStatus::Pending)),
+            vec![0, 2]
+        );
+        assert!(filtered_review_indices(&items, Some(ReviewStatus::Skipped)).is_empty());
     }
 }

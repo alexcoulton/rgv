@@ -101,6 +101,16 @@ fn read_bounded_utf8(path: &Path) -> Result<String, String> {
     Ok(text)
 }
 
+/// Splits one BED line into fields. BED allows either tabs or runs of spaces between fields;
+/// a line that contains a tab is tab-delimited, so its names may contain spaces.
+fn bed_fields(line: &str) -> Vec<&str> {
+    if line.contains('\t') {
+        line.split('\t').map(str::trim).collect()
+    } else {
+        line.split_ascii_whitespace().collect()
+    }
+}
+
 fn parse_region_bed(text: &str) -> Result<Vec<RegionOfInterest>, String> {
     let mut regions = Vec::new();
     for (line_index, line) in text.lines().enumerate() {
@@ -118,7 +128,7 @@ fn parse_region_bed(text: &str) -> Result<Vec<RegionOfInterest>, String> {
                 "line {line_number}: more than {MAXIMUM_REGIONS_OF_INTEREST} regions"
             ));
         }
-        let fields = line.split('\t').collect::<Vec<_>>();
+        let fields = bed_fields(line);
         if fields.len() < 3 {
             return Err(format!(
                 "line {line_number}: BED requires at least 3 columns"
@@ -288,6 +298,22 @@ fn bounded_text(value: &str, maximum_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bed_import_accepts_tabs_or_any_whitespace_between_fields() {
+        assert_eq!(bed_fields("chr1\t100\t200\tmy region"), ["chr1", "100", "200", "my region"]);
+        assert_eq!(bed_fields("chr1 100 200 name"), ["chr1", "100", "200", "name"]);
+        assert_eq!(bed_fields("chr1   100  200"), ["chr1", "100", "200"]);
+        let spaces = parse_region_bed("chr1 100 200 promoter\nchr2   5  50\n").unwrap();
+        assert_eq!(spaces.len(), 2);
+        assert_eq!(spaces[0].name, "promoter");
+        assert_eq!((spaces[0].locus.start, spaces[0].locus.end), (100, 200));
+        assert_eq!(spaces[1].locus.contig, "chr2");
+        let tabs = parse_region_bed("chr1\t100\t200\tmy region\n").unwrap();
+        assert_eq!(tabs[0].name, "my region", "tab-delimited names keep their spaces");
+        assert_eq!(spaces[0].locus, parse_region_bed("chr1\t100\t200\n").unwrap()[0].locus);
+    }
+
 
     #[test]
     fn bed_round_trip_preserves_coordinates_names_and_rgb() {

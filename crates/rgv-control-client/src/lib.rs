@@ -9,10 +9,7 @@ use std::{
 };
 
 use reqwest::StatusCode;
-use rgv_core::{
-    AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationCommand, AutomationRunReport,
-    StressHealthSnapshot,
-};
+use rgv_core::{AutomationBatch, AutomationCommand, AutomationRunReport, StressHealthSnapshot};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -91,8 +88,10 @@ impl ControlClient {
         let _guard = self.gate.lock().await;
         let mutates_viewer = batch_mutates_viewer(batch);
         if mutates_viewer && self.uncertain_mutation.load(Ordering::Acquire) {
+            // Stamp the observation with the caller's (already validated) schema version so a
+            // caller targeting an older supported viewer is not rejected by this internal probe.
             let observation = AutomationBatch {
-                schema_version: AUTOMATION_SCHEMA_VERSION,
+                schema_version: batch.schema_version,
                 commands: vec![AutomationCommand::DescribeWorkspace],
             };
             let report = self.send_batch_locked(&observation, timeout).await?;
@@ -322,6 +321,7 @@ pub enum ControlClientError {
 mod tests {
     use std::thread;
 
+    use rgv_core::AUTOMATION_SCHEMA_VERSION;
     use tiny_http::{Header, Response, Server};
 
     use super::*;

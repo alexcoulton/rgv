@@ -4071,7 +4071,6 @@ name = "rgv-engine"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
- "lru",
  "rgv-alignment-scene",
  "rgv-core",
  "rgv-hts",
@@ -4089,6 +4088,7 @@ dependencies = [
  "flate2",
  "lru",
  "noodles 0.115.0",
+ "noodles-bgzf 0.51.0",
  "reqwest",
  "rgv-core",
  "rust-htslib",
@@ -4158,6 +4158,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "image",
  "reqwest",
  "rgv-control-client",
  "rgv-core",

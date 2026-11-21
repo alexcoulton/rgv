@@ -513,6 +513,7 @@ impl AlignmentSemanticPage {
             &by_handle,
             key,
             presentation,
+            interval,
         )?;
         let _dynamic_scratch = ledger.reserve_transient(
             TransientResourceClass::SemanticPageBuilder,
@@ -590,22 +591,17 @@ impl AlignmentSemanticPage {
                 maximum_labels = maximum_labels.saturating_add(1);
                 maximum_label_bytes = maximum_label_bytes.saturating_add(label.len());
             }
+            // Only operations which can intersect this tile are counted. Counting the whole
+            // CIGAR reserved (and allocated) every aligned base of a long read for every page
+            // it touched.
+            let bound = record_primitive_bound(
+                record,
+                interval,
+                key.lod,
+                presentation.style.minimum_event_label_size,
+            );
             let event_labels = if key.family == AlignmentPageFamily::Labels {
-                record
-                    .cigar()
-                    .iter()
-                    .filter(|operation| {
-                        operation.len >= presentation.style.minimum_event_label_size
-                            && matches!(
-                                operation.kind,
-                                CigarOpKind::Insertion
-                                    | CigarOpKind::Deletion
-                                    | CigarOpKind::ReferenceSkip
-                                    | CigarOpKind::SoftClip
-                                    | CigarOpKind::HardClip
-                            )
-                    })
-                    .count()
+                bound.event_labels
             } else {
                 0
             };
@@ -617,23 +613,7 @@ impl AlignmentSemanticPage {
                 .saturating_add(event_labels)
                 .saturating_add(usize::from(read_label.is_some()))
                 .saturating_add(if key.family == AlignmentPageFamily::ReadGeometry {
-                    match key.lod {
-                        GeometryLod::Overview => 1,
-                        GeometryLod::Span | GeometryLod::Read => {
-                            record.cigar().len().max(1).saturating_add(1)
-                        }
-                        GeometryLod::Base => record.cigar().iter().fold(
-                            record.cigar().len().max(1).saturating_add(1),
-                            |total, operation| {
-                                total.saturating_add(match operation.kind {
-                                    CigarOpKind::Match
-                                    | CigarOpKind::SequenceMatch
-                                    | CigarOpKind::SequenceMismatch => operation.len as usize,
-                                    _ => 0,
-                                })
-                            },
-                        ),
-                    }
+                    bound.geometry
                 } else {
                     0
                 });
@@ -668,7 +648,7 @@ impl AlignmentSemanticPage {
             reservation_kind,
         )?;
         let mut primitives = Vec::with_capacity(maximum_primitives);
-        let mut labels = Vec::with_capacity(maximum_labels);
+        let mut labels = Vec::<PendingLabel>::with_capacity(maximum_labels);
         let tile_start = interval.start();
         for hit in atlas_records {
             let selection_index = *by_handle.get(&hit.record.handle()).ok_or(
@@ -741,6 +721,18 @@ impl AlignmentSemanticPage {
                 0,
             );
         }
+        // Reservation invariant: the tile-clipped first pass must never undercount what the
+        // second pass emits, otherwise the page outgrows what the ledger was asked to admit.
+        debug_assert!(
+            primitives.len() <= maximum_primitives,
+            "semantic page emitted {} primitives but reserved {maximum_primitives}",
+            primitives.len(),
+        );
+        debug_assert!(
+            labels.len() <= maximum_labels,
+            "semantic page emitted {} labels but reserved {maximum_labels}",
+            labels.len(),
+        );
         primitives.sort_unstable_by_key(|primitive| {
             (
                 primitive.row_offset,
@@ -1685,6 +1677,9 @@ fn emit_record_primitives(
 ) -> Result<(), SemanticPageError> {
     let emit_geometry = family == AlignmentPageFamily::ReadGeometry;
     let emit_labels = family == AlignmentPageFamily::Labels;
+    // Each handle is emitted exactly once per page, so this record's primitives are precisely
+    // those appended from here on.
+    let first_record_primitive = output.len();
     let style = AlignmentStyleToken {
         flags: record.flags().bits(),
         mapping_quality: record.mapping_quality(),
@@ -2049,11 +2044,20 @@ fn emit_record_primitives(
             style,
             draw_order,
         );
-        mark_directional_read_geometry(output, handle, row_offset, record, tile, tile_start);
+        mark_directional_read_geometry(
+            &mut output[first_record_primitive..],
+            handle,
+            row_offset,
+            record,
+            tile,
+            tile_start,
+        );
     }
     Ok(())
 }
 
+/// `output` must be the primitives of this one record. Scanning the whole page here made page
+/// construction quadratic in the number of reads.
 fn mark_directional_read_geometry(
     output: &mut [AlignmentSemanticPrimitive],
     handle: AlignmentHandle,
@@ -2645,12 +2649,14 @@ fn semantic_page_dynamic_scratch_bytes(
     by_handle: &HashMap<AlignmentHandle, usize>,
     key: AlignmentPageKey,
     presentation: PresentationContract,
+    tile: GenomicInterval,
 ) -> Result<usize, SemanticPageError> {
     let mut bytes = hash_table_scratch_bytes(
         atlas_records.len(),
         size_of::<(AlignmentHandle, PreparedRecordSemantics)>(),
     );
     let mut overlay_slots = 0_usize;
+    let mut modification_call_slots = 0_usize;
     let mut pending_label_slots = 0_usize;
     let mut pending_label_bytes = 0_usize;
     let detailed = matches!(key.lod, GeometryLod::Read | GeometryLod::Base);
@@ -2666,18 +2672,7 @@ fn semantic_page_dynamic_scratch_bytes(
             Some(SequenceView::Present { bases, .. }) => bases.len(),
             Some(SequenceView::Missing | SequenceView::NotLoaded) | None => 0,
         };
-        let aligned_bases = record.cigar().iter().fold(0_usize, |total, operation| {
-            total.saturating_add(
-                if matches!(
-                    operation.kind,
-                    CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch
-                ) {
-                    operation.len as usize
-                } else {
-                    0
-                },
-            )
-        });
+        let (aligned_bases, tile_aligned_bases) = aligned_base_counts(record, tile);
         let auxiliary_bytes = selection.auxiliary_encoded_len(index).unwrap_or_default();
         // Decoded tag values, kinetics arrays, and modification calls are temporary owned values.
         bytes = bytes.saturating_add(auxiliary_bytes.saturating_mul(8));
@@ -2717,25 +2712,38 @@ fn semantic_page_dynamic_scratch_bytes(
         }
 
         if key.family == AlignmentPageFamily::SpecialistOverlay && detailed {
-            if presentation.style.show_modified_bases {
-                let mm_bytes = selection
-                    .auxiliary_value_payload_len(index, *b"MM")?
-                    .unwrap_or_default()
-                    .max(
-                        selection
-                            .auxiliary_value_payload_len(index, *b"Mm")?
-                            .unwrap_or_default(),
-                    );
-                // Each explicit call consumes MM text, while canonical/unmodified display can
-                // emit at most one base per sequence position and modification group.
-                overlay_slots = overlay_slots
-                    .saturating_add(mm_bytes)
-                    .saturating_add(sequence_len.saturating_mul(mm_bytes));
+            if presentation.style.show_modified_bases && sequence_len > 0 {
+                let mm_upper = selection.auxiliary_field(index, *b"MM")?;
+                let mm_lower = selection.auxiliary_field(index, *b"Mm")?;
+                if let Some(mm) = mm_upper.as_ref().or(mm_lower.as_ref()) {
+                    // The MM text states how many calls it makes, so count them rather than
+                    // assuming every tag byte could call every sequence position: that product
+                    // reserved gigabytes for one long read carrying a dense MM tag.
+                    let bound = modified_base_call_bound(&mm.value);
+                    modification_call_slots = modification_call_slots.saturating_add(bound.calls);
+                    // An overlay needs an aligned base inside this tile, and each modification
+                    // series marks one read position at most once.
+                    let tile_series_slots = bound.series.saturating_mul(tile_aligned_bases);
+                    let explicit = bound.calls.min(tile_series_slots);
+                    let canonical = if presentation.style.modified_base_color_mode
+                        == ModifiedBaseColorMode::ModifiedVsUnmodified
+                    {
+                        tile_series_slots
+                    } else {
+                        0
+                    };
+                    // One further slot covers the "unavailable" marker of a malformed tag.
+                    overlay_slots = overlay_slots
+                        .saturating_add(explicit)
+                        .saturating_add(canonical)
+                        .saturating_add(1);
+                }
             }
             let specialist_slots = match presentation.style.color_mode {
+                // These overlays are emitted per aligned base inside the tile only.
                 AlignmentColorMode::Bisulfite(_)
                 | AlignmentColorMode::SmrtKinetics(_)
-                | AlignmentColorMode::Sbx(_) => aligned_bases
+                | AlignmentColorMode::Sbx(_) => tile_aligned_bases
                     .saturating_add(record.cigar().len())
                     .saturating_add(1),
                 AlignmentColorMode::Ultima(_) => aligned_bases
@@ -2753,9 +2761,16 @@ fn semantic_page_dynamic_scratch_bytes(
                 .saturating_mul(2)
                 .saturating_mul(size_of::<PreparedOverlay>()),
         )
-        // Modified-base decoding temporarily retains calls and canonical-position sets as well
-        // as the final prepared overlays.
         .saturating_add(overlay_slots.saturating_mul(64))
+        // Modified-base decoding temporarily retains every decoded call of the read (a growing
+        // vector, hence twice) and at most one canonical-position set entry per call.
+        .saturating_add(
+            modification_call_slots.saturating_mul(
+                size_of::<rgv_hts::ModifiedBaseCall>()
+                    .saturating_mul(2)
+                    .saturating_add(64),
+            ),
+        )
         .saturating_add(
             pending_label_slots
                 .saturating_mul(2)
@@ -2763,6 +2778,152 @@ fn semantic_page_dynamic_scratch_bytes(
         )
         .saturating_add(pending_label_bytes);
     Ok(bytes)
+}
+
+/// Upper bounds stated by one `MM` value: decoded calls and distinct modification series.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ModifiedBaseCallBound {
+    calls: usize,
+    series: usize,
+}
+
+/// Counts what `decode_modified_bases_parts` can yield without locating any call. Each
+/// `;`-separated group yields one call per listed delta and modification code; a group the
+/// decoder would reject only makes this bound more generous.
+fn modified_base_call_bound(mm: &AuxValue) -> ModifiedBaseCallBound {
+    let AuxValue::String(text) = mm else {
+        return ModifiedBaseCallBound::default();
+    };
+    let mut bound = ModifiedBaseCallBound::default();
+    for group in text.split(';').filter(|group| !group.is_empty()) {
+        let Some((header, deltas)) = group.split_once(',') else {
+            continue;
+        };
+        let codes = header.as_bytes().get(2..).map_or(1, |codes| {
+            let codes = match codes.last() {
+                Some(b'?' | b'.') => &codes[..codes.len() - 1],
+                _ => codes,
+            };
+            if codes.iter().all(u8::is_ascii_digit) {
+                // A numeric ChEBI identifier is one code however many digits it has.
+                1
+            } else {
+                codes.len().max(1)
+            }
+        });
+        let positions = deltas
+            .bytes()
+            .filter(|byte| *byte == b',')
+            .count()
+            .saturating_add(1);
+        bound.calls = bound.calls.saturating_add(codes.saturating_mul(positions));
+        bound.series = bound.series.saturating_add(codes);
+    }
+    bound
+}
+
+/// Aligned (`M`/`=`/`X`) bases of the whole record and of its part inside `tile`.
+fn aligned_base_counts(
+    record: rgv_hts::AlignmentRecordView<'_>,
+    tile: GenomicInterval,
+) -> (usize, usize) {
+    let mut total = 0_usize;
+    let mut inside = 0_usize;
+    let mut reference_position = record.start();
+    for operation in record.cigar() {
+        let end = reference_position.saturating_add(u64::from(operation.len));
+        match operation.kind {
+            CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
+                total = total.saturating_add(operation.len as usize);
+                inside = inside.saturating_add(clipped_len(reference_position, end, tile));
+                reference_position = end;
+            }
+            CigarOpKind::Deletion | CigarOpKind::ReferenceSkip => reference_position = end,
+            CigarOpKind::Insertion
+            | CigarOpKind::SoftClip
+            | CigarOpKind::HardClip
+            | CigarOpKind::Padding => {}
+        }
+    }
+    (total, inside)
+}
+
+/// Length of `[start, end)` inside `tile`.
+fn clipped_len(start: u64, end: u64, tile: GenomicInterval) -> usize {
+    usize::try_from(end.min(tile.end()).saturating_sub(start.max(tile.start())))
+        .unwrap_or(usize::MAX)
+}
+
+/// Upper bound on what [`emit_record_primitives`] appends for one record on one page.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RecordPrimitiveBound {
+    /// Read-geometry primitives at the requested level of detail.
+    geometry: usize,
+    /// CIGAR event labels at or above the minimum labelled size.
+    event_labels: usize,
+}
+
+/// One CIGAR walk which counts only the operations able to intersect `tile`, mirroring the
+/// clipping `push_span`, `push_point` and `emit_bases` apply. Display filters (minimum indel
+/// size, hidden tails, base display mode) can only emit fewer primitives than counted here.
+fn record_primitive_bound(
+    record: rgv_hts::AlignmentRecordView<'_>,
+    tile: GenomicInterval,
+    lod: GeometryLod,
+    minimum_event_label_size: u32,
+) -> RecordPrimitiveBound {
+    if lod == GeometryLod::Overview {
+        return RecordPrimitiveBound {
+            geometry: 1,
+            event_labels: 0,
+        };
+    }
+    let record_start = record.start();
+    let last_position = record.end().saturating_sub(1).max(record_start);
+    let point_visible =
+        |position: u64| tile.contains(position.max(record_start).min(last_position));
+    let cigar = record.cigar();
+    // The direction terminal, plus the whole-read span of a record without a CIGAR.
+    let mut bound = RecordPrimitiveBound {
+        geometry: 1 + usize::from(cigar.is_empty()),
+        event_labels: 0,
+    };
+    let mut reference_position = record_start;
+    for operation in cigar {
+        let end = reference_position.saturating_add(u64::from(operation.len));
+        let labelled = usize::from(operation.len >= minimum_event_label_size);
+        match operation.kind {
+            CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
+                let inside = clipped_len(reference_position, end, tile);
+                if inside > 0 {
+                    bound.geometry = bound.geometry.saturating_add(1);
+                    if lod == GeometryLod::Base {
+                        bound.geometry = bound.geometry.saturating_add(inside);
+                    }
+                }
+                reference_position = end;
+            }
+            CigarOpKind::Deletion | CigarOpKind::ReferenceSkip => {
+                if clipped_len(reference_position, end, tile) > 0 {
+                    bound.geometry = bound.geometry.saturating_add(1);
+                    bound.event_labels = bound.event_labels.saturating_add(labelled);
+                }
+                reference_position = end;
+            }
+            CigarOpKind::Insertion | CigarOpKind::SoftClip | CigarOpKind::HardClip => {
+                if point_visible(reference_position) {
+                    bound.geometry = bound.geometry.saturating_add(1);
+                    bound.event_labels = bound.event_labels.saturating_add(labelled);
+                }
+            }
+            CigarOpKind::Padding => {
+                if point_visible(reference_position) {
+                    bound.geometry = bound.geometry.saturating_add(1);
+                }
+            }
+        }
+    }
+    bound
 }
 
 fn hash_table_scratch_bytes(entries: usize, entry_bytes: usize) -> usize {
@@ -2890,6 +3051,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: crate::ReadSampling::Complete,
         }
     }
 
@@ -2952,6 +3114,12 @@ mod tests {
                         AuxField {
                             tag: *b"ML",
                             value: AuxValue::UnsignedArray(vec![220]),
+                        },
+                        // This fixture read is hard-clipped; `MN` states that `MM` was written
+                        // for the stored 11-base sequence, which the decoder now requires.
+                        AuxField {
+                            tag: *b"MN",
+                            value: AuxValue::Unsigned(11),
                         },
                         AuxField {
                             tag: *b"ip",
@@ -3713,6 +3881,228 @@ mod tests {
         assert!(snapshot.transient_resources.iter().any(|usage| {
             usage.class == TransientResourceClass::SemanticPageBuilder && usage.high_water > 0
         }));
+    }
+
+    /// A read aligned across all three fixture tiles with every base a called cytosine.
+    fn dense_modified_read() -> AlignmentRecord {
+        let length = 280_usize;
+        let mut record = record(
+            b"dense",
+            10,
+            290,
+            &[(CigarOpKind::Match, 280)],
+            &vec![b'C'; length],
+        );
+        record.auxiliary_fields = vec![
+            AuxField {
+                tag: *b"MM",
+                value: AuxValue::String(format!("C+m{};", ",0".repeat(length))),
+            },
+            AuxField {
+                tag: *b"ML",
+                value: AuxValue::UnsignedArray(vec![200; length]),
+            },
+        ];
+        record
+    }
+
+    #[test]
+    fn modified_base_scratch_is_bounded_by_calls_not_sequence_length_times_tag_bytes() {
+        // `sequence_len x MM_tag_bytes` overlay slots came to ~25 MiB for this one 280-base
+        // read; the calls it actually makes need a few tens of kilobytes.
+        let ledger = AllocationLedger::new_with_transient_budget(8 << 20, 0, 1 << 20);
+        let (evidence, atlas) =
+            evidence_and_atlas_for_records(&ledger, &[dense_modified_read()], layout_contract());
+        for color_mode in [
+            ModifiedBaseColorMode::ByType,
+            ModifiedBaseColorMode::ModifiedVsUnmodified,
+        ] {
+            let style = crate::AlignmentStyleContract {
+                modified_base_color_mode: color_mode,
+                ..crate::AlignmentStyleContract::default()
+            };
+            for (tile, expected) in [(0, 90), (1, 100), (2, 90)] {
+                let page = page_with_style(
+                    &ledger,
+                    &evidence,
+                    &atlas,
+                    tile,
+                    GeometryLod::Read,
+                    None,
+                    style,
+                    AlignmentPageFamily::SpecialistOverlay,
+                );
+                let modified = page
+                    .primitives()
+                    .iter()
+                    .filter(|primitive| {
+                        matches!(primitive.component, AlignmentComponent::ModifiedBase { .. })
+                    })
+                    .count();
+                assert_eq!(modified, expected, "tile {tile}, {color_mode:?}");
+            }
+        }
+        let snapshot = ledger.snapshot().unwrap();
+        assert_eq!(snapshot.transient, 0);
+        assert!(snapshot.transient_high_water < (1 << 20));
+    }
+
+    #[test]
+    fn modified_base_call_bound_counts_calls_and_series_from_the_tag_text() {
+        let bound = modified_base_call_bound(&AuxValue::String(
+            "C+mh,0,1,2;A+a?,5;C+76792.,1,1;;".to_owned(),
+        ));
+        assert_eq!(
+            bound,
+            ModifiedBaseCallBound {
+                calls: 2 * 3 + 1 + 2,
+                series: 2 + 1 + 1,
+            }
+        );
+        assert_eq!(
+            modified_base_call_bound(&AuxValue::Unsigned(3)),
+            ModifiedBaseCallBound::default()
+        );
+        // The bound is never below what the decoder yields.
+        let sequence = b"CCACCACCCCAAACCC";
+        let mm = AuxValue::String("C+mh,0,1,2;A+a?,3;".to_owned());
+        let decoded =
+            decode_modified_bases_parts(sequence, AlignmentFlags::from_bits(0), &mm, None).unwrap();
+        let bound = modified_base_call_bound(&mm);
+        assert_eq!(decoded.len(), 7);
+        assert_eq!(bound.calls, 7);
+        assert_eq!(bound.series, 3);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn primitive_reservation_is_clipped_to_the_tile_and_never_below_what_is_emitted() {
+        let ledger = AllocationLedger::new(8 << 20, 0);
+        let mut records = vec![
+            dense_modified_read(),
+            record(
+                b"events",
+                20,
+                30,
+                &[
+                    (CigarOpKind::SoftClip, 2),
+                    (CigarOpKind::Match, 5),
+                    (CigarOpKind::Insertion, 2),
+                    (CigarOpKind::Deletion, 3),
+                    (CigarOpKind::SequenceMismatch, 2),
+                    (CigarOpKind::Padding, 1),
+                    (CigarOpKind::HardClip, 1),
+                ],
+                b"AAACCCCCCCC",
+            ),
+            record(
+                b"spliced",
+                90,
+                210,
+                &[
+                    (CigarOpKind::Match, 10),
+                    (CigarOpKind::ReferenceSkip, 100),
+                    (CigarOpKind::Match, 10),
+                ],
+                b"AAAAAAAAAAAAAAAAAAAA",
+            ),
+            // Clips and an insertion exactly on a tile seam, and a deletion crossing one.
+            record(
+                b"seams",
+                100,
+                205,
+                &[
+                    (CigarOpKind::HardClip, 3),
+                    (CigarOpKind::SoftClip, 4),
+                    (CigarOpKind::Match, 95),
+                    (CigarOpKind::Deletion, 10),
+                    (CigarOpKind::Insertion, 2),
+                    (CigarOpKind::SoftClip, 5),
+                ],
+                &[b'G'; 106],
+            ),
+            record(b"cigarless", 250, 260, &[], b""),
+        ];
+        records[1].flags = AlignmentFlags::from_bits(0x10);
+        let (evidence, _) = evidence_and_atlas_for_records(&ledger, &records, layout_contract());
+        let style = crate::AlignmentStyleContract {
+            base_display: ReadBaseDisplayMode::All,
+            ..crate::AlignmentStyleContract::default()
+        };
+        let label = (AlignmentLabelKind::ReadName, "name".to_owned());
+        let mut dense_base_bounds = Vec::new();
+        for tile_bases in [7_u64, 100, 128, 300] {
+            for tile_start in (0..300).step_by(usize::try_from(tile_bases).unwrap()) {
+                let tile = GenomicInterval::new(
+                    ContigId::new(0),
+                    tile_start,
+                    (tile_start + tile_bases).min(300),
+                )
+                .unwrap();
+                let selection = evidence.select(tile).unwrap();
+                for index in 0..selection.len() {
+                    let view = selection.record_view(index).unwrap();
+                    for lod in [
+                        GeometryLod::Overview,
+                        GeometryLod::Span,
+                        GeometryLod::Read,
+                        GeometryLod::Base,
+                    ] {
+                        let bound = record_primitive_bound(view, tile, lod, 1);
+                        for family in [
+                            AlignmentPageFamily::ReadGeometry,
+                            AlignmentPageFamily::Labels,
+                        ] {
+                            let mut primitives = Vec::new();
+                            let mut labels = Vec::new();
+                            emit_record_primitives(
+                                &mut primitives,
+                                &mut labels,
+                                selection.records()[index].handle,
+                                0,
+                                view,
+                                selection.sequence(index),
+                                AlignmentBodyColorToken::Neutral,
+                                lod,
+                                tile,
+                                tile.start(),
+                                None,
+                                style,
+                                Some(&label),
+                                family,
+                                None,
+                            )
+                            .unwrap();
+                            let reserved = if family == AlignmentPageFamily::ReadGeometry {
+                                bound.geometry
+                            } else {
+                                // One read label besides the CIGAR event labels.
+                                bound.event_labels + 1
+                            };
+                            assert!(
+                                primitives.len() <= reserved,
+                                "{:?} {lod:?} {family:?} in {tile:?}: emitted {} > reserved {reserved}",
+                                String::from_utf8_lossy(view.read_name()),
+                                primitives.len(),
+                            );
+                            if family == AlignmentPageFamily::ReadGeometry
+                                && lod == GeometryLod::Base
+                            {
+                                // With every base displayed the clipped count is exact apart
+                                // from a direction terminal lying in another tile.
+                                assert!(reserved <= primitives.len() + 1);
+                                if view.read_name() == b"dense" && tile_bases == 100 {
+                                    dense_base_bounds.push(reserved);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Segment + direction terminal + the bases inside each tile; the whole-CIGAR count
+        // reserved all 280 bases for every one of the three pages.
+        assert_eq!(dense_base_bounds, vec![92, 102, 92]);
     }
 
     #[test]

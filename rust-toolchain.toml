@@ -1,0 +1,7 @@
+# Pinned so that new stable releases cannot break CI through newly added
+# Clippy or rustc lints. Matches `rust-version` in the workspace Cargo.toml.
+# Bump deliberately, together with `rust-version` when the minimum moves.
+[toolchain]
+channel = "1.93.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

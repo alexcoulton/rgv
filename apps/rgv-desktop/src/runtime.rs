@@ -12,6 +12,9 @@ pub(super) struct Application {
     pub(super) viewer: Option<Viewer>,
     pub(super) options: LaunchOptions,
     pub(super) process_started: Instant,
+    /// Set by a worker that has published a result and asked the event loop to wake; cleared
+    /// just before the results are collected.
+    pub(super) worker_wake_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ApplicationHandler for Application {
@@ -70,11 +73,15 @@ impl ApplicationHandler for Application {
         let request_egui_redraw = should_request_egui_redraw(&event, egui_response.repaint);
         match event {
             WindowEvent::CloseRequested => {
-                viewer.finish_native_input_observation(recording_observation.take());
-                viewer.abort_interaction_recording_before_exit();
-                viewer.save_recording_manual_diagnostic_trace_before_exit();
-                event_loop.exit();
-                return;
+                // Unsaved changes open the Save / Discard / Cancel prompt instead of exiting.
+                if viewer.request_exit() {
+                    viewer.finish_native_input_observation(recording_observation.take());
+                    viewer.abort_interaction_recording_before_exit();
+                    viewer.save_recording_manual_diagnostic_trace_before_exit();
+                    event_loop.exit();
+                    return;
+                }
+                viewer.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
@@ -82,35 +89,23 @@ impl ApplicationHandler for Application {
                     && is_exit_shortcut(&event.logical_key, viewer.modifiers) =>
             {
                 Viewer::mark_native_input_handled(&mut recording_observation);
-                if confirm_or_exit(&mut viewer.exit_confirmation_open) {
+                if viewer.request_exit_from_shortcut() {
                     viewer.finish_native_input_observation(recording_observation.take());
                     viewer.abort_interaction_recording_before_exit();
                     viewer.save_recording_manual_diagnostic_trace_before_exit();
                     event_loop.exit();
                     return;
-                } else {
-                    viewer.window.request_redraw();
                 }
+                viewer.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
                     && event.logical_key == Key::Named(NamedKey::Escape) =>
             {
+                // Escape only ever dismisses the topmost transient surface; it never exits.
                 Viewer::mark_native_input_handled(&mut recording_observation);
-                if viewer.close_alignment_context_menu("escape") {
+                if viewer.escape_pressed(event.repeat, egui_response.consumed) {
                     viewer.window.request_redraw();
-                } else if viewer.exit_confirmation_open {
-                    viewer.exit_confirmation_open = false;
-                    viewer.window.request_redraw();
-                } else if viewer.open_panel.take().is_some() {
-                    viewer.command_search.clear();
-                    viewer.window.request_redraw();
-                } else {
-                    viewer.finish_native_input_observation(recording_observation.take());
-                    viewer.abort_interaction_recording_before_exit();
-                    viewer.save_recording_manual_diagnostic_trace_before_exit();
-                    event_loop.exit();
-                    return;
                 }
             }
             WindowEvent::KeyboardInput { event, .. }
@@ -131,6 +126,8 @@ impl ApplicationHandler for Application {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
                 Viewer::mark_native_input_handled(&mut recording_observation);
+                // A held navigation key is one gesture: record it when the key comes up.
+                viewer.end_navigation_gesture();
             }
             WindowEvent::ModifiersChanged(modifiers) => viewer.modifiers = modifiers.state(),
             WindowEvent::Resized(size) => {
@@ -201,16 +198,8 @@ impl ApplicationHandler for Application {
                     }
                     viewer.window.request_redraw();
                 }
-                if let Some(origin) = viewer.drag_origin_interval.take() {
-                    let interval = viewer.panels.active().viewport.interval();
-                    if origin != interval {
-                        viewer
-                            .panels
-                            .active_mut()
-                            .navigation_history
-                            .visit(interval);
-                    }
-                }
+                viewer.drag_origin_interval = None;
+                viewer.end_navigation_gesture();
                 if was_canvas_dragging {
                     viewer.finish_navigation_gesture();
                 }
@@ -266,15 +255,9 @@ impl ApplicationHandler for Application {
                     viewer.dragging = false;
                     viewer.last_cursor = None;
                     viewer.press_cursor = None;
-                    if let Some(origin) = viewer.drag_origin_interval.take() {
-                        let interval = viewer.panels.active().viewport.interval();
-                        if origin != interval {
-                            viewer
-                                .panels
-                                .active_mut()
-                                .navigation_history
-                                .visit(interval);
-                        }
+                    if viewer.drag_origin_interval.take().is_some() {
+                        // One history entry and one recent locus for the whole drag.
+                        viewer.end_navigation_gesture();
                         viewer.finish_navigation_gesture();
                     }
                     // `press_cursor` is only recorded for the unobstructed GPU canvas.
@@ -313,16 +296,33 @@ impl ApplicationHandler for Application {
                 if let Some(panel_id) = viewer.panel_at_cursor() {
                     viewer.activate_view_panel(panel_id);
                 }
-                if viewer.modifiers.shift_key() || !viewer.cursor_in_genomic_canvas() {
-                    viewer.scroll_tracks(delta);
-                } else {
-                    viewer.zoom(delta);
-                    if matches!(
+                let navigated = viewer.apply_scroll(delta);
+                // The event that ends a trackpad scroll usually carries a zero delta, so the
+                // gesture is settled for any scroll that ends over the canvas.
+                let over_canvas =
+                    viewer.cursor_in_genomic_canvas() && !viewer.modifiers.shift_key();
+                if (navigated || over_canvas)
+                    && matches!(
                         phase,
                         winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
-                    ) {
-                        viewer.finish_navigation_gesture();
-                    }
+                    )
+                {
+                    viewer.finish_navigation_gesture();
+                }
+            }
+            WindowEvent::PinchGesture { delta, phase, .. }
+                if viewer.cursor_over_unobstructed_genomic_canvas() =>
+            {
+                Viewer::mark_native_input_handled(&mut recording_observation);
+                if let Some(panel_id) = viewer.panel_at_cursor() {
+                    viewer.activate_view_panel(panel_id);
+                }
+                viewer.apply_pinch(delta);
+                if matches!(
+                    phase,
+                    winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
+                ) {
+                    viewer.finish_navigation_gesture();
                 }
             }
             WindowEvent::DroppedFile(path) => viewer.handle_dropped_file(&path),
@@ -358,6 +358,9 @@ impl ApplicationHandler for Application {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Clear before collecting: a result published after this point asks for another wake.
+        self.worker_wake_pending
+            .store(false, std::sync::atomic::Ordering::Release);
         if let Some(viewer) = &mut self.viewer {
             viewer.stress_health.note_ui_heartbeat();
             viewer.poll_background_work();
@@ -377,34 +380,44 @@ impl ApplicationHandler for Application {
                 viewer.next_egui_repaint = None;
                 viewer.window.request_redraw();
             }
-            let mut next_wake = viewer.next_egui_repaint;
-            if let Some(deadline) = viewer.pending_resolution_query_refresh {
-                next_wake = Some(next_wake.map_or(deadline, |wake| wake.min(deadline)));
-            }
-            if viewer.settings.autosave_enabled {
-                next_wake = Some(
-                    next_wake.map_or(viewer.next_autosave, |wake| wake.min(viewer.next_autosave)),
-                );
-            }
-            if viewer.has_alignment_engine()
+            viewer.commit_due_navigation_gesture(now);
+            viewer.capture_status_notification();
+            let engines_open = viewer.has_alignment_engine()
                 || viewer.reference_engine.is_some()
-                || viewer.track_engine.is_some()
-                || !viewer.export_tasks.is_empty()
+                || viewer.track_engine.is_some();
+            let polled_work_in_flight = !viewer.export_tasks.is_empty()
                 || viewer.pending_native_window_capture.is_some()
                 || !viewer.session_save_tasks.is_empty()
                 || !viewer.session_load_tasks.is_empty()
                 || !viewer.workspace_list_import_tasks.is_empty()
+                || !viewer.genome_tasks.is_empty()
                 || !viewer.alignment_retirement_tasks.is_empty()
                 || !viewer.engine_retirement_tasks.is_empty()
                 || viewer
                     .automation
                     .as_ref()
-                    .is_some_and(|runner| !runner.finished)
-                || viewer.control_service.is_some()
-            {
-                let worker_poll = now + Duration::from_millis(16);
-                next_wake = Some(next_wake.map_or(worker_poll, |wake| wake.min(worker_poll)));
-            }
+                    .is_some_and(|runner| !runner.finished);
+            let next_wake = crate::app::shell_state::next_wake(
+                now,
+                &[
+                    viewer.next_egui_repaint,
+                    viewer.pending_resolution_query_refresh,
+                    viewer
+                        .settings
+                        .autosave_enabled
+                        .then_some(viewer.next_autosave),
+                    viewer.navigation_gesture_deadline(),
+                ],
+                crate::app::shell_state::WakeState {
+                    polled_work_in_flight,
+                    engines_open,
+                    // Only consulted while engines are open and nothing is being polled.
+                    workspace_settled: engines_open
+                        && !polled_work_in_flight
+                        && viewer.automation_is_settled(),
+                    control_service_open: viewer.control_service.is_some(),
+                },
+            );
             event_loop
                 .set_control_flow(next_wake.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
         }
@@ -477,15 +490,6 @@ fn is_exit_shortcut(key: &Key, modifiers: ModifiersState) -> bool {
         && matches!(key, Key::Character(character) if character.eq_ignore_ascii_case("w"))
 }
 
-fn confirm_or_exit(confirmation_open: &mut bool) -> bool {
-    if *confirmation_open {
-        true
-    } else {
-        *confirmation_open = true;
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,15 +538,6 @@ mod tests {
             egui::pos2(400.0, 300.0),
             Some(divider),
         ));
-    }
-
-    #[test]
-    fn exit_shortcut_requires_confirmation_before_exit() {
-        let mut confirmation_open = false;
-
-        assert!(!confirm_or_exit(&mut confirmation_open));
-        assert!(confirmation_open);
-        assert!(confirm_or_exit(&mut confirmation_open));
     }
 
     #[test]

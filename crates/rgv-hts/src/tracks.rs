@@ -3,6 +3,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Read as _},
     path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
 };
 
 use bigtools::{BBIFileRead, BigBedRead, BigWigRead, utils::reopen::ReopenableFile};
@@ -19,7 +20,10 @@ use rust_htslib::bcf::{
 };
 use thiserror::Error;
 
-use crate::{HttpRangeConfig, HttpRangeReader};
+use crate::{
+    HttpRangeConfig, RemoteCancellation, RemoteIoStats, RemoteTransferBudget,
+    remote::{ControlledRangeReader, RemoteReaderControl},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeatureFormat {
@@ -352,6 +356,9 @@ pub struct QuantitativeQueryProvenance {
     pub records_retained: usize,
     pub non_finite_records: usize,
     pub records_truncated: bool,
+    /// Bases per record when the source's precomputed zoom summaries were read instead of its
+    /// raw values; each record then holds the mean over the bases it covers.
+    pub summary_reduction_bases: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -772,9 +779,15 @@ fn is_remote_url(value: &str) -> bool {
 }
 
 fn parse_bed(line: &str) -> Result<FeatureRecord, String> {
-    let fields = line.split('\t').collect::<Vec<_>>();
+    // BED columns are whitespace-separated. Tabs win when present so names containing spaces
+    // survive; a file written with spaces only is still read.
+    let fields = if line.contains('\t') {
+        line.split('\t').map(str::trim).collect::<Vec<_>>()
+    } else {
+        line.split_whitespace().collect::<Vec<_>>()
+    };
     if fields.len() < 3 {
-        return Err("BED requires at least three tab-separated columns".to_owned());
+        return Err("BED requires at least three whitespace-separated columns".to_owned());
     }
     let start = parse_u64(fields[1], "BED start")?;
     let end = parse_u64(fields[2], "BED end")?;
@@ -785,10 +798,15 @@ fn parse_bed(line: &str) -> Result<FeatureRecord, String> {
     let coding_interval = if fields.len() >= 8 {
         let coding_start = parse_u64(fields[6], "BED thick start")?;
         let coding_end = parse_u64(fields[7], "BED thick end")?;
-        if coding_start < start || coding_end > end || coding_start > coding_end {
+        // An empty thick interval is how BED says "no thick part"; writers put it anywhere,
+        // commonly at 0/0 or at the feature end, so its position is not validated.
+        if coding_start >= coding_end {
+            None
+        } else if coding_start < start || coding_end > end {
             return Err("BED thick interval must be contained within the feature".to_owned());
+        } else {
+            Some((coding_start, coding_end))
         }
-        (coding_start < coding_end).then_some((coding_start, coding_end))
     } else {
         None
     };
@@ -1365,17 +1383,48 @@ fn parse_attributes(raw: &str, gtf: bool) -> Vec<(String, String)> {
             if field.is_empty() {
                 return None;
             }
-            let pair = if gtf {
-                field.split_once(char::is_whitespace)
-            } else {
-                field.split_once('=')
-            }?;
+            if gtf {
+                let pair = field.split_once(char::is_whitespace)?;
+                return Some((
+                    pair.0.trim().to_owned(),
+                    pair.1.trim().trim_matches('"').to_owned(),
+                ));
+            }
+            // GFF3 escapes `;`, `=`, `,`, `%`, tabs and control characters as `%XX` in both
+            // tags and values. Decoding happens after the `;`/`=` split, as the format requires.
+            let pair = field.split_once('=')?;
             Some((
-                pair.0.trim().to_owned(),
-                pair.1.trim().trim_matches('"').to_owned(),
+                percent_decode_gff3(pair.0.trim()),
+                percent_decode_gff3(pair.1.trim().trim_matches('"')),
             ))
         })
         .collect()
+}
+
+/// Decodes GFF3 `%XX` escapes. Malformed escapes and sequences that do not form UTF-8 are
+/// kept verbatim, so a stray `%` never loses data.
+fn percent_decode_gff3(raw: &str) -> String {
+    if !raw.contains('%') {
+        return raw.to_owned();
+    }
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok());
+        if let Some(byte) = escape {
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).unwrap_or_else(|_| raw.to_owned())
 }
 
 fn attribute_value(attributes: &[(String, String)], keys: &[&str]) -> Option<String> {

@@ -3,7 +3,11 @@ use thiserror::Error;
 
 use crate::{DetailLevel, GenomicInterval, IntervalError};
 
+/// Deserialization validates the pixel width (and, through
+/// [`GenomicInterval`], the interval) and sanitises the fractional camera, so
+/// a decoded viewport upholds the same invariants as [`Viewport::new`].
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "SerializedViewport")]
 pub struct Viewport {
     interval: GenomicInterval,
     pixel_width: f64,
@@ -11,6 +15,35 @@ pub struct Viewport {
     start_offset: f64,
     #[serde(default)]
     exact_width: f64,
+}
+
+#[derive(Deserialize)]
+struct SerializedViewport {
+    interval: GenomicInterval,
+    pixel_width: f64,
+    #[serde(default)]
+    start_offset: f64,
+    #[serde(default)]
+    exact_width: f64,
+}
+
+impl TryFrom<SerializedViewport> for Viewport {
+    type Error = ViewportError;
+
+    fn try_from(serialized: SerializedViewport) -> Result<Self, Self::Error> {
+        let mut viewport = Self::new(serialized.interval, serialized.pixel_width)?;
+        if serialized.start_offset.is_finite() && (0.0..1.0).contains(&serialized.start_offset) {
+            viewport.start_offset = serialized.start_offset;
+        }
+        // A valid camera never spans more than its enclosing integer interval.
+        if serialized.exact_width.is_finite()
+            && serialized.exact_width >= 1.0
+            && serialized.exact_width <= viewport.exact_width + 1.0
+        {
+            viewport.exact_width = serialized.exact_width;
+        }
+        Ok(viewport)
+    }
 }
 
 impl Viewport {
@@ -201,6 +234,49 @@ mod tests {
             1_000.0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn decoded_viewports_are_validated_and_round_trip() {
+        let interval = r#"{"contig":0,"start":100,"end":1100}"#;
+        for pixel_width in ["0.0", "-4.0"] {
+            let json = format!(r#"{{"interval":{interval},"pixel_width":{pixel_width}}}"#);
+            assert!(serde_json::from_str::<Viewport>(&json).is_err());
+        }
+        let reversed = r#"{"interval":{"contig":0,"start":9,"end":3},"pixel_width":10.0}"#;
+        assert!(serde_json::from_str::<Viewport>(reversed).is_err());
+
+        // Hostile camera fields fall back to the integer interval.
+        let json = format!(
+            r#"{{"interval":{interval},"pixel_width":500.0,"start_offset":-3.0,"exact_width":1e300}}"#
+        );
+        let decoded: Viewport = serde_json::from_str(&json).unwrap();
+        assert!((decoded.exact_start() - 100.0).abs() < f64::EPSILON);
+        assert!((decoded.span() - 1_000.0).abs() < f64::EPSILON);
+
+        let fractional = viewport().pan_pixels(0.25, 6_000_000_000).unwrap();
+        let fractional = fractional.zoom_at(10.0, 0.37, 6_000_000_000).unwrap();
+        let round_trip: Viewport =
+            serde_json::from_str(&serde_json::to_string(&fractional).unwrap()).unwrap();
+        assert_eq!(round_trip, fractional);
+    }
+
+    #[test]
+    fn coordinates_above_four_gibibases_keep_base_precision() {
+        let contig_length = 40_000_000_000_u64;
+        let start = (1_u64 << 32) + 12_345;
+        let viewport = Viewport::new(
+            GenomicInterval::new(ContigId::new(0), start, start + 100).unwrap(),
+            1_000.0,
+        )
+        .unwrap();
+        assert!((viewport.pixel_at_genomic(start + 50) - 500.0).abs() < 1e-6);
+        assert_eq!(viewport.genomic_at_pixel(500.0).floor() as u64, start + 50);
+        let panned = viewport.pan_pixels(10.0, contig_length).unwrap();
+        assert_eq!(panned.interval().start(), start + 1);
+        let centred = viewport.centered_on(30_000_000_000, contig_length).unwrap();
+        assert_eq!(centred.interval().start(), 30_000_000_000 - 50);
+        assert_eq!(centred.interval().len(), 100);
     }
 
     #[test]

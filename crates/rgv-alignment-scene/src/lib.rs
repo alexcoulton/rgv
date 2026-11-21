@@ -25,10 +25,13 @@ mod panel_summary;
 mod payload;
 mod presentation_scene;
 mod presentation_store;
+#[cfg(test)]
+mod property_tests;
 mod resource;
 mod revision;
 mod row_atlas;
 mod row_oracle;
+mod sampling;
 mod scene_camera;
 mod scene_snapshot;
 mod semantic_page;
@@ -135,6 +138,7 @@ pub use row_atlas::{
     AlignmentRowAtlasPins, AlignmentRowConnector, RowAtlasRecord, RowAtlasRecordHit, RowExtent,
 };
 pub use row_oracle::{AlignmentRowGroup, AlignmentRowGroupKey, RowOracleError};
+pub use sampling::ReadSampling;
 pub use scene_camera::{AlignmentSceneCamera, AlignmentSceneCameraError, AlignmentSceneRowDemand};
 pub use scene_snapshot::{
     AlignmentSceneAlleleSite, AlignmentScenePileupSite, AlignmentSceneSnapshot,

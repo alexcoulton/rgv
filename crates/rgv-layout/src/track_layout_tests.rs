@@ -613,28 +613,74 @@ fn quantitative_fixed_and_shared_ranges_override_automatic_range() {
 }
 
 #[test]
-fn raw_quantitative_layout_has_a_deterministic_record_cap() {
-    let records = (0..MAX_RAW_QUANTITATIVE_RECORDS + 10)
-        .map(|index| QuantitativeRecord {
-            start: 100 + u64::try_from(index % 100).unwrap(),
-            end: 101 + u64::try_from(index % 100).unwrap(),
-            value: 1.0,
-        })
-        .collect::<Vec<_>>();
-    let settings = QuantitativeTrackSettings {
+fn raw_quantitative_layout_covers_the_viewport_beyond_its_record_cap() {
+    let raw = QuantitativeTrackSettings {
         window_function: QuantitativeWindowFunction::Raw,
         show_range_labels: false,
         ..QuantitativeTrackSettings::default()
     };
-    let (_, stats) = layout_quantitative(
-        &records,
+    let covered_pixels = |display: &DisplayList| {
+        let mut covered = vec![false; 1_000];
+        for rectangle in display.rectangles.iter().filter(|r| r.object_id != 0) {
+            let first = rectangle.x.max(0.0) as usize;
+            let last = ((rectangle.x + rectangle.width).min(1_000.0)) as usize;
+            covered[first.min(1_000)..last].fill(true);
+        }
+        covered
+    };
+
+    // Within the cap: one window per record, identified by record index.
+    let few = (0..100_u64)
+        .map(|base| QuantitativeRecord {
+            start: 100 + base,
+            end: 101 + base,
+            value: 1.0 + base as f32,
+        })
+        .collect::<Vec<_>>();
+    let (display, stats) =
+        layout_quantitative(&few, viewport(), TrackLayoutOptions::default(), &raw, None);
+    assert!(!stats.aggregated);
+    assert_eq!(stats.rendered_records, 100);
+    assert_eq!(stats.hidden_records, 0);
+    assert!(covered_pixels(&display).iter().all(|covered| *covered));
+
+    // Beyond the cap, with the records in genomic order: the first
+    // MAX_RAW_QUANTITATIVE_RECORDS all fall in the left half of the viewport,
+    // which is all the previous prefix truncation would have drawn.
+    let per_base = MAX_RAW_QUANTITATIVE_RECORDS / 50;
+    let mut dense = Vec::new();
+    for base in 0..100_u64 {
+        for copy in 0..per_base {
+            dense.push(QuantitativeRecord {
+                start: 100 + base,
+                end: 101 + base,
+                // One trough per base among positive values.
+                value: if copy == 3 { -9.0 } else { 2.0 },
+            });
+        }
+    }
+    assert!(dense.len() > MAX_RAW_QUANTITATIVE_RECORDS);
+    assert!(dense[MAX_RAW_QUANTITATIVE_RECORDS - 1].start <= 150);
+    let (display, stats) = layout_quantitative(
+        &dense,
         viewport(),
         TrackLayoutOptions::default(),
-        &settings,
+        &raw,
         None,
     );
-    assert_eq!(stats.rendered_records, MAX_RAW_QUANTITATIVE_RECORDS);
-    assert_eq!(stats.hidden_records, 10);
+    assert!(stats.aggregated);
+    assert_eq!(stats.rendered_records, 100);
+    assert_eq!(stats.missing_windows, 0);
+    assert!(covered_pixels(&display).iter().all(|covered| *covered));
+    // The fallback keeps the extreme rather than averaging it away.
+    assert_eq!(stats.quantitative_minimum, Some(-9.0));
+    assert_eq!(
+        quantitative_data_range(&dense, viewport(), &raw),
+        Some(QuantitativeRange {
+            minimum: -9.0,
+            maximum: 0.0
+        })
+    );
 }
 
 #[test]
@@ -877,7 +923,24 @@ fn interaction_layout_draws_intrachromosomal_arcs_and_cross_contig_markers() {
         &InteractionTrackSettings::default(),
     );
     assert_eq!(stats.rendered_records, 2);
-    assert!(display.rectangles.len() >= INTERACTION_ARC_SEGMENTS + 4);
+    // One smooth arc primitive for the intrachromosomal record, not a polyline.
+    let arcs = display
+        .rectangles
+        .iter()
+        .filter(|rectangle| rectangle.shape == RectShape::JunctionArcUp)
+        .collect::<Vec<_>>();
+    assert_eq!(arcs.len(), 1);
+    let baseline = TrackLayoutOptions::default().top + TrackLayoutOptions::default().height - 5.0;
+    // Endpoint centres 115 and 185 at ten pixels per base, meeting the baseline.
+    assert!((arcs[0].x - 150.0).abs() < 1e-3);
+    assert!((arcs[0].width - 700.0).abs() < 1e-3);
+    assert!((arcs[0].y + arcs[0].height - baseline).abs() < 1e-3);
+    assert!(arcs[0].height > 3.0);
+    assert_eq!(
+        arcs[0].object_id,
+        TrackLayoutOptions::default().object_id_base
+    );
+    assert!(display.rectangles.len() >= 5);
     assert_eq!(display.texts.len(), 2);
     assert!(display.texts[1].text.contains("chr2:501"));
     assert!(display.texts[1].text.contains("->"));
@@ -1107,6 +1170,377 @@ fn interaction_layout_obeys_filter_fixed_scale_and_hard_record_cap() {
     );
     assert_eq!(stats.rendered_records, MAX_RENDERED_INTERACTIONS);
     assert_eq!(stats.hidden_records, 10);
+}
+
+#[test]
+fn interaction_cap_counts_only_records_drawable_in_the_viewport() {
+    let record = |contig: &str, start: u64, target: u64| InteractionRecord {
+        source: rgv_hts::InteractionEndpoint {
+            contig: contig.to_owned(),
+            start,
+            end: start + 1,
+            name: None,
+            strand: Strand::Unstranded,
+        },
+        target: rgv_hts::InteractionEndpoint {
+            contig: contig.to_owned(),
+            start: target,
+            end: target + 1,
+            name: None,
+            strand: Strand::Unstranded,
+        },
+        name: None,
+        score: Some(10.0),
+        value: None,
+        experiment: None,
+        color: None,
+        directional: false,
+    };
+    // More than the cap of other-contig and off-screen records come first in
+    // file order; the fifty visible records follow them.
+    let mut records = (0..MAX_RENDERED_INTERACTIONS as u64)
+        .map(|index| record("chr2", 100 + index % 50, 150))
+        .collect::<Vec<_>>();
+    records.extend(
+        (0..MAX_RENDERED_INTERACTIONS as u64).map(|index| record("chr1", 5_000 + index, 6_000)),
+    );
+    let first_visible = records.len();
+    records.extend((0..50_u64).map(|index| record("chr1", 110 + index, 190)));
+    let settings = InteractionTrackSettings {
+        show_labels: false,
+        ..InteractionTrackSettings::default()
+    };
+    let options = TrackLayoutOptions::default();
+    let (display, stats) = layout_interactions(&records, "chr1", viewport(), options, &settings);
+    assert_eq!(stats.rendered_records, 50);
+    assert_eq!(stats.hidden_records, records.len() - 50);
+    let arcs = display
+        .rectangles
+        .iter()
+        .filter(|rectangle| rectangle.shape == RectShape::JunctionArcUp)
+        .collect::<Vec<_>>();
+    assert_eq!(arcs.len(), 50);
+    assert_eq!(
+        arcs[0].object_id,
+        options.object_id_base + u32::try_from(first_visible).unwrap()
+    );
+}
+
+#[test]
+fn interaction_arcs_with_distant_endpoints_stay_bounded_and_finite() {
+    let endpoint = |start: u64| rgv_hts::InteractionEndpoint {
+        contig: "chr1".to_owned(),
+        start,
+        end: start + 1,
+        name: None,
+        strand: Strand::Unstranded,
+    };
+    let records = [InteractionRecord {
+        source: endpoint(0),
+        target: endpoint(30_000_000_000),
+        name: None,
+        score: Some(1.0),
+        value: None,
+        experiment: None,
+        color: None,
+        directional: false,
+    }];
+    let (display, stats) = layout_interactions(
+        &records,
+        "chr1",
+        viewport(),
+        TrackLayoutOptions::default(),
+        &InteractionTrackSettings::default(),
+    );
+    assert_eq!(stats.rendered_records, 1);
+    let arc = display
+        .rectangles
+        .iter()
+        .find(|rectangle| rectangle.shape == RectShape::JunctionArcUp)
+        .unwrap();
+    // The arc still spans the whole viewport but within a bounded margin.
+    assert!(arc.x < 0.0 && arc.x >= -4_000.0);
+    assert!(arc.x + arc.width > 1_000.0 && arc.x + arc.width <= 5_000.0);
+    assert!(display.rectangles.iter().all(|rectangle| {
+        rectangle.x.is_finite() && rectangle.width.is_finite() && rectangle.x.abs() <= 5_000.0
+    }));
+}
+
+fn plain_feature(start: u64, end: u64, name: &str, feature_type: Option<&str>) -> FeatureRecord {
+    FeatureRecord {
+        contig: "chr1".to_owned(),
+        start,
+        end,
+        name: Some(name.to_owned()),
+        feature_type: feature_type.map(ToOwned::to_owned),
+        score: None,
+        strand: Strand::Unstranded,
+        blocks: Vec::new(),
+        coding_interval: None,
+        peak: None,
+        attributes: Vec::new(),
+    }
+}
+
+/// Top of the row holding record `index`, read back from its primitives.
+fn feature_row_top(
+    display: &DisplayList,
+    options: TrackLayoutOptions,
+    index: usize,
+) -> Option<f32> {
+    let object_id = options.object_id_base + u32::try_from(index).unwrap();
+    display
+        .rectangles
+        .iter()
+        .filter(|rectangle| rectangle.object_id == object_id)
+        .map(|rectangle| rectangle.y)
+        .min_by(f32::total_cmp)
+}
+
+#[test]
+fn feature_rows_are_stable_while_panning_and_independent_of_input_order() {
+    let options = TrackLayoutOptions {
+        maximum_rows: 4,
+        height: 96.0,
+        ..TrackLayoutOptions::default()
+    };
+    let features = [
+        plain_feature(100, 150, "a", None),
+        plain_feature(140, 190, "b", None),
+        plain_feature(160, 199, "c", None),
+    ];
+    let pan = |start: u64| {
+        Viewport::new(
+            GenomicInterval::new(ContigId::new(0), start, start + 100).unwrap(),
+            1_000.0,
+        )
+        .unwrap()
+    };
+    let (before, _) = layout_features(&features, pan(100), options);
+    // After panning, `a` has left the viewport. Packing only the visible
+    // features would promote `b` to the first row and push `c` down.
+    let (after, stats) = layout_features(&features, pan(155), options);
+    assert_eq!(stats.rendered_records, 2);
+    assert_eq!(feature_row_top(&after, options, 0), None);
+    for index in [1, 2] {
+        assert_eq!(
+            feature_row_top(&before, options, index),
+            feature_row_top(&after, options, index),
+            "feature {index} changed rows while panning"
+        );
+    }
+    assert!(feature_row_top(&before, options, 1) > feature_row_top(&before, options, 0));
+    assert_eq!(
+        feature_row_top(&before, options, 2),
+        feature_row_top(&before, options, 0)
+    );
+
+    // The same records in reverse file order occupy the same rows, and none
+    // is lost to a row that an earlier, later-starting record already claimed.
+    let reversed = [
+        features[2].clone(),
+        features[1].clone(),
+        features[0].clone(),
+    ];
+    let (shuffled, stats) = layout_features(&reversed, pan(100), options);
+    assert_eq!(stats.hidden_records, 0);
+    for (index, original) in [(0, 2), (1, 1), (2, 0)] {
+        assert_eq!(
+            feature_row_top(&shuffled, options, index),
+            feature_row_top(&before, options, original)
+        );
+    }
+}
+
+#[test]
+fn abutting_features_are_padded_onto_separate_rows() {
+    let options = TrackLayoutOptions {
+        maximum_rows: 4,
+        ..TrackLayoutOptions::default()
+    };
+    // One base per pixel: features must be two pixels apart to share a row.
+    let wide = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+    let features = [
+        plain_feature(100, 200, "left", None),
+        plain_feature(200, 300, "abutting", None),
+        plain_feature(202, 300, "separated", None),
+    ];
+    let (display, _) = layout_features(&features, wide, options);
+    let row = |index| feature_row_top(&display, options, index).unwrap();
+    assert!(row(1) > row(0));
+    assert!((row(2) - row(0)).abs() < f32::EPSILON);
+}
+
+#[test]
+fn features_that_fit_no_row_leave_a_visible_overflow_indicator() {
+    let options = TrackLayoutOptions {
+        maximum_rows: 2,
+        ..TrackLayoutOptions::default()
+    };
+    let mut features = (0..5)
+        .map(|index| plain_feature(120 + index, 140 + index, "stacked", None))
+        .collect::<Vec<_>>();
+    features.push(plain_feature(180, 190, "clear", None));
+    let (display, stats) = layout_features(&features, viewport(), options);
+    assert_eq!(stats.rendered_records, 3);
+    assert_eq!(stats.hidden_records, 3);
+    let bottom = options.top + options.height;
+    let indicators = display
+        .rectangles
+        .iter()
+        .filter(|rectangle| {
+            rectangle.object_id == 0 && (rectangle.y + rectangle.height - bottom).abs() < 1e-3
+        })
+        .collect::<Vec<_>>();
+    // The three hidden features 122..142, 123..143, 124..144 merge into one strip.
+    assert_eq!(indicators.len(), 1);
+    assert!((indicators[0].x - 220.0).abs() < 1e-3);
+    assert!((indicators[0].width - 220.0).abs() < 1e-3);
+    assert_eq!(stats.primitive_count, display.rectangles.len());
+
+    // Nothing is marked when everything fits.
+    let (display, stats) = layout_features(&features[4..], viewport(), options);
+    assert_eq!(stats.hidden_records, 0);
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .all(|rectangle| rectangle.object_id != 0)
+    );
+}
+
+#[test]
+fn named_features_without_a_feature_type_are_labelled() {
+    let options = TrackLayoutOptions {
+        maximum_rows: 2,
+        ..TrackLayoutOptions::default()
+    };
+    let features = [
+        plain_feature(110, 150, "peak_1", None),
+        plain_feature(160, 190, "exon_part", Some("exon")),
+        plain_feature(160, 190, "GENE", Some("gene")),
+    ];
+    let (display, _) = layout_features(&features, viewport(), options);
+    let labels = display
+        .texts
+        .iter()
+        .map(|text| text.text.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(labels, ["peak_1", "GENE"]);
+
+    let mut unnamed = plain_feature(110, 150, "", None);
+    unnamed.name = None;
+    let (display, _) = layout_features(&[unnamed], viewport(), options);
+    assert!(display.texts.is_empty());
+}
+
+#[test]
+fn layout_object_ids_never_saturate_onto_another_record() {
+    let options = TrackLayoutOptions {
+        object_id_base: u32::MAX - 1,
+        maximum_rows: 4,
+        ..TrackLayoutOptions::default()
+    };
+    let features = [
+        plain_feature(110, 120, "a", None),
+        plain_feature(130, 140, "b", None),
+        plain_feature(150, 160, "c", None),
+        plain_feature(170, 180, "d", None),
+    ];
+    let (display, stats) = layout_features(&features, viewport(), options);
+    assert_eq!(stats.rendered_records, 4);
+    let ids = display
+        .rectangles
+        .iter()
+        .map(|rectangle| rectangle.object_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    // Records 2 and 3 no longer both claim u32::MAX; they are unpickable.
+    assert_eq!(
+        ids.into_iter().collect::<Vec<_>>(),
+        [0, u32::MAX - 1, u32::MAX]
+    );
+    let leftmost = display
+        .rectangles
+        .iter()
+        .filter(|rectangle| rectangle.object_id == u32::MAX)
+        .map(|rectangle| rectangle.x)
+        .fold(f32::INFINITY, f32::min);
+    assert!((leftmost - 300.0).abs() < 1e-3);
+}
+
+#[test]
+fn variants_extending_beyond_the_viewport_use_clipped_geometry() {
+    let variant = |start: u64, end: u64| VariantRecord {
+        contig: "chr1".to_owned(),
+        start,
+        end,
+        id: None,
+        reference: b"N".to_vec(),
+        alternates: vec![b"<DEL>".to_vec()],
+        quality: None,
+        filters: Vec::new(),
+        info: Vec::new(),
+        genotypes: Vec::new(),
+        variant_types: vec![rgv_hts::VariantType::Complex],
+        breakends: Vec::new(),
+        breakpoint_orientations: Vec::new(),
+    };
+    let options = TrackLayoutOptions {
+        selected_record: Some(0),
+        ..TrackLayoutOptions::default()
+    };
+    let settings = VariantTrackSettings::default();
+    // A deletion that starts far to the left and ends far to the right.
+    let (display, stats) = layout_variants(
+        &[variant(0, 30_000_000_000)],
+        viewport(),
+        options,
+        &settings,
+    );
+    assert_eq!(stats.rendered_records, 1);
+    let baseline = options.top + options.height - 4.0;
+    let span = display
+        .rectangles
+        .iter()
+        .find(|rectangle| (rectangle.y - baseline).abs() < 1e-3)
+        .unwrap();
+    assert!((span.x - 0.0).abs() < 1e-3);
+    assert!((span.width - 1_000.0).abs() < 1e-3);
+    for rectangle in &display.rectangles {
+        assert!(rectangle.x >= -10.0 && rectangle.x + rectangle.width <= 1_010.0);
+    }
+    // The start marker is not drawn at the clipped edge it does not occupy.
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .all(|rectangle| (rectangle.y - (options.top + 1.0)).abs() > 1e-3)
+    );
+
+    // A variant starting inside the viewport keeps its marker and clips its tail.
+    let (display, _) = layout_variants(
+        &[variant(150, 30_000_000_000)],
+        viewport(),
+        TrackLayoutOptions::default(),
+        &settings,
+    );
+    let head = display
+        .rectangles
+        .iter()
+        .find(|rectangle| (rectangle.y - (options.top + 1.0)).abs() < 1e-3)
+        .unwrap();
+    assert!((head.x - 496.0).abs() < 1e-3);
+    let span = display
+        .rectangles
+        .iter()
+        .find(|rectangle| (rectangle.y - baseline).abs() < 1e-3)
+        .unwrap();
+    assert!((span.x - 500.0).abs() < 1e-3);
+    assert!((span.width - 500.0).abs() < 1e-3);
 }
 
 #[test]
@@ -1459,4 +1893,48 @@ fn gwas_chromosome_and_alternating_colours_are_stable() {
             .abs()
             < f32::EPSILON
     );
+}
+
+/// Timing probe, not a correctness test: run with
+/// `cargo test --release -p rgv-layout -- --ignored feature_layout_cost --nocapture`.
+#[test]
+#[ignore = "timing probe"]
+fn feature_layout_cost() {
+    for count in [500_u64, 5_000, 50_000] {
+        let features = (0..count)
+            .map(|index| {
+                let start = index * 40;
+                FeatureRecord {
+                    contig: "chr1".to_owned(),
+                    start,
+                    end: start + 900,
+                    name: Some(format!("GENE{index}")),
+                    feature_type: Some("transcript".to_owned()),
+                    score: None,
+                    strand: Strand::Forward,
+                    blocks: (0..6)
+                        .map(|block| (start + block * 150, start + block * 150 + 80))
+                        .collect(),
+                    coding_interval: Some((start + 100, start + 800)),
+                    peak: None,
+                    attributes: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let viewport = Viewport::new(
+            GenomicInterval::new(ContigId::new(0), 0, count * 40 + 900).unwrap(),
+            1280.0,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let iterations = 20;
+        for _ in 0..iterations {
+            let (display, _) = layout_features(&features, viewport, TrackLayoutOptions::default());
+            std::hint::black_box(display);
+        }
+        println!(
+            "{count} features: {:.3} ms per layout",
+            started.elapsed().as_secs_f64() * 1e3 / f64::from(iterations)
+        );
+    }
 }

@@ -642,6 +642,7 @@ mod tests {
             view_as_pairs: false,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling: crate::ReadSampling::Complete,
         };
         let atlas = crate::AlignmentRowAtlas::build(
             RowAtlasRevision::new(RevisionFingerprint::new(seed + 11, seed + 12)),

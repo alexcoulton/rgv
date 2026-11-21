@@ -1547,7 +1547,7 @@ pub(crate) fn alignment_scene_source_query_options(
         detail: QueryDetail::Full,
         retained_auxiliary_tags,
         layout_requires_sequence: true,
-        max_records: NonZeroUsize::new(config.maximum_alignments.max(1))
+        max_records: NonZeroUsize::new(config.effective_complete_read_limit())
             .expect("the complete read limit is non-zero"),
         collect_alleles: false,
         collect_modifications: false,
@@ -1723,6 +1723,22 @@ fn compile_alignment_view_predicate(
     }
 }
 
+/// Converts the persisted read-sampling setting into the scene layout contract.
+pub(crate) fn scene_read_sampling(sampling: AlignmentReadSampling) -> ReadSampling {
+    match sampling.normalized() {
+        AlignmentReadSampling::Complete => ReadSampling::Complete,
+        AlignmentReadSampling::Downsampled {
+            window_bases,
+            maximum_reads,
+        } => ReadSampling::Downsampled {
+            window_bases: std::num::NonZeroU32::new(window_bases)
+                .expect("normalized sampling window is non-zero"),
+            maximum_reads: std::num::NonZeroU32::new(maximum_reads)
+                .expect("normalized sampling limit is non-zero"),
+        },
+    }
+}
+
 pub(crate) fn alignment_scene_build_contract(
     config: &SessionAlignmentTrack,
     active_filters: &ActiveFilters,
@@ -1793,7 +1809,7 @@ pub(crate) fn alignment_scene_build_contract(
         record_contract: metadata.record_contract,
         contig,
         contig_length,
-        complete_read_limit: NonZeroUsize::new(config.maximum_alignments.max(1))
+        complete_read_limit: NonZeroUsize::new(config.effective_complete_read_limit())
             .expect("the complete read limit is non-zero"),
         // Complete record inspection/export is a product consumer. Retain the full payload once
         // in canonical evidence rather than creating a second query authority on demand.
@@ -1835,6 +1851,7 @@ pub(crate) fn alignment_scene_build_contract(
                 maximum: filters.maximum_template_length,
             },
             promoted_template,
+            sampling: scene_read_sampling(filters.read_sampling),
         },
         presentation: PresentationContract {
             geometry_lod,
@@ -2123,9 +2140,12 @@ pub(crate) fn commit_alignment_settings_draft(
             Err(error) => update.filter_editor.error = Some(error.to_string()),
         }
     }
+    update.filters.read_sampling = update.filters.read_sampling.normalized();
     let filters_changed = old_filters != update.filters;
     let limit = update.maximum_alignments.min(workspace_limit).max(1);
-    query_changed |= old_limit != limit;
+    query_changed |= old_limit != limit
+        || old_filters.read_sampling.is_downsampled()
+            != update.filters.read_sampling.is_downsampled();
     *filter_editor = update.filter_editor;
     config.filters = update.filters;
     config.maximum_alignments = limit;
@@ -2146,6 +2166,7 @@ pub(crate) fn copy_compatible_alignment_appearance(
     target.alignment_sort_order = source.alignment_sort_order;
     target.alignment_sort_anchor = source.alignment_sort_anchor;
     target.read_stacking_mode = source.read_stacking_mode;
+    target.read_sampling = source.read_sampling;
     target.view_as_pairs = source.view_as_pairs;
     target.minimum_template_length = source.minimum_template_length;
     target.maximum_template_length = source.maximum_template_length;
@@ -2177,64 +2198,60 @@ pub(crate) fn copy_compatible_alignment_appearance(
         .clone_from(&source.hidden_modification_codes);
 }
 
+/// Whether a local path or URL names a CRAM, ignoring any URL query string or fragment.
+pub(crate) fn alignment_source_is_cram(location: &str) -> bool {
+    let path = if location.starts_with("http://") || location.starts_with("https://") {
+        location.split(['?', '#']).next().unwrap_or(location)
+    } else {
+        location
+    };
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cram"))
+}
+
 pub(crate) fn spawn_alignment_track_controller(
     config: SessionAlignmentTrack,
     cache_bytes: NonZeroUsize,
     scene_ledger: AllocationLedger,
-    _reference_path: Option<PathBuf>,
+    reference_path: Option<PathBuf>,
     remote_reference_index_url: Option<String>,
     panel_ids: &[PanelId],
 ) -> Result<AlignmentTrackController> {
     let (filter_editor, active_filters) = filter_state_from_session(&config.filters)?;
-    let (scene_engine, lifecycle) = match &config.source {
-        TrackSource::Local { path }
-            if Path::new(path)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("bam")) =>
-        {
-            let query_options = alignment_scene_source_query_options(&config, &active_filters);
-            (
-                Some(AlignmentSceneEngine::spawn_local_bam(
-                    LocalAlignmentSceneEngineConfig {
-                        path: PathBuf::from(path),
-                        // BAM decoding is reference-independent. FASTA authority is validated
-                        // against the opened BAM dictionary and installed into semantic scenes
-                        // separately; passing it into HTSlib here would couple core reads to an
-                        // incompatible optional reference before that validation can run.
-                        open_options: alignment_open_options(
-                            None,
-                            config.remote_index_url.clone(),
-                            remote_reference_index_url,
-                        ),
-                        query_options,
-                        ledger: scene_ledger,
-                        mailbox_control_capacity: NonZeroUsize::new(32)
-                            .expect("scene mailbox capacity is non-zero"),
-                        source_control_capacity: NonZeroUsize::new(8)
-                            .expect("scene source control capacity is non-zero"),
-                        maximum_source_control_burst: NonZeroUsize::new(4)
-                            .expect("scene source control burst is non-zero"),
-                    },
-                )),
-                AlignmentTrackLifecycle::Opening,
-            )
-        }
-        TrackSource::Local { .. } => (
-            None,
-            AlignmentTrackLifecycle::Failed(
-                "The unified alignment scene currently supports local BAM sources; this source was not opened and no legacy fallback was used"
-                    .to_owned(),
-            ),
-        ),
-        TrackSource::Remote { .. } => (
-            None,
-            AlignmentTrackLifecycle::Failed(
-                "Remote alignment scene support is not qualified yet; this source was not opened and no legacy fallback was used"
-                    .to_owned(),
-            ),
-        ),
+    let source_location = match &config.source {
+        TrackSource::Local { path } => path.clone(),
+        TrackSource::Remote { url } => url.clone(),
     };
-    let scene_complete_read_limit = config.maximum_alignments.max(1);
+    // BAM decoding is reference-independent: FASTA authority is validated against the opened
+    // dictionary and installed into semantic scenes separately, so no reference is handed to
+    // the BAM decoder. CRAM is reference-compressed and cannot be decoded without one.
+    let decode_reference = alignment_source_is_cram(&source_location)
+        .then_some(reference_path)
+        .flatten();
+    let query_options = alignment_scene_source_query_options(&config, &active_filters);
+    let (scene_engine, lifecycle) = (
+        Some(AlignmentSceneEngine::spawn_local_bam(
+            LocalAlignmentSceneEngineConfig {
+                path: PathBuf::from(source_location),
+                open_options: alignment_open_options(
+                    decode_reference,
+                    config.remote_index_url.clone(),
+                    remote_reference_index_url,
+                ),
+                query_options,
+                ledger: scene_ledger,
+                mailbox_control_capacity: NonZeroUsize::new(32)
+                    .expect("scene mailbox capacity is non-zero"),
+                source_control_capacity: NonZeroUsize::new(8)
+                    .expect("scene source control capacity is non-zero"),
+                maximum_source_control_burst: NonZeroUsize::new(4)
+                    .expect("scene source control burst is non-zero"),
+            },
+        )),
+        AlignmentTrackLifecycle::Opening,
+    );
+    let scene_complete_read_limit = config.effective_complete_read_limit();
     Ok(AlignmentTrackController {
         config,
         scene_engine,

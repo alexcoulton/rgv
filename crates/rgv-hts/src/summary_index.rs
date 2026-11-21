@@ -10,7 +10,7 @@ use crate::{
         JunctionObservation, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
     },
     pair::PairSummaryBuilder,
-    pileup::{OverlapCollapser, OverlapMask},
+    pileup::{MateAlignment, MateOverlapMask, OverlapCollapser},
     template_id,
 };
 
@@ -96,15 +96,22 @@ impl AlignmentSummaryIndex {
                 .ok_or(crate::PackedRecordError::InvalidIndex(index))?;
             let flags = record.flags();
             let reverse = flags.is_reverse();
-            let overlap_mask = overlap_collapser.mask_for(
-                record.read_name(),
-                record.contig(),
-                record.start(),
-                record.end(),
-                flags,
-                record.mate_contig(),
-                record.mate_start(),
+            // Depth and indel summaries are independent of base quality, so every aligned base
+            // of the earlier mate counts as contributed.
+            let overlap_mask = overlap_collapser.mask_for_alignment(
+                MateAlignment {
+                    read_name: record.read_name(),
+                    contig: record.contig(),
+                    start: record.start(),
+                    end: record.end(),
+                    flags,
+                    mate_contig: record.mate_contig(),
+                    mate_start: record.mate_start(),
+                },
+                record.cigar().iter().copied(),
+                |_| true,
             );
+            let overlap_mask = overlap_mask.as_ref();
             let mut reference_position = record.start();
             let mut aligned_segments = Vec::new();
             let mut record_junctions = RecordJunctionCollector::default();
@@ -119,13 +126,18 @@ impl AlignmentSummaryIndex {
                         reference_position = end;
                     }
                     CigarOpKind::Deletion => {
-                        add_unmasked_ranges(reference_position, end, overlap_mask, |start, end| {
+                        let mut add = |start, end| {
                             deletions.push(RangeEvent {
                                 start,
                                 end,
                                 reverse,
                             });
-                        });
+                        };
+                        if let Some(mask) = overlap_mask {
+                            mask.add_unmasked_deletion_range(reference_position, end, add);
+                        } else {
+                            add(reference_position, end);
+                        }
                         reference_position = end;
                     }
                     CigarOpKind::ReferenceSkip => {
@@ -133,7 +145,7 @@ impl AlignmentSummaryIndex {
                         reference_position = end;
                     }
                     CigarOpKind::Insertion => {
-                        if !overlap_mask.is_some_and(|mask| mask.contains(reference_position)) {
+                        if !overlap_mask.is_some_and(|mask| mask.masks_indel(reference_position)) {
                             insertions.push(InsertionEvent {
                                 position: reference_position,
                                 reverse,
@@ -521,53 +533,35 @@ fn add_depth_segment(
     let end = end.min(interval.end());
     while start < end {
         let coordinate = start / ALIGNMENT_SUMMARY_TILE_BASES;
-        let tile_end = coordinate
-            .saturating_add(1)
-            .saturating_mul(ALIGNMENT_SUMMARY_TILE_BASES)
-            .min(end);
         let tile_start = coordinate.saturating_mul(ALIGNMENT_SUMMARY_TILE_BASES);
-        let tile_interval = GenomicInterval::new(interval.contig(), tile_start, tile_end)
+        let tile_boundary = coordinate
+            .saturating_add(1)
+            .saturating_mul(ALIGNMENT_SUMMARY_TILE_BASES);
+        let segment_end = tile_boundary.min(end);
+        // The builder clips every segment to its interval, so that interval must be the whole
+        // canonical tile. Ending it at the first segment seen would silently drop the depth of
+        // every later segment that reaches further into the same tile.
+        let tile_interval = GenomicInterval::new(interval.contig(), tile_start, tile_boundary)
             .expect("a non-empty depth segment creates a valid canonical tile interval");
         tiles
             .entry(coordinate)
             .or_insert_with(|| ExactDepthTileBuilder::new(tile_interval))
-            .add_aligned_segment(start, tile_end, reverse, mapping_quality);
-        start = tile_end;
+            .add_aligned_segment(start, segment_end, reverse, mapping_quality);
+        start = segment_end;
     }
-}
-
-fn add_unmasked_ranges(
-    start: u64,
-    end: u64,
-    mask: Option<OverlapMask>,
-    mut add: impl FnMut(u64, u64),
-) {
-    add_unmasked_ranges_with_overlap(start, end, mask, &mut add, |_, _| {});
 }
 
 fn add_unmasked_ranges_with_overlap(
     start: u64,
     end: u64,
-    mask: Option<OverlapMask>,
+    mask: Option<&MateOverlapMask>,
     mut add: impl FnMut(u64, u64),
-    mut overlap: impl FnMut(u64, u64),
+    overlap: impl FnMut(u64, u64),
 ) {
-    let Some(mask) = mask else {
+    if let Some(mask) = mask {
+        mask.split_depth_range(start, end, add, overlap);
+    } else {
         add(start, end);
-        return;
-    };
-    let overlap_start = start.max(mask.start);
-    let overlap_end = end.min(mask.end);
-    if overlap_start >= overlap_end {
-        add(start, end);
-        return;
-    }
-    if start < overlap_start {
-        add(start, overlap_start);
-    }
-    overlap(overlap_start, overlap_end);
-    if overlap_end < end {
-        add(overlap_end, end);
     }
 }
 

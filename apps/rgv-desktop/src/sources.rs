@@ -324,18 +324,38 @@ pub(super) fn load_assembly(
     dictionary: ReferenceDictionary,
     cytoband_path: Option<&Path>,
 ) -> GenomeAssembly {
+    load_assembly_reporting(name, dictionary, cytoband_path).0
+}
+
+/// As [`load_assembly`], also returning why the cytoband file could not be used. The assembly
+/// then falls back to the plain ideogram, which must be explained to the user rather than only
+/// written to the log.
+pub(super) fn load_assembly_reporting(
+    name: &str,
+    dictionary: ReferenceDictionary,
+    cytoband_path: Option<&Path>,
+) -> (GenomeAssembly, Option<String>) {
     let mut assembly = GenomeAssembly::from_dictionary(name, dictionary);
     let Some(path) = cytoband_path else {
-        return assembly;
+        return (assembly, None);
     };
     match std::fs::read_to_string(path)
         .with_context(|| format!("failed to read cytobands from {}", path.display()))
         .and_then(|text| parse_ucsc_cytobands(&text, &assembly.dictionary).map_err(Into::into))
     {
-        Ok(cytobands) => assembly.cytobands = cytobands,
-        Err(error) => tracing::warn!(path = %path.display(), %error, "using ideogram fallback"),
+        Ok(cytobands) => {
+            assembly.cytobands = cytobands;
+            (assembly, None)
+        }
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "using ideogram fallback");
+            let failure = format!(
+                "Could not load cytobands from {}: {error:#}; showing the plain ideogram",
+                path.display()
+            );
+            (assembly, Some(failure))
+        }
     }
-    assembly
 }
 
 pub(super) fn alignment_open_options(
@@ -357,6 +377,7 @@ pub(super) fn reference_open_options(remote_index_url: Option<String>) -> FastaO
     FastaOpenOptions {
         remote_index_url,
         remote_range: remote_range_config(),
+        ..FastaOpenOptions::default()
     }
 }
 
@@ -459,6 +480,69 @@ pub(super) fn inferred_desktop_track_kind(path: &Path) -> Result<(TrackSpecKind,
         }
     };
     Ok((specification, classified.kind()))
+}
+
+/// What a dropped (or picked) file is opened as.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DroppedFileKind {
+    Alignment,
+    Reference,
+    GenomeConfiguration,
+    /// A `.json` document whose content decides: see [`classify_dropped_json`].
+    Json,
+    IgvSession,
+    /// Anything else is offered to the track loader, which reports unsupported formats.
+    Track,
+}
+
+/// Classifies by the same extension table every other open path uses
+/// ([`classify_genomic_source`]), so compressed and less common spellings behave identically
+/// whether a file is dropped, picked or passed on the command line.
+pub(super) fn classify_dropped_file(path: &Path) -> DroppedFileKind {
+    let extension = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "rgvgenome" => return DroppedFileKind::GenomeConfiguration,
+        "json" => return DroppedFileKind::Json,
+        "xml" => return DroppedFileKind::IgvSession,
+        _ => {}
+    }
+    match classify_genomic_source(&path.to_string_lossy()).map(|classified| classified.format) {
+        Some(GenomicSourceFormat::Bam | GenomicSourceFormat::Cram) => DroppedFileKind::Alignment,
+        Some(GenomicSourceFormat::Fasta) => DroppedFileKind::Reference,
+        _ => DroppedFileKind::Track,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DroppedJsonKind {
+    IgvGenome,
+    GenomeConfiguration,
+    Session,
+}
+
+/// Decides what a dropped JSON document is from one parse of its text. Anything that is not
+/// recognisably a genome is a project session; the session loader reports invalid documents.
+pub(super) fn classify_dropped_json(text: &str) -> DroppedJsonKind {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
+        return DroppedJsonKind::Session;
+    };
+    let has_text = |key: &str| {
+        object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    if has_text("fastaURL") || has_text("twoBitURL") {
+        DroppedJsonKind::IgvGenome
+    } else if object.contains_key("reference") && !object.contains_key("locus") {
+        DroppedJsonKind::GenomeConfiguration
+    } else {
+        DroppedJsonKind::Session
+    }
 }
 
 pub(super) fn track_source(path: &std::path::Path) -> TrackSource {

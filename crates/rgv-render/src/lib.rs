@@ -3,7 +3,10 @@
 mod alignment_scene;
 mod alignment_summary;
 mod context_scene;
+mod device_health;
+pub mod palette;
 mod semantic_export;
+pub use device_health::{GpuDeviceHealth, GpuDeviceLoss};
 pub use semantic_export::{SemanticAlignmentExport, project_semantic_alignment_export};
 
 /// Constant-size policy view accepted by replacement planners. Desktop code supplies
@@ -361,13 +364,22 @@ pub struct RectangleRenderer {
     cached_slabs: HashMap<u64, CachedRectangleSlab>,
     active_slab_key: Option<u64>,
     slab_revision: u64,
-    last_prepare_stats: PrepareStats,
+    last_prepare: RectanglePrepareRecord,
     operation_counters: RectangleRendererOperationCounters,
+}
+
+/// Outcome of the most recent preparation plus the running count of dropped rectangles.
+#[derive(Clone, Copy, Debug, Default)]
+struct RectanglePrepareRecord {
+    stats: PrepareStats,
+    dropped_rectangles: usize,
+    total_dropped_rectangles: u64,
 }
 
 struct CachedRectangleSlab {
     buffer: wgpu::Buffer,
     instance_count: u32,
+    dropped_rectangles: usize,
     allocated_bytes: usize,
     last_used_revision: u64,
 }
@@ -497,7 +509,7 @@ impl RectangleRenderer {
             cached_slabs: HashMap::new(),
             active_slab_key: None,
             slab_revision: 0,
-            last_prepare_stats: PrepareStats::default(),
+            last_prepare: RectanglePrepareRecord::default(),
             operation_counters: RectangleRendererOperationCounters::default(),
         }
     }
@@ -561,9 +573,12 @@ impl RectangleRenderer {
             slab.last_used_revision = self.slab_revision;
             self.active_slab_key = Some(key);
             self.instance_count = slab.instance_count;
+            let dropped_rectangles = slab.dropped_rectangles;
+            self.record_dropped_rectangles(dropped_rectangles);
             self.trim_cached_slabs(maximum_slab_bytes);
             let stats = PrepareStats {
                 total_instances: self.instance_count as usize,
+                truncated: dropped_rectangles > 0,
                 slab_cache_hit: true,
                 slab_entries: self.cached_slabs.len(),
                 slab_resident_bytes: self.slab_resident_bytes(),
@@ -573,8 +588,9 @@ impl RectangleRenderer {
             return;
         }
 
-        let maximum_instances =
-            MAX_UPLOAD_BYTES_PER_FRAME / std::mem::size_of::<RectangleInstance>();
+        let (maximum_instances, dropped_rectangles) =
+            rectangle_upload_budget(display_list.rectangles.len());
+        self.record_dropped_rectangles(dropped_rectangles);
         self.scratch_instances.clear();
         let previous_cpu_capacity = self.scratch_instances.capacity();
         self.scratch_instances.extend(
@@ -595,7 +611,7 @@ impl RectangleRenderer {
         }
         let mut stats = PrepareStats {
             total_instances: instances.len(),
-            truncated: display_list.rectangles.len() > instances.len(),
+            truncated: dropped_rectangles > 0,
             cpu_capacity_grew: instances.capacity() > previous_cpu_capacity,
             ..PrepareStats::default()
         };
@@ -618,6 +634,7 @@ impl RectangleRenderer {
                 CachedRectangleSlab {
                     buffer,
                     instance_count: self.instance_count,
+                    dropped_rectangles,
                     allocated_bytes,
                     last_used_revision: self.slab_revision,
                 },
@@ -686,7 +703,36 @@ impl RectangleRenderer {
     }
 
     pub const fn last_prepare_stats(&self) -> PrepareStats {
-        self.last_prepare_stats
+        self.last_prepare.stats
+    }
+
+    /// Number of rectangles the most recent preparation could not draw because the display list
+    /// exceeded the per-frame upload budget ([`Self::maximum_rectangles_per_frame`]). Zero means
+    /// the presented frame is complete. Callers should surface a non-zero value to the user
+    /// rather than present a silently incomplete frame.
+    #[must_use]
+    pub const fn dropped_rectangles(&self) -> usize {
+        self.last_prepare.dropped_rectangles
+    }
+
+    /// Rectangles dropped across every preparation since this renderer was created.
+    #[must_use]
+    pub const fn total_dropped_rectangles(&self) -> u64 {
+        self.last_prepare.total_dropped_rectangles
+    }
+
+    /// Largest display list one preparation draws in full.
+    #[must_use]
+    pub const fn maximum_rectangles_per_frame() -> usize {
+        MAX_UPLOAD_BYTES_PER_FRAME / std::mem::size_of::<RectangleInstance>()
+    }
+
+    fn record_dropped_rectangles(&mut self, dropped: usize) {
+        self.last_prepare.dropped_rectangles = dropped;
+        self.last_prepare.total_dropped_rectangles = self
+            .last_prepare
+            .total_dropped_rectangles
+            .saturating_add(dropped as u64);
     }
 
     #[must_use]
@@ -713,8 +759,8 @@ impl RectangleRenderer {
     /// authoritative frame replaces it.
     pub fn set_maximum_slab_bytes(&mut self, maximum_slab_bytes: usize) {
         self.trim_cached_slabs(maximum_slab_bytes.max(1));
-        self.last_prepare_stats.slab_entries = self.cached_slabs.len();
-        self.last_prepare_stats.slab_resident_bytes = self.slab_resident_bytes();
+        self.last_prepare.stats.slab_entries = self.cached_slabs.len();
+        self.last_prepare.stats.slab_resident_bytes = self.slab_resident_bytes();
     }
 
     fn active_buffer_and_count(&self) -> (&wgpu::Buffer, u32) {
@@ -744,7 +790,7 @@ impl RectangleRenderer {
             .operation_counters
             .buffer_reallocations
             .saturating_add(u64::from(stats.buffer_reallocated));
-        self.last_prepare_stats = stats;
+        self.last_prepare.stats = stats;
     }
 
     fn slab_resident_bytes(&self) -> usize {
@@ -799,6 +845,31 @@ fn changed_instance_range(
     (first < current_end).then_some(first..current_end)
 }
 
+/// Intersects a captured `[x, y, width, height]` scissor with a render target of `target_size`
+/// physical pixels. Returns `None` when nothing of the scissor remains inside the target, in
+/// which case the draw must be skipped: wgpu rejects a scissor that leaves the attachment.
+#[must_use]
+pub fn clamp_scissor_to_target(scissor: [u32; 4], target_size: [u32; 2]) -> Option<[u32; 4]> {
+    let [x, y, width, height] = scissor;
+    if x >= target_size[0] || y >= target_size[1] {
+        return None;
+    }
+    let width = width.min(target_size[0] - x);
+    let height = height.min(target_size[1] - y);
+    (width > 0 && height > 0).then_some([x, y, width, height])
+}
+
+/// Splits a display list of `rectangles` entries into the prefix one preparation uploads and the
+/// count it has to drop to stay inside the per-frame upload budget.
+const fn rectangle_upload_budget(rectangles: usize) -> (usize, usize) {
+    let maximum = RectangleRenderer::maximum_rectangles_per_frame();
+    if rectangles > maximum {
+        (maximum, rectangles - maximum)
+    } else {
+        (rectangles, 0)
+    }
+}
+
 fn create_instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("RGV rectangle instances"),
@@ -814,20 +885,63 @@ pub fn export_png(
     height: u32,
     path: impl AsRef<Path>,
 ) -> Result<(), ImageError> {
-    let mut image = RgbaImage::from_pixel(width, height, image::Rgba([255, 255, 255, 255]));
+    export_png_scaled(display_list, width, height, 1.0, path)
+}
+
+/// Largest edge, in physical pixels, that [`export_png_scaled`] will allocate.
+pub const MAX_EXPORT_PNG_EDGE: u32 = 32_768;
+
+/// Exports `display_list`, laid out in a `width` x `height` logical-point frame, as a PNG with
+/// `scale` physical pixels per logical point. Pass the window scale factor (2.0 on a Retina
+/// display) so the export has the same pixel density as the presented frame, or a larger value
+/// for print. Geometry and text are rasterised at the output resolution, not resampled.
+///
+/// # Errors
+///
+/// Returns a parameter error if `scale` is not a positive finite number or the scaled image would
+/// exceed [`MAX_EXPORT_PNG_EDGE`] on either edge, and any error from encoding or writing the file.
+pub fn export_png_scaled(
+    display_list: &DisplayList,
+    width: u32,
+    height: u32,
+    scale: f32,
+    path: impl AsRef<Path>,
+) -> Result<(), ImageError> {
+    let (pixel_width, pixel_height) = scaled_export_size(width, height, scale)?;
+    let mut image =
+        RgbaImage::from_pixel(pixel_width, pixel_height, image::Rgba([255, 255, 255, 255]));
     for rectangle in &display_list.rectangles {
-        rasterize_rectangle(&mut image, *rectangle);
+        rasterize_rectangle(&mut image, *rectangle, scale);
     }
     for text in &display_list.texts {
-        rasterize_text(&mut image, text);
+        rasterize_text(&mut image, text, scale);
     }
     image.save_with_format(path, image::ImageFormat::Png)
 }
 
-fn rasterize_text(image: &mut RgbaImage, text: &TextPrimitive) {
+fn scaled_export_size(width: u32, height: u32, scale: f32) -> Result<(u32, u32), ImageError> {
+    let invalid = |reason: &str| {
+        ImageError::Parameter(image::error::ParameterError::from_kind(
+            image::error::ParameterErrorKind::Generic(reason.to_owned()),
+        ))
+    };
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(invalid("PNG export scale must be a positive finite number"));
+    }
+    let edge = |points: u32| {
+        let pixels = (f64::from(points) * f64::from(scale)).round().max(1.0);
+        (pixels <= f64::from(MAX_EXPORT_PNG_EDGE)).then_some(pixels as u32)
+    };
+    edge(width)
+        .zip(edge(height))
+        .ok_or_else(|| invalid("scaled PNG export exceeds the maximum image size"))
+}
+
+fn rasterize_text(image: &mut RgbaImage, text: &TextPrimitive, scale: f32) {
     let font = FontRef::try_from_slice(epaint_default_fonts::HACK_REGULAR)
         .expect("egui's embedded Hack font is valid");
-    let scaled = font.as_scaled(text.font_size);
+    let font_size = text.font_size * scale;
+    let scaled = font.as_scaled(font_size);
     let mut width = 0.0;
     let mut previous = None;
     for character in text.text.chars() {
@@ -839,15 +953,15 @@ fn rasterize_text(image: &mut RgbaImage, text: &TextPrimitive) {
         previous = Some(glyph);
     }
 
-    let mut cursor_x = text.x - width * 0.5;
-    let baseline_y = text.y + (scaled.ascent() + scaled.descent()) * 0.5;
+    let mut cursor_x = text.x * scale - width * 0.5;
+    let baseline_y = text.y * scale + (scaled.ascent() + scaled.descent()) * 0.5;
     previous = None;
     for character in text.text.chars() {
         let glyph_id = scaled.glyph_id(character);
         if let Some(previous) = previous {
             cursor_x += scaled.kern(previous, glyph_id);
         }
-        let glyph = glyph_id.with_scale_and_position(text.font_size, point(cursor_x, baseline_y));
+        let glyph = glyph_id.with_scale_and_position(font_size, point(cursor_x, baseline_y));
         cursor_x += scaled.h_advance(glyph_id);
         previous = Some(glyph_id);
         let Some(outlined) = font.outline_glyph(glyph) else {
@@ -886,18 +1000,23 @@ fn blend_pixel(destination: &mut image::Rgba<u8>, color: rgv_layout::Rgba, cover
     destination[3] = 255;
 }
 
-fn rasterize_rectangle(image: &mut RgbaImage, rectangle: RectPrimitive) {
-    let left = rectangle.x.floor().max(0.0) as u32;
-    let top = rectangle.y.floor().max(0.0) as u32;
-    let right = (rectangle.x + rectangle.width)
+/// Rasterises one logical-point rectangle into an image holding `scale` pixels per point. Each
+/// output pixel is tested at its centre in logical coordinates, so shape rules (arrow heads,
+/// arcs, brackets) are evaluated in the same units at every scale.
+fn rasterize_rectangle(image: &mut RgbaImage, rectangle: RectPrimitive, scale: f32) {
+    let left = (rectangle.x * scale).floor().max(0.0) as u32;
+    let top = (rectangle.y * scale).floor().max(0.0) as u32;
+    let right = ((rectangle.x + rectangle.width) * scale)
         .ceil()
         .clamp(0.0, image.width() as f32) as u32;
-    let bottom = (rectangle.y + rectangle.height)
+    let bottom = ((rectangle.y + rectangle.height) * scale)
         .ceil()
         .clamp(0.0, image.height() as f32) as u32;
     for y in top..bottom {
         for x in left..right {
-            if !rectangle_contains_pixel(rectangle, x, y) {
+            let point_x = (x as f32 + 0.5) / scale;
+            let point_y = (y as f32 + 0.5) / scale;
+            if !rectangle_contains_point(rectangle, point_x, point_y) {
                 continue;
             }
             let destination = image.get_pixel_mut(x, y);
@@ -906,13 +1025,13 @@ fn rasterize_rectangle(image: &mut RgbaImage, rectangle: RectPrimitive) {
     }
 }
 
-fn rectangle_contains_pixel(rectangle: RectPrimitive, x: u32, y: u32) -> bool {
-    let local_x = x as f32 + 0.5 - rectangle.x;
-    let local_y = y as f32 + 0.5 - rectangle.y;
+fn rectangle_contains_point(rectangle: RectPrimitive, point_x: f32, point_y: f32) -> bool {
+    let local_x = point_x - rectangle.x;
+    let local_y = point_y - rectangle.y;
     if rectangle.shape.is_junction_arc() {
         let stroke = junction_arc_stroke_width(rectangle.height)
             + rectangle.shape.junction_arc_interaction_expansion() * 2.0;
-        return junction_arc_distance_to_point(rectangle, x as f32 + 0.5, y as f32 + 0.5)
+        return junction_arc_distance_to_point(rectangle, point_x, point_y)
             .is_some_and(|distance| distance <= stroke * 0.5);
     }
     if matches!(
@@ -958,6 +1077,108 @@ mod tests {
     use rgv_layout::{RectPrimitive, Rgba};
 
     use super::*;
+
+    fn rectangle_contains_pixel(rectangle: RectPrimitive, x: u32, y: u32) -> bool {
+        rectangle_contains_point(rectangle, x as f32 + 0.5, y as f32 + 0.5)
+    }
+
+    #[test]
+    fn scissors_are_intersected_with_the_render_target() {
+        let target = [800, 600];
+        assert_eq!(
+            clamp_scissor_to_target([10, 20, 100, 50], target),
+            Some([10, 20, 100, 50])
+        );
+        // Captured against a larger surface, replayed after the window shrank.
+        assert_eq!(
+            clamp_scissor_to_target([700, 500, 400, 300], target),
+            Some([700, 500, 100, 100])
+        );
+        assert_eq!(
+            clamp_scissor_to_target([0, 0, 800, 600], target),
+            Some([0, 0, 800, 600])
+        );
+        assert_eq!(clamp_scissor_to_target([800, 0, 10, 10], target), None);
+        assert_eq!(clamp_scissor_to_target([0, 600, 10, 10], target), None);
+        assert_eq!(clamp_scissor_to_target([10, 10, 0, 10], target), None);
+        assert_eq!(clamp_scissor_to_target([10, 10, 10, 10], [0, 0]), None);
+        // The unclamped entry points pass an unbounded target, and overflow cannot wrap.
+        assert_eq!(
+            clamp_scissor_to_target([u32::MAX - 1, 5, u32::MAX, 7], [u32::MAX; 2]),
+            Some([u32::MAX - 1, 5, 1, 7])
+        );
+    }
+
+    #[test]
+    fn rectangle_upload_budget_reports_every_dropped_rectangle() {
+        let maximum = RectangleRenderer::maximum_rectangles_per_frame();
+        assert!(maximum * std::mem::size_of::<RectangleInstance>() <= MAX_UPLOAD_BYTES_PER_FRAME);
+        assert_eq!(rectangle_upload_budget(0), (0, 0));
+        assert_eq!(rectangle_upload_budget(maximum), (maximum, 0));
+        assert_eq!(rectangle_upload_budget(maximum + 1), (maximum, 1));
+        assert_eq!(rectangle_upload_budget(maximum * 3), (maximum, maximum * 2));
+    }
+
+    #[test]
+    fn scaled_png_export_rasterises_geometry_at_the_output_resolution() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("scaled.png");
+        let display = DisplayList {
+            rectangles: vec![
+                RectPrimitive {
+                    x: 1.0,
+                    y: 1.0,
+                    width: 3.0,
+                    height: 2.0,
+                    color: Rgba::new(1.0, 0.0, 0.0, 1.0),
+                    object_id: 0,
+                    shape: RectShape::default(),
+                },
+                // Half a logical point wide: one whole pixel at 2x.
+                RectPrimitive {
+                    x: 6.0,
+                    y: 1.0,
+                    width: 0.5,
+                    height: 2.0,
+                    color: Rgba::new(0.0, 0.0, 1.0, 1.0),
+                    object_id: 0,
+                    shape: RectShape::default(),
+                },
+            ],
+            texts: Vec::new(),
+        };
+        export_png_scaled(&display, 8, 8, 2.0, &path).unwrap();
+        let decoded = image::open(&path).unwrap().to_rgba8();
+        assert_eq!(decoded.dimensions(), (16, 16));
+        assert_eq!(decoded.get_pixel(1, 2).0, [255, 255, 255, 255]);
+        assert_eq!(decoded.get_pixel(2, 2).0, [255, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(7, 5).0, [255, 0, 0, 255]);
+        assert_eq!(decoded.get_pixel(8, 5).0, [255, 255, 255, 255]);
+        assert_eq!(decoded.get_pixel(7, 6).0, [255, 255, 255, 255]);
+        assert_eq!(decoded.get_pixel(12, 3).0, [0, 0, 255, 255]);
+        assert_eq!(decoded.get_pixel(13, 3).0, [255, 255, 255, 255]);
+
+        // The unscaled entry point is exactly the 1x case.
+        let unscaled = directory.path().join("unscaled.png");
+        let explicit = directory.path().join("explicit.png");
+        export_png(&display, 8, 8, &unscaled).unwrap();
+        export_png_scaled(&display, 8, 8, 1.0, &explicit).unwrap();
+        assert_eq!(
+            std::fs::read(unscaled).unwrap(),
+            std::fs::read(explicit).unwrap()
+        );
+    }
+
+    #[test]
+    fn scaled_png_export_rejects_unusable_scales() {
+        assert_eq!(scaled_export_size(400, 200, 2.0).unwrap(), (800, 400));
+        assert_eq!(scaled_export_size(3, 3, 1.5).unwrap(), (5, 5));
+        assert_eq!(scaled_export_size(0, 0, 1.0).unwrap(), (1, 1));
+        for scale in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(scaled_export_size(8, 8, scale).is_err());
+        }
+        assert!(scaled_export_size(MAX_EXPORT_PNG_EDGE, 8, 2.0).is_err());
+    }
 
     #[test]
     fn primitive_conversion_preserves_geometry_and_pick_id() {

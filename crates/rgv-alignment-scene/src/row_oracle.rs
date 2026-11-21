@@ -13,7 +13,8 @@ use thiserror::Error;
 
 use crate::{
     AlignmentHandle, CapabilityRequirement, EvidenceRoot, EvidenceSelection,
-    EvidenceSelectionError, LayoutContract,
+    EvidenceSelectionError, LayoutContract, ReadSampling,
+    sampling::{SamplingCandidate, retained_by_sampling, sampling_priority},
 };
 
 /// Stable semantic identity for a contiguous row group. Dynamic tag values are retained as
@@ -132,6 +133,8 @@ pub(crate) struct RowOracleOutput {
     pub extents: Vec<OracleRowExtent>,
     pub groups: Vec<OracleGroup>,
     pub connectors: Vec<OraclePairConnector>,
+    /// Eligible reads overlapping the interval before read sampling.
+    pub eligible_records: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -207,7 +210,9 @@ pub(crate) fn build_row_oracle(
         AlignmentOrderDirection::Natural => grouped.into_iter().collect::<Vec<_>>(),
         AlignmentOrderDirection::Reverse => grouped.into_iter().rev().collect::<Vec<_>>(),
     };
-    pack_groups(&candidates, &units, ordered_groups)
+    let mut output = pack_groups(&candidates, &units, ordered_groups)?;
+    output.eligible_records = selection.records().len();
+    Ok(output)
 }
 
 fn build_candidates(
@@ -217,10 +222,12 @@ fn build_candidates(
 ) -> Result<Vec<Candidate>, RowOracleError> {
     let group_tag = mode_tag(contract.grouping);
     let sort_tag = sort_tag(contract.sorting);
+    let retained = sampled_selection(selection, contract.sampling)?;
     selection
         .records()
         .iter()
         .enumerate()
+        .filter(|(index, _)| retained.as_ref().is_none_or(|retained| retained[*index]))
         .map(|(index, reference)| {
             let record = selection
                 .record_view(index)
@@ -283,6 +290,38 @@ fn build_candidates(
             })
         })
         .collect()
+}
+
+/// Evaluates read sampling over the complete selection before any per-record layout scratch is
+/// built, so a deep locus pays layout cost only for the reads that receive rows.
+fn sampled_selection(
+    selection: &EvidenceSelection,
+    sampling: ReadSampling,
+) -> Result<Option<Vec<bool>>, RowOracleError> {
+    if !sampling.is_downsampled() {
+        return Ok(None);
+    }
+    let candidates = selection
+        .records()
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            let record = selection
+                .record_view(index)
+                .ok_or(RowOracleError::InvalidEvidenceRecord)?;
+            Ok(SamplingCandidate {
+                handle: reference.handle,
+                start: record.start(),
+                priority: sampling_priority(record.read_name()),
+                decided: None,
+            })
+        })
+        .collect::<Result<Vec<_>, RowOracleError>>()?;
+    Ok(Some(retained_by_sampling(
+        sampling,
+        &candidates,
+        &HashMap::new(),
+    )))
 }
 
 fn validate_capabilities(
@@ -672,6 +711,7 @@ fn pack_groups(
         extents,
         groups: retained_groups,
         connectors,
+        eligible_records: 0,
     })
 }
 

@@ -3,30 +3,66 @@ use super::*;
 
 pub struct BigWigSource {
     reader: BigWigBackend,
+    remote: Option<RemoteReaderControl>,
 }
 
 enum BigWigBackend {
     Local(BigWigRead<ReopenableFile>),
-    Remote(Box<BigWigRead<HttpRangeReader>>),
+    Remote(Box<BigWigRead<ControlledRangeReader>>),
 }
 
 impl BigWigSource {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TrackError> {
+        Self::open_with_remote_config(path, HttpRangeConfig::default())
+    }
+
+    /// Opens a bigWig; a remote URL is read with `remote` (authentication, timeouts, retries
+    /// and cache geometry) instead of the anonymous defaults. `remote` is unused for a file.
+    pub fn open_with_remote_config(
+        path: impl AsRef<Path>,
+        remote: HttpRangeConfig,
+    ) -> Result<Self, TrackError> {
         let path = path.as_ref();
         let raw = path.to_string_lossy();
-        let reader = if is_remote_url(&raw) {
-            let remote = HttpRangeReader::open(&raw, HttpRangeConfig::default())
+        if is_remote_url(&raw) {
+            let (reader, control) = ControlledRangeReader::open(&raw, remote)
                 .map_err(|error| TrackError::Backend(error.to_string()))?;
-            BigWigBackend::Remote(Box::new(
-                BigWigRead::open(remote).map_err(|error| TrackError::Backend(error.to_string()))?,
-            ))
+            Ok(Self {
+                reader: BigWigBackend::Remote(Box::new(
+                    BigWigRead::open(reader)
+                        .map_err(|error| TrackError::Backend(error.to_string()))?,
+                )),
+                remote: Some(control),
+            })
         } else {
-            BigWigBackend::Local(
-                BigWigRead::open_file(path)
-                    .map_err(|error| TrackError::Backend(error.to_string()))?,
-            )
-        };
-        Ok(Self { reader })
+            Ok(Self {
+                reader: BigWigBackend::Local(
+                    BigWigRead::open_file(path)
+                        .map_err(|error| TrackError::Backend(error.to_string()))?,
+                ),
+                remote: None,
+            })
+        }
+    }
+
+    /// Installs (or clears) the check that abandons remote reads once the view has moved on.
+    /// No effect on a local file.
+    pub fn set_remote_cancellation(&mut self, cancellation: Option<RemoteCancellation>) {
+        if let Some(remote) = &self.remote {
+            remote.set_cancellation(cancellation);
+        }
+    }
+
+    /// Bounds the requests and bytes spent from now on; `None` lifts the bound.
+    pub fn set_remote_transfer_budget(&mut self, budget: Option<RemoteTransferBudget>) {
+        if let Some(remote) = &self.remote {
+            remote.set_transfer_budget(budget);
+        }
+    }
+
+    /// Transfer statistics of a remote source; `None` for a local file.
+    pub fn remote_io_stats(&self) -> Option<RemoteIoStats> {
+        self.remote.as_ref().map(RemoteReaderControl::stats)
     }
 
     pub fn query(
@@ -45,11 +81,12 @@ impl BigWigSource {
 pub struct BigBedSource {
     reader: BigBedBackend,
     format: BigBedFeatureFormat,
+    remote: Option<RemoteReaderControl>,
 }
 
 enum BigBedBackend {
     Local(BigBedRead<ReopenableFile>),
-    Remote(Box<BigBedRead<HttpRangeReader>>),
+    Remote(Box<BigBedRead<ControlledRangeReader>>),
 }
 
 impl BigBedSource {
@@ -61,25 +98,66 @@ impl BigBedSource {
         path: impl AsRef<Path>,
         format: BigBedFeatureFormat,
     ) -> Result<Self, TrackError> {
+        Self::open_with_format_and_remote_config(path, format, HttpRangeConfig::default())
+    }
+
+    /// Opens a bigBed; a remote URL is read with `remote` (authentication, timeouts, retries
+    /// and cache geometry) instead of the anonymous defaults. `remote` is unused for a file.
+    pub fn open_with_format_and_remote_config(
+        path: impl AsRef<Path>,
+        format: BigBedFeatureFormat,
+        remote: HttpRangeConfig,
+    ) -> Result<Self, TrackError> {
         let path = path.as_ref();
         let raw = path.to_string_lossy();
-        let reader = if is_remote_url(&raw) {
-            let remote = HttpRangeReader::open(&raw, HttpRangeConfig::default())
+        let (reader, remote) = if is_remote_url(&raw) {
+            let (reader, control) = ControlledRangeReader::open(&raw, remote)
                 .map_err(|error| TrackError::Backend(error.to_string()))?;
-            BigBedBackend::Remote(Box::new(
-                BigBedRead::open(remote).map_err(|error| TrackError::Backend(error.to_string()))?,
-            ))
+            (
+                BigBedBackend::Remote(Box::new(
+                    BigBedRead::open(reader)
+                        .map_err(|error| TrackError::Backend(error.to_string()))?,
+                )),
+                Some(control),
+            )
         } else {
-            BigBedBackend::Local(
-                BigBedRead::open_file(path)
-                    .map_err(|error| TrackError::Backend(error.to_string()))?,
+            (
+                BigBedBackend::Local(
+                    BigBedRead::open_file(path)
+                        .map_err(|error| TrackError::Backend(error.to_string()))?,
+                ),
+                None,
             )
         };
         match &reader {
             BigBedBackend::Local(reader) => validate_bigbed_schema(reader, format)?,
             BigBedBackend::Remote(reader) => validate_bigbed_schema(reader, format)?,
         }
-        Ok(Self { reader, format })
+        Ok(Self {
+            reader,
+            format,
+            remote,
+        })
+    }
+
+    /// Installs (or clears) the check that abandons remote reads once the view has moved on.
+    /// No effect on a local file.
+    pub fn set_remote_cancellation(&mut self, cancellation: Option<RemoteCancellation>) {
+        if let Some(remote) = &self.remote {
+            remote.set_cancellation(cancellation);
+        }
+    }
+
+    /// Bounds the requests and bytes spent from now on; `None` lifts the bound.
+    pub fn set_remote_transfer_budget(&mut self, budget: Option<RemoteTransferBudget>) {
+        if let Some(remote) = &self.remote {
+            remote.set_transfer_budget(budget);
+        }
+    }
+
+    /// Transfer statistics of a remote source; `None` for a local file.
+    pub fn remote_io_stats(&self) -> Option<RemoteIoStats> {
+        self.remote.as_ref().map(RemoteReaderControl::stats)
     }
 
     pub fn query(
@@ -150,6 +228,23 @@ const fn bigbed_format_name(format: BigBedFeatureFormat) -> &'static str {
     }
 }
 
+/// Minimum summary bins across one query for a precomputed zoom level to be used. Zoom levels
+/// are typically spaced by a factor of four, so the level chosen yields between this many and
+/// four times this many bins: at least one bin per pixel on a 4K-wide canvas.
+const BIGWIG_ZOOM_TARGET_BINS: u64 = 4_096;
+
+/// The coarsest precomputed zoom level that still yields at least the target number of bins
+/// across `span` bases. `None` means the raw values should be read.
+fn bigwig_zoom_reduction(reductions: &[u32], span: u64) -> Option<u32> {
+    reductions
+        .iter()
+        .copied()
+        .filter(|reduction| {
+            *reduction > 0 && span / u64::from(*reduction) >= BIGWIG_ZOOM_TARGET_BINS
+        })
+        .max()
+}
+
 fn query_bigwig<R: BBIFileRead>(
     reader: &mut BigWigRead<R>,
     contig: &str,
@@ -158,6 +253,39 @@ fn query_bigwig<R: BBIFileRead>(
 ) -> Result<QuantitativeQuery, TrackError> {
     let start = u32::try_from(start).map_err(|_| TrackError::Coordinate)?;
     let end = u32::try_from(end).map_err(|_| TrackError::Coordinate)?;
+    let reductions = reader
+        .info()
+        .zoom_headers
+        .iter()
+        .map(|header| header.reduction_level)
+        .collect::<Vec<_>>();
+    let span = u64::from(end.saturating_sub(start));
+    if let Some(reduction) = bigwig_zoom_reduction(&reductions, span) {
+        return query_bigwig_zoom(reader, contig, start, end, reduction);
+    }
+    let raw = query_bigwig_raw(reader, contig, start, end)?;
+    if !raw.provenance.records_truncated {
+        return Ok(raw);
+    }
+    // Dense raw data exceeded the record cap. A truncated signal would be blank on the right of
+    // the view, so prefer the finest zoom level that covers the whole query.
+    let Some(finest) = reductions.iter().copied().filter(|level| *level > 0).min() else {
+        return Ok(raw);
+    };
+    let summarized = query_bigwig_zoom(reader, contig, start, end, finest)?;
+    Ok(if summarized.provenance.records_truncated {
+        raw
+    } else {
+        summarized
+    })
+}
+
+fn query_bigwig_raw<R: BBIFileRead>(
+    reader: &mut BigWigRead<R>,
+    contig: &str,
+    start: u32,
+    end: u32,
+) -> Result<QuantitativeQuery, TrackError> {
     let mut query = QuantitativeQuery::default();
     let intervals = reader
         .get_interval(contig, start, end)
@@ -170,6 +298,43 @@ fn query_bigwig<R: BBIFileRead>(
                 start: u64::from(value.start),
                 end: u64::from(value.end),
                 value: value.value,
+            },
+            MAX_QUANTITATIVE_RECORDS_PER_QUERY,
+        ) {
+            break;
+        }
+    }
+    query.provenance.records_retained = query.records.len();
+    Ok(query)
+}
+
+/// Reads one precomputed zoom level. Each summary becomes one record carrying the mean of the
+/// covered bases, which is what the file's own reductions are designed to display.
+fn query_bigwig_zoom<R: BBIFileRead>(
+    reader: &mut BigWigRead<R>,
+    contig: &str,
+    start: u32,
+    end: u32,
+    reduction: u32,
+) -> Result<QuantitativeQuery, TrackError> {
+    let mut query = QuantitativeQuery::default();
+    query.provenance.summary_reduction_bases = Some(reduction);
+    let summaries = reader
+        .get_zoom_interval(contig, start, end, reduction)
+        .map_err(|error| TrackError::Backend(error.to_string()))?;
+    for result in summaries {
+        let summary = result.map_err(|error| TrackError::Backend(error.to_string()))?;
+        if summary.summary.bases_covered == 0 {
+            continue;
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let mean = (summary.summary.sum / summary.summary.bases_covered as f64) as f32;
+        if !retain_quantitative_record(
+            &mut query,
+            QuantitativeRecord {
+                start: u64::from(summary.start),
+                end: u64::from(summary.end),
+                value: mean,
             },
             MAX_QUANTITATIVE_RECORDS_PER_QUERY,
         ) {

@@ -820,9 +820,65 @@ fn redact_url_credentials(url: &str) -> String {
     if parsed.password().is_some() {
         let _ = parsed.set_password(None);
     }
-    parsed.set_query(None);
-    parsed.set_fragment(None);
+    // Only credential-bearing parameters are removed: stripping the whole
+    // query would also discard parameters the server needs to identify the
+    // resource (`?format=bam&id=7`), leaving a persisted URL that cannot be
+    // reopened even after the user authenticates again.
+    if parsed.query().is_some() {
+        let retained = parsed
+            .query_pairs()
+            .filter(|(key, value)| {
+                !is_credential_parameter(key) && !looks_like_embedded_credential(value)
+            })
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        if retained.is_empty() {
+            parsed.set_query(None);
+        } else {
+            parsed.query_pairs_mut().clear().extend_pairs(retained);
+        }
+    }
+    if parsed
+        .fragment()
+        .is_some_and(|fragment| fragment.contains('=') || is_credential_parameter(fragment))
+    {
+        // OAuth-style `#access_token=...` fragments; a plain anchor is kept.
+        parsed.set_fragment(None);
+    }
     parsed.into()
+}
+
+/// Query-parameter names that carry a secret in presigned-URL and bearer
+/// schemes (AWS SigV2/SigV4, Google signed URLs, Azure SAS, `CloudFront`,
+/// OAuth, and generic API keys). Matching is by substring so vendor prefixes
+/// such as `X-Amz-` and `X-Goog-` need no enumeration; a false positive only
+/// drops a parameter from the persisted copy.
+fn is_credential_parameter(name: &str) -> bool {
+    const MARKERS: [&str; 14] = [
+        "sig",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "credential",
+        "auth",
+        "key",
+        "policy",
+        "jwt",
+        "session",
+        "bearer",
+        "cookie",
+    ];
+    let name = name.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| name.contains(marker))
+}
+
+/// A value that is itself `user:password@host` or a nested URL with a query.
+fn looks_like_embedded_credential(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|nested| {
+        !nested.username().is_empty() || nested.password().is_some() || nested.query().is_some()
+    })
 }
 
 #[cfg(test)]
@@ -955,6 +1011,61 @@ mod tests {
         assert!(!label.contains("secret"));
         assert!(!label.contains("signature"));
         assert_eq!(label, "https://example.org/data.bam");
+    }
+
+    #[test]
+    fn redaction_keeps_non_secret_query_parameters() {
+        let redact = |url: &str| match (TrackSource::Remote {
+            url: url.to_owned(),
+        })
+        .redacted_for_persistence()
+        {
+            TrackSource::Remote { url } => url,
+            TrackSource::Local { .. } => unreachable!(),
+        };
+        assert_eq!(
+            redact("https://example.org/api/reads?format=bam&id=7&referenceName=chr1"),
+            "https://example.org/api/reads?format=bam&id=7&referenceName=chr1"
+        );
+        assert_eq!(
+            redact(
+                "https://bucket.s3.amazonaws.com/a.bam?versionId=3&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2Fscope&X-Amz-Date=20260101T000000Z&X-Amz-Expires=600&X-Amz-SignedHeaders=host&X-Amz-Security-Token=tok&X-Amz-Signature=abcdef"
+            ),
+            "https://bucket.s3.amazonaws.com/a.bam?versionId=3&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260101T000000Z&X-Amz-Expires=600"
+        );
+        assert_eq!(
+            redact("https://acct.blob.core.windows.net/c/a.cram?sv=2022&sr=b&sp=r&sig=SECRET"),
+            "https://acct.blob.core.windows.net/c/a.cram?sv=2022&sr=b&sp=r"
+        );
+        for secret in [
+            "access_token=abc",
+            "api_key=abc",
+            "apikey=abc",
+            "AWSAccessKeyId=abc",
+            "Signature=abc",
+            "Key-Pair-Id=abc",
+            "Policy=abc",
+            "password=abc",
+            "next=https%3A%2F%2Fu%3Ap%40example.org%2F",
+        ] {
+            assert_eq!(
+                redact(&format!("https://example.org/a.bam?track=1&{secret}")),
+                "https://example.org/a.bam?track=1",
+                "{secret}"
+            );
+        }
+        assert_eq!(
+            redact("https://example.org/a.bam?token=abc"),
+            "https://example.org/a.bam"
+        );
+        assert_eq!(
+            redact("https://example.org/a.html?x=1#section-2"),
+            "https://example.org/a.html?x=1#section-2"
+        );
+        assert_eq!(
+            redact("https://example.org/a.bam#access_token=abc"),
+            "https://example.org/a.bam"
+        );
     }
 
     #[test]

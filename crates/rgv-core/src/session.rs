@@ -15,7 +15,14 @@ use crate::{
 };
 
 pub const SESSION_SCHEMA_VERSION: u32 = 4;
+/// Additive revision of schema [`SESSION_SCHEMA_VERSION`]. Bump it whenever a
+/// field or enum variant is added that an older build of the same major
+/// schema would drop or fail to parse. Files without writer metadata are
+/// revision zero.
+pub const SESSION_SCHEMA_MINOR_VERSION: u32 = 1;
 pub const MAXIMUM_ALIGNMENT_TRACKS: usize = 64;
+/// Bound on non-alignment tracks in one session document.
+pub const MAXIMUM_SESSION_TRACKS: usize = 4_096;
 pub const MAXIMUM_VIEW_PANELS: usize = 16;
 pub const MAXIMUM_CONTIG_ALIASES: usize = 10_000;
 pub const MAXIMUM_REGIONS_OF_INTEREST: usize = 100_000;
@@ -150,6 +157,26 @@ impl IgvImportReport {
 pub struct IgvSessionImport {
     pub document: SessionDocument,
     pub report: IgvImportReport,
+    /// How faithfully `document.locus` reflects `Session.locus`. Anything but
+    /// [`IgvLocusResolution::Interval`] means the document holds a one-base
+    /// placeholder that the caller must replace once a dictionary is known.
+    pub locus_resolution: IgvLocusResolution,
+}
+
+/// The outcome of translating IGV's `Session.locus`, which may name things
+/// only a reference dictionary or an annotation can place.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IgvLocusResolution {
+    /// `document.locus` is the interval IGV showed (the first, for a
+    /// multi-locus session).
+    Interval,
+    /// IGV named a whole contig (`chr1`) or a feature (`BRCA1`).
+    /// `document.locus` is a placeholder on `name`; resolve `name` with
+    /// [`crate::Locus::resolve`] or a feature search.
+    Named { name: String },
+    /// IGV's whole-genome view (`All`), a missing locus, or an unparseable
+    /// one. `document.locus` is a placeholder; open the default locus.
+    Unresolved { requested: String },
 }
 
 #[derive(Default)]
@@ -591,6 +618,61 @@ pub enum ReadStackingMode {
     Compact,
 }
 
+/// Which eligible reads receive rows in an alignment track. Coverage and every other summary are
+/// always computed from the complete eligible population.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AlignmentReadSampling {
+    /// Present every eligible read, or refuse individual reads above the complete-read limit.
+    Complete,
+    /// Present at most `maximum_reads` reads starting in each `window_bases` window.
+    Downsampled {
+        window_bases: u32,
+        maximum_reads: u32,
+    },
+}
+
+impl AlignmentReadSampling {
+    pub const DEFAULT_WINDOW_BASES: u32 = 50;
+    pub const DEFAULT_MAXIMUM_READS: u32 = 100;
+    pub const MAXIMUM_WINDOW_BASES: u32 = 1_000_000;
+    pub const MAXIMUM_READS_PER_WINDOW: u32 = 1_000_000;
+
+    /// The default for newly created tracks.
+    #[must_use]
+    pub const fn downsampled_default() -> Self {
+        Self::Downsampled {
+            window_bases: Self::DEFAULT_WINDOW_BASES,
+            maximum_reads: Self::DEFAULT_MAXIMUM_READS,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_downsampled(self) -> bool {
+        matches!(self, Self::Downsampled { .. })
+    }
+
+    /// Clamps persisted or user-entered values into the supported range.
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Complete => Self::Complete,
+            Self::Downsampled {
+                window_bases,
+                maximum_reads,
+            } => Self::Downsampled {
+                window_bases: window_bases.clamp(1, Self::MAXIMUM_WINDOW_BASES),
+                maximum_reads: maximum_reads.clamp(1, Self::MAXIMUM_READS_PER_WINDOW),
+            },
+        }
+    }
+}
+
+/// Projects saved before read sampling existed presented every read; keep reproducing that.
+const fn legacy_alignment_read_sampling() -> AlignmentReadSampling {
+    AlignmentReadSampling::Complete
+}
+
 /// Why the current read-row projection was established. This is reported to
 /// diagnostics and automation so an intentional reflow is distinguishable
 /// from ordinary navigation.
@@ -628,6 +710,8 @@ pub struct SessionFilters {
     pub alignment_sort_anchor: Option<u64>,
     #[serde(default)]
     pub read_stacking_mode: ReadStackingMode,
+    #[serde(default = "legacy_alignment_read_sampling")]
+    pub read_sampling: AlignmentReadSampling,
     #[serde(default)]
     pub view_as_pairs: bool,
     #[serde(default)]
@@ -721,6 +805,7 @@ impl Default for SessionFilters {
             alignment_sort_order: AlignmentOrderDirection::Natural,
             alignment_sort_anchor: None,
             read_stacking_mode: ReadStackingMode::Stable,
+            read_sampling: AlignmentReadSampling::downsampled_default(),
             view_as_pairs: false,
             minimum_template_length: None,
             maximum_template_length: None,
@@ -1195,7 +1280,7 @@ impl WorkspacePresentation {
                 })
             }));
         }
-        Self {
+        let mut presentation = Self {
             read_pane_height: alignment_tracks
                 .first()
                 .map_or_else(default_alignment_track_height, |track| {
@@ -1216,7 +1301,48 @@ impl WorkspacePresentation {
                 .max(default_next_presentation_group_id()),
             groups,
             composites: Vec::new(),
+        };
+        presentation.make_groups_contiguous();
+        presentation
+    }
+
+    /// Moves every group's members next to its first member, in member order.
+    ///
+    /// Legacy schemas stored a group id per track, so two members could be
+    /// separated by an unrelated track; schema four requires a group to
+    /// occupy one contiguous run of its pane. Returns whether anything moved.
+    fn make_groups_contiguous(&mut self) -> bool {
+        let mut moved = false;
+        for group in &self.groups {
+            let position = |pane_tracks: &[SessionPaneTrackState], member: TrackId| {
+                pane_tracks
+                    .iter()
+                    .position(|node| node.channel == group.channel && node.track_id == member)
+            };
+            let Some(first) = group.members.first() else {
+                continue;
+            };
+            let Some(mut anchor) = position(&self.pane_tracks, *first) else {
+                continue;
+            };
+            for member in group.members.iter().skip(1) {
+                let Some(current) = position(&self.pane_tracks, *member) else {
+                    continue;
+                };
+                if current == anchor + 1 {
+                    anchor = current;
+                    continue;
+                }
+                let node = self.pane_tracks.remove(current);
+                if current < anchor {
+                    anchor -= 1;
+                }
+                anchor += 1;
+                self.pane_tracks.insert(anchor, node);
+                moved = true;
+            }
         }
+        moved
     }
 
     /// Returns the ordered root nodes for one pane. Group members occupy one
@@ -1698,6 +1824,17 @@ impl WorkspacePresentation {
 }
 
 impl SessionAlignmentTrack {
+    /// The individual-read admission limit the source must enforce. Downsampled tracks bound
+    /// their rows by sampling, so only the hard configurable ceiling applies to decoding.
+    #[must_use]
+    pub fn effective_complete_read_limit(&self) -> usize {
+        if self.filters.read_sampling.is_downsampled() {
+            crate::MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT
+        } else {
+            self.maximum_alignments.max(1)
+        }
+    }
+
     pub fn new(id: TrackId, name: String, source: TrackSource) -> Self {
         Self {
             id,
@@ -1772,6 +1909,62 @@ pub struct SessionDocument {
 #[derive(Deserialize)]
 struct SessionVersionProbe {
     schema_version: u32,
+    #[serde(default)]
+    writer: Option<SessionWriter>,
+}
+
+/// Identifies the build that wrote a session so a reader can tell "corrupt"
+/// from "written by a newer RGV". Persisted as the trailing `writer` object.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SessionWriter {
+    #[serde(default)]
+    application: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    schema_minor_version: u32,
+}
+
+impl SessionWriter {
+    fn current() -> Self {
+        Self {
+            application: "rgv".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            schema_minor_version: SESSION_SCHEMA_MINOR_VERSION,
+        }
+    }
+
+    /// A bounded, printable description for error messages.
+    fn describe(&self) -> String {
+        let clean = |value: &str| {
+            value
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(64)
+                .collect::<String>()
+        };
+        match (clean(&self.application), clean(&self.version)) {
+            (application, version) if application.is_empty() && version.is_empty() => {
+                format!("schema revision {}", self.schema_minor_version)
+            }
+            (application, version) => format!(
+                "{application} {version}, schema revision {}",
+                self.schema_minor_version
+            )
+            .trim()
+            .to_owned(),
+        }
+    }
+}
+
+/// The on-disk shape: the document's own fields followed by writer metadata.
+/// A wrapper keeps `SessionDocument` free of a field every in-memory
+/// constructor would otherwise have to fill.
+#[derive(Serialize)]
+struct PersistedSessionDocument<'a> {
+    #[serde(flatten)]
+    document: &'a SessionDocument,
+    writer: SessionWriter,
 }
 
 #[derive(Deserialize)]
@@ -1900,8 +2093,27 @@ impl SessionDocument {
 
     pub fn from_json(json: &str) -> Result<Self, SessionError> {
         let probe: SessionVersionProbe = serde_json::from_str(json)?;
+        let newer_writer = probe
+            .writer
+            .as_ref()
+            .filter(|writer| writer.schema_minor_version > SESSION_SCHEMA_MINOR_VERSION);
         let mut document = match probe.schema_version {
-            SESSION_SCHEMA_VERSION => serde_json::from_str(json)?,
+            SESSION_SCHEMA_VERSION => match serde_json::from_str(json) {
+                Ok(document) => document,
+                // A newer revision of this schema may use an enum variant or
+                // field shape this build cannot parse. Say so instead of
+                // surfacing a raw serde error that reads like corruption.
+                Err(error) => {
+                    return Err(match newer_writer {
+                        Some(writer) => SessionError::WrittenByNewerVersion {
+                            schema_version: probe.schema_version,
+                            writer: writer.describe(),
+                            detail: Some(error.to_string()),
+                        },
+                        None => SessionError::Json(error),
+                    });
+                }
+            },
             MULTI_PANEL_SESSION_SCHEMA_VERSION => {
                 let mut version_three: SessionDocument = serde_json::from_str(json)?;
                 version_three.schema_version = SESSION_SCHEMA_VERSION;
@@ -1919,10 +2131,28 @@ impl SessionDocument {
                 let legacy: LegacySessionDocument = serde_json::from_str(json)?;
                 legacy.migrate()
             }
+            version if version > SESSION_SCHEMA_VERSION => {
+                return Err(SessionError::WrittenByNewerVersion {
+                    schema_version: version,
+                    writer: probe
+                        .writer
+                        .as_ref()
+                        .map_or_else(|| "a newer RGV".to_owned(), SessionWriter::describe),
+                    detail: None,
+                });
+            }
             version => return Err(SessionError::UnsupportedVersion(version)),
         };
         if probe.schema_version < SESSION_SCHEMA_VERSION {
             document.migration_notices = document.legacy_presentation_migration_notices();
+        }
+        if let Some(writer) = newer_writer {
+            // The document parsed, but fields this build does not model were
+            // dropped and will be lost if the project is saved from here.
+            document.migration_notices.push(format!(
+                "This project was written by a newer RGV ({}). Settings this version does not understand were ignored and will be lost if the project is saved.",
+                writer.describe()
+            ));
         }
         document.normalize_presentation();
         document.validate()?;
@@ -2023,9 +2253,32 @@ impl SessionDocument {
                     notices.push(format!(
                         "Discarded legacy {channel:?} group {group_id}: groups require at least two members"
                     ));
-                } else if had_collapsed && had_expanded {
+                    continue;
+                }
+                if had_collapsed && had_expanded {
                     notices.push(format!(
                         "Repaired inconsistent legacy {channel:?} group {group_id}: collapsed state was applied because at least one member was collapsed"
+                    ));
+                }
+                let mut positions = self
+                    .alignment_tracks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, track)| {
+                        Some(group_id)
+                            == match channel {
+                                TrackChannel::Annotation => track.track_group,
+                                TrackChannel::Reads => track.read_track_group,
+                            }
+                    })
+                    .map(|(index, _)| index);
+                if let Some(first) = positions.next()
+                    && positions
+                        .enumerate()
+                        .any(|(offset, index)| index != first + offset + 1)
+                {
+                    notices.push(format!(
+                        "Repaired legacy {channel:?} group {group_id}: its members were not adjacent and were moved next to the first member"
                     ));
                 }
             }
@@ -2056,7 +2309,13 @@ impl SessionDocument {
         for track in &mut persisted.tracks {
             track.source = track.source.redacted_for_persistence();
         }
-        Ok(format!("{}\n", serde_json::to_string_pretty(&persisted)?))
+        Ok(format!(
+            "{}\n",
+            serde_json::to_string_pretty(&PersistedSessionDocument {
+                document: &persisted,
+                writer: SessionWriter::current(),
+            })?
+        ))
     }
 
     /// Reads a session and resolves every relative local source against the
@@ -2244,20 +2503,11 @@ impl SessionDocument {
             if !ids.insert(track.id) {
                 return Err(SessionError::DuplicateTrackId);
             }
+            // The legacy group, height and eye mirrors are not checked here:
+            // `normalize_presentation` always resets them before validation,
+            // and their migrated values are validated on the presentation.
             if track.name.trim().is_empty()
                 || !valid_sample_association(track.sample_key.as_deref())
-                || track.track_group == Some(0)
-                || (track.track_group.is_none() && track.track_group_collapsed)
-                || track.read_track_group == Some(0)
-                || (track.read_track_group.is_none() && track.read_track_group_collapsed)
-                || !track.height.is_finite()
-                || track.height < 26.0
-                || track
-                    .annotation_height
-                    .is_some_and(|height| !height.is_finite() || !(80.0..=600.0).contains(&height))
-                || track.read_group_height.is_some_and(|height| {
-                    !height.is_finite() || !(40.0..=1_200.0).contains(&height)
-                })
             {
                 return Err(SessionError::InvalidAlignmentTrack);
             }
@@ -2266,14 +2516,15 @@ impl SessionDocument {
             }
             validate_filters(&track.filters)?;
         }
+        if self.tracks.len() > MAXIMUM_SESSION_TRACKS {
+            return Err(SessionError::TooManyTracks);
+        }
         if self.tracks.iter().any(|track| !ids.insert(track.id)) {
             return Err(SessionError::DuplicateTrackId);
         }
         if self.tracks.iter().any(|track| {
             track.name.trim().is_empty()
                 || !valid_sample_association(track.sample_key.as_deref())
-                || !track.height.is_finite()
-                || track.height < 26.0
                 || !valid_track_format(track)
                 || track.built_in.as_ref().is_some_and(|identity| {
                     !identity.is_valid()
@@ -2561,7 +2812,7 @@ fn project_directory_for_write(path: &Path) -> std::io::Result<PathBuf> {
     absolute_path(parent)
 }
 
-fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let parent = session_parent(path);
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(contents)?;
@@ -2603,8 +2854,11 @@ fn validate_session_genome_metadata(document: &SessionDocument) -> Result<(), Se
                 || target.is_empty()
                 || alias.len() > 256
                 || target.len() > 256
-                || alias.contains([':', ' ', '\t', '\n'])
-                || target.contains([':', ' ', '\t', '\n'])
+                // Colons are legal in contig names (`HLA-A*01:01:01:01`).
+                || alias.contains(char::is_whitespace)
+                || target.contains(char::is_whitespace)
+                || alias.contains(char::is_control)
+                || target.contains(char::is_control)
         })
     {
         return Err(SessionError::InvalidContigAliases);
@@ -2910,6 +3164,17 @@ pub enum SessionError {
     SampleMetadata(#[from] SampleMetadataError),
     #[error("session schema version {0} is not supported")]
     UnsupportedVersion(u32),
+    #[error(
+        "this project was written by a newer RGV ({writer}, schema version {schema_version}) and cannot be opened by this version{}",
+        detail.as_ref().map_or_else(String::new, |detail| format!(": {detail}"))
+    )]
+    WrittenByNewerVersion {
+        schema_version: u32,
+        writer: String,
+        detail: Option<String>,
+    },
+    #[error("session contains more than {MAXIMUM_SESSION_TRACKS} tracks")]
+    TooManyTracks,
     #[error("session locus is invalid")]
     InvalidLocus,
     #[error("session view panels or active panel are invalid")]

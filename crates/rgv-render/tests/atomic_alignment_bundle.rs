@@ -662,6 +662,7 @@ fn test_snapshot(ledger: &AllocationLedger) -> Arc<AlignmentSceneSnapshot> {
         view_as_pairs: false,
         pair_length_bounds: TemplateLengthBounds::default(),
         promoted_template: None,
+        sampling: rgv_alignment_scene::ReadSampling::Complete,
     };
     let atlas = AlignmentRowAtlas::build(
         RowAtlasRevision::new(RevisionFingerprint::new(20, 21)),

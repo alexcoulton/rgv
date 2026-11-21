@@ -61,6 +61,14 @@ struct Arguments {
     require_contained_camera_only: bool,
     #[arg(long)]
     view_as_pairs: bool,
+    /// Present at most this many reads per sampling window; omit for complete read presentation.
+    #[arg(long)]
+    downsample_maximum_reads: Option<std::num::NonZeroU32>,
+    #[arg(long, default_value = "50")]
+    downsample_window_bases: std::num::NonZeroU32,
+    /// Decode reference FASTA; required for reference-compressed CRAM inputs.
+    #[arg(long)]
+    reference: Option<PathBuf>,
     #[arg(long)]
     output: Option<PathBuf>,
     #[arg(long)]
@@ -91,6 +99,8 @@ struct Report {
     scene_budget_mib: usize,
     read_browsing_buffer_percent: u16,
     view_as_pairs: bool,
+    downsample_maximum_reads: Option<u32>,
+    downsample_window_bases: u32,
     working_set_navigation: bool,
     contained_camera_gate_required: bool,
     open_ms: f64,
@@ -132,6 +142,8 @@ struct Report {
     ledger_reserved_bytes: usize,
     ledger_transient_high_water_bytes: usize,
     ledger_pinned_bytes: usize,
+    /// Retained bytes by allocation class, largest first.
+    ledger_charged_by_class: Vec<(String, usize)>,
 }
 
 fn main() -> Result<()> {
@@ -171,7 +183,10 @@ fn main() -> Result<()> {
     let opened_at = Instant::now();
     let engine = AlignmentSceneEngine::spawn_local_bam(LocalAlignmentSceneEngineConfig {
         path: arguments.input.clone(),
-        open_options: AlignmentOpenOptions::default(),
+        open_options: AlignmentOpenOptions {
+            reference_path: arguments.reference.clone(),
+            ..AlignmentOpenOptions::default()
+        },
         query_options,
         ledger: ledger.clone(),
         mailbox_control_capacity: NonZeroUsize::new(256).unwrap(),
@@ -195,6 +210,13 @@ fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     let policy = preparation_policy(arguments.read_browsing_buffer_percent)?;
+    let sampling = arguments.downsample_maximum_reads.map_or(
+        rgv_alignment_scene::ReadSampling::Complete,
+        |maximum_reads| rgv_alignment_scene::ReadSampling::Downsampled {
+            window_bases: arguments.downsample_window_bases,
+            maximum_reads,
+        },
+    );
 
     let first_started = Instant::now();
     let mut expected = HashMap::new();
@@ -216,6 +238,7 @@ fn main() -> Result<()> {
                     contig_length,
                     arguments.view_as_pairs,
                     maximum_alignments,
+                    sampling,
                 ),
                 policy,
             )?;
@@ -389,10 +412,31 @@ fn main() -> Result<()> {
         );
     }
     let progress = ledger.progress()?;
+    let mut charged_by_class = std::collections::BTreeMap::<String, usize>::new();
+    for record in ledger.snapshot()?.records {
+        *charged_by_class
+            .entry(format!("{:?}", record.class))
+            .or_default() += record.charged_capacity;
+    }
+    let mut ledger_charged_by_class = charged_by_class.into_iter().collect::<Vec<_>>();
+    ledger_charged_by_class.sort_by(|left, right| right.1.cmp(&left.1));
+    let input_is_remote = {
+        let input = arguments.input.to_string_lossy();
+        input.starts_with("http://") || input.starts_with("https://")
+    };
     let report = Report {
         architecture: "unified_alignment_scene",
-        input_bytes: fs::metadata(&arguments.input)?.len(),
-        input_sha256: sha256(&arguments.input)?,
+        // A remote input has no local bytes to measure or hash.
+        input_bytes: if input_is_remote {
+            0
+        } else {
+            fs::metadata(&arguments.input)?.len()
+        },
+        input_sha256: if input_is_remote {
+            "remote".to_owned()
+        } else {
+            sha256(&arguments.input)?
+        },
         input: arguments.input,
         loci: locus_labels,
         viewport_width: arguments.viewport_width,
@@ -403,6 +447,10 @@ fn main() -> Result<()> {
         scene_budget_mib: arguments.decoded_cache_mib,
         read_browsing_buffer_percent: arguments.read_browsing_buffer_percent,
         view_as_pairs: arguments.view_as_pairs,
+        downsample_maximum_reads: arguments
+            .downsample_maximum_reads
+            .map(std::num::NonZeroU32::get),
+        downsample_window_bases: arguments.downsample_window_bases.get(),
         working_set_navigation: arguments.working_set_navigation,
         contained_camera_gate_required: arguments.require_contained_camera_only,
         open_ms,
@@ -444,6 +492,7 @@ fn main() -> Result<()> {
         ledger_reserved_bytes: progress.reserved,
         ledger_transient_high_water_bytes: progress.transient_high_water,
         ledger_pinned_bytes: progress.pinned,
+        ledger_charged_by_class,
     };
     let json = serde_json::to_string_pretty(&report)?;
     if let Some(output) = arguments.output {
@@ -558,6 +607,7 @@ fn build_contract(
     contig_length: u64,
     view_as_pairs: bool,
     complete_read_limit: NonZeroUsize,
+    sampling: rgv_alignment_scene::ReadSampling,
 ) -> AlignmentSceneBuildContract {
     AlignmentSceneBuildContract {
         source_revision: metadata.source_revision,
@@ -589,6 +639,7 @@ fn build_contract(
             view_as_pairs,
             pair_length_bounds: TemplateLengthBounds::default(),
             promoted_template: None,
+            sampling,
         },
         presentation: PresentationContract {
             geometry_lod: GeometryLod::Span,

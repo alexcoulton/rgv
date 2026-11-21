@@ -333,8 +333,14 @@ fn junction_vertex(input: JunctionInput) -> VertexOutput {
             && input.evidence.z >= frame.minimum_junction_flank
             && input.evidence.w >= frame.minimum_junction_flank,
     );
-    let left = max(project_x(input.start_offset), frame.covered_clip_x.x);
-    let semantic_right = min(project_x(input.end_offset), frame.covered_clip_x.y);
+    // The quad covers only the visible (covered and clipped) part of the junction, but the arc
+    // itself is parameterised over the junction's full, unclamped span below. Clamping the span
+    // instead would squeeze the whole parabola into the visible part, so an end that is really
+    // off-screen would appear to land on the viewport edge.
+    let full_left = project_x(input.start_offset);
+    let full_right = project_x(input.end_offset);
+    let left = max(full_left, frame.covered_clip_x.x);
+    let semantic_right = min(full_right, frame.covered_clip_x.y);
     visible *= select(0u, 1u, semantic_right > left);
     let right = max(semantic_right, left + 1.0);
     var row = 0u;
@@ -392,7 +398,7 @@ fn junction_vertex(input: JunctionInput) -> VertexOutput {
         color = mix(color, vec4<f32>(0.16, 0.42, 0.92, 1.0), 0.22);
         stroke = min(stroke + 1.25, 5.75);
     }
-    return junction_output(
+    var output = junction_output(
         input.vertex_index,
         vec2<f32>(left, top),
         vec2<f32>(right - left, height),
@@ -402,6 +408,15 @@ fn junction_vertex(input: JunctionInput) -> VertexOutput {
         stroke,
         component,
     );
+    // `local.x` is the arc parameter (0 at the junction start, 1 at its end) and `pixel_size.x`
+    // the full arc width; the fragment stage therefore draws the slice of the true curve that
+    // falls inside this quad. Mirrored by `project_alignment_summary_junction_instance` and the
+    // CPU summary projector, which both report the unclamped arc bounds.
+    let full_width = max(full_right - full_left, 1.0);
+    let arc_parameter = (vec2<f32>(left, right) - vec2<f32>(full_left)) / full_width;
+    output.local.x = mix(arc_parameter.x, arc_parameter.y, corner(input.vertex_index).x);
+    output.pixel_size = vec2<f32>(full_width, height);
+    return output;
 }
 
 @vertex

@@ -2133,10 +2133,327 @@ fn igv_import_applies_supported_track_state_and_reports_every_semantic_category(
 
 #[test]
 fn future_session_versions_are_rejected() {
+    let error =
+        SessionDocument::from_json(include_str!("../../../validation/future-session-v99.json"))
+            .unwrap_err();
     assert!(matches!(
-        SessionDocument::from_json(include_str!("../../../validation/future-session-v99.json")),
-        Err(SessionError::UnsupportedVersion(99))
+        error,
+        SessionError::WrittenByNewerVersion {
+            schema_version: 99,
+            detail: None,
+            ..
+        }
     ));
+    assert!(error.to_string().contains("written by a newer RGV"));
+    assert!(matches!(
+        SessionDocument::from_json(r#"{"schema_version":0}"#),
+        Err(SessionError::UnsupportedVersion(0))
+    ));
+}
+
+fn minimal_session() -> SessionDocument {
+    SessionDocument::new(SessionLocus {
+        contig: "chr1".to_owned(),
+        start: 0,
+        end: 100,
+    })
+}
+
+#[test]
+fn sessions_record_their_writer_and_explain_newer_revisions() {
+    let json = minimal_session().to_json().unwrap();
+    let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+    assert_eq!(value["writer"]["application"], "rgv");
+    assert_eq!(value["writer"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        value["writer"]["schema_minor_version"],
+        SESSION_SCHEMA_MINOR_VERSION
+    );
+    assert_eq!(value["schema_version"], SESSION_SCHEMA_VERSION);
+    // The document's own keys still lead the file and it round-trips cleanly.
+    assert!(json.starts_with("{\n  \"schema_version\""));
+    let reread = SessionDocument::from_json(&json).unwrap();
+    assert!(reread.migration_notices.is_empty());
+    assert_eq!(reread.to_json().unwrap(), json);
+
+    // Files from before writer metadata existed still open silently.
+    let mut legacy = value.clone();
+    legacy.as_object_mut().unwrap().remove("writer");
+    let legacy = SessionDocument::from_json(&legacy.to_string()).unwrap();
+    assert!(legacy.migration_notices.is_empty());
+
+    // Same schema, newer revision, parseable: opened with a data-loss notice.
+    let mut newer = value.clone();
+    newer["writer"]["schema_minor_version"] = serde_json::json!(SESSION_SCHEMA_MINOR_VERSION + 1);
+    newer["writer"]["version"] = serde_json::json!("9.9.9");
+    newer["a_field_from_the_future"] = serde_json::json!({"x": 1});
+    let opened = SessionDocument::from_json(&newer.to_string()).unwrap();
+    assert_eq!(opened.migration_notices.len(), 1);
+    assert!(opened.migration_notices[0].contains("newer RGV (rgv 9.9.9"));
+    assert!(opened.migration_notices[0].contains("lost if the project is saved"));
+
+    // Same schema, newer revision, unknown enum variant: a named error, not raw serde.
+    newer["reference_genetic_code"] = serde_json::json!("a_code_from_the_future");
+    let error = SessionDocument::from_json(&newer.to_string()).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            SessionError::WrittenByNewerVersion {
+                schema_version: SESSION_SCHEMA_VERSION,
+                detail: Some(_),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("rgv 9.9.9"));
+
+    // The same damage without a newer writer is still reported as JSON damage.
+    newer["writer"]["schema_minor_version"] = serde_json::json!(SESSION_SCHEMA_MINOR_VERSION);
+    assert!(matches!(
+        SessionDocument::from_json(&newer.to_string()),
+        Err(SessionError::Json(_))
+    ));
+}
+
+#[test]
+fn legacy_groups_with_separated_members_are_made_contiguous() {
+    let mut legacy = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../validation/multi-panel-four-track-session-v3.json"
+    ))
+    .unwrap();
+    // Tracks 0 and 2 share a group in both panes; 3 and 1 share another (reads only).
+    for (index, group, read_group) in [
+        (0, Some(7), Some(7)),
+        (2, Some(7), Some(7)),
+        (3, None, Some(9)),
+        (1, None, Some(9)),
+    ] {
+        let track = &mut legacy["alignment_tracks"][index];
+        track["track_group"] = serde_json::json!(group);
+        track["read_track_group"] = serde_json::json!(read_group);
+    }
+    let ids = legacy["alignment_tracks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|track| TrackId::new(track["id"].as_u64().unwrap()))
+        .collect::<Vec<_>>();
+
+    let document = SessionDocument::from_json(&serde_json::to_string(&legacy).unwrap()).unwrap();
+    let pane = |channel| {
+        document
+            .presentation
+            .pane_tracks
+            .iter()
+            .filter(|node| node.channel == channel)
+            .map(|node| node.track_id)
+            .take(4)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        pane(TrackChannel::Annotation),
+        [ids[0], ids[2], ids[1], ids[3]]
+    );
+    assert_eq!(pane(TrackChannel::Reads), [ids[0], ids[2], ids[1], ids[3]]);
+    assert_eq!(document.presentation.groups.len(), 3);
+    for group in &document.presentation.groups {
+        assert_eq!(group.members.len(), 2);
+    }
+    assert_eq!(
+        document
+            .migration_notices
+            .iter()
+            .filter(|notice| notice.contains("were not adjacent"))
+            .count(),
+        3,
+        "{:?}",
+        document.migration_notices
+    );
+    // The repaired document is stable under a save and reload.
+    let reread = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
+    assert_eq!(reread.presentation, document.presentation);
+}
+
+#[test]
+fn session_tracks_are_capped_and_aliases_may_contain_colons() {
+    let mut document = minimal_session();
+    document
+        .contig_aliases
+        .insert("HLA-A:01".to_owned(), "HLA-A*01:01:01:01".to_owned());
+    let reread = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
+    assert_eq!(reread.contig_aliases, document.contig_aliases);
+    for invalid in ["has space", "tab\tbed", "line\nfeed", "bell\u{7}"] {
+        let mut document = minimal_session();
+        document
+            .contig_aliases
+            .insert(invalid.to_owned(), "chr1".to_owned());
+        assert!(
+            matches!(document.to_json(), Err(SessionError::InvalidContigAliases)),
+            "{invalid:?}"
+        );
+    }
+
+    let track = |id: u64| {
+        TrackConfig::new(
+            TrackId::new(id),
+            format!("track {id}"),
+            TrackKind::Feature,
+            TrackSource::Local {
+                path: format!("{id}.bed"),
+            },
+        )
+    };
+    let mut document = minimal_session();
+    document.tracks = (1..=MAXIMUM_SESSION_TRACKS as u64).map(track).collect();
+    assert!(document.to_json().is_ok());
+    document
+        .tracks
+        .push(track(MAXIMUM_SESSION_TRACKS as u64 + 1));
+    assert!(matches!(
+        document.to_json(),
+        Err(SessionError::TooManyTracks)
+    ));
+}
+
+#[test]
+fn igv_import_tolerates_loci_rgv_cannot_place() {
+    let import = |locus: &str| {
+        SessionDocument::import_igv_with_report(&format!(
+            r#"<Session genome="hg38" {locus}><Resources><Resource path="reads.bam"/></Resources></Session>"#
+        ))
+        .unwrap()
+    };
+    let locus = |import: &IgvSessionImport| {
+        let locus = &import.document.locus;
+        (locus.contig.clone(), locus.start, locus.end)
+    };
+
+    for (attribute, requested) in [
+        (r#"locus="All""#, "All"),
+        (r#"locus="all""#, "all"),
+        ("", ""),
+        (r#"locus="chr1:0-10""#, "chr1:0-10"),
+    ] {
+        let imported = import(attribute);
+        assert_eq!(
+            imported.locus_resolution,
+            IgvLocusResolution::Unresolved {
+                requested: requested.to_owned()
+            },
+            "{attribute}"
+        );
+        assert_eq!(imported.document.alignment_tracks.len(), 1);
+        assert!(
+            imported
+                .report
+                .approximated
+                .iter()
+                .chain(&imported.report.ignored)
+                .any(|notice| notice.contains("default locus")),
+            "{attribute}: {:?}",
+            imported.report
+        );
+    }
+
+    for name in ["chr1", "BRCA1", "HLA-DRB1*15:01:01:01N"] {
+        let imported = import(&format!(r#"locus="{name}""#));
+        assert_eq!(
+            imported.locus_resolution,
+            IgvLocusResolution::Named {
+                name: name.to_owned()
+            }
+        );
+        assert_eq!(locus(&imported), (name.to_owned(), 0, 1));
+    }
+
+    for (text, expected) in [
+        ("chr1:101-200", ("chr1", 100, 200)),
+        ("chr1:1,001-2,000", ("chr1", 1_000, 2_000)),
+        ("HLA-A*01:01:01:01:101-200", ("HLA-A*01:01:01:01", 100, 200)),
+        (
+            "chr1:5,000,000,001-5,000,000,100",
+            ("chr1", 5_000_000_000, 5_000_000_100),
+        ),
+        ("chr2:1000", ("chr2", 979, 1_020)),
+        ("chr3 11 20", ("chr3", 10, 20)),
+    ] {
+        let imported = import(&format!(r#"locus="{text}""#));
+        assert_eq!(
+            imported.locus_resolution,
+            IgvLocusResolution::Interval,
+            "{text}"
+        );
+        assert_eq!(
+            locus(&imported),
+            (expected.0.to_owned(), expected.1, expected.2),
+            "{text}"
+        );
+    }
+
+    let several = import(r#"locus="chr1:101-200 chr2:301-400""#);
+    assert_eq!(several.locus_resolution, IgvLocusResolution::Interval);
+    assert_eq!(locus(&several), ("chr1".to_owned(), 100, 200));
+    assert!(
+        several
+            .report
+            .approximated
+            .iter()
+            .any(|notice| notice.contains("several loci"))
+    );
+}
+
+#[test]
+fn igv_import_does_not_treat_url_schemes_as_local_paths() {
+    let xml = r#"<Session locus="chr1:1-10"><Resources>
+        <Resource path="s3://bucket/a.bam"/>
+        <Resource path="gs://bucket/b.cram"/>
+        <Resource path="ftp://example.org/c.bw"/>
+        <Resource path="file:///data/with%20space/d.bed"/>
+        <Resource path="https://example.org/e.bw"/>
+        <Resource path="C:\data\f.bed"/>
+        <Resource path="relative/g.bed"/>
+    </Resources></Session>"#;
+    let imported = SessionDocument::import_igv_with_report(xml).unwrap();
+    let document = &imported.document;
+    let remote = |url: &str| TrackSource::Remote {
+        url: url.to_owned(),
+    };
+    let local = |path: &str| TrackSource::Local {
+        path: path.to_owned(),
+    };
+    assert_eq!(
+        document.alignment_tracks[0].source,
+        remote("s3://bucket/a.bam")
+    );
+    assert_eq!(
+        document.alignment_tracks[1].source,
+        remote("gs://bucket/b.cram")
+    );
+    assert_eq!(document.tracks[0].source, remote("ftp://example.org/c.bw"));
+    #[cfg(unix)]
+    assert_eq!(document.tracks[1].source, local("/data/with space/d.bed"));
+    assert_eq!(
+        document.tracks[2].source,
+        remote("https://example.org/e.bw")
+    );
+    assert_eq!(document.tracks[3].source, local("C:\\data\\f.bed"));
+    assert_eq!(document.tracks[4].source, local("relative/g.bed"));
+    assert!(
+        imported
+            .report
+            .approximated
+            .iter()
+            .any(|notice| notice.contains("remote scheme RGV cannot open yet"))
+    );
+
+    // Remote sources are never rebased onto the project directory.
+    let mut resolved = document.clone();
+    resolved.resolve_project_paths("/project");
+    assert_eq!(
+        resolved.alignment_tracks[0].source,
+        remote("s3://bucket/a.bam")
+    );
 }
 
 #[test]

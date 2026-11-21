@@ -5,7 +5,11 @@ yanked = "deny"
 # The advisory is abandonment-only and does not report a vulnerability.
 # winit 0.30.13 reaches ttf-parser through its Linux decoration stack; that
 # advisory is likewise abandonment-only with no safe compatible upgrade.
-ignore = ["RUSTSEC-2025-0058", "RUSTSEC-2026-0192"]
+# bincode 1.3.3 (RUSTSEC-2025-0141) is likewise abandonment-only: the advisory
+# reports no vulnerability and lists no patched version. It is reached only
+# through bigtools 0.5.8 (BigWig/BigBed reading in rgv-hts), which has no
+# release without it. Revisit when bigtools drops or replaces bincode.
+ignore = ["RUSTSEC-2025-0058", "RUSTSEC-2026-0192", "RUSTSEC-2025-0141"]
 
 [licenses]
 version = 2
