@@ -39,7 +39,7 @@ pub use sashimi_layout::{
 };
 pub use track_layout::{
     COPY_NUMBER_HEADER_HEIGHT, CopyNumberLayout, CopyNumberVisibleRow,
-    MAX_COPY_NUMBER_VALUE_LABELS, MAX_INTERACTION_LABELS, MAX_MUTATION_LABELS,
+    MAX_COPY_NUMBER_VALUE_LABELS, MAX_FEATURE_LABELS, MAX_INTERACTION_LABELS, MAX_MUTATION_LABELS,
     MAX_QUANTITATIVE_WINDOWS, MAX_RAW_QUANTITATIVE_RECORDS, MAX_RENDERED_COPY_NUMBER_SEGMENTS,
     MAX_RENDERED_GWAS_POINTS, MAX_RENDERED_INTERACTIONS, MAX_RENDERED_MUTATIONS,
     MUTATION_HEADER_HEIGHT, MutationLayout, MutationVisibleRow, QuantitativeComposition,
@@ -51,7 +51,8 @@ pub use track_layout::{
 };
 pub use track_world_layout::{
     MAXIMUM_WORLD_LABEL_CHARACTERS, PlacedTrackLabel, TrackLabelView, TrackSceneHit,
-    TrackScenePoint, WORLD_FEATURE_ROW_PADDING_POINTS, WorldRowItem, cluster_closure_extent,
-    hit_test_track_scene, lay_out_bin_tile, lay_out_feature_tile, lay_out_interaction_tile,
+    TrackScenePoint, TrackSceneProbe, TrackSceneRowPosition, WORLD_FEATURE_ROW_PADDING_POINTS,
+    WorldRowItem, cluster_closure_extent, hit_test_track_scene, hit_test_track_scene_at,
+    lay_out_bin_tile, lay_out_feature_tile, lay_out_interaction_tile,
     lay_out_variant_tile, pack_seam_stable_rows, place_track_labels, world_feature_row_padding,
 };

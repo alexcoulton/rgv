@@ -1,0 +1,23 @@
+[package]
+name = "rgv-session"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+rgv-alignment-scene = { version = "0.1.0", path = "../rgv-alignment-scene" }
+rgv-automation = { version = "0.1.0", path = "../rgv-automation" }
+rgv-core = { version = "0.1.0", path = "../rgv-core" }
+rgv-engine = { version = "0.1.0", path = "../rgv-engine" }
+rgv-hts = { version = "0.1.0", path = "../rgv-hts" }
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -179,14 +179,14 @@ impl Viewer {
             }
             AutomationCommand::ClearSelection => {
                 let previous = self.automation_selection_snapshot();
-                self.panels.active_mut().clear_selection();
+                self.session.panels.active_mut().clear_selection();
                 self.bump_workspace_revision();
-                self.rebuild_genomic_display(self.panels.active().id);
+                self.rebuild_genomic_display(self.session.panels.active().id);
                 AutomationExecution::Complete {
                     message: "Cleared the active panel selection".to_owned(),
                     data: serde_json::json!({
                         "previous_selection_id": previous.map(|selection| selection.selection_id),
-                        "workspace_revision": self.workspace_revision,
+                        "workspace_revision": self.session.workspace_revision,
                     }),
                 }
             }
@@ -224,7 +224,7 @@ impl Viewer {
                         deadline: now + Duration::from_secs(30),
                     });
                 }
-                self.panels.active_mut().retained_evidence = None;
+                self.session.panels.active_mut().retained_evidence = None;
                 self.bump_workspace_revision();
                 self.retain_active_selection(granularity);
                 let Some(refreshed) = self.automation_selection_snapshot() else {
@@ -239,7 +239,7 @@ impl Viewer {
                         "previous_selection_id": previous.selection_id,
                         "previous_evidence_revision": previous.evidence_revision,
                         "selection": refreshed,
-                        "workspace_revision": self.workspace_revision,
+                        "workspace_revision": self.session.workspace_revision,
                     }),
                 }
             }
@@ -257,23 +257,23 @@ impl Viewer {
                 }
             }
             AutomationCommand::NewWorkspace => {
-                let interval = self.panels.active().viewport.interval();
+                let interval = self.session.panels.active().viewport.interval();
                 let mut session = SessionDocument::new(SessionLocus {
-                    contig: self.panels.active().contig_name.clone(),
+                    contig: self.session.panels.active().contig_name.clone(),
                     start: interval.start(),
                     end: interval.end(),
                 });
-                session.reference = self.reference_source.clone();
-                session.genome_name = Some(self.assembly_name.clone());
-                session.assembly_identity = self.assembly_identity.clone();
-                session.cytobands = self.cytoband_path.as_deref().map(track_source);
+                session.reference = self.session.reference_source.clone();
+                session.genome_name = Some(self.session.assembly_name.clone());
+                session.assembly_identity = self.session.assembly_identity.clone();
+                session.cytobands = self.session.cytoband_path.as_deref().map(track_source);
                 match self.apply_session(&session) {
                     Ok(()) => {
                         self.bump_workspace_revision();
                         AutomationExecution::Complete {
                             message: "Started a new workspace while retaining the active genome"
                                 .to_owned(),
-                            data: serde_json::json!({"panel_id": self.panels.active_mut().id.get()}),
+                            data: serde_json::json!({"panel_id": self.session.panels.active_mut().id.get()}),
                         }
                     }
                     Err(error) => automation_failure(AutomationErrorCode::InvalidState, error),
@@ -292,7 +292,7 @@ impl Viewer {
                     );
                 }
                 let path = PathBuf::from(path);
-                let dirty = self.document_state.is_dirty();
+                let dirty = self.session.document_state.is_dirty();
                 let mut save_destination = None;
                 if dirty {
                     match unsaved_changes {
@@ -303,7 +303,8 @@ impl Viewer {
                             );
                         }
                         AutomationUnsavedChangesPolicy::SaveThenOpen => {
-                            let Some(current_path) = self.current_session_path.clone() else {
+                            let Some(current_path) = self.session.current_session_path.clone()
+                            else {
                                 return automation_failure(
                                     AutomationErrorCode::UnsavedChanges,
                                     "save_then_open requires an existing project destination",
@@ -346,13 +347,13 @@ impl Viewer {
                     );
                 }
                 if let Some(name) = name {
-                    self.assembly_name = name;
+                    self.session.assembly_name = name;
                 }
                 self.open_reference_source(Path::new(&path));
-                if self.reference_engine.is_none() {
+                if self.session.reference_engine.is_none() {
                     return automation_failure(
                         AutomationErrorCode::InvalidState,
-                        &self.data_status,
+                        &self.session.data_status,
                     );
                 }
                 self.bump_workspace_revision();
@@ -377,7 +378,7 @@ impl Viewer {
                     .alignment_tracks
                     .iter()
                     .map(|track| track.config.id)
-                    .chain(self.tracks.tracks().iter().map(|track| track.id))
+                    .chain(self.session.tracks.tracks().iter().map(|track| track.id))
                     .collect::<BTreeSet<_>>();
                 match effective_kind {
                     TrackKind::Reference => {
@@ -388,10 +389,10 @@ impl Viewer {
                             );
                         }
                         self.open_reference_source(&path);
-                        if self.reference_engine.is_none() {
+                        if self.session.reference_engine.is_none() {
                             return automation_failure(
                                 AutomationErrorCode::InvalidState,
-                                &self.data_status,
+                                &self.session.data_status,
                             );
                         }
                         AutomationExecution::Wait(AutomationWait::Reference {
@@ -409,7 +410,7 @@ impl Viewer {
                         let Some(track_id) = track_id else {
                             return automation_failure(
                                 AutomationErrorCode::InvalidState,
-                                &self.data_status,
+                                &self.session.data_status,
                             );
                         };
                         if let Some(name) = name
@@ -438,6 +439,7 @@ impl Viewer {
                             return automation_failure(AutomationErrorCode::InvalidCommand, error);
                         }
                         let track_id = self
+                            .session
                             .tracks
                             .tracks()
                             .iter()
@@ -451,6 +453,7 @@ impl Viewer {
                         };
                         if let Some(name) = name
                             && let Some(track) = self
+                                .session
                                 .tracks
                                 .tracks_mut()
                                 .iter_mut()
@@ -740,14 +743,14 @@ impl Viewer {
                 expected_workspace_revision,
             } => {
                 if expected_workspace_revision
-                    .is_some_and(|expected| expected != self.workspace_revision)
+                    .is_some_and(|expected| expected != self.session.workspace_revision)
                 {
                     return automation_failure(
                         AutomationErrorCode::WorkspaceRevisionConflict,
                         anyhow::anyhow!(
                             "workspace revision changed: expected {}, observed {}",
                             expected_workspace_revision.unwrap_or_default(),
-                            self.workspace_revision
+                            self.session.workspace_revision
                         ),
                     );
                 }
@@ -780,14 +783,14 @@ impl Viewer {
                 expected_workspace_revision,
             } => {
                 if expected_workspace_revision
-                    .is_some_and(|expected| expected != self.workspace_revision)
+                    .is_some_and(|expected| expected != self.session.workspace_revision)
                 {
                     return automation_failure(
                         AutomationErrorCode::WorkspaceRevisionConflict,
                         anyhow::anyhow!(
                             "workspace revision changed: expected {}, observed {}",
                             expected_workspace_revision.unwrap_or_default(),
-                            self.workspace_revision
+                            self.session.workspace_revision
                         ),
                     );
                 }
@@ -882,7 +885,7 @@ impl Viewer {
             },
             AutomationCommand::Export { path, kind } => {
                 if kind == AutomationExportKind::SelectedEvidence {
-                    match self.panels.active().retained_evidence.as_ref() {
+                    match self.session.panels.active().retained_evidence.as_ref() {
                         None => {
                             return automation_failure(
                                 AutomationErrorCode::NoSelection,

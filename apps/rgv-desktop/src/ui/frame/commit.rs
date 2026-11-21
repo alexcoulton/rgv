@@ -96,10 +96,10 @@ impl Viewer {
         // Last, so nothing this frame drafted is committed on top of the restored state.
         if st.commands.undo_requested {
             if !self.undo_action() {
-                "Nothing to undo".clone_into(&mut self.data_status);
+                "Nothing to undo".clone_into(&mut self.session.data_status);
             }
         } else if st.commands.redo_requested && !self.redo_action() {
-            "Nothing to redo".clone_into(&mut self.data_status);
+            "Nothing to redo".clone_into(&mut self.session.data_status);
         }
         self.capture_status_notification();
         self.diagnostics.frame_phase(
@@ -112,12 +112,12 @@ impl Viewer {
     /// Notification-log edits and the answer to the unsaved-changes prompt.
     fn commit_shell_dialogs(&mut self, st: &mut ShellFrame) {
         let draft = &mut st.commands.shell;
-        let shell = &mut self.shell;
-        shell.notifications_open = draft.notifications_open;
+        self.shell.notifications_open = draft.notifications_open;
+        let notifications = &mut self.session.notifications;
         if draft.clear_notifications {
-            shell.notifications.clear();
+            notifications.clear();
         } else if let Some(sequence) = draft.dismiss_notification.take() {
-            shell.notifications.dismiss(sequence);
+            notifications.dismiss(sequence);
         }
         if let Some(choice) = draft.unsaved_choice.take() {
             self.resolve_unsaved_choice(choice);
@@ -194,16 +194,19 @@ impl Viewer {
         // layout changes; presentation cameras use the exact live canvas width and must never see
         // the previous frame's width here.
         let panel_widths_changed = self.workspace_layout.panels.iter().any(|layout| {
-            self.panels.get(layout.panel_id).is_some_and(|panel| {
-                (panel.viewport.pixel_width() - f64::from(layout.canvas.width())).abs()
-                    > f64::EPSILON
-            })
+            self.session
+                .panels
+                .get(layout.panel_id)
+                .is_some_and(|panel| {
+                    (panel.viewport.pixel_width() - f64::from(layout.canvas.width())).abs()
+                        > f64::EPSILON
+                })
         });
         if panel_widths_changed {
             self.synchronize_panel_widths();
         }
         if workspace_layout_changed {
-            for panel in self.panels.iter_mut() {
+            for panel in self.session.panels.iter_mut() {
                 panel
                     .navigation_presentation
                     .invalidate_contract("workspace layout changed");
@@ -222,7 +225,7 @@ impl Viewer {
                 if !properties_resize_active {
                     self.schedule_resolution_query_refresh();
                 }
-            } else if self.synthetic {
+            } else if self.session.synthetic {
                 self.mark_display_dirty("explicit display invalidation");
             } else {
                 self.rebuild_all_panel_displays();
@@ -232,7 +235,7 @@ impl Viewer {
         if properties_resize_ended {
             self.schedule_resolution_query_refresh();
         }
-        if st.layout.overview_panel_id != self.panels.active().id {
+        if st.layout.overview_panel_id != self.session.panels.active().id {
             self.activate_view_panel(st.layout.overview_panel_id);
         }
         self.handle_overview_interaction(st.layout.overview_interaction);
@@ -255,6 +258,7 @@ impl Viewer {
                 self.window.request_redraw();
             }
             let current_read_stack_offset = self
+                .session
                 .panels
                 .get(workspace.panel_id)
                 .map_or(0.0, |panel| panel.read_stack_scroll_points);
@@ -266,13 +270,15 @@ impl Viewer {
                         Some((workspace.panel_id, ui::TrackPane::Reads));
                 }
                 self.activate_view_panel(workspace.panel_id);
-                self.panels.active_mut().read_stack_scroll_points = workspace.read_stack_offset;
-                self.rebuild_genomic_display(self.panels.active().id);
+                self.session.panels.active_mut().read_stack_scroll_points =
+                    workspace.read_stack_offset;
+                self.rebuild_genomic_display(self.session.panels.active().id);
                 self.mark_display_dirty("read-track stack scrollbar changed");
                 self.window.request_redraw();
             }
             for scrollbar in &mut workspace.read_panels {
                 let current_offset = self
+                    .session
                     .panels
                     .get(workspace.panel_id)
                     .map(|panel| {
@@ -330,7 +336,7 @@ impl Viewer {
                         st.tracks.track_settings_panel = Some(track);
                     } else {
                         "Select a track before opening track settings"
-                            .clone_into(&mut self.data_status);
+                            .clone_into(&mut self.session.data_status);
                     }
                 }
                 UiCommand::ToggleTrackVisibility => {
@@ -471,21 +477,21 @@ impl Viewer {
         }
         if alignment_configuration_changed {
             self.invalidate_navigation_contract("alignment track layout changed");
-            self.rebuild_genomic_display(self.panels.active().id);
+            self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if self.alignment_tracks.is_empty()
             && st.align.alignment_visible != self.primary_alignment_visible()
         {
             self.set_primary_alignment_visible(st.align.alignment_visible);
-            self.rebuild_genomic_display(self.panels.active().id);
+            self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if self.alignment_tracks.is_empty()
             && st.align.alignment_collapsed != self.primary_alignment_collapsed()
         {
             self.set_primary_alignment_collapsed(st.align.alignment_collapsed);
-            self.rebuild_genomic_display(self.panels.active().id);
+            self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if self.alignment_tracks.is_empty()
@@ -493,7 +499,7 @@ impl Viewer {
             && st.align.alignment_name != self.primary_alignment_name()
         {
             self.set_primary_alignment_name(std::mem::take(&mut st.align.alignment_name));
-            self.rebuild_genomic_display(self.panels.active().id);
+            self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         (alignment_track_to_remove, alignment_subtracks_to_toggle)
@@ -557,18 +563,18 @@ impl Viewer {
             let name = st.align.read_name_editor.trim().as_bytes().to_vec();
             if self.select_read_or_template_by_name(st.align.settings_alignment_id, &name) {
                 "Selected the exact read/template name from the complete view"
-                    .clone_into(&mut self.data_status);
+                    .clone_into(&mut self.session.data_status);
             } else {
                 "No exact read/template name is loaded in this track at the current locus"
-                    .clone_into(&mut self.data_status);
+                    .clone_into(&mut self.session.data_status);
             }
         }
         if st.inspect.selected_to_top_requested && self.promote_selected_read_to_top() {
-            self.rebuild_genomic_display(self.panels.active().id);
+            self.rebuild_genomic_display(self.session.panels.active().id);
         }
         if st.inspect.clear_selection {
             self.clear_promoted_read();
-            self.panels.active_mut().clear_selection();
+            self.session.panels.active_mut().clear_selection();
             self.mark_display_dirty("explicit display invalidation");
         }
     }

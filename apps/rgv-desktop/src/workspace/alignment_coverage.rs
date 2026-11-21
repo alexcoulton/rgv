@@ -528,7 +528,7 @@ struct OwnedPyramidDraw {
 impl Viewer {
     /// The shared sidecar cache, opened on first use while the setting allows it.
     pub(crate) fn alignment_coverage_sidecar(&mut self) -> Option<Arc<CoverageSidecarCache>> {
-        if !self.settings.coverage_cache_enabled {
+        if !self.session.settings.coverage_cache_enabled {
             return None;
         }
         if self.alignment_coverage_sidecar.is_none() {
@@ -542,10 +542,11 @@ impl Viewer {
     pub(crate) fn respawn_alignment_coverage_engines(&mut self) {
         let sidecar = self.alignment_coverage_sidecar();
         let reference_path = self
+            .session
             .reference_source
             .as_ref()
             .map(crate::sources::source_path);
-        let remote_reference_index_url = self.remote_reference_index_url.clone();
+        let remote_reference_index_url = self.session.remote_reference_index_url.clone();
         let ledger = self.alignment_scene_ledger.clone();
         for index in 0..self.alignment_tracks.len() {
             let (path, open_options) = crate::workspace::alignments::alignment_source_open_request(
@@ -577,7 +578,7 @@ impl Viewer {
 
     /// Applies a change of the coverage-cache setting to the running session.
     pub(crate) fn apply_coverage_cache_setting(&mut self) {
-        if !self.settings.coverage_cache_enabled {
+        if !self.session.settings.coverage_cache_enabled {
             self.alignment_coverage_sidecar = None;
         }
         self.respawn_alignment_coverage_engines();
@@ -596,8 +597,8 @@ impl Viewer {
         match cleared {
             Some(Ok(bytes)) => tracing::info!(bytes, "cleared the coverage cache"),
             Some(Err(error)) => crate::app::shell_state::report_error_to(
-                &mut self.shell.notifications,
-                &mut self.data_status,
+                &mut self.session.notifications,
+                &mut self.session.data_status,
                 format!("Could not clear the coverage cache: {error}"),
             ),
             None => {}
@@ -626,7 +627,7 @@ impl Viewer {
         panel_id: PanelId,
         track_index: usize,
     ) -> Option<Viewport> {
-        let panel = self.panels.get(panel_id)?;
+        let panel = self.session.panels.get(panel_id)?;
         let dictionary = self
             .alignment_tracks
             .get(track_index)?
@@ -643,7 +644,7 @@ impl Viewer {
 
     /// Whether the track's coverage lane has a drawable clip in the panel's final pane layout.
     fn alignment_coverage_lane_on_screen(&self, panel_id: PanelId, track_id: TrackId) -> bool {
-        self.panels.get(panel_id).is_some_and(|panel| {
+        self.session.panels.get(panel_id).is_some_and(|panel| {
             self.panel_column_rect(panel_id).is_some_and(|rect| {
                 alignment_coverage_lane_clip(
                     &panel.pane_layout.annotation,
@@ -676,7 +677,12 @@ impl Viewer {
     /// display was built from. Runs every poll: an unchanged request is a no-op in the engine.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn synchronize_alignment_coverage(&mut self) {
-        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let panel_ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         let pyramid_pages_refused = self.alignment_depth_pyramid_pages_refused;
         let mut changed = false;
         for track_index in 0..self.alignment_tracks.len() {
@@ -795,6 +801,7 @@ impl Viewer {
         track_id: TrackId,
     ) -> AlignmentCoverageMode {
         let overview = self
+            .session
             .panels
             .get(panel_id)
             .is_some_and(|panel| panel.viewport.detail_level() == DetailLevel::Overview);
@@ -822,6 +829,7 @@ impl Viewer {
         frame: &mut ui::TrackFrame,
     ) {
         let overview = self
+            .session
             .panels
             .get(panel_id)
             .is_some_and(|panel| panel.viewport.detail_level() == DetailLevel::Overview);
@@ -861,7 +869,7 @@ impl Viewer {
     /// visible and whose mode is a pyramid mode, split around any exactly covered span.
     fn alignment_coverage_pyramid_draws(&self, scale_factor: f32) -> Vec<OwnedPyramidDraw> {
         let mut draws = Vec::<OwnedPyramidDraw>::new();
-        for panel in self.panels.iter() {
+        for panel in self.session.panels.iter() {
             let Some(panel_rect) = self.panel_column_rect(panel.id) else {
                 continue;
             };

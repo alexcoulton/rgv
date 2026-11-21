@@ -24,10 +24,19 @@
 //!   be served from that engine's reader instead of a second one:
 //!   [`crate::TrackEngine::try_share_tile_sources`].
 //!
-//! The engine never blocks its caller: every method takes one short lock and returns.
+//! * **Records on demand.** A tile carries what is drawn. The complete record behind a
+//!   [`TrackRecordId`] (feature type, attributes, every block, the coding interval) is resolved
+//!   by [`TrackTileEngine::lookup_record`]: from the records the tile's source handed over
+//!   with the tile when it kept them, else by one bounded, cancellable re-read of the
+//!   record's own interval on a helper.
+//! * **Row cap.** [`TrackTileSettings::maximum_feature_rows`] of the view bounds the packed
+//!   feature rows a scene draws; the scene states what the cap hid.
+//!
+//! The engine never blocks its caller: every method takes one short lock and returns
+//! ([`TrackTileEngine::lookup_record_blocking`], which says so in its name, excepted).
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
@@ -38,8 +47,9 @@ use std::{
 use rgv_core::TrackId;
 use rgv_hts::{HttpRangeConfig, MAX_FEATURE_SEARCH_RESULTS};
 use rgv_model::{
-    FeatureRecord, TrackCancellation, TrackTile, TrackTileError, TrackTileKey, TrackTileRequest,
-    TrackTileScene, TrackTileSettings,
+    FeatureRecord, TrackCancellation, TrackRecord, TrackRecordId, TrackRecordLookup,
+    TrackRecordQuery, TrackTile, TrackTileError, TrackTileKey, TrackTileRequest, TrackTileScene,
+    TrackTileSettings,
 };
 
 use crate::{
@@ -50,6 +60,9 @@ use crate::{
     },
     track_engine::{TdfSourceCache, open_tile_source},
 };
+
+/// Resolved record lookups one track remembers (least recently resolved are forgotten).
+const RESOLVED_RECORD_LOOKUPS: usize = 64;
 
 /// Default byte budget of one track's tile cache.
 pub const DEFAULT_TRACK_TILE_CACHE_BYTES: usize = 64 << 20;
@@ -119,6 +132,14 @@ impl LaidOutTrackTile {
             .resident_bytes()
             .saturating_add(self.scene.resident_bytes())
     }
+
+    /// The contig of the tile, as its source spells it. With the track id, `tile.key` and
+    /// `settings_digest` it completes the identity of the tile and of its GPU page
+    /// (`rgv_render::TrackTilePageKey::for_contig`): a tile key alone names no contig.
+    #[must_use]
+    pub fn contig(&self) -> &str {
+        &self.tile.contig
+    }
 }
 
 /// What one panel wants to see of one track.
@@ -153,9 +174,36 @@ pub struct TrackTileViewSnapshot {
     /// Cached tiles of other levels (same contig and settings) that intersect the view; drawn
     /// beneath `tiles` they fill the gaps while a zoom's own level loads.
     pub fallback: Vec<Arc<LaidOutTrackTile>>,
+    /// Contig of the view as the workspace spells it ([`TrackTileView::contig`]); empty for
+    /// a default snapshot.
+    pub contig: String,
+    /// The same contig as the track's source spells it (after the track's aliases): the
+    /// contig of every tile in `tiles`, `missing`, `failed` and `fallback`.
+    pub source_contig: String,
+    /// Digest of the view's settings; the `settings_digest` of its tiles.
+    pub settings_digest: u64,
 }
 
 impl TrackTileViewSnapshot {
+    /// Contig the view was requested for, as the workspace spells it.
+    #[must_use]
+    pub fn contig(&self) -> &str {
+        &self.contig
+    }
+
+    /// Contig of the view's tiles, as the track's source spells it.
+    #[must_use]
+    pub fn source_contig(&self) -> &str {
+        &self.source_contig
+    }
+
+    /// What the view's row cap hid over the ready tiles: the deepest hidden row count and the
+    /// number of distinct hidden features. See [`TrackTileSettings::maximum_feature_rows`].
+    #[must_use]
+    pub fn overflow(&self) -> rgv_model::TrackSceneOverflow {
+        TrackTileScene::lane_overflow(self.tiles.iter().map(|tile| &tile.scene))
+    }
+
     /// Every visible tile is ready or has failed.
     #[must_use]
     pub fn is_settled(&self) -> bool {
@@ -228,8 +276,13 @@ struct CacheKey {
     digest: u64,
 }
 
+/// Complete records a source handed over with a tile, by identity.
+type RetainedRecords = HashMap<TrackRecordId, Arc<TrackRecord>>;
+
 struct CacheEntry {
     tile: Arc<LaidOutTrackTile>,
+    /// Empty when the source kept nothing for this tile.
+    records: RetainedRecords,
     bytes: usize,
     last_used: u64,
 }
@@ -256,15 +309,22 @@ impl TileCache {
         &mut self,
         key: CacheKey,
         tile: Arc<LaidOutTrackTile>,
+        records: RetainedRecords,
         budget: usize,
         wanted: &dyn Fn(&CacheKey) -> bool,
     ) -> u64 {
         self.tick += 1;
-        let bytes = tile.resident_bytes();
+        let bytes = tile.resident_bytes().saturating_add(
+            records
+                .values()
+                .map(|record| record.resident_bytes() + size_of::<TrackRecordId>())
+                .sum(),
+        );
         if let Some(previous) = self.entries.insert(
             key,
             CacheEntry {
                 tile,
+                records,
                 bytes,
                 last_used: self.tick,
             },
@@ -358,6 +418,23 @@ struct TrackState {
     cache: TileCache,
     stats: TrackTileCacheStats,
     diagnostics: Option<TrackSourceDiagnostics>,
+    /// The record lookup waiting for or occupying this track's source; the newest wins.
+    lookup: Option<PendingLookup>,
+    /// Finished lookups, oldest first, at most [`RESOLVED_RECORD_LOOKUPS`].
+    resolved: VecDeque<(LookupKey, TrackRecordLookup)>,
+    /// Why the source is [`SourceSlot::Failed`], for views requested afterwards.
+    failure: Option<String>,
+}
+
+/// Source contig and identity of a looked-up record.
+type LookupKey = (Arc<str>, TrackRecordId);
+
+struct PendingLookup {
+    key: LookupKey,
+    query: TrackRecordQuery,
+    cancel: Arc<AtomicBool>,
+    /// A helper is running it.
+    started: bool,
 }
 
 impl TrackState {
@@ -377,6 +454,18 @@ impl TrackState {
             cache: TileCache::default(),
             stats: TrackTileCacheStats::default(),
             diagnostics: None,
+            lookup: None,
+            resolved: VecDeque::new(),
+            failure: None,
+        }
+    }
+
+    /// Records the outcome of a lookup, forgetting the oldest beyond the bound.
+    fn resolve(&mut self, key: LookupKey, outcome: TrackRecordLookup) {
+        self.resolved.retain(|(resolved, _)| *resolved != key);
+        self.resolved.push_back((key, outcome));
+        while self.resolved.len() > RESOLVED_RECORD_LOOKUPS {
+            self.resolved.pop_front();
         }
     }
 
@@ -441,6 +530,8 @@ struct Shared {
     tdf_sources: Mutex<TdfSourceCache>,
     cache_bytes_per_track: usize,
     margin_tiles: u64,
+    /// Signalled, with the state lock, whenever a record lookup finishes.
+    lookups: Condvar,
 }
 
 impl Shared {
@@ -528,6 +619,7 @@ impl TrackTileEngine {
             tdf_sources: Mutex::new(HashMap::new()),
             cache_bytes_per_track: config.cache_bytes_per_track,
             margin_tiles: config.margin_tiles,
+            lookups: Condvar::new(),
         });
         let helpers = (0..config.helpers.clamp(1, maximum_helpers))
             .filter_map(|ordinal| {
@@ -603,13 +695,17 @@ impl TrackTileEngine {
     pub fn remove_tracks(&self, ids: &[TrackId]) {
         let mut state = self.shared.lock();
         for id in ids {
-            if let Some(track) = state.tracks.remove(id)
-                && let Some(in_flight) = &track.in_flight
-            {
-                in_flight.cancel.store(true, Ordering::Release);
+            if let Some(track) = state.tracks.remove(id) {
+                if let Some(in_flight) = &track.in_flight {
+                    in_flight.cancel.store(true, Ordering::Release);
+                }
+                if let Some(lookup) = &track.lookup {
+                    lookup.cancel.store(true, Ordering::Release);
+                }
             }
         }
         drop(state);
+        self.shared.lookups.notify_all();
         self.shared
             .tdf_sources
             .lock()
@@ -677,6 +773,26 @@ impl TrackTileEngine {
                 track.stats.misses += 1;
             }
         }
+        let mut new_view = new_view;
+        // A track that failed to open before this view was requested will never read: the
+        // view's uncached tiles fail now, with the reason, instead of loading for ever.
+        if matches!(track.source, SourceSlot::Failed)
+            && let Some(message) = &track.failure
+        {
+            for tile in new_view.visible.clone() {
+                if track.cache.entries.contains_key(&new_view.cache_key(tile)) {
+                    continue;
+                }
+                new_view.failed.insert(tile, message.clone());
+                events.push(TrackTileEngineEvent::TileFailed {
+                    panel: view.panel,
+                    track: view.track,
+                    generation,
+                    key: tile,
+                    message: message.clone(),
+                });
+            }
+        }
         track.views.insert(view.panel, new_view);
         // A read nobody wants any more stops now, not when its transfer happens to finish.
         if let Some(in_flight) = &track.in_flight
@@ -717,6 +833,9 @@ impl TrackTileEngine {
         let mut snapshot = TrackTileViewSnapshot {
             generation: view.generation,
             level: view.level,
+            contig: view.contig.to_string(),
+            source_contig: view.source_contig.to_string(),
+            settings_digest: view.digest,
             ..TrackTileViewSnapshot::default()
         };
         for tile in &view.visible {
@@ -748,6 +867,169 @@ impl TrackTileEngine {
                 .sort_by_key(|tile| (std::cmp::Reverse(tile.tile.key.level), tile.tile.key.index));
         }
         Some(snapshot)
+    }
+
+    /// The complete record behind `id`, an identity a tile of `track` on `contig` (workspace
+    /// spelling; the track's aliases are applied) showed: the same [`FeatureRecord`] or
+    /// variant record the legacy query returns, with its type, attributes, every block and
+    /// the coding interval.
+    ///
+    /// * [`TrackRecordLookup::Ready`] at once when a cached tile retained the record (the
+    ///   built-in feature sources hand over each tile's records up to a byte bound) or an
+    ///   earlier lookup resolved it.
+    /// * Otherwise one read of the record's own interval is scheduled on a helper, ahead of
+    ///   tile reads, and [`TrackRecordLookup::Pending`] is returned; call again to collect
+    ///   the outcome. The UI waker ([`crate::set_ui_waker`]) is invoked when it finishes.
+    /// * [`TrackRecordLookup::NotFound`] when no cached tile shows `id` (its interval is then
+    ///   unknown and nothing is read), or the source has no such record.
+    ///
+    /// A track runs one lookup at a time and the newest wins: asking for another record
+    /// cancels the pending one, including its remote transfer, as do
+    /// [`Self::cancel_record_lookup`], removing the track and dropping the engine. A failed
+    /// or not-found outcome is reported once and then forgotten, so asking again retries.
+    pub fn lookup_record(
+        &self,
+        track: TrackId,
+        contig: &str,
+        id: TrackRecordId,
+    ) -> TrackRecordLookup {
+        let mut state = self.shared.lock();
+        let Some(track) = state.tracks.get_mut(&track) else {
+            return TrackRecordLookup::NotFound;
+        };
+        let source_contig: Arc<str> =
+            Arc::from(track.aliases.get(contig).map_or(contig, String::as_str));
+        // 1. A cached tile that kept the record; otherwise the interval a tile showed it at.
+        let mut shown = None;
+        for (key, entry) in &track.cache.entries {
+            if key.contig != source_contig {
+                continue;
+            }
+            if let Some(record) = entry.records.get(&id) {
+                return TrackRecordLookup::Ready(Arc::clone(record));
+            }
+            if shown.is_none()
+                && let Some(record) = entry
+                    .tile
+                    .scene
+                    .records
+                    .iter()
+                    .find(|record| record.id == id)
+            {
+                shown = Some((record.start, record.end, key.digest));
+            }
+        }
+        let key: LookupKey = (source_contig, id);
+        // 2. An earlier lookup.
+        if let Some(index) = track
+            .resolved
+            .iter()
+            .position(|(resolved, _)| *resolved == key)
+        {
+            let outcome = track.resolved[index].1.clone();
+            if !matches!(outcome, TrackRecordLookup::Ready(_)) {
+                track.resolved.remove(index);
+            }
+            return outcome;
+        }
+        // The same record already asked for, unless that read was cancelled: a cancelled
+        // read answers nothing, so asking again schedules a fresh one behind it.
+        if track
+            .lookup
+            .as_ref()
+            .is_some_and(|lookup| lookup.key == key && !lookup.cancel.load(Ordering::Acquire))
+        {
+            return TrackRecordLookup::Pending;
+        }
+        // 3. A bounded re-read, which needs the record's interval.
+        let Some((start, end, digest)) = shown else {
+            return TrackRecordLookup::NotFound;
+        };
+        if matches!(track.source, SourceSlot::Failed) {
+            return TrackRecordLookup::Failed(format!("{}: the track is not open", track.name));
+        }
+        let settings = track
+            .views
+            .values()
+            .find(|view| view.digest == digest)
+            .map_or_else(TrackTileSettings::default, |view| view.settings.clone());
+        if let Some(previous) = track.lookup.replace(PendingLookup {
+            query: TrackRecordQuery {
+                contig: key.0.to_string(),
+                id,
+                start,
+                end,
+                settings,
+            },
+            key,
+            cancel: Arc::new(AtomicBool::new(false)),
+            started: false,
+        }) {
+            previous.cancel.store(true, Ordering::Release);
+        }
+        // An inspection is the user waiting: a prefetch of this track gives way to it.
+        if let Some(in_flight) = track.in_flight_margin() {
+            in_flight.cancel.store(true, Ordering::Release);
+        }
+        drop(state);
+        self.shared.work.notify_all();
+        TrackRecordLookup::Pending
+    }
+
+    /// [`Self::lookup_record`], waiting up to `timeout` for a pending re-read: for callers
+    /// that are not a UI thread (automation, export, tests). Returns
+    /// [`TrackRecordLookup::Pending`] when the time runs out; the read keeps going and a
+    /// later call collects it.
+    pub fn lookup_record_blocking(
+        &self,
+        track: TrackId,
+        contig: &str,
+        id: TrackRecordId,
+        timeout: std::time::Duration,
+    ) -> TrackRecordLookup {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let outcome = self.lookup_record(track, contig, id);
+            if !outcome.is_pending() {
+                return outcome;
+            }
+            let state = self.shared.lock();
+            let still_pending = state.tracks.get(&track).is_some_and(|track| {
+                track.lookup.as_ref().is_some_and(|lookup| {
+                    lookup.key.1 == id
+                        && *lookup.key.0
+                            == *track.aliases.get(contig).map_or(contig, String::as_str)
+                })
+            });
+            if !still_pending {
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return TrackRecordLookup::Pending;
+            }
+            drop(
+                self.shared
+                    .lookups
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+    }
+
+    /// Abandons the pending record lookup of `track`, cancelling its read if one is running.
+    pub fn cancel_record_lookup(&self, track: TrackId) {
+        let mut state = self.shared.lock();
+        if let Some(track) = state.tracks.get_mut(&track)
+            && let Some(lookup) = &track.lookup
+        {
+            lookup.cancel.store(true, Ordering::Release);
+            if !lookup.started {
+                track.lookup = None;
+            }
+        }
+        drop(state);
+        self.shared.lookups.notify_all();
     }
 
     #[must_use]
@@ -857,6 +1139,9 @@ impl Drop for TrackTileEngine {
             if let Some(in_flight) = &track.in_flight {
                 in_flight.cancel.store(true, Ordering::Release);
             }
+            if let Some(lookup) = &track.lookup {
+                lookup.cancel.store(true, Ordering::Release);
+            }
         }
         for fan_out in [&state.search, &state.adjacent].into_iter().flatten() {
             fan_out.cancel.store(true, Ordering::Release);
@@ -864,6 +1149,7 @@ impl Drop for TrackTileEngine {
         drop(state);
         self.output.close();
         self.shared.work.notify_all();
+        self.shared.lookups.notify_all();
         for helper in self.helpers.drain(..) {
             drop(reap_worker(
                 helper,
@@ -1009,6 +1295,7 @@ fn fail_track_open(
     } else {
         format!("{}: {message}", track.name)
     };
+    track.failure = Some(message.clone());
     for (panel, view) in &mut track.views {
         for tile in view.visible.clone() {
             view.failed.insert(tile, message.clone());
@@ -1176,6 +1463,11 @@ enum JobWork {
         /// Contig of an adjacent-feature step as this track's source spells it.
         source_contig: Option<String>,
     },
+    Lookup {
+        source: Box<dyn TrackTileSource>,
+        key: LookupKey,
+        query: TrackRecordQuery,
+    },
 }
 
 struct Job {
@@ -1191,13 +1483,18 @@ enum JobOutcome {
     Tile {
         source: Option<Box<dyn TrackTileSource>>,
         key: CacheKey,
-        result: Result<Arc<LaidOutTrackTile>, TrackTileError>,
+        result: Result<(Arc<LaidOutTrackTile>, RetainedRecords), TrackTileError>,
     },
     FanOut {
         source: Option<Box<dyn TrackTileSource>>,
         generation: u64,
         is_search: bool,
         result: Result<FanOutPart, TrackTileError>,
+    },
+    Lookup {
+        source: Option<Box<dyn TrackTileSource>>,
+        key: LookupKey,
+        result: Result<Option<TrackRecord>, TrackTileError>,
     },
 }
 
@@ -1329,6 +1626,37 @@ fn next_job(state: &mut State) -> Option<Job> {
             });
         }
     }
+    // 2b. Record lookups: one bounded read each, for a user who is waiting.
+    for id in &order {
+        let Some(track) = state.tracks.get_mut(id) else {
+            continue;
+        };
+        if !idle(track) {
+            continue;
+        }
+        let Some(lookup) = track.lookup.as_mut().filter(|lookup| !lookup.started) else {
+            continue;
+        };
+        lookup.started = true;
+        let (key, query, cancel) = (
+            lookup.key.clone(),
+            lookup.query.clone(),
+            Arc::clone(&lookup.cancel),
+        );
+        track.in_flight = Some(InFlight {
+            cancel: Arc::clone(&cancel),
+            tile: None,
+        });
+        let epoch = track.epoch;
+        state.cursor = Some(*id);
+        let source = take_source(state.tracks.get_mut(id)?);
+        return Some(Job {
+            track: *id,
+            epoch,
+            cancel,
+            work: JobWork::Lookup { source, key, query },
+        });
+    }
     // 3. Visible tiles of every track, then 4. margins, which never take the whole pool.
     for visible in [true, false] {
         if !visible && margin_reads_in_flight(state) >= margin_read_limit(state.helpers) {
@@ -1366,6 +1694,7 @@ fn next_job(state: &mut State) -> Option<Job> {
 
 /// Runs one operation with no lock held. A panic inside a source is contained here: it becomes
 /// that operation's error, and the source is dropped rather than reused in an unknown state.
+#[allow(clippy::too_many_lines)]
 fn run_job(shared: &Shared, job: JobWork, cancel: &TrackCancellation) -> JobOutcome {
     match job {
         JobWork::Open(specification) => {
@@ -1397,13 +1726,22 @@ fn run_job(shared: &Shared, job: JobWork, cancel: &TrackCancellation) -> JobOutc
         } => {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let tile = source.query_tile(&request, cancel)?;
+                let records = source
+                    .take_retained_records()
+                    .into_iter()
+                    .map(|record| (record.id(), Arc::new(record)))
+                    .collect::<RetainedRecords>();
                 cancel.check()?;
-                let scene = shared.layouts.lay_out(&tile)?;
-                Ok(Arc::new(LaidOutTrackTile {
-                    tile,
-                    scene,
-                    settings_digest: key.digest,
-                }))
+                let mut scene = shared.layouts.lay_out(&tile)?;
+                scene.apply_row_cap(request.settings.maximum_feature_rows);
+                Ok((
+                    Arc::new(LaidOutTrackTile {
+                        tile,
+                        scene,
+                        settings_digest: key.digest,
+                    }),
+                    records,
+                ))
             }));
             match result {
                 Ok(result) => JobOutcome::Tile {
@@ -1412,6 +1750,30 @@ fn run_job(shared: &Shared, job: JobWork, cancel: &TrackCancellation) -> JobOutc
                     result,
                 },
                 Err(payload) => JobOutcome::Tile {
+                    source: None,
+                    key,
+                    result: Err(TrackTileError::Source(format!(
+                        "internal error: {}",
+                        panic_message(payload.as_ref())
+                    ))),
+                },
+            }
+        }
+        JobWork::Lookup {
+            mut source,
+            key,
+            query,
+        } => {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                source.lookup_record(&query, cancel)
+            }));
+            match result {
+                Ok(result) => JobOutcome::Lookup {
+                    source: Some(source),
+                    key,
+                    result,
+                },
+                Err(payload) => JobOutcome::Lookup {
                     source: None,
                     key,
                     result: Err(TrackTileError::Source(format!(
@@ -1551,6 +1913,47 @@ fn complete_job(
             }
             (source, None)
         }
+        JobOutcome::Lookup {
+            source,
+            key,
+            result,
+        } => {
+            if current(state)
+                && let Some(track) = state.tracks.get_mut(&id)
+            {
+                // Only the lookup still asked for is answered. A superseded or cancelled one
+                // keeps nothing but a record it happened to find.
+                let asked = track
+                    .lookup
+                    .as_ref()
+                    .is_some_and(|lookup| lookup.started && lookup.key == key);
+                if asked {
+                    track.lookup = None;
+                }
+                match result {
+                    Ok(Some(record)) => {
+                        // A fresh read of the same record queued behind this one is moot.
+                        if track
+                            .lookup
+                            .as_ref()
+                            .is_some_and(|lookup| !lookup.started && lookup.key == key)
+                        {
+                            track.lookup = None;
+                        }
+                        track.resolve(key, TrackRecordLookup::Ready(Arc::new(record)));
+                    }
+                    Ok(None) if asked => track.resolve(key, TrackRecordLookup::NotFound),
+                    Err(error) if asked && error != TrackTileError::Cancelled => {
+                        let message = format!("{}: {error}", track.name);
+                        track.resolve(key, TrackRecordLookup::Failed(message));
+                    }
+                    Ok(None) | Err(_) => {}
+                }
+            }
+            shared.lookups.notify_all();
+            crate::mailbox::wake_ui();
+            (source, None)
+        }
         JobOutcome::Tile {
             source,
             key,
@@ -1577,7 +1980,7 @@ fn complete_job(
         return;
     };
     match result {
-        Ok(tile) => {
+        Ok((tile, records)) => {
             track.stats.completed += 1;
             let TrackState {
                 cache,
@@ -1587,10 +1990,13 @@ fn complete_job(
             } = track;
             // A complete tile is cached even if its view has moved on: it is viewport
             // independent and the user may pan back.
-            stats.evictions +=
-                cache.insert(key.clone(), tile, shared.cache_bytes_per_track, &|key| {
-                    views.values().any(|view| view.wants(key))
-                });
+            stats.evictions += cache.insert(
+                key.clone(),
+                tile,
+                records,
+                shared.cache_bytes_per_track,
+                &|key| views.values().any(|view| view.wants(key)),
+            );
             for (panel, view) in views.iter() {
                 if view.wants(&key) {
                     events.push(TrackTileEngineEvent::TileReady {
@@ -1681,7 +2087,7 @@ mod tests {
 
     use rgv_model::{
         BinSemantics, BinTile, FeatureRowAxis, FeatureTile, Strand, TileBin, TileFeature,
-        TrackRecordId, TrackTileLod, TrackTilePayload, TrackTileProvenance,
+        TrackTileLod, TrackTilePayload, TrackTileProvenance,
     };
 
     use super::*;
@@ -2617,6 +3023,589 @@ mod tests {
                 .iter()
                 .any(|record| record.name.as_deref() == Some("beta"))
         }));
+    }
+
+    /// A source of stacked features whose complete records are only available by lookup.
+    #[derive(Clone, Default)]
+    struct Stacked {
+        rows: u32,
+        lookups: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicUsize>,
+        /// When set, a lookup blocks until released or cancelled.
+        gate: Option<Arc<AtomicBool>>,
+        fail_lookups: bool,
+    }
+
+    impl Stacked {
+        fn record(row: u32) -> FeatureRecord {
+            FeatureRecord {
+                contig: "chr1".to_owned(),
+                start: 100,
+                end: 600,
+                name: Some(format!("gene{row}")),
+                feature_type: Some("mRNA".to_owned()),
+                score: Some(1.5),
+                strand: Strand::Forward,
+                blocks: vec![(100, 200), (500, 600)],
+                coding_interval: Some((150, 550)),
+                peak: None,
+                attributes: vec![("ID".to_owned(), format!("tx{row}"))],
+            }
+        }
+    }
+
+    impl TrackTileSource for Stacked {
+        fn query_tile(
+            &mut self,
+            request: &TrackTileRequest,
+            _cancel: &TrackCancellation,
+        ) -> Result<TrackTile, TrackTileError> {
+            let features = (0..self.rows)
+                .map(|row| {
+                    let record = Self::record(row);
+                    TileFeature {
+                        id: TrackRecordId::for_feature(&record),
+                        start: record.start,
+                        end: record.end,
+                        strand: record.strand,
+                        blocks: Vec::new(),
+                        name: record.name.as_deref().map(Arc::from),
+                        score: record.score,
+                        color: None,
+                        row_hint: Some(row),
+                        labelable: true,
+                    }
+                })
+                .collect();
+            Ok(TrackTile {
+                contig: request.contig.clone(),
+                key: request.tile,
+                lod: TrackTileLod::Detail,
+                payload: TrackTilePayload::Features(FeatureTile {
+                    features,
+                    rows: FeatureRowAxis::Packed,
+                }),
+                provenance: TrackTileProvenance::default(),
+            })
+        }
+
+        fn lookup_record(
+            &mut self,
+            query: &TrackRecordQuery,
+            cancel: &TrackCancellation,
+        ) -> Result<Option<TrackRecord>, TrackTileError> {
+            self.lookups.fetch_add(1, Ordering::AcqRel);
+            if let Some(gate) = &self.gate {
+                let deadline = Instant::now() + WAIT;
+                while !gate.load(Ordering::Acquire) {
+                    if cancel.is_cancelled() {
+                        self.cancelled.fetch_add(1, Ordering::AcqRel);
+                        return Err(TrackTileError::Cancelled);
+                    }
+                    assert!(Instant::now() < deadline, "gated lookup was never released");
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+            if self.fail_lookups {
+                return Err(TrackTileError::Source("unreadable".to_owned()));
+            }
+            assert_eq!((query.start, query.end), (100, 600));
+            Ok((0..self.rows)
+                .map(Self::record)
+                .find(|record| TrackRecordId::for_feature(record) == query.id)
+                .map(TrackRecord::Feature))
+        }
+    }
+
+    fn stacked_id(row: u32) -> TrackRecordId {
+        TrackRecordId::for_feature(&Stacked::record(row))
+    }
+
+    #[test]
+    fn the_views_row_cap_bounds_the_scene_and_the_snapshot_reports_what_it_hid() {
+        let engine = engine(2, 0, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        let source = Stacked {
+            rows: 20,
+            ..Stacked::default()
+        };
+        engine.add_source(TrackId::new(1), "stacked".to_owned(), Box::new(source));
+        // The default cap is today's twelve rows.
+        let generation = engine.request_view(view(1, 0.0, 1_000.0, 1.0)).unwrap();
+        wait_for(&engine, settled(1, generation));
+        let snapshot = engine.view(1, TrackId::new(1)).unwrap();
+        let scene = &snapshot.tiles[0].scene;
+        assert_eq!((scene.row_count, scene.row_cap), (20, Some(12)));
+        assert_eq!((scene.hidden_rows, scene.hidden_features), (8, 8));
+        assert_eq!(scene.instances.len(), 12);
+        assert_eq!(scene.records.len(), 20);
+        let overflow = snapshot.overflow();
+        assert_eq!((overflow.hidden_rows, overflow.hidden_features), (8, 8));
+
+        // A larger cap is another tile (the cap is part of the settings digest) with every
+        // row drawn and nothing reported hidden.
+        let mut roomy = view(1, 0.0, 1_000.0, 1.0);
+        roomy.settings = TrackTileSettings::default().with_maximum_feature_rows(32);
+        let roomy_digest = roomy.settings.digest();
+        assert_ne!(roomy_digest, TrackTileSettings::default().digest());
+        let generation = engine.request_view(roomy).unwrap();
+        wait_for(&engine, settled(1, generation));
+        let snapshot = engine.view(1, TrackId::new(1)).unwrap();
+        let scene = &snapshot.tiles[0].scene;
+        assert_eq!((scene.row_count, scene.row_cap), (20, Some(32)));
+        assert_eq!(scene.instances.len(), 20);
+        assert!(snapshot.overflow().is_empty());
+        assert_eq!(snapshot.settings_digest, roomy_digest);
+
+        // A tighter cap hides more, and no cap hides nothing.
+        for (cap, hidden) in [(3_u32, 17_u32), (u32::MAX, 0)] {
+            let mut capped = view(1, 0.0, 1_000.0, 1.0);
+            capped.settings = TrackTileSettings::default().with_maximum_feature_rows(cap);
+            let generation = engine.request_view(capped).unwrap();
+            wait_for(&engine, settled(1, generation));
+            let snapshot = engine.view(1, TrackId::new(1)).unwrap();
+            assert_eq!(snapshot.overflow().hidden_rows, hidden);
+            assert_eq!(snapshot.overflow().hidden_features, hidden);
+            assert_eq!(
+                snapshot.tiles[0].scene.instances.len(),
+                (20 - hidden) as usize
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_names_its_contig_so_tiles_of_two_contigs_are_told_apart() {
+        let engine = engine(2, 0, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        let probe = Probe::default();
+        engine.add_source(TrackId::new(1), "probe".to_owned(), Box::new(probe));
+        engine.set_contig_aliases(
+            TrackId::new(1),
+            BTreeMap::from([("2".to_owned(), "chr2".to_owned())]),
+        );
+        let mut first = view(1, 0.0, 1_000.0, 1.0);
+        first.panel = 1;
+        let mut second = view(1, 0.0, 1_000.0, 1.0);
+        second.panel = 2;
+        second.contig = "2".to_owned();
+        let first_generation = engine.request_view(first).unwrap();
+        let second_generation = engine.request_view(second).unwrap();
+        let mut pending = BTreeSet::from([first_generation, second_generation]);
+        wait_for(&engine, |event| {
+            if let TrackTileEngineEvent::ViewSettled { generation, .. } = event {
+                pending.remove(generation);
+            }
+            pending.is_empty()
+        });
+        let first = engine.view(1, TrackId::new(1)).unwrap();
+        let second = engine.view(2, TrackId::new(1)).unwrap();
+        // The same tile key and settings on two contigs: only the contig tells them apart.
+        assert_eq!(first.tiles[0].tile.key, second.tiles[0].tile.key);
+        assert_eq!(
+            first.tiles[0].settings_digest,
+            second.tiles[0].settings_digest
+        );
+        assert_eq!(first.settings_digest, first.tiles[0].settings_digest);
+        assert_eq!((first.contig(), first.source_contig()), ("chr1", "chr1"));
+        assert_eq!((second.contig(), second.source_contig()), ("2", "chr2"));
+        assert_eq!(first.tiles[0].contig(), first.source_contig());
+        assert_eq!(second.tiles[0].contig(), second.source_contig());
+        assert_ne!(first.tiles[0].contig(), second.tiles[0].contig());
+        assert!(!Arc::ptr_eq(&first.tiles[0], &second.tiles[0]));
+        // A default snapshot names no contig.
+        assert_eq!(TrackTileViewSnapshot::default().contig(), "");
+    }
+
+    #[test]
+    fn a_record_lookup_is_one_bounded_read_newest_wins_and_is_cancellable() {
+        let engine = engine(2, 0, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        let gate = Arc::new(AtomicBool::new(false));
+        let source = Stacked {
+            rows: 3,
+            gate: Some(Arc::clone(&gate)),
+            ..Stacked::default()
+        };
+        engine.add_source(
+            TrackId::new(1),
+            "stacked".to_owned(),
+            Box::new(source.clone()),
+        );
+        let track = TrackId::new(1);
+        // Nothing is cached yet: the identity's interval is unknown and nothing is read.
+        assert_eq!(
+            engine.lookup_record(track, "chr1", stacked_id(0)),
+            TrackRecordLookup::NotFound
+        );
+        let generation = engine.request_view(view(1, 0.0, 1_000.0, 1.0)).unwrap();
+        wait_for(&engine, settled(1, generation));
+        // An identity no tile shows, an unknown track and another contig read nothing either.
+        for outcome in [
+            engine.lookup_record(track, "chr1", TrackRecordId(7)),
+            engine.lookup_record(TrackId::new(9), "chr1", stacked_id(0)),
+            engine.lookup_record(track, "chr2", stacked_id(0)),
+        ] {
+            assert_eq!(outcome, TrackRecordLookup::NotFound);
+        }
+        assert_eq!(source.lookups.load(Ordering::Acquire), 0);
+
+        // The source kept no records with the tile, so the first lookup schedules a read.
+        assert!(
+            engine
+                .lookup_record(track, "chr1", stacked_id(0))
+                .is_pending()
+        );
+        wait_until(|| source.lookups.load(Ordering::Acquire) == 1);
+        assert!(
+            engine
+                .lookup_record(track, "chr1", stacked_id(0))
+                .is_pending()
+        );
+        // Asking for another record cancels the running read; only the newest is answered.
+        assert!(
+            engine
+                .lookup_record(track, "chr1", stacked_id(1))
+                .is_pending()
+        );
+        wait_until(|| source.cancelled.load(Ordering::Acquire) == 1);
+        wait_until(|| source.lookups.load(Ordering::Acquire) == 2);
+        gate.store(true, Ordering::Release);
+        let outcome = engine.lookup_record_blocking(track, "chr1", stacked_id(1), WAIT);
+        assert_eq!(
+            outcome.record().and_then(TrackRecord::as_feature),
+            Some(&Stacked::record(1))
+        );
+        // Resolved once, it is answered from memory.
+        assert_eq!(engine.lookup_record(track, "chr1", stacked_id(1)), outcome);
+        assert_eq!(source.lookups.load(Ordering::Acquire), 2);
+        // The cancelled lookup left nothing behind; asking again reads again.
+        let outcome = engine.lookup_record_blocking(track, "chr1", stacked_id(0), WAIT);
+        assert_eq!(
+            outcome.record().and_then(TrackRecord::as_feature),
+            Some(&Stacked::record(0))
+        );
+        assert_eq!(source.lookups.load(Ordering::Acquire), 3);
+
+        // An explicit cancellation stops a running read and leaves the lookup unanswered.
+        gate.store(false, Ordering::Release);
+        assert!(
+            engine
+                .lookup_record(track, "chr1", stacked_id(2))
+                .is_pending()
+        );
+        wait_until(|| source.lookups.load(Ordering::Acquire) == 4);
+        engine.cancel_record_lookup(track);
+        wait_until(|| source.cancelled.load(Ordering::Acquire) == 2);
+        // A wait that runs out of time says so and does not block.
+        assert!(
+            engine
+                .lookup_record_blocking(track, "chr1", stacked_id(2), Duration::from_millis(30))
+                .is_pending()
+        );
+        // Tiles keep being served while a lookup waits on the source: dropping the engine
+        // with the lookup in flight cancels it and returns.
+        drop(engine);
+        wait_until(|| source.cancelled.load(Ordering::Acquire) == 3);
+    }
+
+    #[test]
+    fn a_failed_record_lookup_is_reported_once_and_retried_on_the_next_request() {
+        let engine = engine(1, 0, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        let source = Stacked {
+            rows: 2,
+            fail_lookups: true,
+            ..Stacked::default()
+        };
+        engine.add_source(
+            TrackId::new(1),
+            "stacked".to_owned(),
+            Box::new(source.clone()),
+        );
+        let generation = engine.request_view(view(1, 0.0, 1_000.0, 1.0)).unwrap();
+        wait_for(&engine, settled(1, generation));
+        let track = TrackId::new(1);
+        let outcome = engine.lookup_record_blocking(track, "chr1", stacked_id(0), WAIT);
+        assert_eq!(
+            outcome,
+            TrackRecordLookup::Failed("stacked: unreadable".to_owned())
+        );
+        assert_eq!(source.lookups.load(Ordering::Acquire), 1);
+        // The failure was handed over; the next request is a fresh attempt.
+        assert!(
+            engine
+                .lookup_record(track, "chr1", stacked_id(0))
+                .is_pending()
+        );
+        wait_until(|| source.lookups.load(Ordering::Acquire) == 2);
+    }
+
+    #[test]
+    fn asking_again_for_a_cancelled_lookup_reads_again_instead_of_waiting_on_the_dead_read() {
+        let engine = engine(2, 0, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        let gate = Arc::new(AtomicBool::new(false));
+        let source = Stacked {
+            rows: 2,
+            gate: Some(Arc::clone(&gate)),
+            ..Stacked::default()
+        };
+        engine.add_source(
+            TrackId::new(1),
+            "stacked".to_owned(),
+            Box::new(source.clone()),
+        );
+        let generation = engine.request_view(view(1, 0.0, 1_000.0, 1.0)).unwrap();
+        wait_for(&engine, settled(1, generation));
+        let track = TrackId::new(1);
+        // A read starts and is cancelled while it is still blocked on the source.
+        assert!(
+            engine
+                .lookup_record(track, "chr1", stacked_id(1))
+                .is_pending()
+        );
+        wait_until(|| source.lookups.load(Ordering::Acquire) == 1);
+        engine.cancel_record_lookup(track);
+        // The same record is asked for again before the cancelled read has returned: that
+        // is a new lookup, not the dead one.
+        assert!(
+            engine
+                .lookup_record(track, "chr1", stacked_id(1))
+                .is_pending()
+        );
+        wait_until(|| source.cancelled.load(Ordering::Acquire) == 1);
+        wait_until(|| source.lookups.load(Ordering::Acquire) == 2);
+        gate.store(true, Ordering::Release);
+        let outcome = engine.lookup_record_blocking(track, "chr1", stacked_id(1), WAIT);
+        assert_eq!(
+            outcome.record().and_then(TrackRecord::as_feature),
+            Some(&Stacked::record(1))
+        );
+        // The blocking form of a request on another contig spelling of the same track does
+        // not wait on this track's lookup: nothing shows the record there.
+        assert_eq!(
+            engine.lookup_record_blocking(track, "chr9", stacked_id(1), WAIT),
+            TrackRecordLookup::NotFound
+        );
+        assert_eq!(source.lookups.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn a_view_requested_after_the_track_failed_to_open_fails_instead_of_loading_for_ever() {
+        let directory = tempfile::tempdir().unwrap();
+        let engine = engine(1, 0, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        engine.add_track(
+            TrackSpec {
+                id: TrackId::new(8),
+                name: "missing".to_owned(),
+                path: directory.path().join("absent.bed"),
+                kind: TrackSpecKind::Bed,
+            },
+            BTreeMap::new(),
+        );
+        wait_for(&engine, |event| {
+            matches!(event, TrackTileEngineEvent::TrackOpenFailed { .. })
+        });
+        // The failure is already known when the view arrives.
+        let generation = engine.request_view(view(8, 0.0, 1_000.0, 1.0)).unwrap();
+        let events = wait_for(&engine, settled(8, generation));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TrackTileEngineEvent::TileFailed { message, .. } if message.starts_with("missing: ")
+        )));
+        let snapshot = engine.view(1, TrackId::new(8)).unwrap();
+        assert!(snapshot.is_settled());
+        assert_eq!(snapshot.failed.len(), 1);
+    }
+
+    /// A built-in source with the records it would hand over with each tile withheld, so
+    /// every lookup takes the re-read path.
+    struct WithoutRetention {
+        source: Box<dyn TrackTileSource>,
+        lookups: Arc<AtomicUsize>,
+    }
+
+    impl TrackTileSource for WithoutRetention {
+        fn query_tile(
+            &mut self,
+            request: &TrackTileRequest,
+            cancel: &TrackCancellation,
+        ) -> Result<TrackTile, TrackTileError> {
+            let tile = self.source.query_tile(request, cancel);
+            drop(self.source.take_retained_records());
+            tile
+        }
+
+        fn lookup_record(
+            &mut self,
+            query: &TrackRecordQuery,
+            cancel: &TrackCancellation,
+        ) -> Result<Option<TrackRecord>, TrackTileError> {
+            self.lookups.fetch_add(1, Ordering::AcqRel);
+            self.source.lookup_record(query, cancel)
+        }
+    }
+
+    const BED12: &str = "\
+chr1\t1000\t5000\ttxA\t960\t+\t1200\t4500\t255,0,0\t3\t500,400,1000\t0,1500,3000\n\
+chr1\t2000\t9000\ttxB\t10\t-\t2000\t2000\t0\t2\t300,700\t0,6300\n\
+chr1\t12000\t12500\tsingle\t0\t.\t12000\t12500\t0\t1\t500\t0\n";
+
+    const GFF3: &str = "\
+##gff-version 3\n\
+chr1\tsrc\tgene\t1001\t9000\t.\t+\t.\tID=gene1;Name=ALPHA;gene_biotype=protein_coding\n\
+chr1\tsrc\tmRNA\t1001\t9000\t.\t+\t.\tID=tx1;Parent=gene1;Name=ALPHA-201;tag=basic\n\
+chr1\tsrc\texon\t1001\t1500\t.\t+\t.\tID=ex1;Parent=tx1\n\
+chr1\tsrc\texon\t3001\t3600\t.\t+\t.\tID=ex2;Parent=tx1\n\
+chr1\tsrc\texon\t8001\t9000\t.\t+\t.\tID=ex3;Parent=tx1\n\
+chr1\tsrc\tCDS\t1201\t1500\t.\t+\t0\tID=cds1;Parent=tx1\n\
+chr1\tsrc\tCDS\t3001\t3600\t.\t+\t0\tID=cds1;Parent=tx1\n\
+chr1\tsrc\tCDS\t8001\t8400\t.\t+\t0\tID=cds1;Parent=tx1\n\
+chr1\tsrc\tgene\t20001\t21000\t5.5\t-\t.\tID=gene2;Name=BETA;note=a%20note\n";
+
+    const GTF: &str = "\
+chr1\tsrc\tgene\t1001\t9000\t.\t+\t.\tgene_id \"G1\"; gene_name \"ALPHA\"; gene_biotype \"protein_coding\";\n\
+chr1\tsrc\ttranscript\t1001\t9000\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\"; gene_name \"ALPHA\"; transcript_name \"ALPHA-201\";\n\
+chr1\tsrc\texon\t1001\t1500\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\"; exon_number \"1\";\n\
+chr1\tsrc\texon\t3001\t3600\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\"; exon_number \"2\";\n\
+chr1\tsrc\texon\t8001\t9000\t.\t+\t.\tgene_id \"G1\"; transcript_id \"T1\"; exon_number \"3\";\n\
+chr1\tsrc\tCDS\t1201\t1500\t.\t+\t0\tgene_id \"G1\"; transcript_id \"T1\";\n\
+chr1\tsrc\tCDS\t3001\t3600\t.\t+\t0\tgene_id \"G1\"; transcript_id \"T1\";\n\
+chr1\tsrc\tCDS\t8001\t8400\t.\t+\t0\tgene_id \"G1\"; transcript_id \"T1\";\n\
+chr1\tsrc\tgene\t20001\t21000\t.\t-\t.\tgene_id \"G2\"; gene_name \"BETA\";\n\
+chr1\tsrc\ttranscript\t20001\t21000\t.\t-\t.\tgene_id \"G2\"; transcript_id \"T2\";\n\
+chr1\tsrc\texon\t20001\t21000\t.\t-\t.\tgene_id \"G2\"; transcript_id \"T2\";\n";
+
+    #[test]
+    fn a_looked_up_record_equals_the_legacy_querys_record_for_bed12_gff3_and_gtf() {
+        let directory = tempfile::tempdir().unwrap();
+        for (name, text, kind) in [
+            ("genes.bed", BED12, TrackSpecKind::Bed),
+            ("genes.gff3", GFF3, TrackSpecKind::Gff3),
+            ("genes.gtf", GTF, TrackSpecKind::Gtf),
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            let specification = |id: u64| TrackSpec {
+                id: TrackId::new(id),
+                name: name.to_owned(),
+                path: path.clone(),
+                kind,
+            };
+            // What the legacy inspector is given: the legacy query's own records.
+            let legacy = crate::track_engine::legacy_feature_records(
+                &specification(1),
+                "chr1",
+                0,
+                1_000_000,
+            );
+            assert!(legacy.len() >= 3, "{name}: {legacy:?}");
+            // The fixtures exercise what a tile does not carry: BED12's complete block list
+            // and coding interval, and the type and attribute list of GFF3 and GTF lines.
+            if kind == TrackSpecKind::Bed {
+                assert!(
+                    legacy.iter().any(|record| record.blocks.len() >= 3),
+                    "{name}"
+                );
+                assert!(
+                    legacy.iter().any(|record| record.coding_interval.is_some()),
+                    "{name}"
+                );
+                assert!(legacy.iter().any(|record| record.score.is_some()), "{name}");
+            } else {
+                assert!(
+                    legacy.iter().all(|record| record.feature_type.is_some()),
+                    "{name}"
+                );
+                assert!(
+                    legacy.iter().all(|record| record.attributes.len() >= 2),
+                    "{name}"
+                );
+                assert!(
+                    legacy.iter().any(|record| record
+                        .attributes
+                        .iter()
+                        .any(|(key, _)| key == "transcript_id" || key == "Parent")),
+                    "{name}"
+                );
+            }
+            let legacy_with = |id: TrackRecordId| {
+                legacy
+                    .iter()
+                    .filter(|record| TrackRecordId::for_feature(record) == id)
+                    .collect::<Vec<_>>()
+            };
+
+            let engine = engine(2, 0, DEFAULT_TRACK_TILE_CACHE_BYTES);
+            // Track 1 is the built-in source as the desktop opens it; track 2 is the same
+            // source with nothing retained, so its lookups re-read the file.
+            engine.add_track(specification(1), BTreeMap::new());
+            let rereads = Arc::new(AtomicUsize::new(0));
+            engine.add_source(
+                TrackId::new(2),
+                name.to_owned(),
+                Box::new(WithoutRetention {
+                    source: crate::track_engine::open_tile_source(
+                        &specification(2),
+                        &mut HashMap::new(),
+                        &HttpRangeConfig::default(),
+                    )
+                    .unwrap(),
+                    lookups: Arc::clone(&rereads),
+                }),
+            );
+            // 32 bases per point: one level-5 tile holds the whole fixture.
+            let mut pending = BTreeSet::from([
+                engine.request_view(view(1, 0.0, 30_000.0, 32.0)).unwrap(),
+                engine.request_view(view(2, 0.0, 30_000.0, 32.0)).unwrap(),
+            ]);
+            wait_for(&engine, |event| {
+                if let TrackTileEngineEvent::ViewSettled { generation, .. } = event {
+                    pending.remove(generation);
+                }
+                pending.is_empty()
+            });
+            let mut resolved = 0;
+            for track in [1, 2] {
+                let track = TrackId::new(track);
+                let snapshot = engine.view(1, track).unwrap();
+                assert!(snapshot.failed.is_empty(), "{name}: {:?}", snapshot.failed);
+                let ids = snapshot
+                    .tiles
+                    .iter()
+                    .flat_map(|tile| tile.scene.records.iter().map(|record| record.id))
+                    .collect::<BTreeSet<_>>();
+                // Every legacy record is shown by the tiles.
+                assert_eq!(
+                    ids,
+                    legacy
+                        .iter()
+                        .map(TrackRecordId::for_feature)
+                        .collect::<BTreeSet<_>>(),
+                    "{name}"
+                );
+                for id in ids {
+                    let outcome = if track.get() == 1 {
+                        // Retained with the tile: answered at once, with no read.
+                        engine.lookup_record(track, "chr1", id)
+                    } else {
+                        engine.lookup_record_blocking(track, "chr1", id, WAIT)
+                    };
+                    let TrackRecordLookup::Ready(record) = &outcome else {
+                        panic!("{name}: {id:?} resolved to {outcome:?}");
+                    };
+                    let record = record.as_feature().unwrap();
+                    let expected = legacy_with(id);
+                    assert_eq!(
+                        expected.len(),
+                        1,
+                        "{name}: {id:?} is ambiguous in the fixture"
+                    );
+                    assert_eq!(record, expected[0], "{name}");
+                    assert_eq!(TrackRecordId::for_feature(record), id);
+                    resolved += 1;
+                }
+            }
+            assert_eq!(resolved, legacy.len() * 2);
+            // Only the track without retained records read its source for lookups, once per
+            // record.
+            assert_eq!(rereads.load(Ordering::Acquire), legacy.len(), "{name}");
+        }
     }
 
     #[test]

@@ -185,14 +185,14 @@ impl Viewer {
         let origin = origin.and_then(|path| normalized_session_destination(path).ok());
         self.shell.newer_writer_guard.project_opened(
             origin.as_deref(),
-            rgv_core::newer_writer_notice(&self.session_migration_notices),
+            rgv_core::newer_writer_notice(&self.session.session_migration_notices),
         );
-        for notice in &self.session_migration_notices {
-            self.shell
+        for notice in &self.session.session_migration_notices {
+            self.session
                 .notifications
                 .push(NotificationSeverity::Warning, None, notice.clone());
         }
-        if !self.session_migration_notices.is_empty() {
+        if !self.session.session_migration_notices.is_empty() {
             self.window.request_redraw();
         }
     }
@@ -241,7 +241,7 @@ impl Viewer {
         }
         self.observe_document_changes();
         let document = self.session_document();
-        let ticket = self.document_state.ticket();
+        let ticket = self.session.document_state.ticket();
         let display_path = path.display().to_string();
         match std::thread::Builder::new()
             .name("rgv-session-save".to_owned())
@@ -257,7 +257,7 @@ impl Viewer {
                     ticket,
                     worker,
                 });
-                self.data_status = format!("Saving project {display_path}…");
+                self.session.data_status = format!("Saving project {display_path}…");
             }
             Err(error) => return Err(error.into()),
         }
@@ -266,14 +266,15 @@ impl Viewer {
 
     pub(crate) fn schedule_next_autosave(&mut self) {
         self.next_autosave =
-            Instant::now() + Duration::from_secs(self.settings.autosave_interval_seconds);
+            Instant::now() + Duration::from_secs(self.session.settings.autosave_interval_seconds);
     }
 
     pub(crate) fn maybe_start_autosave(&mut self, now: Instant) {
-        if !self.settings.autosave_enabled || now < self.next_autosave {
+        if !self.session.settings.autosave_enabled || now < self.next_autosave {
             return;
         }
-        self.next_autosave = now + Duration::from_secs(self.settings.autosave_interval_seconds);
+        self.next_autosave =
+            now + Duration::from_secs(self.session.settings.autosave_interval_seconds);
         if self
             .session_save_tasks
             .iter()
@@ -284,19 +285,19 @@ impl Viewer {
         self.observe_document_changes();
         // Rewriting an unchanged document would only rotate distinct older snapshots out of the
         // retention window.
-        let marker = self.document_state.autosave_marker();
+        let marker = self.session.document_state.autosave_marker();
         if !crate::app::shell_state::autosave_needed(
-            self.document_state.is_dirty(),
+            self.session.document_state.is_dirty(),
             marker,
-            self.shell.last_autosaved,
+            self.session.last_autosaved,
         ) {
             return;
         }
         let document = self.session_document();
-        let ticket = self.document_state.ticket();
+        let ticket = self.session.document_state.ticket();
         let (path, prefix) = autosave_snapshot_path(
-            &self.settings_path,
-            self.current_session_path.as_deref(),
+            &self.session.settings_path,
+            self.session.current_session_path.as_deref(),
             &self.application_instance_id,
             SystemTime::now(),
         );
@@ -307,8 +308,8 @@ impl Viewer {
                 return;
             }
         };
-        let directory = autosave_directory(&self.settings_path);
-        let retention = self.settings.autosave_retention;
+        let directory = autosave_directory(&self.session.settings_path);
+        let retention = self.session.settings.autosave_retention;
         match std::thread::Builder::new()
             .name("rgv-autosave".to_owned())
             .spawn({
@@ -322,7 +323,7 @@ impl Viewer {
             Ok(worker) => {
                 // Recorded when the write starts; a failed write clears it so the next interval
                 // retries.
-                self.shell.last_autosaved = Some(marker);
+                self.session.last_autosaved = Some(marker);
                 self.session_save_tasks.push(SessionSaveTask {
                     path,
                     kind: SessionSaveKind::Autosave,
@@ -360,16 +361,18 @@ impl Viewer {
                 (SessionSaveKind::Manual, _) => Some(false),
                 (SessionSaveKind::Autosave, Ok(Ok(()))) => None,
                 (SessionSaveKind::Autosave, _) => {
-                    self.shell.last_autosaved = None;
+                    self.session.last_autosaved = None;
                     None
                 }
             };
             let failed = !matches!(outcome, Ok(Ok(())));
             let (status, automation_outcome) = match (task.kind, outcome) {
                 (SessionSaveKind::Manual, Ok(Ok(()))) => {
-                    if self.document_state.complete_save(task.ticket) {
-                        self.current_session_path = Some(path.clone());
-                        self.settings.remember_session(path.display().to_string());
+                    if self.session.document_state.complete_save(task.ticket) {
+                        self.session.current_session_path = Some(path.clone());
+                        self.session
+                            .settings
+                            .remember_session(path.display().to_string());
                         self.persist_settings();
                     }
                     (
@@ -419,7 +422,7 @@ impl Viewer {
             if failed {
                 self.report_error(status);
             } else {
-                self.data_status = status;
+                self.session.data_status = status;
             }
             if let (Some(command_index), Some(outcome)) = (automation_command, automation_outcome) {
                 self.finish_automation_command(command_index, outcome);
@@ -461,7 +464,7 @@ impl Viewer {
     ) -> Result<()> {
         self.observe_document_changes();
         // Issuing a request supersedes old ones even if this request fails to start.
-        let ticket = self.document_state.begin_load();
+        let ticket = self.session.document_state.begin_load();
         anyhow::ensure!(
             self.session_load_tasks.len() < 8,
             "previous project reads are still finishing; retry shortly"
@@ -537,7 +540,7 @@ impl Viewer {
                     save_completed,
                     worker,
                 });
-                self.data_status = format!("Opening {display_path}…");
+                self.session.data_status = format!("Opening {display_path}…");
             }
             Err(error) => return Err(error.into()),
         }
@@ -557,7 +560,7 @@ impl Viewer {
             {
                 let task = &mut self.session_load_tasks[index];
                 task.deadline = None;
-                self.document_state.cancel_load(task.ticket);
+                self.session.document_state.cancel_load(task.ticket);
                 if let Some(command) = task.automation_command.take() {
                     self.finish_automation_command(
                         command,
@@ -580,23 +583,25 @@ impl Viewer {
             if task
                 .save_completed
                 .load(std::sync::atomic::Ordering::Acquire)
-                && self.document_state.complete_save(task.ticket)
+                && self.session.document_state.complete_save(task.ticket)
             {
-                self.current_session_path.clone_from(&task.save_destination);
+                self.session
+                    .current_session_path
+                    .clone_from(&task.save_destination);
             }
             // Automation asked for an exact replacement and keeps the strict revision check. A
             // GUI open was already confirmed through the unsaved-changes gate, so revisions
             // bumped by unrelated background work while the file was read do not reject it.
             let can_commit = if task.automation_command.is_some() {
-                self.document_state.load_can_commit(task.ticket)
+                self.session.document_state.load_can_commit(task.ticket)
             } else {
-                self.document_state.gui_load_can_commit(task.ticket)
+                self.session.document_state.gui_load_can_commit(task.ticket)
             };
             if !can_commit {
-                let current = self.document_state.current_load(task.ticket);
+                let current = self.session.document_state.current_load(task.ticket);
                 let _ = task.worker.join();
                 if current {
-                    self.data_status =
+                    self.session.data_status =
                         "Project changed while opening; retry to confirm replacement".into();
                 }
                 if let Some(command) = task.automation_command {
@@ -650,26 +655,32 @@ impl Viewer {
                         Ok(()) => {
                             applied = true;
                             self.bump_workspace_revision();
-                            self.igv_import_report = igv_report;
+                            self.session.igv_import_report = igv_report;
                             match task.kind {
                                 SessionLoadKind::Native => {
                                     self.arm_newer_writer_guard(Some(&path));
-                                    self.document_state.mark_saved_baseline();
-                                    self.current_session_path = Some(path.clone());
-                                    self.settings.remember_session(path.display().to_string());
+                                    self.session.document_state.mark_saved_baseline();
+                                    self.session.current_session_path = Some(path.clone());
+                                    self.session
+                                        .settings
+                                        .remember_session(path.display().to_string());
                                     self.persist_settings();
-                                    self.data_status = opened_project_status(&path, &unresolved);
+                                    self.session.data_status =
+                                        opened_project_status(&path, &unresolved);
                                 }
                                 SessionLoadKind::IgvImport => {
                                     self.arm_newer_writer_guard(None);
-                                    self.current_session_path = None;
-                                    self.settings.remember_session(path.display().to_string());
+                                    self.session.current_session_path = None;
+                                    self.session
+                                        .settings
+                                        .remember_session(path.display().to_string());
                                     self.persist_settings();
-                                    self.data_status = if unresolved.is_empty() {
+                                    self.session.data_status = if unresolved.is_empty() {
                                         format!(
                                             "Imported IGV session {} · {}",
                                             path.display(),
-                                            self.igv_import_report
+                                            self.session
+                                                .igv_import_report
                                                 .as_ref()
                                                 .map_or_else(String::new, IgvImportReport::summary)
                                         )
@@ -680,9 +691,9 @@ impl Viewer {
                                 }
                                 SessionLoadKind::Recovery => {
                                     self.arm_newer_writer_guard(None);
-                                    self.current_session_path = None;
+                                    self.session.current_session_path = None;
                                     self.recovery_open = false;
-                                    self.data_status = format!(
+                                    self.session.data_status = format!(
                                         "Recovered autosave {} · use Save project as… to keep it",
                                         path.display()
                                     );
@@ -713,16 +724,16 @@ impl Viewer {
             if let Some(command) = task.automation_command {
                 let result = if applied {
                     Ok((
-                        self.data_status.clone(),
+                        self.session.data_status.clone(),
                         serde_json::json!({
                             "application_instance_id": self.application_instance_id,
-                            "workspace_revision": self.workspace_revision,
+                            "workspace_revision": self.session.workspace_revision,
                             "settled": self.automation_is_settled(),
                             "panels": self.automation_workspace_snapshot().panels,
                         }),
                     ))
                 } else {
-                    Err((failure_code, self.data_status.clone()))
+                    Err((failure_code, self.session.data_status.clone()))
                 };
                 self.finish_automation_command(command, result);
             }
@@ -757,7 +768,7 @@ impl Viewer {
                     automation_data: None,
                     worker,
                 });
-                self.data_status = format!("Exporting {display_path}…");
+                self.session.data_status = format!("Exporting {display_path}…");
             }
             Err(error) => self.report_error(format!("Could not start export: {error}")),
         }
@@ -798,7 +809,7 @@ impl Viewer {
                 }
             };
             if status.starts_with("Exported ") {
-                self.data_status = status;
+                self.session.data_status = status;
             } else {
                 self.report_error(status);
             }
@@ -831,7 +842,7 @@ impl Viewer {
             Ok(worker) => {
                 self.workspace_list_import_tasks
                     .push(WorkspaceListImportTask { path, worker });
-                self.data_status = format!("Importing {display_path}…");
+                self.session.data_status = format!("Importing {display_path}…");
             }
             Err(error) => self.report_error(format!("Could not start import: {error}")),
         }
@@ -849,31 +860,33 @@ impl Viewer {
             match task.worker.join() {
                 Ok(Ok(WorkspaceListImport::Regions(imported))) => {
                     let (added, omitted) = merge_imported_regions(
-                        &mut self.regions_of_interest,
+                        &mut self.session.regions_of_interest,
                         imported,
                         MAXIMUM_REGIONS_OF_INTEREST,
                     );
                     if added > 0 {
                         self.rebuild_all_panel_displays();
                     }
-                    self.data_status = imported_list_status("regions", added, omitted, &path);
+                    self.session.data_status =
+                        imported_list_status("regions", added, omitted, &path);
                 }
                 Ok(Ok(WorkspaceListImport::Review(imported))) => {
                     let (added, omitted) = merge_imported_review_items(
-                        &mut self.review_items,
+                        &mut self.session.review_items,
                         imported,
                         MAXIMUM_REVIEW_ITEMS,
                     );
-                    self.data_status = imported_list_status("review items", added, omitted, &path);
+                    self.session.data_status =
+                        imported_list_status("review items", added, omitted, &path);
                 }
                 Ok(Ok(WorkspaceListImport::SampleMetadata(imported))) => {
                     let rows = imported.rows.len();
                     let columns = imported.columns.len();
-                    self.sample_metadata = Some(imported);
+                    self.session.sample_metadata = Some(imported);
                     self.metadata_filter_column = 0;
                     self.metadata_filter_value = None;
                     self.metadata_selected_tracks.clear();
-                    self.data_status =
+                    self.session.data_status =
                         format!("Imported {rows} sample rows and {columns} attributes from {path}");
                 }
                 Ok(Err(error)) => self.report_error(format!("Could not import {path}: {error}")),

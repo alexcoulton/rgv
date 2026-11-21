@@ -98,6 +98,7 @@ impl Viewer {
         let read_operations = self.alignment_gpu_renderer.operation_counters();
         let summary_operations = self.alignment_summary_gpu_renderer.operation_counters();
         let (contextual_text_anchors_examined, contextual_text_anchors_available) = self
+            .session
             .panels
             .iter()
             .fold((0_usize, 0_usize), |(examined, available), panel| {
@@ -206,9 +207,11 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn automation_workspace_snapshot(&self) -> AutomationWorkspaceSnapshot {
-        let shared_annotation_scroll = self.panels.annotation_scroll_points;
-        let maximum_shared_annotation_scroll = self.panels.maximum_annotation_scroll_points();
+        let shared_annotation_scroll = self.session.panels.annotation_scroll_points;
+        let maximum_shared_annotation_scroll =
+            crate::workspace::panels::maximum_annotation_scroll_points(&self.session.panels);
         let mut panels: Vec<_> = self
+            .session
             .panels
             .iter()
             .map(|panel| {
@@ -256,6 +259,7 @@ impl Viewer {
                 let index_only_overview =
                     alignment_projection.is_some_and(|projection| projection.index_only_overview);
                 let read_content_visible = self
+                    .session
                     .track_presentation
                     .effective_track_visibility(
                         ui::TrackPane::Reads,
@@ -497,6 +501,7 @@ impl Viewer {
             })
             .collect();
         let active_scene_presentation_committed = self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -505,9 +510,9 @@ impl Viewer {
             .alignment_tracks
             .iter()
             .map(|track| {
-                let projection = track.projection(self.panels.active().id);
+                let projection = track.projection(self.session.panels.active().id);
                 let presented_scene = track.scene_engine.as_ref().and_then(|_| {
-                    self.presented_alignment_lane(self.panels.active().id, track.config.id)
+                    self.presented_alignment_lane(self.session.panels.active().id, track.config.id)
                 });
                 let (lifecycle, failure) = match &track.lifecycle {
                     AlignmentTrackLifecycle::Opening => (AutomationTrackLifecycle::Opening, None),
@@ -527,10 +532,12 @@ impl Viewer {
                     track.scene_complete_read_limit,
                 );
                 let annotation = self
+                    .session
                     .track_presentation
                     .pane_track_state(ui::TrackPane::Annotation, track.config.id);
                 let annotation_visible = annotation.is_none_or(|node| node.content_visible);
                 let read_visible = self
+                    .session
                     .track_presentation
                     .pane_track_state(ui::TrackPane::Reads, track.config.id)
                     .is_none_or(|node| node.content_visible);
@@ -682,7 +689,7 @@ impl Viewer {
                 }
             })
             .collect::<Vec<_>>();
-        tracks.extend(self.tracks.tracks().iter().map(|track| {
+        tracks.extend(self.session.tracks.tracks().iter().map(|track| {
             let (lifecycle, failure) = match self.automation_auxiliary_open_state.get(&track.id) {
                 Some(AutomationAuxiliaryOpenState::Pending) => {
                     (AutomationTrackLifecycle::Opening, None)
@@ -696,6 +703,7 @@ impl Viewer {
                 }
             };
             let annotation = self
+                .session
                 .track_presentation
                 .pane_track_state(ui::TrackPane::Annotation, track.id);
             let annotation_visible = annotation.is_none_or(|node| node.content_visible);
@@ -720,7 +728,7 @@ impl Viewer {
                 .iter()
                 .find(|track| track.config.id == track_id)
                 .is_some_and(|track| !matches!(track.lifecycle, AlignmentTrackLifecycle::Failed(_)))
-                || self.tracks.tracks().iter().any(|track| {
+                || self.session.tracks.tracks().iter().any(|track| {
                     track.id == track_id
                         && !matches!(
                             self.automation_auxiliary_open_state.get(&track_id),
@@ -729,42 +737,55 @@ impl Viewer {
                 })
         };
         let parent_composite = |track_id: TrackId| {
-            self.tracks
+            self.session
+                .tracks
                 .tracks()
                 .iter()
                 .find(|track| track.id == track_id)
                 .and_then(|track| track.quantitative.overlay_group)
                 .filter(|id| {
-                    self.track_presentation.composites.iter().any(|composite| {
-                        composite.channel == ui::TrackPane::Annotation && composite.id == *id
-                    })
+                    self.session
+                        .track_presentation
+                        .composites
+                        .iter()
+                        .any(|composite| {
+                            composite.channel == ui::TrackPane::Annotation && composite.id == *id
+                        })
                 })
         };
         let composite_visible = |track_id: TrackId| {
             parent_composite(track_id).is_none_or(|id| {
-                self.track_presentation
+                self.session
+                    .track_presentation
                     .composite_content_visible(ui::TrackPane::Annotation, id)
             })
         };
         let mut presentation_nodes = Vec::new();
         for channel in [ui::TrackPane::Annotation, ui::TrackPane::Reads] {
             let mut order_index = 0_usize;
-            if channel == ui::TrackPane::Annotation && self.reference_engine.is_some() {
+            if channel == ui::TrackPane::Annotation && self.session.reference_engine.is_some() {
                 presentation_nodes.push(AutomationPresentationNodeSnapshot {
                     id: PresentationNodeId::Reference,
                     order_index,
-                    desired_content_visible: self.track_presentation.reference_content_visible,
-                    effective_content_visible: self.track_presentation.reference_content_visible,
-                    preferred_height: self.track_presentation.reference_preferred_height,
+                    desired_content_visible: self
+                        .session
+                        .track_presentation
+                        .reference_content_visible,
+                    effective_content_visible: self
+                        .session
+                        .track_presentation
+                        .reference_content_visible,
+                    preferred_height: self.session.track_presentation.reference_preferred_height,
                     parent_group_id: None,
                     parent_composite_id: None,
                 });
                 order_index += 1;
             }
-            for root in self.track_presentation.pane_root_nodes(channel) {
+            for root in self.session.track_presentation.pane_root_nodes(channel) {
                 match root {
                     PresentationNodeId::Group { group_id, .. } => {
                         if let Some(group) = self
+                            .session
                             .track_presentation
                             .groups
                             .iter()
@@ -781,8 +802,10 @@ impl Viewer {
                             });
                             order_index += 1;
                             for track_id in &group.members {
-                                let node =
-                                    self.track_presentation.pane_track_state(channel, *track_id);
+                                let node = self
+                                    .session
+                                    .track_presentation
+                                    .pane_track_state(channel, *track_id);
                                 let desired = node.is_some_and(|node| node.content_visible);
                                 let source_available = source_available(*track_id);
                                 presentation_nodes.push(AutomationPresentationNodeSnapshot {
@@ -806,7 +829,10 @@ impl Viewer {
                         }
                     }
                     PresentationNodeId::Track { track_id, .. } => {
-                        let node = self.track_presentation.pane_track_state(channel, track_id);
+                        let node = self
+                            .session
+                            .track_presentation
+                            .pane_track_state(channel, track_id);
                         let desired = node.is_some_and(|node| node.content_visible);
                         let source_available = source_available(track_id);
                         presentation_nodes.push(AutomationPresentationNodeSnapshot {
@@ -833,6 +859,7 @@ impl Viewer {
             bottom: rect.bottom(),
         };
         let pane_layouts = self
+            .session
             .panels
             .iter()
             .flat_map(|panel| {
@@ -932,14 +959,14 @@ impl Viewer {
             })
             .map(|target| AutomationTrackGestureSnapshot {
                 kind: AutomationTrackGestureKind::ResizeNode,
-                panel_id: self.panels.active().id,
+                panel_id: self.session.panels.active().id,
                 target: Some(target),
             })
             .or_else(|| {
                 self.resizing_read_track
                     .map(|(track_id, _)| AutomationTrackGestureSnapshot {
                         kind: AutomationTrackGestureKind::ResizeNode,
-                        panel_id: self.panels.active().id,
+                        panel_id: self.session.panels.active().id,
                         target: Some(PresentationNodeId::Track {
                             channel: ui::TrackPane::Reads,
                             track_id,
@@ -950,7 +977,7 @@ impl Viewer {
                 self.resizing_read_pane
                     .map(|_| AutomationTrackGestureSnapshot {
                         kind: AutomationTrackGestureKind::ResizeReadPane,
-                        panel_id: self.panels.active().id,
+                        panel_id: self.session.panels.active().id,
                         target: None,
                     })
             })
@@ -988,38 +1015,42 @@ impl Viewer {
             application_version: env!("CARGO_PKG_VERSION").to_owned(),
             schema_version: AUTOMATION_SCHEMA_VERSION,
             application_instance_id: self.application_instance_id.clone(),
-            workspace_revision: self.workspace_revision,
+            workspace_revision: self.session.workspace_revision,
             genome: AutomationGenomeSnapshot {
-                name: self.assembly_name.clone(),
-                context_label: self.assembly.context_label(),
-                assembly_identity: self.assembly_identity.clone(),
-                suggested_assembly_identity: self.suggested_assembly_identity.clone(),
-                reference_configured: self.reference_engine.is_some(),
-                reference_ready: self.reference_engine.is_some()
-                    && self.reference_dictionary.is_some(),
-                reference_contig_count: self.assembly.reference_contig_count,
-                navigation_contig_count: self.assembly.dictionary.len(),
-                reference_is_subset: self.assembly_identity.as_ref().is_some_and(|identity| {
-                    identity.expected_primary_contigs > 0
-                        && self.assembly.reference_contig_count < identity.expected_primary_contigs
-                }),
-                cytobands_loaded: self.assembly.has_cytobands(),
-                default_annotation_count: self.assembly.default_annotation_count,
+                name: self.session.assembly_name.clone(),
+                context_label: self.session.assembly.context_label(),
+                assembly_identity: self.session.assembly_identity.clone(),
+                suggested_assembly_identity: self.session.suggested_assembly_identity.clone(),
+                reference_configured: self.session.reference_engine.is_some(),
+                reference_ready: self.session.reference_engine.is_some()
+                    && self.session.reference_dictionary.is_some(),
+                reference_contig_count: self.session.assembly.reference_contig_count,
+                navigation_contig_count: self.session.assembly.dictionary.len(),
+                reference_is_subset: self.session.assembly_identity.as_ref().is_some_and(
+                    |identity| {
+                        identity.expected_primary_contigs > 0
+                            && self.session.assembly.reference_contig_count
+                                < identity.expected_primary_contigs
+                    },
+                ),
+                cytobands_loaded: self.session.assembly.has_cytobands(),
+                default_annotation_count: self.session.assembly.default_annotation_count,
                 gene_model_track_count: self
+                    .session
                     .tracks
                     .tracks()
                     .iter()
                     .filter(|track| track.kind == TrackKind::GeneModel)
                     .count(),
-                contig_alias_count: self.contig_aliases.len(),
+                contig_alias_count: self.session.contig_aliases.len(),
                 landmarks: self.automation_landmark_snapshot(),
             },
             settled: self.automation_data_is_settled(),
-            active_panel_id: self.panels.active().id,
+            active_panel_id: self.session.panels.active().id,
             panels,
             tracks,
-            read_browsing_buffer_percent: self.settings.read_browsing_buffer_percent,
-            total_cache_budget_mib: self.settings.cache_budget_mib,
+            read_browsing_buffer_percent: self.session.settings.read_browsing_buffer_percent,
+            total_cache_budget_mib: self.session.settings.cache_budget_mib,
             alignment_scene_budget_bytes: scene_budget.budget_bytes,
             alignment_scene_charged_bytes: scene_budget.charged_bytes,
             alignment_scene_reserved_bytes: scene_budget.reserved_bytes,
@@ -1033,10 +1064,14 @@ impl Viewer {
             alignment_scene_active_replacement_bundle: scene_budget.active_replacement_bundle,
             alignment_scene_budget_refreshes: scene_budget.refreshes,
             alignment_scene_diagnostics,
-            read_pane_height: self.track_presentation.read_pane_height,
-            annotation_section_expanded: self.track_presentation.annotation_section_expanded,
-            read_section_expanded: self.track_presentation.read_section_expanded,
+            read_pane_height: self.session.track_presentation.read_pane_height,
+            annotation_section_expanded: self
+                .session
+                .track_presentation
+                .annotation_section_expanded,
+            read_section_expanded: self.session.track_presentation.read_section_expanded,
             presentation_groups: self
+                .session
                 .track_presentation
                 .groups
                 .iter()
@@ -1050,6 +1085,7 @@ impl Viewer {
                 })
                 .collect(),
             presentation_composites: self
+                .session
                 .track_presentation
                 .composites
                 .iter()
@@ -1074,6 +1110,7 @@ impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn automation_selection_snapshot(&self) -> Option<AutomationSelectionSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -1082,9 +1119,15 @@ impl Viewer {
             return None;
         }
         Some(observed_retained_selection(
-            &self.panels.active().retained_evidence.as_ref()?.selection,
-            self.panels.active().viewport.interval(),
-            &self.panels.active().contig_name,
+            &self
+                .session
+                .panels
+                .active()
+                .retained_evidence
+                .as_ref()?
+                .selection,
+            self.session.panels.active().viewport.interval(),
+            &self.session.panels.active().contig_name,
         ))
     }
 
@@ -1093,7 +1136,7 @@ impl Viewer {
         const MAXIMUM_FIELD_KEY_BYTES: usize = 256;
         const MAXIMUM_FIELD_VALUE_BYTES: usize = 4_096;
 
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         if !panel.navigation_presentation.is_interactive() {
             return None;
         }
@@ -1114,7 +1157,7 @@ impl Viewer {
             AutomationSelectionSnapshot {
                 selection_id: String::new(),
                 evidence_revision: 0,
-                workspace_revision_at_selection: self.workspace_revision,
+                workspace_revision_at_selection: self.session.workspace_revision,
                 panel_id: panel.id,
                 contig: panel.contig_name.clone(),
                 track_id,

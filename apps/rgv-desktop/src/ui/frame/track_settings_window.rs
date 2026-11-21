@@ -412,7 +412,7 @@ impl Viewer {
             .and_then(|snapshot| {
                 snapshot
                     .summaries()
-                    .maximum_depth(self.panels.active().viewport.interval())
+                    .maximum_depth(self.session.panels.active().viewport.interval())
                     .ok()
             })
         {
@@ -432,13 +432,13 @@ impl Viewer {
                 alignment_sort_position(
                     AlignmentSortMode::Base,
                     None,
-                    self.panels.active().viewport,
+                    self.session.panels.active().viewport,
                 )
             });
             if let Some(anchor) = anchor {
                 ui.small(format!(
                     "Base-sort anchor: {}:{}",
-                    self.panels.active().contig_name,
+                    self.session.panels.active().contig_name,
                     anchor.saturating_add(1)
                 ));
             }
@@ -825,13 +825,16 @@ impl Viewer {
                 if response.clicked() {
                     let predicate = quick_alignment_predicate(
                         quick,
-                        &self.panels.active().contig_name,
-                        self.panels
+                        &self.session.panels.active().contig_name,
+                        self.session
+                            .panels
                             .active()
                             .viewport
                             .interval()
                             .start()
-                            .saturating_add(self.panels.active().viewport.interval().len() / 2),
+                            .saturating_add(
+                                self.session.panels.active().viewport.interval().len() / 2,
+                            ),
                     );
                     if !st
                         .align

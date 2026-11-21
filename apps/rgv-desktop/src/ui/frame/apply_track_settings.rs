@@ -73,7 +73,10 @@ impl Viewer {
         {
             self.primary_alignment_filters_mut()
                 .show_modification_frequency = st.align.show_modification_frequency;
-            self.panels.active_mut().selected_modification_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
             self.query_options_changed();
         }
     }
@@ -108,7 +111,7 @@ impl Viewer {
         {
             self.primary_alignment_filters_mut().inspector_activation =
                 st.align.inspector_activation;
-            self.panels.active_mut().hover_inspector_target = None;
+            self.session.panels.active_mut().hover_inspector_target = None;
         }
         if editing_primary_settings
             && ((st.align.minimum_allele_fraction
@@ -166,12 +169,12 @@ impl Viewer {
                 .quality_weighted_alleles = st.align.quality_weighted_alleles;
             self.primary_alignment_filters_mut().show_reference = st.align.show_reference;
             if !st.align.show_coverage {
-                self.panels.active_mut().selected_pileup_position = None;
+                self.session.panels.active_mut().selected_pileup_position = None;
             }
             self.primary_alignment_filters_mut().show_coverage = st.align.show_coverage;
             if !st.align.show_junctions {
-                self.panels.active_mut().selected_junction = None;
-                self.panels.active_mut().selected_junction_component = None;
+                self.session.panels.active_mut().selected_junction = None;
+                self.session.panels.active_mut().selected_junction_component = None;
             }
             self.primary_alignment_filters_mut().show_junctions = st.align.show_junctions;
             self.primary_alignment_filters_mut().minimum_junction_depth =
@@ -214,19 +217,21 @@ impl Viewer {
                 .map(modification_code_label)
                 .collect();
             self.invalidate_navigation_contract("alignment presentation changed");
-            self.rebuild_genomic_display(self.panels.active().id);
+            self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
     }
 
     #[allow(clippy::too_many_lines)]
     pub(super) fn apply_auxiliary_track_settings(&mut self, st: &mut ShellFrame) {
-        let previous_auxiliary_query_membership = auxiliary_query_track_ids(self.tracks.tracks())
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let previous_auxiliary_query_membership =
+            auxiliary_query_track_ids(self.session.tracks.tracks())
+                .into_iter()
+                .collect::<HashSet<_>>();
         let mut track_configuration_changed = false;
         if let Some(id) = st.align.editing_auxiliary_id
             && let Some(track) = self
+                .session
                 .tracks
                 .tracks_mut()
                 .iter_mut()
@@ -240,6 +245,7 @@ impl Viewer {
         }
         for control in std::mem::take(&mut st.tracks.track_controls) {
             if let Some(track) = self
+                .session
                 .tracks
                 .tracks_mut()
                 .iter_mut()
@@ -252,6 +258,7 @@ impl Viewer {
         }
         for (id, settings) in std::mem::take(&mut st.tracks.feature_settings_controls) {
             if let Some(track) = self
+                .session
                 .tracks
                 .tracks_mut()
                 .iter_mut()
@@ -265,6 +272,7 @@ impl Viewer {
         let mut variant_query_requested = false;
         for (id, settings) in std::mem::take(&mut st.tracks.variant_settings_controls) {
             if let Some(track) = self
+                .session
                 .tracks
                 .tracks_mut()
                 .iter_mut()
@@ -281,6 +289,7 @@ impl Viewer {
                 continue;
             }
             if let Some(track) = self
+                .session
                 .tracks
                 .tracks_mut()
                 .iter_mut()
@@ -300,6 +309,7 @@ impl Viewer {
                 continue;
             }
             if let Some(track) = self
+                .session
                 .tracks
                 .tracks_mut()
                 .iter_mut()
@@ -316,6 +326,7 @@ impl Viewer {
                 continue;
             }
             if let Some(track) = self
+                .session
                 .tracks
                 .tracks_mut()
                 .iter_mut()
@@ -333,6 +344,7 @@ impl Viewer {
                 continue;
             }
             if let Some(track) = self
+                .session
                 .tracks
                 .tracks_mut()
                 .iter_mut()
@@ -349,6 +361,7 @@ impl Viewer {
                 continue;
             }
             if let Some(track) = self
+                .session
                 .tracks
                 .tracks_mut()
                 .iter_mut()
@@ -362,16 +375,16 @@ impl Viewer {
             }
         }
         if let Some((id, new_index)) = st.tracks.track_move {
-            track_configuration_changed |= self.tracks.move_track(id, new_index);
+            track_configuration_changed |= self.session.tracks.move_track(id, new_index);
         }
         let auxiliary_query_membership_changed = previous_auxiliary_query_membership
-            != auxiliary_query_track_ids(self.tracks.tracks())
+            != auxiliary_query_track_ids(self.session.tracks.tracks())
                 .into_iter()
                 .collect::<HashSet<_>>();
         if track_configuration_changed {
             self.invalidate_navigation_contract("auxiliary track presentation changed");
             self.reconcile_track_presentation();
-            self.rebuild_genomic_display(self.panels.active().id);
+            self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if auxiliary_query_membership_changed {
@@ -422,7 +435,7 @@ impl Viewer {
                         alignment_sort_position(
                             AlignmentSortMode::Base,
                             None,
-                            self.panels.active().viewport,
+                            self.session.panels.active().viewport,
                         )
                     })
             })
@@ -666,7 +679,10 @@ impl Viewer {
             self.report_error(error.to_string());
         }
         if st.lists.metadata_bulk_auxiliary_appearance_requested
-            && apply_compatible_auxiliary_appearance(self.tracks.tracks_mut(), &metadata_selected)
+            && apply_compatible_auxiliary_appearance(
+                self.session.tracks.tracks_mut(),
+                &metadata_selected,
+            )
         {
             self.rebuild_all_panel_displays();
             self.mark_display_dirty("explicit display invalidation");
@@ -690,7 +706,7 @@ impl Viewer {
         if st.lists.metadata_bulk_remove_requested {
             match self.remove_tracks(&metadata_selected) {
                 Ok(removed) => {
-                    self.data_status = format!("Removed {removed} selected tracks");
+                    self.session.data_status = format!("Removed {removed} selected tracks");
                 }
                 Err(error) => self.report_error(error.to_string()),
             }

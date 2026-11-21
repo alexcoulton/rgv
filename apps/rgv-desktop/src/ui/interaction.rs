@@ -95,14 +95,12 @@ impl Viewer {
             if !consumed && let Some(previous) = self.last_cursor {
                 let scale = self.window.scale_factor();
                 let delta_points = (position.x - previous.x) / scale;
-                if let Ok(viewport) = self
-                    .panels
-                    .active()
-                    .viewport
-                    .pan_pixels(-delta_points, self.panels.active_mut().contig_length)
-                {
+                if let Ok(viewport) = self.session.panels.active().viewport.pan_pixels(
+                    -delta_points,
+                    self.session.panels.active_mut().contig_length,
+                ) {
                     self.set_panel_viewport(
-                        self.panels.active().id,
+                        self.session.panels.active().id,
                         viewport,
                         crate::action::ViewportCommit::Gesture,
                     );
@@ -126,11 +124,12 @@ impl Viewer {
         // the inspector shows that panel's selection.
         let hover_panel = self
             .panel_at_cursor()
-            .unwrap_or_else(|| self.panels.active().id);
+            .unwrap_or_else(|| self.session.panels.active().id);
         let hovered_scene = hover_allowed
             .then(|| self.alignment_scene_hit_at_cursor(hover_panel))
             .flatten();
-        let hover_changed = retarget_alignment_hover(&mut self.panels, hover_panel, hovered_scene);
+        let hover_changed =
+            retarget_alignment_hover(&mut self.session.panels, hover_panel, hovered_scene);
         if !hover_changed.is_empty() {
             for panel_id in hover_changed {
                 self.synchronize_alignment_scene_interactions(panel_id);
@@ -158,7 +157,7 @@ impl Viewer {
         };
         let junction_hit_duration = junction_hit_started.map(|started| started.elapsed());
         let hovered_junction_arc = junction_hit.hover;
-        let previous_junction_arc = self.panels.active().hovered_junction_arc;
+        let previous_junction_arc = self.session.panels.active().hovered_junction_arc;
         let junction_arc_changed = hovered_junction_arc
             .map(|hover| (hover.key, hover.interaction_token, hover.content_revision))
             != previous_junction_arc
@@ -166,7 +165,7 @@ impl Viewer {
         let scale = self.window.scale_factor();
         self.sashimi_interaction_diagnostics.record_latest_probe(
             egui::pos2((position.x / scale) as f32, (position.y / scale) as f32),
-            self.panels.active().navigation_presentation.phase,
+            self.session.panels.active().navigation_presentation.phase,
             junction_hit,
         );
         if should_hit_test_junction_arc {
@@ -188,7 +187,7 @@ impl Viewer {
                 .saturating_add(1);
         }
         if junction_arc_changed {
-            self.panels.active_mut().hovered_junction_arc = hovered_junction_arc;
+            self.session.panels.active_mut().hovered_junction_arc = hovered_junction_arc;
             if junction_hit.native_authority {
                 // Hover is frame state for persistent junction pages. Recapture uniforms from the
                 // already-published scene; no source query or geometry upload is involved.
@@ -199,15 +198,17 @@ impl Viewer {
             } else {
                 CursorIcon::Default
             });
-            if self.synthetic || !self.refresh_panel_scroll_display(self.panels.active().id) {
+            if self.session.synthetic
+                || !self.refresh_panel_scroll_display(self.session.panels.active().id)
+            {
                 self.mark_display_dirty("wheel read-panel fast-scroll refresh was unavailable");
             }
             self.window.request_redraw();
         }
         if hover_allowed && self.inspector_activation_at_cursor() == InspectorActivation::Hover {
             let target = self.hover_inspector_target_at_cursor();
-            if target != self.panels.active().hover_inspector_target {
-                self.panels.active_mut().hover_inspector_target = target;
+            if target != self.session.panels.active().hover_inspector_target {
+                self.session.panels.active_mut().hover_inspector_target = target;
                 if target.is_some_and(|target| {
                     !matches!(target, HoverInspectorTarget::Junction(_, _, _, _))
                 }) {
@@ -215,8 +216,14 @@ impl Viewer {
                 }
                 self.window.request_redraw();
             }
-        } else if self.panels.active().hover_inspector_target.is_some() {
-            self.panels.active_mut().hover_inspector_target = None;
+        } else if self
+            .session
+            .panels
+            .active()
+            .hover_inspector_target
+            .is_some()
+        {
+            self.session.panels.active_mut().hover_inspector_target = None;
             self.window.request_redraw();
         }
     }
@@ -233,7 +240,7 @@ impl Viewer {
                 track_id, start, end, component,
             ));
         }
-        self.alignment_scene_hit_at_cursor(self.panels.active().id)
+        self.alignment_scene_hit_at_cursor(self.session.panels.active().id)
             .map(HoverInspectorTarget::Read)
     }
 
@@ -243,13 +250,13 @@ impl Viewer {
         let panel_rect = self.active_panel_rect();
         let anchor_points =
             self.cursor.x / self.window.scale_factor() - f64::from(panel_rect.left());
-        if let Ok(viewport) = self.panels.active_mut().viewport.zoom_at(
+        if let Ok(viewport) = self.session.panels.active_mut().viewport.zoom_at(
             anchor_points,
             factor,
-            self.panels.active_mut().contig_length,
+            self.session.panels.active_mut().contig_length,
         ) {
             self.set_panel_viewport(
-                self.panels.active().id,
+                self.session.panels.active().id,
                 viewport,
                 crate::action::ViewportCommit::Gesture,
             );
@@ -260,6 +267,7 @@ impl Viewer {
     pub(crate) fn scroll_tracks_points(&mut self, points: f32) {
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
         let annotation_clip_bottom = self
+            .session
             .panels
             .active()
             .scroll_display_cache
@@ -270,9 +278,9 @@ impl Viewer {
         if cursor_y < annotation_clip_bottom {
             self.scroll_annotations_by(-points);
         } else if let Some(track_id) =
-            self.read_panel_at_screen_y(self.panels.active().id, cursor_y)
+            self.read_panel_at_screen_y(self.session.panels.active().id, cursor_y)
         {
-            self.scroll_read_panel_by(self.panels.active().id, track_id, -points);
+            self.scroll_read_panel_by(self.session.panels.active().id, track_id, -points);
         }
     }
 
@@ -280,11 +288,11 @@ impl Viewer {
     /// primary alignment.
     fn keyboard_scroll_reads(&mut self, points: f32) {
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
-        let active = self.panels.active().id;
+        let active = self.session.panels.active().id;
         let panel_id = self.panel_at_cursor().unwrap_or(active);
         let track_id = keyboard_scroll_track(
             panel_id == active,
-            self.panels.panel(panel_id).selected_alignment_track,
+            self.session.panels.panel(panel_id).selected_alignment_track,
             self.read_panel_at_screen_y(panel_id, cursor_y),
             self.primary_alignment_track_id(),
         );
@@ -298,6 +306,7 @@ impl Viewer {
         points: f32,
     ) {
         let current = self
+            .session
             .panels
             .panel(panel_id)
             .read_panel_scroll_state(track_id)
@@ -331,6 +340,7 @@ impl Viewer {
             // rebound to the successor's exact extent when it arrives; silently discarding this
             // movement is what made a captured thumb appear permanently locked.
             let state = self
+                .session
                 .panels
                 .panel(panel_id)
                 .read_panel_scroll_state(track_id);
@@ -341,14 +351,16 @@ impl Viewer {
                 state.latent_scroll_fraction
             };
             if let Some(fraction) = desired_fraction {
-                self.panels
+                self.session
+                    .panels
                     .panel_mut(panel_id)
                     .read_panel_scrolls
                     .entry(track_id)
                     .or_default()
                     .latent_scroll_fraction = Some(fraction);
                 if track_id == self.primary_alignment_track_id() {
-                    self.panels
+                    self.session
+                        .panels
                         .panel_mut(panel_id)
                         .latent_vertical_scroll_fraction = Some(fraction);
                 }
@@ -374,6 +386,7 @@ impl Viewer {
             return;
         }
         let state = self
+            .session
             .panels
             .panel(panel_id)
             .read_panel_scroll_state(track_id);
@@ -394,6 +407,7 @@ impl Viewer {
         let primary_track_id = self.primary_alignment_track_id();
         let latent_fraction = {
             let state = self
+                .session
                 .panels
                 .panel_mut(panel_id)
                 .read_panel_scrolls
@@ -406,13 +420,17 @@ impl Viewer {
             state.latent_scroll_fraction
         };
         if track_id == primary_track_id {
-            self.panels.panel_mut(panel_id).vertical_scroll_points = next;
-            self.panels
+            self.session
+                .panels
+                .panel_mut(panel_id)
+                .vertical_scroll_points = next;
+            self.session
+                .panels
                 .panel_mut(panel_id)
                 .latent_vertical_scroll_fraction = latent_fraction;
         }
         let materialization = self.read_panel_materialization_coverage_for(panel_id, track_id);
-        if self.synthetic {
+        if self.session.synthetic {
             self.mark_display_dirty("read-panel synthetic scroll requires display rebuild");
         } else if materialization.is_covered() {
             if !self.refresh_panel_scroll_display(panel_id) {
@@ -435,9 +453,10 @@ impl Viewer {
     }
 
     pub(crate) fn scroll_annotations_by(&mut self, points: f32) {
-        let maximum = self.panels.maximum_annotation_scroll_points();
-        let next = (self.panels.annotation_scroll_points + points).clamp(0.0, maximum);
-        if (next - self.panels.annotation_scroll_points).abs() <= f32::EPSILON {
+        let maximum =
+            crate::workspace::panels::maximum_annotation_scroll_points(&self.session.panels);
+        let next = (self.session.panels.annotation_scroll_points + points).clamp(0.0, maximum);
+        if (next - self.session.panels.annotation_scroll_points).abs() <= f32::EPSILON {
             return;
         }
         self.invalidate_navigation_contract("annotation vertical scroll changed");
@@ -496,7 +515,7 @@ impl Viewer {
             Key::Named(NamedKey::PageDown) => self.keyboard_scroll_reads(self.canvas_page_height()),
             Key::Named(NamedKey::Home) => self.navigate_home(),
             Key::Named(NamedKey::Enter) => {
-                if let Some(track) = self.panels.active_mut().selected_track {
+                if let Some(track) = self.session.panels.active_mut().selected_track {
                     self.open_panel = Some(UiPanel::TrackSettings(track));
                 }
             }
@@ -509,7 +528,7 @@ impl Viewer {
     /// the span multiplier (0.8 zooms in). A step the contig cannot accommodate is ignored.
     pub(crate) fn keyboard_zoom(&mut self, factor: f64) {
         let _ = self.apply_action(crate::action::translate::keyboard_zoom(
-            self.panels.active().id,
+            self.session.panels.active().id,
             factor,
         ));
     }
@@ -517,7 +536,7 @@ impl Viewer {
     /// One keyboard pan step of the focused panel, as a fraction of its width.
     pub(crate) fn keyboard_pan(&mut self, fraction: f64) {
         let _ = self.apply_action(crate::action::translate::keyboard_pan(
-            self.panels.active().id,
+            self.session.panels.active().id,
             fraction,
         ));
     }
@@ -531,7 +550,7 @@ impl Viewer {
     /// One repeatable navigation step (key repeat, toolbar zoom, span slider). The viewport
     /// updates immediately; history and recent loci get one entry when the burst settles.
     pub(crate) fn viewport_step_changed(&mut self, panel_id: PanelId) {
-        if self.panels.is_active(panel_id) {
+        if self.session.panels.is_active(panel_id) {
             self.sync_locus_editor();
         }
         self.note_navigation_gesture(panel_id);
@@ -539,9 +558,15 @@ impl Viewer {
     }
 
     fn discrete_viewport_changed(&mut self, panel_id: PanelId) {
-        self.panels.panel_mut(panel_id).hovered_alignment_hit = None;
-        self.panels.panel_mut(panel_id).hover_inspector_target = None;
-        self.panels.panel_mut(panel_id).hovered_junction_arc = None;
+        self.session
+            .panels
+            .panel_mut(panel_id)
+            .hovered_alignment_hit = None;
+        self.session
+            .panels
+            .panel_mut(panel_id)
+            .hover_inspector_target = None;
+        self.session.panels.panel_mut(panel_id).hovered_junction_arc = None;
         self.window.set_cursor(CursorIcon::Default);
         self.synchronize_alignment_scene_interactions(panel_id);
         self.record_manual_navigation_intent(panel_id, "discrete_viewport_change");
@@ -549,11 +574,11 @@ impl Viewer {
     }
 
     pub(crate) fn viewport_gesture_changed(&mut self, panel_id: PanelId) {
-        if self.panels.is_active(panel_id) {
+        if self.session.panels.is_active(panel_id) {
             self.sync_locus_editor();
         }
         self.note_navigation_gesture(panel_id);
-        let panel = self.panels.panel_mut(panel_id);
+        let panel = self.session.panels.panel_mut(panel_id);
         panel.hovered_alignment_hit = None;
         panel.hover_inspector_target = None;
         panel.hovered_junction_arc = None;
@@ -601,15 +626,21 @@ impl Viewer {
         }
         if interaction.show_all {
             if let Ok(interval) = GenomicInterval::new(
-                self.panels.active_mut().viewport.interval().contig(),
+                self.session
+                    .panels
+                    .active_mut()
+                    .viewport
+                    .interval()
+                    .contig(),
                 0,
-                self.panels.active_mut().contig_length.max(1),
-            ) && let Ok(viewport) =
-                Viewport::new(interval, self.panels.active_mut().viewport.pixel_width())
-            {
+                self.session.panels.active_mut().contig_length.max(1),
+            ) && let Ok(viewport) = Viewport::new(
+                interval,
+                self.session.panels.active_mut().viewport.pixel_width(),
+            ) {
                 self.horizontal_overview_drag = None;
                 self.set_panel_viewport(
-                    self.panels.active().id,
+                    self.session.panels.active().id,
                     viewport,
                     crate::action::ViewportCommit::Discrete,
                 );
@@ -629,13 +660,14 @@ impl Viewer {
                 return;
             }
             if let Ok(viewport) = self
+                .session
                 .panels
                 .active()
                 .viewport
-                .centered_on(position, self.panels.active_mut().contig_length)
+                .centered_on(position, self.session.panels.active_mut().contig_length)
             {
                 self.set_panel_viewport(
-                    self.panels.active().id,
+                    self.session.panels.active().id,
                     viewport,
                     crate::action::ViewportCommit::Discrete,
                 );
@@ -651,19 +683,19 @@ impl Viewer {
             )
         {
             let (viewport, anchor_fraction) = overview_drag_origin(
-                self.panels.active().viewport,
+                self.session.panels.active().viewport,
                 anchor_position,
                 interaction.press_handle_fraction,
-                self.panels.active().contig_length,
+                self.session.panels.active().contig_length,
             );
             self.horizontal_overview_drag = Some(HorizontalOverviewDrag {
                 anchor_fraction,
                 last_pointer_x: press_x,
                 last_pointer_y: press_y,
             });
-            if viewport != self.panels.active_mut().viewport {
+            if viewport != self.session.panels.active_mut().viewport {
                 self.set_panel_viewport(
-                    self.panels.active().id,
+                    self.session.panels.active().id,
                     viewport,
                     crate::action::ViewportCommit::Gesture,
                 );
@@ -679,14 +711,14 @@ impl Viewer {
             let delta_x = pointer_x - drag.last_pointer_x;
             let delta_y = pointer_y - drag.last_pointer_y;
             if let Some(viewport) = overview_drag_step(
-                self.panels.active_mut().viewport,
+                self.session.panels.active_mut().viewport,
                 drag.anchor_fraction,
                 delta_x,
                 delta_y,
-                self.panels.active_mut().contig_length,
+                self.session.panels.active_mut().contig_length,
             ) {
                 self.set_panel_viewport(
-                    self.panels.active().id,
+                    self.session.panels.active().id,
                     viewport,
                     crate::action::ViewportCommit::Gesture,
                 );
@@ -706,7 +738,7 @@ impl Viewer {
         }
         if interaction.drag_stopped && self.horizontal_overview_drag.take().is_some() {
             self.commit_navigation_gesture();
-            self.finish_navigation_gesture(self.panels.active().id);
+            self.finish_navigation_gesture(self.session.panels.active().id);
         }
     }
 
@@ -716,7 +748,8 @@ impl Viewer {
         interaction: ui::ScrollbarInteraction,
         requested_scroll: &mut f32,
     ) {
-        let row_authority = self.read_panel_row_authority(self.panels.active().id, track_id);
+        let row_authority =
+            self.read_panel_row_authority(self.session.panels.active().id, track_id);
         if !row_authority.is_exact() {
             if self.diagnostics.recording()
                 && (interaction.pointer_down
@@ -727,12 +760,12 @@ impl Viewer {
                     "overview_interaction_rejected",
                     serde_json::json!({
                         "reason": "read row authority is not exact",
-                        "panel_id": self.panels.active().id.get(),
+                        "panel_id": self.session.panels.active().id.get(),
                         "track_id": track_id.get(),
                         "requested_points": *requested_scroll,
                         "row_authority": format!("{row_authority:?}"),
                         "scroll_cache_authority": self.manual_read_panel_scroll_cache_diagnostic_state(
-                            self.panels.active().id,
+                            self.session.panels.active().id,
                             track_id,
                         ),
                     }),
@@ -747,12 +780,12 @@ impl Viewer {
         }
         if interaction.keyboard_density_pixels.abs() > f32::EPSILON {
             let viewport_height = self
-                .read_panel_metrics(self.panels.active().id, track_id)
+                .read_panel_metrics(self.session.panels.active().id, track_id)
                 .map_or(
                     self.canvas_geometry().viewport.height(),
                     |(top, bottom, _)| (bottom - top).max(1.0),
                 );
-            let panel_id = self.panels.active().id;
+            let panel_id = self.session.panels.active().id;
             let previous_density = self.alignment_density_for_panel_track(panel_id, track_id);
             let anchor_y = viewport_height * 0.5;
             let (density, scroll) = vertical_overview_step(
@@ -767,10 +800,10 @@ impl Viewer {
                 self.mark_display_dirty("keyboard changed read-panel density");
             }
             let maximum = self
-                .read_panel_metrics(self.panels.active().id, track_id)
+                .read_panel_metrics(self.session.panels.active().id, track_id)
                 .map_or(0.0, |(_, bottom, _)| {
                     self.read_panel_presented_scroll_maximum(
-                        self.panels.active().id,
+                        self.session.panels.active().id,
                         track_id,
                         bottom,
                     )
@@ -778,7 +811,7 @@ impl Viewer {
             *requested_scroll = scroll.clamp(0.0, maximum);
             self.mark_display_dirty("keyboard changed read-panel scroll camera");
         }
-        self.set_read_panel_scroll(self.panels.active().id, track_id, *requested_scroll);
+        self.set_read_panel_scroll(self.session.panels.active().id, track_id, *requested_scroll);
     }
 
     pub(crate) fn begin_vertical_scrollbar_drag(&mut self) -> bool {
@@ -792,32 +825,43 @@ impl Viewer {
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         );
-        let target_panel = self.panels.iter().enumerate().find_map(|(index, panel)| {
-            (self.panel_scrollbar_rect_at(index).contains(pointer)
-                && panel.live_read_panel_at_y(pointer.y).is_some())
-            .then_some(panel.id)
-        });
+        let target_panel = self
+            .session
+            .panels
+            .iter()
+            .enumerate()
+            .find_map(|(index, panel)| {
+                (self.panel_scrollbar_rect_at(index).contains(pointer)
+                    && panel.live_read_panel_at_y(pointer.y).is_some())
+                .then_some(panel.id)
+            });
         let Some(target_panel) = target_panel else {
             return false;
         };
         self.activate_view_panel(target_panel);
-        let Some(track_id) = self.read_panel_at_screen_y(self.panels.active().id, pointer.y) else {
+        let Some(track_id) =
+            self.read_panel_at_screen_y(self.session.panels.active().id, pointer.y)
+        else {
             return false;
         };
         if !self
-            .read_panel_row_authority(self.panels.active().id, track_id)
+            .read_panel_row_authority(self.session.panels.active().id, track_id)
             .is_exact()
         {
             return false;
         }
         let Some((clip_top, clip_bottom, _)) =
-            self.read_panel_metrics(self.panels.active().id, track_id)
+            self.read_panel_metrics(self.session.panels.active().id, track_id)
         else {
             return false;
         };
-        let state = self.panels.active().read_panel_scroll_state(track_id);
+        let state = self
+            .session
+            .panels
+            .active()
+            .read_panel_scroll_state(track_id);
         let maximum = self.read_panel_presented_scroll_maximum(
-            self.panels.active().id,
+            self.session.panels.active().id,
             track_id,
             clip_bottom,
         );
@@ -825,7 +869,8 @@ impl Viewer {
         let scrollbar_rect = self
             .read_panel_scrollbar_rect(track_id)
             .unwrap_or(self.canvas_geometry().scrollbar);
-        let density = self.alignment_density_for_panel_track(self.panels.active().id, track_id);
+        let density =
+            self.alignment_density_for_panel_track(self.session.panels.active().id, track_id);
         let latent_fraction = state.latent_scroll_fraction;
         let scroll_fraction =
             (maximum > f32::EPSILON).then(|| (state.scroll_points / maximum).clamp(0.0, 1.0));
@@ -859,7 +904,7 @@ impl Viewer {
             .or(latent_fraction)
             .unwrap_or(thumb_grab_fraction);
         self.vertical_overview_drag = Some(VerticalOverviewDrag {
-            panel_id: self.panels.active().id,
+            panel_id: self.session.panels.active().id,
             track_id,
             grab_offset: if thumb_hit {
                 pointer.y - geometry.thumb.top()
@@ -923,17 +968,21 @@ impl Viewer {
             return true;
         }
         let Some((clip_top, clip_bottom, _)) =
-            self.read_panel_metrics(self.panels.active().id, drag.track_id)
+            self.read_panel_metrics(self.session.panels.active().id, drag.track_id)
         else {
             return false;
         };
         if !self
-            .read_panel_row_authority(self.panels.active().id, drag.track_id)
+            .read_panel_row_authority(self.session.panels.active().id, drag.track_id)
             .is_exact()
         {
-            let state = self.panels.active().read_panel_scroll_state(drag.track_id);
+            let state = self
+                .session
+                .panels
+                .active()
+                .read_panel_scroll_state(drag.track_id);
             let maximum = self.read_panel_presented_scroll_maximum(
-                self.panels.active().id,
+                self.session.panels.active().id,
                 drag.track_id,
                 clip_bottom,
             );
@@ -971,23 +1020,30 @@ impl Viewer {
                 drag.thumb_grab_fraction,
             );
             drag.last_pointer_x = pointer.x;
-            self.panels
+            self.session
+                .panels
                 .active_mut()
                 .read_panel_scrolls
                 .entry(drag.track_id)
                 .or_default()
                 .latent_scroll_fraction = Some(drag.virtual_scroll_fraction);
             if drag.track_id == self.primary_alignment_track_id() {
-                self.panels.active_mut().latent_vertical_scroll_fraction =
-                    Some(drag.virtual_scroll_fraction);
+                self.session
+                    .panels
+                    .active_mut()
+                    .latent_vertical_scroll_fraction = Some(drag.virtual_scroll_fraction);
             }
             self.vertical_overview_drag = Some(drag);
             self.window.request_redraw();
             return true;
         }
-        let state = self.panels.active().read_panel_scroll_state(drag.track_id);
+        let state = self
+            .session
+            .panels
+            .active()
+            .read_panel_scroll_state(drag.track_id);
         let maximum = self.read_panel_presented_scroll_maximum(
-            self.panels.active().id,
+            self.session.panels.active().id,
             drag.track_id,
             clip_bottom,
         );
@@ -1017,7 +1073,7 @@ impl Viewer {
             },
         );
         let next = ui::scrollbar_offset_at_grab(geometry, maximum, pointer.y, drag.grab_offset);
-        self.set_read_panel_scroll(self.panels.active().id, drag.track_id, next);
+        self.set_read_panel_scroll(self.session.panels.active().id, drag.track_id, next);
         drag.last_pointer_x = pointer.x;
         self.vertical_overview_drag = Some(drag);
         self.window.request_redraw();
@@ -1127,14 +1183,14 @@ impl Viewer {
                     return;
                 };
                 if let Some(viewport) = overview_drag_step(
-                    self.panels.active_mut().viewport,
+                    self.session.panels.active_mut().viewport,
                     drag.anchor_fraction,
                     delta_x,
                     delta_y,
-                    self.panels.active_mut().contig_length,
+                    self.session.panels.active_mut().contig_length,
                 ) {
                     self.set_panel_viewport(
-                        self.panels.active().id,
+                        self.session.panels.active().id,
                         viewport,
                         crate::action::ViewportCommit::Gesture,
                     );
@@ -1150,11 +1206,11 @@ impl Viewer {
         let Some(mut drag) = self.vertical_overview_drag else {
             return;
         };
-        if drag.panel_id != self.panels.active().id {
+        if drag.panel_id != self.session.panels.active().id {
             return;
         }
         if !self
-            .read_panel_row_authority(self.panels.active().id, drag.track_id)
+            .read_panel_row_authority(self.session.panels.active().id, drag.track_id)
             .is_exact()
         {
             return;
@@ -1162,7 +1218,7 @@ impl Viewer {
         let previous_density = self.alignment_density_for_panel_track(drag.panel_id, drag.track_id);
         let density = density_from_horizontal_drag(previous_density, delta_x);
         let Some((read_viewport_top, read_viewport_bottom, actual_content_bottom)) =
-            self.read_panel_metrics(self.panels.active().id, drag.track_id)
+            self.read_panel_metrics(self.session.panels.active().id, drag.track_id)
         else {
             return;
         };
@@ -1197,10 +1253,14 @@ impl Viewer {
         drag.virtual_scroll_fraction =
             ui::scrollbar_fraction_at_grab(geometry, drag.virtual_pointer_y, grab_fraction);
         let next_scroll = drag.virtual_scroll_fraction * maximum;
-        let previous_state = self.panels.active().read_panel_scroll_state(drag.track_id);
+        let previous_state = self
+            .session
+            .panels
+            .active()
+            .read_panel_scroll_state(drag.track_id);
         let previous_effective_scroll = previous_state.effective_scroll_points();
         self.record_manual_vertical_scroll_intent(
-            self.panels.active().id,
+            self.session.panels.active().id,
             drag.track_id,
             next_scroll,
             previous_state.scroll_points,
@@ -1215,6 +1275,7 @@ impl Viewer {
         let scroll_changed = (next_scroll - previous_state.scroll_points).abs() > f32::EPSILON;
         self.vertical_overview_drag = Some(drag);
         let state = self
+            .session
             .panels
             .active_mut()
             .read_panel_scrolls
@@ -1225,11 +1286,16 @@ impl Viewer {
         state.latent_scroll_fraction = Some(drag.virtual_scroll_fraction);
         state.content_bottom_points = read_viewport_bottom + maximum;
         if drag.track_id == self.primary_alignment_track_id() {
-            self.panels.active_mut().vertical_scroll_points = next_scroll;
-            self.panels.active_mut().vertical_content_origin_points = content_origin;
-            self.panels.active_mut().latent_vertical_scroll_fraction =
-                Some(drag.virtual_scroll_fraction);
-            self.panels.active_mut().content_bottom_points = read_viewport_bottom + maximum;
+            self.session.panels.active_mut().vertical_scroll_points = next_scroll;
+            self.session
+                .panels
+                .active_mut()
+                .vertical_content_origin_points = content_origin;
+            self.session
+                .panels
+                .active_mut()
+                .latent_vertical_scroll_fraction = Some(drag.virtual_scroll_fraction);
+            self.session.panels.active_mut().content_bottom_points = read_viewport_bottom + maximum;
         }
         if density_changed {
             self.set_read_panel_density(drag.panel_id, drag.track_id, density);
@@ -1238,12 +1304,14 @@ impl Viewer {
                 InteractionTraceStage::DensityChanged,
             ));
         } else if scroll_changed {
-            let materialization = self
-                .read_panel_materialization_coverage_for(self.panels.active().id, drag.track_id);
-            if self.synthetic {
+            let materialization = self.read_panel_materialization_coverage_for(
+                self.session.panels.active().id,
+                drag.track_id,
+            );
+            if self.session.synthetic {
                 self.mark_display_dirty("synthetic vertical overview requires display rebuild");
             } else if materialization.is_covered()
-                && !self.refresh_panel_scroll_display(self.panels.active().id)
+                && !self.refresh_panel_scroll_display(self.session.panels.active().id)
             {
                 self.mark_display_dirty(
                     "covered vertical overview fast-scroll refresh was unavailable",
@@ -1264,7 +1332,10 @@ impl Viewer {
             self.window.request_redraw();
         }
         if density_changed || scroll_changed {
-            self.request_alignment_scene_camera_update(self.panels.active().id, drag.track_id);
+            self.request_alignment_scene_camera_update(
+                self.session.panels.active().id,
+                drag.track_id,
+            );
         }
     }
 
@@ -1286,7 +1357,7 @@ impl Viewer {
                 self.suppress_horizontal_overview_click = moved;
                 if self.horizontal_overview_drag.take().is_some() {
                     self.commit_navigation_gesture();
-                    self.finish_navigation_gesture(self.panels.active().id);
+                    self.finish_navigation_gesture(self.session.panels.active().id);
                 }
             }
             OverviewCapture::VerticalDensity => {
@@ -1297,11 +1368,13 @@ impl Viewer {
     }
 
     pub(crate) fn query_options_changed(&mut self) {
-        self.remember_current_locus(self.panels.active().id);
+        self.remember_current_locus(self.session.panels.active().id);
         self.mark_display_dirty("explicit display invalidation");
         self.invalidate_navigation_contract("query or presentation options changed");
-        if !self.synthetic && (self.has_alignment_engine() || self.track_engine.is_some()) {
-            for panel in &mut self.panels.panels {
+        if !self.session.synthetic
+            && (self.has_alignment_engine() || self.session.track_engine.is_some())
+        {
+            for panel in &mut self.session.panels.panels {
                 panel.generation_clock.advance();
             }
             for track in &mut self.alignment_tracks {
@@ -1363,7 +1436,8 @@ impl Viewer {
     }
 
     pub(crate) fn panel_column_rect(&self, id: PanelId) -> Option<egui::Rect> {
-        self.panels
+        self.session
+            .panels
             .iter()
             .position(|panel| panel.id == id)
             .map(|index| self.panel_column_rect_at(index))
@@ -1377,7 +1451,7 @@ impl Viewer {
     }
 
     pub(crate) fn active_panel_rect(&self) -> egui::Rect {
-        self.panel_column_rect(self.panels.active().id)
+        self.panel_column_rect(self.session.panels.active().id)
             .expect("committed workspace layout contains the active locus panel")
     }
 
@@ -1393,7 +1467,12 @@ impl Viewer {
     }
 
     pub(crate) fn synchronize_panel_widths(&mut self) {
-        let current_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let current_ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         let layout_ids = self
             .workspace_layout
             .panels
@@ -1402,10 +1481,12 @@ impl Viewer {
             .collect::<Vec<_>>();
         if current_ids != layout_ids {
             let panel_inputs = self
+                .session
                 .panels
                 .iter()
                 .map(|panel| {
                     let cytobands = if self
+                        .session
                         .assembly
                         .cytobands_for(panel.viewport.interval().contig())
                         .next()
@@ -1444,7 +1525,12 @@ impl Viewer {
             self.workspace_layout_recomputations =
                 self.workspace_layout_recomputations.saturating_add(1);
         }
-        let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         for id in &ids {
             let width = self
                 .workspace_layout
@@ -1453,7 +1539,7 @@ impl Viewer {
                 .canvas
                 .width()
                 .max(1.0);
-            if let Some(panel) = self.panels.get_mut(*id)
+            if let Some(panel) = self.session.panels.get_mut(*id)
                 && let Ok(viewport) = panel.viewport.resized(f64::from(width))
             {
                 panel.viewport = viewport;
@@ -1469,10 +1555,10 @@ impl Viewer {
     }
 
     pub(crate) fn refresh_active_panel_context(&mut self) {
-        let interval = self.panels.active().viewport.interval();
+        let interval = self.session.panels.active().viewport.interval();
         self.locus_editor = format!(
             "{}:{}-{}",
-            self.panels.active().contig_name,
+            self.session.panels.active().contig_name,
             interval.start().saturating_add(1),
             interval.end()
         );
@@ -1517,14 +1603,21 @@ impl Viewer {
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         );
-        self.panels.iter().enumerate().any(|(index, panel)| {
-            self.panel_scrollbar_rect_at(index).contains(point)
-                && panel.live_read_panel_at_y(point.y).is_some()
-        })
+        self.session
+            .panels
+            .iter()
+            .enumerate()
+            .any(|(index, panel)| {
+                self.panel_scrollbar_rect_at(index).contains(point)
+                    && panel.live_read_panel_at_y(point.y).is_some()
+            })
     }
 
     fn read_panel_at_screen_y(&self, panel_id: PanelId, screen_y: f32) -> Option<TrackId> {
-        self.panels.panel(panel_id).live_read_panel_at_y(screen_y)
+        self.session
+            .panels
+            .panel(panel_id)
+            .live_read_panel_at_y(screen_y)
     }
 
     pub(crate) fn read_panel_metrics(
@@ -1532,7 +1625,7 @@ impl Viewer {
         panel_id: PanelId,
         track_id: TrackId,
     ) -> Option<(f32, f32, f32)> {
-        let panel = self.panels.panel(panel_id);
+        let panel = self.session.panels.panel(panel_id);
         let allocation = panel.live_read_panel_rect(track_id)?;
         let actual_content_bottom = panel
             .scroll_display_cache
@@ -1556,6 +1649,7 @@ impl Viewer {
             .alignment_scene_publication_authority
             .committed_row_target_matches_desired(panel_id, track_id);
         let Some(panel) = self
+            .session
             .panels
             .panel(panel_id)
             .scroll_display_cache
@@ -1584,7 +1678,8 @@ impl Viewer {
         clip_bottom: f32,
     ) -> f32 {
         crate::display::read_panel_scrollbar_maximum(
-            self.panels
+            self.session
+                .panels
                 .panel(panel_id)
                 .read_panel_scroll_state(track_id),
             clip_bottom,
@@ -1593,8 +1688,9 @@ impl Viewer {
     }
 
     fn read_panel_scrollbar_rect(&self, track_id: TrackId) -> Option<egui::Rect> {
-        let (top, bottom, _) = self.read_panel_metrics(self.panels.active().id, track_id)?;
-        let active_index = self.panels.active;
+        let (top, bottom, _) =
+            self.read_panel_metrics(self.session.panels.active().id, track_id)?;
+        let active_index = self.session.panels.active;
         let full = self.panel_scrollbar_rect_at(active_index);
         Some(egui::Rect::from_min_max(
             egui::pos2(full.left(), top.clamp(full.top(), full.bottom())),
@@ -1604,7 +1700,7 @@ impl Viewer {
 
     pub(crate) fn inspector_activation_at_cursor(&self) -> InspectorActivation {
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         let annotation_clip_top = panel
             .scroll_display_cache
             .as_ref()
@@ -1638,7 +1734,7 @@ impl Viewer {
                     if read_panel {
                         0.0
                     } else {
-                        self.panels.annotation_scroll_points
+                        self.session.panels.annotation_scroll_points
                     },
                     if read_panel {
                         frame.top

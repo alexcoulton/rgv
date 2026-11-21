@@ -190,37 +190,11 @@ fn synchronize_panel_track_selection(
 
 impl Viewer {
     pub(crate) fn effective_auxiliary_presentation_configs(&self) -> Vec<TrackConfig> {
-        let by_id = self
-            .tracks
-            .tracks()
-            .iter()
-            .map(|track| (track.id, track))
-            .collect::<BTreeMap<_, _>>();
-        self.track_presentation
-            .pane_tracks
-            .iter()
-            .filter(|node| node.channel == ui::TrackPane::Annotation)
-            .filter_map(|node| {
-                let mut track = (*by_id.get(&node.track_id)?).clone();
-                let parent = self
-                    .track_presentation
-                    .group_for_track(ui::TrackPane::Annotation, node.track_id);
-                if parent.is_some_and(|group| !group.expanded) {
-                    return None;
-                }
-                track.visible =
-                    node.content_visible && parent.is_none_or(|group| group.content_visible);
-                track.collapsed = !track.visible;
-                if let Some(height) = node.preferred_height {
-                    track.height = height;
-                }
-                Some(track)
-            })
-            .collect()
+        self.session.effective_auxiliary_presentation_configs()
     }
 
     pub(crate) fn workspace_presentation_snapshot(&self) -> WorkspacePresentation {
-        self.track_presentation.clone()
+        self.session.workspace_presentation_snapshot()
     }
 
     /// Reconciles source lifecycle only. Presentation choices are never read
@@ -242,14 +216,17 @@ impl Viewer {
             })
             .collect::<Vec<_>>();
         let auxiliary_defaults = self
+            .session
             .tracks
             .tracks()
             .iter()
             .map(|track| (track.id, Some(track.height.clamp(26.0, 1_200.0))))
             .collect::<Vec<_>>();
-        self.track_presentation
+        self.session
+            .track_presentation
             .reconcile_sources(&alignment_defaults, &auxiliary_defaults);
         let overlay_ids = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -262,9 +239,11 @@ impl Viewer {
             .into_iter()
             .filter_map(|(id, count)| (count >= 2).then_some(id))
             .collect::<BTreeSet<_>>();
-        self.track_presentation
+        self.session
+            .track_presentation
             .reconcile_composites(ui::TrackPane::Annotation, &overlay_ids);
-        self.track_presentation
+        self.session
+            .track_presentation
             .reconcile_composites(ui::TrackPane::Reads, &BTreeSet::new());
         for track in &mut self.alignment_tracks {
             track.config.visible = true;
@@ -274,7 +253,7 @@ impl Viewer {
             track.config.read_group_height = None;
             track.config.filters.show_reads = true;
         }
-        for track in self.tracks.tracks_mut() {
+        for track in self.session.tracks.tracks_mut() {
             track.visible = true;
             track.collapsed = false;
             track.height = 120.0;
@@ -289,18 +268,20 @@ impl Viewer {
             .map(|track| track.config.id)
             .collect::<BTreeSet<_>>();
         let mut valid_nodes = self
+            .session
             .track_presentation
             .pane_interactive_nodes(ui::TrackPane::Annotation)
             .into_iter()
             .chain(
-                self.track_presentation
+                self.session
+                    .track_presentation
                     .pane_interactive_nodes(ui::TrackPane::Reads),
             )
             .collect::<BTreeSet<_>>();
-        if self.reference_engine.is_some() {
+        if self.session.reference_engine.is_some() {
             valid_nodes.insert(PresentationNodeId::Reference);
         }
-        for panel in self.panels.iter_mut() {
+        for panel in self.session.panels.iter_mut() {
             panel
                 .selected_presentation_nodes
                 .retain(|node| valid_nodes.contains(node));
@@ -362,7 +343,7 @@ impl Viewer {
         &mut self,
         intents: &[TrackIntent],
     ) -> Result<TrackChangeSet> {
-        let mut changes = self.track_presentation.apply_intents(intents)?;
+        let mut changes = self.session.track_presentation.apply_intents(intents)?;
         for intent in intents {
             match intent {
                 TrackIntent::SetNodeVisibility {
@@ -381,6 +362,7 @@ impl Viewer {
                     visible: false,
                 } => {
                     if let Some(members) = self
+                        .session
                         .track_presentation
                         .groups
                         .iter()
@@ -397,6 +379,7 @@ impl Viewer {
                     visible: false,
                 } => {
                     let members = self
+                        .session
                         .tracks
                         .tracks()
                         .iter()
@@ -414,6 +397,7 @@ impl Viewer {
                     expanded: false,
                 } => {
                     let members = self
+                        .session
                         .track_presentation
                         .pane_tracks
                         .iter()
@@ -422,7 +406,7 @@ impl Viewer {
                         .collect::<Vec<_>>();
                     self.reconcile_suppressed_group_selection(*channel, &members);
                     if *channel == ui::TrackPane::Annotation {
-                        for panel in self.panels.iter_mut() {
+                        for panel in self.session.panels.iter_mut() {
                             panel
                                 .selected_presentation_nodes
                                 .retain(|node| *node != PresentationNodeId::Reference);
@@ -491,7 +475,8 @@ impl Viewer {
     }
 
     pub(crate) fn alignment_track_group_chrome(&self) -> Vec<ui::TrackGroupChrome> {
-        self.track_presentation
+        self.session
+            .track_presentation
             .groups
             .iter()
             .filter_map(|group| {
@@ -518,7 +503,7 @@ impl Viewer {
             .iter()
             .map(|track| track.config.id)
             .collect::<BTreeSet<_>>();
-        for panel in self.panels.iter_mut() {
+        for panel in self.session.panels.iter_mut() {
             let suppressed_selected = panel.selected_presentation_nodes.iter().any(|node| {
                 matches!(
                     node,
@@ -638,7 +623,8 @@ impl Viewer {
         if track.scene_engine.is_none() {
             return None;
         }
-        let presented = self.presented_alignment_lane(self.panels.active().id, track.config.id)?;
+        let presented =
+            self.presented_alignment_lane(self.session.panels.active().id, track.config.id)?;
         if !presented.lane.summary_current() || !presented.source.semantic_target_complete {
             return None;
         }
@@ -659,13 +645,14 @@ impl Viewer {
     }
 
     pub(crate) fn sashimi_export_bundle(&self) -> SashimiExportBundle {
-        let selected = &self.panels.active().selected_alignment_tracks;
+        let selected = &self.session.panels.active().selected_alignment_tracks;
         let use_selected = !selected.is_empty();
         let mut omitted_tracks = 0_usize;
         let mut tracks = Vec::new();
-        let interval = self.panels.active().viewport.interval();
+        let interval = self.session.panels.active().viewport.interval();
         for track in self.alignment_tracks.iter().filter(|track| {
-            self.track_presentation
+            self.session
+                .track_presentation
                 .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
                 .unwrap_or(false)
                 && (!use_selected || selected.contains(&track.config.id))
@@ -687,13 +674,13 @@ impl Viewer {
         SashimiExportBundle {
             tracks,
             omitted_tracks,
-            viewport: self.panels.active().viewport,
-            contig_name: self.panels.active().contig_name.clone(),
+            viewport: self.session.panels.active().viewport,
+            contig_name: self.session.panels.active().contig_name.clone(),
             annotations: junction_annotation_context(
-                &self.tracks,
-                &self.panels.active().track_snapshots,
-                &self.panels.active().track_snapshot_intervals,
-                self.panels.active().viewport.interval(),
+                &self.session.tracks,
+                &self.session.panels.active().track_snapshots,
+                &self.session.panels.active().track_snapshot_intervals,
+                self.session.panels.active().viewport.interval(),
             ),
         }
     }
@@ -723,14 +710,14 @@ impl Viewer {
             | TrackFrameKey::Auxiliary(_)
             | TrackFrameKey::Group { .. } => return,
         };
-        let mut order = self.track_presentation.pane_interactive_nodes(pane);
-        if pane == ui::TrackPane::Annotation && self.reference_engine.is_some() {
+        let mut order = self.session.track_presentation.pane_interactive_nodes(pane);
+        if pane == ui::TrackPane::Annotation && self.session.reference_engine.is_some() {
             order.insert(0, PresentationNodeId::Reference);
         }
         if !order.contains(&target) {
             return;
         }
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         let selected = panel
             .selected_presentation_nodes
             .iter()
@@ -747,7 +734,7 @@ impl Viewer {
             .iter()
             .map(|track| track.config.id)
             .collect::<BTreeSet<_>>();
-        let panel = self.panels.active_mut();
+        let panel = self.session.panels.active_mut();
         panel.selected_presentation_nodes = next;
         panel.presentation_selection_anchor = next_anchor;
         synchronize_panel_track_selection(panel, &alignment_ids);
@@ -792,7 +779,7 @@ impl Viewer {
         if query_requested {
             self.request_all_alignment_queries();
         }
-        self.rebuild_genomic_display(self.panels.active().id);
+        self.rebuild_genomic_display(self.session.panels.active().id);
         self.mark_display_dirty("explicit display invalidation");
         Ok(())
     }
@@ -805,9 +792,10 @@ impl Viewer {
         height: Option<f32>,
         rename_to_sample: bool,
     ) {
-        let previous_auxiliary_query_membership = auxiliary_query_track_ids(self.tracks.tracks())
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let previous_auxiliary_query_membership =
+            auxiliary_query_track_ids(self.session.tracks.tracks())
+                .into_iter()
+                .collect::<HashSet<_>>();
         let alignment_ids = self
             .alignment_tracks
             .iter()
@@ -827,7 +815,8 @@ impl Viewer {
                 }
             }));
             presentation_intents.extend(
-                self.tracks
+                self.session
+                    .tracks
                     .tracks()
                     .iter()
                     .filter(|track| selected.contains(&track.id))
@@ -847,6 +836,7 @@ impl Viewer {
                     .iter()
                     .any(|track| track.config.id == track_id);
                 let auxiliary = self
+                    .session
                     .tracks
                     .tracks()
                     .iter()
@@ -884,6 +874,7 @@ impl Viewer {
             }
         }
         for track in self
+            .session
             .tracks
             .tracks_mut()
             .iter_mut()
@@ -899,7 +890,7 @@ impl Viewer {
         }
         debug_assert_eq!(
             previous_auxiliary_query_membership,
-            auxiliary_query_track_ids(self.tracks.tracks())
+            auxiliary_query_track_ids(self.session.tracks.tracks())
                 .into_iter()
                 .collect::<HashSet<_>>(),
             "presentation changes must not alter auxiliary query membership"
@@ -947,7 +938,8 @@ impl Viewer {
         selected: &BTreeSet<TrackId>,
         action: QuantitativeBulkAction,
     ) {
-        let changed = apply_quantitative_bulk_action(self.tracks.tracks_mut(), selected, action);
+        let changed =
+            apply_quantitative_bulk_action(self.session.tracks.tracks_mut(), selected, action);
         if changed {
             self.rebuild_all_panel_displays();
             self.mark_display_dirty("explicit display invalidation");
@@ -965,6 +957,7 @@ impl Viewer {
     ) -> Result<usize> {
         let requested = ids.iter().copied().collect::<HashSet<_>>();
         let actual = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -975,6 +968,7 @@ impl Viewer {
             return Ok(0);
         }
         let suppressed_bundles = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -983,7 +977,7 @@ impl Viewer {
             .filter(|identity| identity.asset_role == LandmarkAssetRole::RepresentativeGenes)
             .map(|identity| identity.bundle_id.clone())
             .collect::<BTreeSet<_>>();
-        if let Some(engine) = &self.track_engine {
+        if let Some(engine) = &self.session.track_engine {
             // The actor request is queued before any replacement query. Do not
             // mutate visible state if bounded backpressure rejects the command.
             engine.try_remove_many(actual.clone())?;
@@ -991,18 +985,19 @@ impl Viewer {
 
         let removed = actual.iter().copied().collect::<HashSet<_>>();
         for id in &actual {
-            let _ = self.tracks.remove(*id);
-            self.track_presentation.remove_source(*id);
+            let _ = self.session.tracks.remove(*id);
+            self.session.track_presentation.remove_source(*id);
             self.automation_auxiliary_open_state.remove(id);
             self.metadata_selected_tracks.remove(id);
         }
         if suppress_builtin_genes && !suppressed_bundles.is_empty() {
-            self.suppressed_builtin_gene_bundles
+            self.session
+                .suppressed_builtin_gene_bundles
                 .extend(suppressed_bundles);
             self.landmark_search_index = None;
         }
         self.reconcile_track_presentation();
-        clear_removed_quantitative_dependencies(self.tracks.tracks_mut(), &removed);
+        clear_removed_quantitative_dependencies(self.session.tracks.tracks_mut(), &removed);
         self.annotation_search_results
             .hits
             .retain(|hit| !removed.contains(&hit.track_id));
@@ -1023,8 +1018,8 @@ impl Viewer {
             self.resizing_annotation_track = None;
         }
 
-        let has_engine = self.track_engine.is_some();
-        for panel in self.panels.iter_mut() {
+        let has_engine = self.session.track_engine.is_some();
+        for panel in self.session.panels.iter_mut() {
             // Invalidate any unread result produced before the actor processed
             // Remove, while retaining unaffected snapshots for the next frame.
             panel.generation_clock.advance();
@@ -1051,6 +1046,7 @@ impl Viewer {
     /// The implementation behind `Action::RemoveTracks`; only the action path calls it.
     pub(crate) fn remove_tracks_now(&mut self, selected: &BTreeSet<TrackId>) -> Result<usize> {
         let auxiliary_ids = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -1113,10 +1109,10 @@ impl Viewer {
             for projection in track.projections.values_mut() {
                 projection.advance_scene_generation();
             }
-            self.panels.active_mut().pending_queries.alignment = true;
+            self.session.panels.active_mut().pending_queries.alignment = true;
         }
         if outcome.configuration_changed {
-            self.rebuild_genomic_display(self.panels.active().id);
+            self.rebuild_genomic_display(self.session.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if outcome.query_changed {

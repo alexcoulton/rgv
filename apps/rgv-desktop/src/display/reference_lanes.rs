@@ -61,9 +61,9 @@ impl Viewer {
         let unavailable_context_lanes = &mut pass.unavailable_context_lanes;
         let context_lane_drafts = &mut pass.context_lane_drafts;
         let mut top = pass.top;
-        if self.reference_engine.is_some() {
+        if self.session.reference_engine.is_some() {
             let frame_top = top;
-            let reference_expanded = self.track_presentation.reference_content_visible;
+            let reference_expanded = self.session.track_presentation.reference_content_visible;
             let sequence_top = frame_top + 25.0;
             let translation_top = sequence_top + 23.0;
             let natural_bottom = if reference_expanded {
@@ -72,7 +72,8 @@ impl Viewer {
                 frame_top + 26.0
             };
             let bottom = if reference_expanded {
-                self.track_presentation
+                self.session
+                    .track_presentation
                     .reference_preferred_height
                     .map_or(natural_bottom, |height| {
                         frame_top + height.clamp(80.0, 600.0)
@@ -82,8 +83,8 @@ impl Viewer {
             };
             let reference_context_interval = buffered_context_interval(
                 target_viewport,
-                self.panels.panel(panel_id).contig_length,
-                self.settings.read_browsing_buffer_percent,
+                self.session.panels.panel(panel_id).contig_length,
+                self.session.settings.read_browsing_buffer_percent,
                 Some(MAX_REFERENCE_QUERY_BASES),
             );
             if reference_expanded {
@@ -91,25 +92,41 @@ impl Viewer {
                     ContextLaneKey::Reference,
                     (TrackFrameKey::Reference, Some(reference_context_interval)),
                 );
-                if self.panels.panel(panel_id).pending_queries.reference
-                    || self.panels.panel(panel_id).reference_settled_generation != Some(generation)
+                if self
+                    .session
+                    .panels
+                    .panel(panel_id)
+                    .pending_queries
+                    .reference
+                    || self
+                        .session
+                        .panels
+                        .panel(panel_id)
+                        .reference_settled_generation
+                        != Some(generation)
                 {
                     pending_context_lanes.insert(ContextLaneKey::Reference);
                 }
-                if self.panels.panel(panel_id).reference_query_error_generation == Some(generation)
+                if self
+                    .session
+                    .panels
+                    .panel(panel_id)
+                    .reference_query_error_generation
+                    == Some(generation)
                 {
                     unavailable_context_lanes.insert(ContextLaneKey::Reference);
                 }
             }
             if reference_expanded
                 && let Some(reference) = self
+                    .session
                     .panels
                     .panel(panel_id)
                     .reference_slice
                     .as_deref()
                     .filter(|_| {
-                        self.panels.panel(panel_id).reference_slice_revision
-                            == self.reference_revision
+                        self.session.panels.panel(panel_id).reference_slice_revision
+                            == self.session.reference_revision
                     })
                     .filter(|slice| retained_data_overlaps(slice.interval, viewport_interval))
             {
@@ -129,11 +146,12 @@ impl Viewer {
                     translation_top,
                     &self.reference_translation_frames,
                     self.reference_genetic_code,
-                    self.panels.panel(panel_id).contig_length,
+                    self.session.panels.panel(panel_id).contig_length,
                 );
                 context_lane_drafts.push(ContextLaneDraft {
                     key: ContextLaneKey::Reference,
                     generation: self
+                        .session
                         .panels
                         .panel(panel_id)
                         .reference_slice_generation
@@ -146,7 +164,12 @@ impl Viewer {
             }
             let mut subtracks = Vec::new();
             if reference_expanded {
-                let bases_per_pixel = self.panels.panel(panel_id).viewport.bases_per_pixel();
+                let bases_per_pixel = self
+                    .session
+                    .panels
+                    .panel(panel_id)
+                    .viewport
+                    .bases_per_pixel();
                 let reference_detail = if bases_per_pixel > MAXIMUM_BASE_MARK_BASES_PER_PIXEL {
                     Some("zoom in to see sequence".to_owned())
                 } else if 1.0 / bases_per_pixel < f64::from(MINIMUM_BASE_GLYPH_PIXEL_WIDTH) {
@@ -185,6 +208,7 @@ impl Viewer {
                 name: "Reference sequence".to_owned(),
                 kind: TrackKind::Reference,
                 source_label: self
+                    .session
                     .reference_source
                     .as_ref()
                     .map(TrackSource::redacted_label),
@@ -195,7 +219,11 @@ impl Viewer {
                 frozen_bottom: None,
                 subtracks,
             };
-            self.panels.panel_mut(panel_id).track_frames.push(frame);
+            self.session
+                .panels
+                .panel_mut(panel_id)
+                .track_frames
+                .push(frame);
             top = bottom;
         }
         pass.top = top;
@@ -247,12 +275,14 @@ impl Viewer {
                         Some(desired_context_interval),
                     ),
                 );
-                if self.panels.panel(panel_id).pending_queries.tracks
-                    || self.panels.panel(panel_id).track_settled_generation != Some(generation)
+                if self.session.panels.panel(panel_id).pending_queries.tracks
+                    || self.session.panels.panel(panel_id).track_settled_generation
+                        != Some(generation)
                 {
                     pending_context_lanes.insert(key);
                 }
                 if self
+                    .session
                     .panels
                     .panel(panel_id)
                     .track_query_error_generations
@@ -264,6 +294,7 @@ impl Viewer {
             }
             if !config.collapsed
                 && let Some(loaded_interval) = self
+                    .session
                     .panels
                     .panel(panel_id)
                     .track_snapshot_intervals
@@ -274,6 +305,7 @@ impl Viewer {
                     data: TrackSnapshotData::Features(records),
                     ..
                 }) = self
+                    .session
                     .panels
                     .panel(panel_id)
                     .track_snapshots
@@ -286,6 +318,7 @@ impl Viewer {
                     height,
                     maximum_rows: pinned_gene_layout_maximum_rows(height),
                     selected_record: self
+                        .session
                         .panels
                         .panel(panel_id)
                         .selected_feature
@@ -310,6 +343,7 @@ impl Viewer {
                 context_lane_drafts.push(ContextLaneDraft {
                     key: ContextLaneKey::Auxiliary(config.id),
                     generation: self
+                        .session
                         .panels
                         .panel(panel_id)
                         .track_snapshot_generations
@@ -324,7 +358,8 @@ impl Viewer {
                     display: gene_display,
                 });
             }
-            self.panels
+            self.session
+                .panels
                 .panel_mut(panel_id)
                 .track_frames
                 .push(TrackFrame {

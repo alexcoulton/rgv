@@ -47,9 +47,9 @@ use rgv_model::{
     FeatureRowAxis, FeatureTile, GenotypeCall, GenotypeMatrix, GwasQuery, InteractionQuery,
     InteractionTile, MutationQuery, Strand, TRACK_TILE_BINS, TileBin, TileFeature,
     TileFeatureBlock, TileInteraction, TileVariant, TileVariantKind, TrackCancellation, TrackColor,
-    TrackColorToken, TrackDigest, TrackRecordId, TrackRendererId, TrackRowStability, TrackTile,
-    TrackTileError, TrackTileKey, TrackTileLod, TrackTilePayload, TrackTileProvenance,
-    TrackTileRequest, TrackTileScene, VariantQuery, VariantType,
+    TrackColorToken, TrackDigest, TrackRecord, TrackRecordId, TrackRecordQuery, TrackRendererId,
+    TrackRowStability, TrackTile, TrackTileError, TrackTileKey, TrackTileLod, TrackTilePayload,
+    TrackTileProvenance, TrackTileRequest, TrackTileScene, VariantQuery, VariantType,
 };
 
 use crate::{
@@ -63,6 +63,10 @@ use crate::{
 pub const MAXIMUM_CLUSTER_CLOSURE_ROUNDS: usize = 8;
 /// Furthest a feature tile reads beyond either of its edges for row stability, in tile spans.
 pub const MAXIMUM_CLUSTER_CLOSURE_TILES: u64 = 64;
+/// Most bytes of complete records a built-in feature source hands over with one tile
+/// ([`TrackTileSource::take_retained_records`]). Records beyond it are resolved by a re-read
+/// ([`TrackTileSource::lookup_record`]).
+pub const MAXIMUM_RETAINED_RECORD_BYTES_PER_TILE: usize = 256 << 10;
 
 /// A name search handed to a source.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +125,25 @@ pub trait TrackTileSource: Send {
     /// Input the source had to skip; `None` for kinds that do not track it.
     fn diagnostics(&self) -> Option<TrackSourceDiagnostics> {
         None
+    }
+
+    /// The complete record with identity `query.id`, found by reading `query`'s interval (the
+    /// record's own) and nothing wider. `None` when the source has no such record there, and
+    /// for kinds whose tiles carry everything there is to show.
+    fn lookup_record(
+        &mut self,
+        _query: &TrackRecordQuery,
+        _cancel: &TrackCancellation,
+    ) -> Result<Option<TrackRecord>, TrackTileError> {
+        Ok(None)
+    }
+
+    /// Complete records of the tile the last successful [`Self::query_tile`] returned, for
+    /// the engine to keep with the tile so a later [`Self::lookup_record`] needs no read. The
+    /// engine calls it once after each tile; a source that keeps nothing returns nothing.
+    /// What is returned is charged to the track's tile cache budget.
+    fn take_retained_records(&mut self) -> Vec<TrackRecord> {
+        Vec::new()
     }
 }
 
@@ -211,11 +234,16 @@ fn source_error(message: String, cancel: &TrackCancellation) -> TrackTileError {
 /// Adapter giving any legacy [`TrackSource`] the tile contract.
 pub(crate) struct LegacyTrackTileSource {
     source: Box<dyn TrackSource>,
+    /// Complete records of the feature tile built last, until the engine takes them.
+    retained: Vec<TrackRecord>,
 }
 
 impl LegacyTrackTileSource {
     pub(crate) fn new(source: Box<dyn TrackSource>) -> Self {
-        Self { source }
+        Self {
+            source,
+            retained: Vec::new(),
+        }
     }
 
     fn query(
@@ -290,6 +318,17 @@ impl LegacyTrackTileSource {
             .zip(rows)
             .filter(|((record, _), _)| record.end > key.start() && record.start < key.end())
             .map(|((record, (_, _, id)), row)| tile_feature(record, id, Some(row), key))
+            .collect();
+        // The complete records of the tile, within the retention bound, go with the tile.
+        let mut retained_bytes = 0_usize;
+        self.retained = records
+            .into_iter()
+            .filter(|record| record.end > key.start() && record.start < key.end())
+            .map(TrackRecord::Feature)
+            .take_while(|record| {
+                retained_bytes = retained_bytes.saturating_add(record.resident_bytes());
+                retained_bytes <= MAXIMUM_RETAINED_RECORD_BYTES_PER_TILE
+            })
             .collect();
         Ok((
             FeatureTile {
@@ -532,24 +571,13 @@ fn variant_payload(
     let variants = query
         .records
         .iter()
-        .map(|record| {
-            let alternates = record.alternates.join(&b","[..]);
-            TileVariant {
-                id: TrackRecordId::from_parts(
-                    record.start,
-                    record.end,
-                    &[
-                        record.id.as_deref().unwrap_or_default().as_bytes(),
-                        &record.reference,
-                        &alternates,
-                    ],
-                ),
-                start: record.start,
-                end: record.end,
-                kind: variant_kind(&record.variant_types),
-                name: record.id.as_deref().map(Arc::from),
-                quality: record.quality,
-            }
+        .map(|record| TileVariant {
+            id: TrackRecordId::for_variant(record),
+            start: record.start,
+            end: record.end,
+            kind: variant_kind(&record.variant_types),
+            name: record.id.as_deref().map(Arc::from),
+            quality: record.quality,
         })
         .collect::<Vec<_>>();
     let genotypes = (request.settings.genotype_matrix
@@ -796,11 +824,68 @@ impl TrackTileSource for LegacyTrackTileSource {
     ) -> Result<TrackTile, TrackTileError> {
         let (keep_going, budget) = remote_control(request.transfer_budget, cancel);
         self.source.set_remote_control(keep_going, budget);
+        self.retained.clear();
         let result = self.query_tile_installed(request, cancel);
+        if result.is_err() {
+            self.retained.clear();
+        }
         // A later search or feature step must not inherit this request's cancellation.
         self.source
             .set_remote_control(None, Some(REMOTE_TRACK_OPERATION_TRANSFER_BUDGET));
         result
+    }
+
+    fn lookup_record(
+        &mut self,
+        query: &TrackRecordQuery,
+        cancel: &TrackCancellation,
+    ) -> Result<Option<TrackRecord>, TrackTileError> {
+        cancel.check()?;
+        let (keep_going, budget) = remote_control(None, cancel);
+        self.source.set_remote_control(keep_going, budget);
+        let settings = TrackQuerySettings {
+            variant: query.settings.variant.as_deref(),
+            interaction: query.settings.interaction.as_deref(),
+            copy_number: query.settings.copy_number.as_deref(),
+        };
+        // The record's own interval, and at least one base of it for a zero-length record.
+        let result = self
+            .source
+            .query(
+                &query.contig,
+                query.start,
+                query.end.max(query.start.saturating_add(1)),
+                settings,
+            )
+            .map_err(|message| source_error(message, cancel));
+        self.source
+            .set_remote_control(None, Some(REMOTE_TRACK_OPERATION_TRANSFER_BUDGET));
+        let data = result?;
+        cancel.check()?;
+        Ok(match data {
+            TrackSnapshotData::Features(records) => records
+                .into_iter()
+                .find(|record| {
+                    record.start == query.start
+                        && record.end == query.end
+                        && TrackRecordId::for_feature(record) == query.id
+                })
+                .map(TrackRecord::Feature),
+            TrackSnapshotData::Variants(variants) => variants
+                .records
+                .iter()
+                .find(|record| {
+                    record.start == query.start
+                        && record.end == query.end
+                        && TrackRecordId::for_variant(record) == query.id
+                })
+                .map(|record| TrackRecord::Variant(Box::new(record.clone()))),
+            _ => None,
+        })
+    }
+
+    fn take_retained_records(&mut self) -> Vec<TrackRecord> {
+        std::mem::take(&mut self.retained)
     }
 
     fn adjacent_feature(

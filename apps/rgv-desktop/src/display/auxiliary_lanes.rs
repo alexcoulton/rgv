@@ -80,7 +80,8 @@ impl Viewer {
             };
             let overlay_group = config.quantitative.overlay_group;
             let composite_visible = overlay_group.is_none_or(|group| {
-                self.track_presentation
+                self.session
+                    .track_presentation
                     .composite_content_visible(ui::TrackPane::Annotation, group)
             });
             let member_content_visible = members.iter().any(|member| member.visible);
@@ -121,12 +122,14 @@ impl Viewer {
                             Some(desired_context_interval),
                         ),
                     );
-                    if self.panels.panel(panel_id).pending_queries.tracks
-                        || self.panels.panel(panel_id).track_settled_generation != Some(generation)
+                    if self.session.panels.panel(panel_id).pending_queries.tracks
+                        || self.session.panels.panel(panel_id).track_settled_generation
+                            != Some(generation)
                     {
                         pending_context_lanes.insert(key);
                     }
                     if self
+                        .session
                         .panels
                         .panel(panel_id)
                         .track_query_error_generations
@@ -151,6 +154,7 @@ impl Viewer {
                         continue;
                     }
                     let Some(snapshot) = self
+                        .session
                         .panels
                         .panel(panel_id)
                         .track_snapshots
@@ -160,6 +164,7 @@ impl Viewer {
                         continue;
                     };
                     let Some(loaded_interval) = self
+                        .session
                         .panels
                         .panel(panel_id)
                         .track_snapshot_intervals
@@ -198,6 +203,7 @@ impl Viewer {
                     context_lane_drafts.push(ContextLaneDraft {
                         key: ContextLaneKey::Auxiliary(member.id),
                         generation: self
+                            .session
                             .panels
                             .panel(panel_id)
                             .track_snapshot_generations
@@ -213,7 +219,8 @@ impl Viewer {
                     });
                 }
             }
-            self.panels
+            self.session
+                .panels
                 .panel_mut(panel_id)
                 .track_frames
                 .push(TrackFrame {
@@ -246,48 +253,55 @@ impl Viewer {
     /// Index of the record selected on `track_id` in the active panel,
     /// whichever kind of auxiliary selection holds it.
     fn selected_auxiliary_record(&self, panel_id: PanelId, track_id: TrackId) -> Option<usize> {
-        self.panels
+        self.session
+            .panels
             .panel(panel_id)
             .selected_feature
             .filter(|selection| selection.track_id == track_id)
             .map(|selection| selection.record_index)
             .or_else(|| {
-                self.panels
+                self.session
+                    .panels
                     .panel(panel_id)
                     .selected_variant
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.record_index)
             })
             .or_else(|| {
-                self.panels
+                self.session
+                    .panels
                     .panel(panel_id)
                     .selected_gwas
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.record_index)
             })
             .or_else(|| {
-                self.panels
+                self.session
+                    .panels
                     .panel(panel_id)
                     .selected_quantitative
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.record_index)
             })
             .or_else(|| {
-                self.panels
+                self.session
+                    .panels
                     .panel(panel_id)
                     .selected_interaction
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.record_index)
             })
             .or_else(|| {
-                self.panels
+                self.session
+                    .panels
                     .panel(panel_id)
                     .selected_copy_number
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.segment_index)
             })
             .or_else(|| {
-                self.panels
+                self.session
+                    .panels
                     .panel(panel_id)
                     .selected_mutation
                     .filter(|selection| selection.track_id == track_id)
@@ -322,7 +336,7 @@ impl Viewer {
             .then(|| {
                 quantitative_display_records(
                     member,
-                    &self.panels.panel(panel_id).track_snapshots,
+                    &self.session.panels.panel(panel_id).track_snapshots,
                     source_viewport,
                 )
             })
@@ -382,7 +396,7 @@ impl Viewer {
                     .then(|| {
                         shared_quantitative_range(
                             effective_auxiliary_configs,
-                            &self.panels.panel(panel_id).track_snapshots,
+                            &self.session.panels.panel(panel_id).track_snapshots,
                             source_viewport,
                             member.quantitative.scale_transform,
                             member.quantitative.scale_group,
@@ -407,7 +421,7 @@ impl Viewer {
                         shared_copy_number_range(
                             member,
                             effective_auxiliary_configs,
-                            &self.panels.panel(panel_id).track_snapshots,
+                            &self.session.panels.panel(panel_id).track_snapshots,
                         )
                     })
                     .flatten();
@@ -418,8 +432,9 @@ impl Viewer {
                     effective_copy_number_settings,
                     &member.quantitative,
                     shared_range,
-                    self.panels.annotation_scroll_points + self.canvas_geometry().viewport.top(),
-                    self.panels.annotation_scroll_points + annotation_clip_bottom,
+                    self.session.panels.annotation_scroll_points
+                        + self.canvas_geometry().viewport.top(),
+                    self.session.panels.annotation_scroll_points + annotation_clip_bottom,
                 );
                 if effective_copy_number_settings.show_sample_names {
                     subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
@@ -450,8 +465,9 @@ impl Viewer {
                     source_viewport,
                     options,
                     effective_mutation_settings,
-                    self.panels.annotation_scroll_points + self.canvas_geometry().viewport.top(),
-                    self.panels.annotation_scroll_points + annotation_clip_bottom,
+                    self.session.panels.annotation_scroll_points
+                        + self.canvas_geometry().viewport.top(),
+                    self.session.panels.annotation_scroll_points + annotation_clip_bottom,
                 );
                 if effective_mutation_settings.show_sample_names {
                     subtracks.extend(layout.visible_rows.iter().filter_map(|row| {
@@ -474,7 +490,7 @@ impl Viewer {
             TrackSnapshotData::Interactions(query) => {
                 layout_interactions(
                     &query.records,
-                    &self.panels.panel(panel_id).contig_name,
+                    &self.session.panels.panel(panel_id).contig_name,
                     source_viewport,
                     options,
                     &member.interaction,

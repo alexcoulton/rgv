@@ -63,7 +63,7 @@ impl Viewer {
                         .selected_text(&st.snapshot.contig_name)
                         .width(90.0)
                         .show_ui(ui, |ui| {
-                            for contig in self.assembly.dictionary.iter() {
+                            for contig in self.session.assembly.dictionary.iter() {
                                 if ui
                                     .selectable_label(
                                         contig.name() == st.snapshot.contig_name,
@@ -216,14 +216,22 @@ impl Viewer {
     pub(super) fn locus_history_and_zoom_ui(&self, ui: &mut egui::Ui, st: &mut ShellFrame) {
         let previous_locus = ui
             .add_enabled(
-                self.panels.active().navigation_history.can_go_back(),
+                self.session
+                    .panels
+                    .active()
+                    .navigation_history
+                    .can_go_back(),
                 ui::icons::IconButton::new(ui::icons::AppIcon::Previous, "Previous locus"),
             )
             .on_hover_text("Previous locus");
         previous_locus.widget_info(|| {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Button,
-                self.panels.active().navigation_history.can_go_back(),
+                self.session
+                    .panels
+                    .active()
+                    .navigation_history
+                    .can_go_back(),
                 "Previous locus",
             )
         });
@@ -232,14 +240,22 @@ impl Viewer {
         }
         let next_locus = ui
             .add_enabled(
-                self.panels.active().navigation_history.can_go_forward(),
+                self.session
+                    .panels
+                    .active()
+                    .navigation_history
+                    .can_go_forward(),
                 ui::icons::IconButton::new(ui::icons::AppIcon::Next, "Next locus"),
             )
             .on_hover_text("Next locus");
         next_locus.widget_info(|| {
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Button,
-                self.panels.active().navigation_history.can_go_forward(),
+                self.session
+                    .panels
+                    .active()
+                    .navigation_history
+                    .can_go_forward(),
                 "Next locus",
             )
         });
@@ -269,11 +285,12 @@ impl Viewer {
         if zoom_out.clicked() {
             st.nav.zoom_out_requested = true;
         }
-        let maximum_zoom = (self.panels.active().contig_length.max(1) as f64)
+        let maximum_zoom = (self.session.panels.active().contig_length.max(1) as f64)
             .log10()
             .max(1.0);
-        let mut zoom_level =
-            (self.panels.active().contig_length as f64 / st.snapshot.interval.len() as f64).log10();
+        let mut zoom_level = (self.session.panels.active().contig_length as f64
+            / st.snapshot.interval.len() as f64)
+            .log10();
         let zoom_response = ui
             .add(egui::Slider::new(&mut zoom_level, 0.0..=maximum_zoom).show_value(false))
             .on_hover_text("Genome zoom");
@@ -281,9 +298,10 @@ impl Viewer {
             .widget_info(|| egui::WidgetInfo::slider(true, zoom_level, "Genome zoom level"));
         if zoom_response.changed() {
             st.nav.requested_span = Some(
-                (self.panels.active().contig_length as f64 / 10_f64.powf(zoom_level))
+                (self.session.panels.active().contig_length as f64 / 10_f64.powf(zoom_level))
                     .round()
-                    .clamp(1.0, self.panels.active().contig_length as f64) as u64,
+                    .clamp(1.0, self.session.panels.active().contig_length as f64)
+                    as u64,
             );
         }
         let zoom_in = ui

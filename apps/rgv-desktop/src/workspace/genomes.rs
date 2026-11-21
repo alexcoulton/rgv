@@ -273,7 +273,7 @@ impl Viewer {
                     let name = configuration.name.clone();
                     match self.apply_genome_configuration(&configuration) {
                         Ok(()) => {
-                            self.data_status = if notices.is_empty() {
+                            self.session.data_status = if notices.is_empty() {
                                 format!("Opening genome {name}…")
                             } else {
                                 format!("Opening genome {name}… ({})", notices.join("; "))
@@ -328,16 +328,19 @@ impl Viewer {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        self.assembly_name.clone_from(&configuration.name);
-        self.assembly_identity
+        self.session.assembly_name.clone_from(&configuration.name);
+        self.session
+            .assembly_identity
             .clone_from(&configuration.assembly_identity);
-        self.assembly
+        self.session
+            .assembly
             .identity
             .clone_from(&configuration.assembly_identity);
-        self.assembly.default_annotation_count = configuration.default_annotations.len();
-        self.contig_aliases
+        self.session.assembly.default_annotation_count = configuration.default_annotations.len();
+        self.session
+            .contig_aliases
             .clone_from(&configuration.contig_aliases);
-        self.cytoband_path = cytoband_path;
+        self.session.cytoband_path = cytoband_path;
         let reference = source_path(&configuration.reference);
         self.open_reference_source_with_remote_index(
             &reference,

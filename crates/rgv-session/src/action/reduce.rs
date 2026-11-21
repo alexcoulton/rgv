@@ -3,15 +3,14 @@
 //!
 //! Nothing here touches engines, layout or the window. A reducer validates first, then edits
 //! the workspace, and reports the [`Effect`]s the host owes and the actions that would undo the
-//! edit. Tests drive it directly; `Viewer::apply_action` drives it with the live workspace.
+//! edit. Tests drive it directly; the host's `apply_action` drives it with the live workspace.
 
 use super::{Action, ActionOutcome, Effect, PanelRestore, ViewportCommit};
-use crate::automation::automation_viewport_after_operation;
-use crate::workspace::navigation::{resolve_initial_locus, standalone_locus};
-use crate::workspace::navigation_controller::{
-    HistoryPanelContig, LociNavigationPlan, loci_navigation_plan, resolve_history_entry,
+use crate::navigation::{
+    HistoryPanelContig, LociNavigationPlan, automation_viewport_after_operation,
+    loci_navigation_plan, resolve_history_entry, resolve_initial_locus, standalone_locus,
 };
-use crate::workspace::panels::{PanelWorkspace, ViewPanelController};
+use crate::panels::{Panel, PanelState, PanelWorkspace};
 use anyhow::{Context as _, Result};
 use rgv_automation::AutomationHistoryNavigation;
 use rgv_core::{
@@ -20,29 +19,29 @@ use rgv_core::{
 };
 
 /// Narrowest canvas, in logical points, a panel may be given.
-pub(crate) const MINIMUM_PANEL_CANVAS_WIDTH: f32 = 140.0;
+pub const MINIMUM_PANEL_CANVAS_WIDTH: f32 = 140.0;
 
 /// What a panel reducer needs to know about the world outside the panel workspace.
-pub(crate) struct PanelContext<'a> {
+pub struct PanelContext<'a> {
     /// The dictionary the addressed panel's coordinates are expressed in, if one is open.
-    pub(crate) dictionary: Option<&'a ReferenceDictionary>,
+    pub dictionary: Option<&'a ReferenceDictionary>,
     /// The dictionary a new panel falls back to when no source dictionary is open.
-    pub(crate) fallback_dictionary: &'a ReferenceDictionary,
-    pub(crate) aliases: &'a ContigAliases,
+    pub fallback_dictionary: &'a ReferenceDictionary,
+    pub aliases: &'a ContigAliases,
     /// Canvas width, in logical points, each panel gets when the workspace holds that many.
-    pub(crate) canvas_width_for: &'a dyn Fn(usize) -> f32,
+    pub canvas_width_for: &'a dyn Fn(usize) -> f32,
     /// Top of the track viewport, where a new panel's content starts.
-    pub(crate) content_top: f32,
+    pub content_top: f32,
 }
 
 /// The result of one reduction.
 #[derive(Debug, Default)]
-pub(crate) struct Reduced {
-    pub(crate) outcome: ActionOutcome,
-    pub(crate) effects: Vec<Effect>,
+pub struct Reduced {
+    pub outcome: ActionOutcome,
+    pub effects: Vec<Effect>,
     /// Actions that put the document back, in the order to apply them. Empty for navigation,
     /// which Back/Forward already covers, and for focus changes.
-    pub(crate) inverse: Vec<Action>,
+    pub inverse: Vec<Action>,
 }
 
 impl Reduced {
@@ -63,7 +62,7 @@ impl Reduced {
 }
 
 /// Whether [`reduce_panel_action`] implements the action.
-pub(crate) const fn is_panel_action(action: &Action) -> bool {
+pub const fn is_panel_action(action: &Action) -> bool {
     !matches!(
         action,
         Action::ApplyTrackIntents { .. }
@@ -81,7 +80,7 @@ fn resolve_locus(ctx: &PanelContext<'_>, locus: &str) -> Result<(GenomicInterval
     }
 }
 
-fn ensure_panel(panels: &PanelWorkspace, panel_id: PanelId) -> Result<()> {
+fn ensure_panel<P: Panel>(panels: &PanelWorkspace<P>, panel_id: PanelId) -> Result<()> {
     anyhow::ensure!(
         panels.get(panel_id).is_some(),
         "panel {} was not found",
@@ -92,8 +91,8 @@ fn ensure_panel(panels: &PanelWorkspace, panel_id: PanelId) -> Result<()> {
 
 /// The primitive actions a multi-locus `GoToLoci` stands for. Every locus is validated before
 /// anything is returned, so a bad expression replaces no panel.
-pub(crate) fn expand_go_to_loci(
-    panels: &PanelWorkspace,
+pub fn expand_go_to_loci<P: Panel>(
+    panels: &PanelWorkspace<P>,
     ctx: &PanelContext<'_>,
     panel_id: PanelId,
     loci: &[String],
@@ -121,7 +120,7 @@ pub(crate) fn expand_go_to_loci(
     actions.extend(
         panels
             .iter()
-            .map(|panel| panel.id)
+            .map(|panel| panel.state().id)
             .filter(|id| *id != panel_id)
             .map(|panel_id| Action::ClosePanel { panel_id }),
     );
@@ -134,8 +133,11 @@ pub(crate) fn expand_go_to_loci(
 
 /// Records where `panel_id` is as one history entry and returns the locus string for the recent
 /// list. This is what committing a settled gesture does.
-pub(crate) fn record_panel_visit(panels: &mut PanelWorkspace, panel_id: PanelId) -> Option<String> {
-    let panel = panels.get_mut(panel_id)?;
+pub fn record_panel_visit<P: Panel>(
+    panels: &mut PanelWorkspace<P>,
+    panel_id: PanelId,
+) -> Option<String> {
+    let panel = panels.get_mut(panel_id)?.state_mut();
     let interval = panel.viewport.interval();
     panel.visit_history(interval);
     Some(format!(
@@ -146,8 +148,8 @@ pub(crate) fn record_panel_visit(panels: &mut PanelWorkspace, panel_id: PanelId)
     ))
 }
 
-fn retarget(
-    panels: &mut PanelWorkspace,
+fn retarget<P: Panel>(
+    panels: &mut PanelWorkspace<P>,
     panel_id: PanelId,
     interval: GenomicInterval,
     contig_name: String,
@@ -155,7 +157,7 @@ fn retarget(
     viewport: Viewport,
     record: bool,
 ) -> Reduced {
-    let panel = panels.panel_mut(panel_id);
+    let panel = panels.panel_mut(panel_id).state_mut();
     panel.viewport = viewport;
     panel.contig_name = contig_name;
     panel.contig_length = contig_length;
@@ -177,14 +179,14 @@ fn retarget(
     }
 }
 
-fn navigate_to_entry(
-    panels: &mut PanelWorkspace,
+fn navigate_to_entry<P: Panel>(
+    panels: &mut PanelWorkspace<P>,
     ctx: &PanelContext<'_>,
     panel_id: PanelId,
     entry: &NavigationEntry,
     record: bool,
 ) -> Result<Reduced> {
-    let panel = panels.panel(panel_id);
+    let panel = panels.panel(panel_id).state();
     let (interval, contig_name, contig_length) = resolve_history_entry(
         entry,
         ctx.dictionary,
@@ -207,14 +209,14 @@ fn navigate_to_entry(
     ))
 }
 
-fn insert_panel(
-    panels: &mut PanelWorkspace,
-    panel: ViewPanelController,
+fn insert_panel<P: Panel>(
+    panels: &mut PanelWorkspace<P>,
+    panel: P,
     index: Option<usize>,
     focus: bool,
 ) -> Result<Reduced> {
-    let panel_id = panel.id;
-    let previous_focus = panels.active().id;
+    let panel_id = panel.state().id;
+    let previous_focus = panels.active().state().id;
     anyhow::ensure!(panels.push(panel), "view panel identity collision");
     if let Some(index) = index {
         panels.move_panel(panel_id, index);
@@ -247,17 +249,20 @@ fn insert_panel(
 /// navigation; the host uses it to turn a still-pending gesture into its own history entry so
 /// the gesture's end point is not lost.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn reduce_panel_action(
-    panels: &mut PanelWorkspace,
+pub fn reduce_panel_action<P: Panel>(
+    panels: &mut PanelWorkspace<P>,
     ctx: &PanelContext<'_>,
     action: &Action,
-    before_commit: &mut dyn FnMut(&mut PanelWorkspace),
+    before_commit: &mut dyn FnMut(&mut PanelWorkspace<P>),
 ) -> Result<Reduced> {
     match action {
         Action::GoToLocus { panel_id, locus } => {
             ensure_panel(panels, *panel_id)?;
             let (interval, contig_name, contig_length) = resolve_locus(ctx, locus)?;
-            let viewport = Viewport::new(interval, panels.panel(*panel_id).viewport.pixel_width())?;
+            let viewport = Viewport::new(
+                interval,
+                panels.panel(*panel_id).state().viewport.pixel_width(),
+            )?;
             before_commit(panels);
             Ok(retarget(
                 panels,
@@ -283,13 +288,13 @@ pub(crate) fn reduce_panel_action(
             commit,
         } => {
             ensure_panel(panels, *panel_id)?;
-            let panel = panels.panel(*panel_id);
+            let panel = panels.panel(*panel_id).state();
             let next = automation_viewport_after_operation(
                 panel.viewport,
                 panel.contig_length,
                 *operation,
             )?;
-            let panel = panels.panel_mut(*panel_id);
+            let panel = panels.panel_mut(*panel_id).state_mut();
             panel.viewport = next;
             if *commit == ViewportCommit::Discrete {
                 panel.visit_history(next.interval());
@@ -318,7 +323,7 @@ pub(crate) fn reduce_panel_action(
             if *commit == ViewportCommit::Discrete {
                 before_commit(panels);
             }
-            let panel = panels.panel_mut(*panel_id);
+            let panel = panels.panel_mut(*panel_id).state_mut();
             panel.viewport = *viewport;
             if *commit == ViewportCommit::Discrete {
                 panel.visit_history(interval);
@@ -359,7 +364,7 @@ pub(crate) fn reduce_panel_action(
             ensure_panel(panels, *panel_id)?;
             // An unsettled gesture is recorded first, so Back returns to where it started.
             before_commit(panels);
-            let history = &mut panels.panel_mut(*panel_id).navigation_history;
+            let history = &mut panels.panel_mut(*panel_id).state_mut().navigation_history;
             let entry = match step {
                 AutomationHistoryNavigation::Back => history.back(),
                 AutomationHistoryNavigation::Forward => history.forward(),
@@ -375,7 +380,7 @@ pub(crate) fn reduce_panel_action(
         Action::NavigateHome { panel_id } => {
             ensure_panel(panels, *panel_id)?;
             before_commit(panels);
-            let panel = panels.panel_mut(*panel_id);
+            let panel = panels.panel_mut(*panel_id).state_mut();
             let home = panel.home.clone();
             panel.navigation_history.visit(home.clone());
             navigate_to_entry(panels, ctx, *panel_id, &home, false)
@@ -403,7 +408,7 @@ pub(crate) fn reduce_panel_action(
             let (interval, contig_name, contig_length) =
                 resolve_initial_locus(dictionary, ctx.aliases, Some(locus))?;
             let viewport = Viewport::new(interval, f64::from(width.max(1.0)))?;
-            let mut panel = ViewPanelController::new(
+            let mut panel = PanelState::new(
                 panels.next_id(),
                 viewport,
                 Some(locus.clone()),
@@ -411,7 +416,7 @@ pub(crate) fn reduce_panel_action(
                 contig_length,
             );
             panel.content_bottom_points = ctx.content_top;
-            insert_panel(panels, panel, None, true)
+            insert_panel(panels, P::from_state(panel), None, true)
         }
         Action::RestorePanel(restore) => {
             anyhow::ensure!(
@@ -428,7 +433,7 @@ pub(crate) fn reduce_panel_action(
                 width >= MINIMUM_PANEL_CANVAS_WIDTH,
                 "the window is too narrow to add another readable panel"
             );
-            let focused = panels.active();
+            let focused = panels.active().state();
             let (interval, contig_name, contig_length) = resolve_history_entry(
                 &restore.locus,
                 ctx.dictionary,
@@ -440,7 +445,7 @@ pub(crate) fn reduce_panel_action(
                 },
             )?;
             let viewport = Viewport::new(interval, f64::from(width.max(1.0)))?;
-            let mut panel = ViewPanelController::new(
+            let mut panel = PanelState::new(
                 restore.panel_id,
                 viewport,
                 restore.requested_locus.clone(),
@@ -448,10 +453,18 @@ pub(crate) fn reduce_panel_action(
                 contig_length,
             );
             panel.content_bottom_points = ctx.content_top;
-            insert_panel(panels, panel, Some(restore.index), restore.was_focused)
+            insert_panel(
+                panels,
+                P::from_state(panel),
+                Some(restore.index),
+                restore.was_focused,
+            )
         }
         Action::ClosePanel { panel_id } => {
-            let Some(index) = panels.iter().position(|panel| panel.id == *panel_id) else {
+            let Some(index) = panels
+                .iter()
+                .position(|panel| panel.state().id == *panel_id)
+            else {
                 return Ok(Reduced::unchanged());
             };
             if panels.len() == 1 {
@@ -461,6 +474,7 @@ pub(crate) fn reduce_panel_action(
             let Some(panel) = panels.remove(*panel_id) else {
                 return Ok(Reduced::unchanged());
             };
+            let panel = panel.state();
             let restore = PanelRestore {
                 panel_id: *panel_id,
                 index,
@@ -482,11 +496,17 @@ pub(crate) fn reduce_panel_action(
             })
         }
         Action::MovePanel { panel_id, index } => {
-            let Some(previous) = panels.iter().position(|panel| panel.id == *panel_id) else {
+            let Some(previous) = panels
+                .iter()
+                .position(|panel| panel.state().id == *panel_id)
+            else {
                 return Ok(Reduced::unchanged());
             };
             panels.move_panel(*panel_id, *index);
-            let moved = panels.iter().position(|panel| panel.id == *panel_id) != Some(previous);
+            let moved = panels
+                .iter()
+                .position(|panel| panel.state().id == *panel_id)
+                != Some(previous);
             Ok(Reduced {
                 outcome: ActionOutcome {
                     changed: true,
@@ -505,7 +525,7 @@ pub(crate) fn reduce_panel_action(
             })
         }
         Action::ActivatePanel { panel_id } => {
-            let previous = panels.active().id;
+            let previous = panels.active().state().id;
             if !panels.activate(*panel_id) {
                 return Ok(Reduced::unchanged());
             }
@@ -534,17 +554,17 @@ pub(crate) fn reduce_panel_action(
 
 /// What replacing the regions of interest and review queue changed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct WorkspaceListChange {
-    pub(crate) regions_changed: bool,
-    pub(crate) review_changed: bool,
+pub struct WorkspaceListChange {
+    pub regions_changed: bool,
+    pub review_changed: bool,
     /// The edit kept every item and its place: a rename, note, status or colour change. Such
     /// edits arrive once per keystroke and are one undo step while they keep coming.
-    pub(crate) in_place: bool,
+    pub in_place: bool,
 }
 
 /// Replaces both lists and returns what changed and the action that puts the old lists back
 /// (`None` when nothing changed).
-pub(crate) fn reduce_workspace_lists(
+pub fn reduce_workspace_lists(
     current_regions: &mut Vec<RegionOfInterest>,
     current_review: &mut Vec<ReviewItem>,
     regions: Vec<RegionOfInterest>,

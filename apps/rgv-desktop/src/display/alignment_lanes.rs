@@ -37,7 +37,8 @@ impl Viewer {
             .copied()
         {
             let bottom = top + 26.0;
-            self.panels
+            self.session
+                .panels
                 .panel_mut(panel_id)
                 .track_frames
                 .push(TrackFrame {
@@ -74,16 +75,18 @@ impl Viewer {
                 if let Some(config) = self.alignment_tracks.first().map(|track| &track.config) {
                     alignment::alignment_scene_annotation_frame(
                         config,
-                        self.panels.panel(panel_id).viewport,
+                        self.session.panels.panel(panel_id).viewport,
                         top,
-                        self.track_presentation
+                        self.session
+                            .track_presentation
                             .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
                             .and_then(|node| node.preferred_height),
                     )
                 } else {
                     unreachable!("the primary source exists only with a primary track")
                 };
-            if self.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview {
+            if self.session.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview
+            {
                 // The overview frame has always carried the primary track's display identity.
                 frame.name = primary_alignment_name;
                 frame.source_label = primary_source_label;
@@ -95,7 +98,11 @@ impl Viewer {
                 frame.collapsed = !primary_annotation_desired;
             }
             top = frame.bottom;
-            self.panels.panel_mut(panel_id).track_frames.push(frame);
+            self.session
+                .panels
+                .panel_mut(panel_id)
+                .track_frames
+                .push(frame);
         }
         pass.top = top;
     }
@@ -127,10 +134,12 @@ impl Viewer {
             let track_id = config.id;
             let annotation_group_collapsed = collapsed_annotation_group_members.contains(&track_id);
             let annotation_desired = self
+                .session
                 .track_presentation
                 .pane_track_state(ui::TrackPane::Annotation, track_id)
                 .is_some_and(|node| node.content_visible);
             let annotation_effective = self
+                .session
                 .track_presentation
                 .track_content_exposed(ui::TrackPane::Annotation, track_id)
                 .unwrap_or(false);
@@ -138,7 +147,8 @@ impl Viewer {
                 annotation_group_headers_by_anchor.get(&track_id).copied()
             {
                 let bottom = top + 26.0;
-                self.panels
+                self.session
+                    .panels
                     .panel_mut(panel_id)
                     .track_frames
                     .push(TrackFrame {
@@ -166,9 +176,10 @@ impl Viewer {
             let mut frame = if scene_backed {
                 alignment::alignment_scene_annotation_frame(
                     &config,
-                    self.panels.panel(panel_id).viewport,
+                    self.session.panels.panel(panel_id).viewport,
                     top,
-                    self.track_presentation
+                    self.session
+                        .track_presentation
                         .pane_track_state(ui::TrackPane::Annotation, track_id)
                         .and_then(|node| node.preferred_height),
                 )
@@ -210,7 +221,11 @@ impl Viewer {
                 frame.collapsed = !annotation_desired;
             }
             top = frame.bottom;
-            self.panels.panel_mut(panel_id).track_frames.push(frame);
+            self.session
+                .panels
+                .panel_mut(panel_id)
+                .track_frames
+                .push(frame);
         }
         pass.top = top;
     }
@@ -236,6 +251,7 @@ impl Viewer {
                 continue;
             };
             if self
+                .session
                 .panels
                 .panel(panel_id)
                 .track_frames
@@ -255,18 +271,20 @@ impl Viewer {
                 continue;
             };
             let desired = self
+                .session
                 .track_presentation
                 .pane_track_state(ui::TrackPane::Reads, track_id)
                 .is_some_and(|node| node.content_visible);
             let index_only_overview = track
                 .projection(panel_id)
                 .is_some_and(|projection| projection.index_only_overview)
-                || self.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview;
+                || self.session.panels.panel(panel_id).viewport.detail_level()
+                    == DetailLevel::Overview;
             let mapped_record_count = track
                 .dictionary
                 .as_ref()
                 .and_then(|dictionary| {
-                    dictionary.id_by_name(&self.panels.panel(panel_id).contig_name)
+                    dictionary.id_by_name(&self.session.panels.panel(panel_id).contig_name)
                 })
                 .and_then(|contig| {
                     track
@@ -377,7 +395,8 @@ impl Viewer {
                 let retained_pending_overview = row_coordinate_authority
                     .is_pending()
                     .then(|| {
-                        self.panels
+                        self.session
+                            .panels
                             .panel(panel_id)
                             .scroll_display_cache
                             .as_ref()
@@ -415,7 +434,8 @@ impl Viewer {
                 });
             }
             let read_frame_name = self.read_panel_frame_name(panel_id, track, presented);
-            self.panels
+            self.session
+                .panels
                 .panel_mut(panel_id)
                 .track_frames
                 .push(TrackFrame {

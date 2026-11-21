@@ -8,9 +8,9 @@ use rgv_core::{MAXIMUM_REVIEW_ITEMS, PanelId, ReviewStatus};
 
 impl Viewer {
     pub(crate) fn automation_review_queue_snapshot(&self) -> serde_json::Value {
-        let active = self.panels.active();
+        let active = self.session.panels.active();
         let mut items = self
-            .review_items
+            .session.review_items
             .iter()
             .take(MAXIMUM_REVIEW_ITEMS)
             .map(|item| {
@@ -28,11 +28,11 @@ impl Viewer {
                 })
             })
             .collect::<Vec<_>>();
-        let truncated = self.review_items.len() > items.len();
+        let truncated = self.session.review_items.len() > items.len();
         items.shrink_to_fit();
         serde_json::json!({
             "application_instance_id": self.application_instance_id,
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
             "items": items,
             "truncated": truncated,
         })
@@ -43,6 +43,7 @@ impl Viewer {
         panel_id: PanelId,
     ) -> Result<serde_json::Value> {
         let panel = self
+            .session
             .panels
             .get(panel_id)
             .with_context(|| format!("panel {} was not found", panel_id.get()))?;
@@ -69,7 +70,7 @@ impl Viewer {
             .collect::<Vec<_>>();
         Ok(serde_json::json!({
             "application_instance_id": self.application_instance_id,
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
             "panel_id": panel_id.get(),
             "entries": entries,
             "cursor": panel.navigation_history.cursor(),
@@ -85,10 +86,12 @@ impl Viewer {
     ) -> Result<serde_json::Value> {
         let item = match action {
             AutomationReviewNavigation::Item { review_item_id } => self
+                .session
                 .review_items
                 .iter()
                 .find(|item| item.id == *review_item_id),
             AutomationReviewNavigation::NextPending => self
+                .session
                 .review_items
                 .iter()
                 .find(|item| item.status == ReviewStatus::Pending),
@@ -101,7 +104,7 @@ impl Viewer {
             item.locus.start.saturating_add(1),
             item.locus.end
         );
-        self.navigate_to_locus(self.panels.active().id, &locus)?;
+        self.navigate_to_locus(self.session.panels.active().id, &locus)?;
         self.bump_workspace_revision();
         Ok(serde_json::json!({
             "review_item_id": item.id,
@@ -109,7 +112,7 @@ impl Viewer {
             "start": item.locus.start,
             "end": item.locus.end,
             "settled": self.automation_is_settled(),
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
         }))
     }
 
@@ -121,7 +124,7 @@ impl Viewer {
         action: AutomationHistoryNavigation,
     ) -> Result<serde_json::Value> {
         anyhow::ensure!(
-            self.panels.get(panel_id).is_some(),
+            self.session.panels.get(panel_id).is_some(),
             "panel {} was not found",
             panel_id.get()
         );
@@ -136,11 +139,11 @@ impl Viewer {
         self.bump_workspace_revision();
         Ok(serde_json::json!({
             "panel_id": panel_id.get(),
-            "contig": self.panels.panel(panel_id).contig_name,
+            "contig": self.session.panels.panel(panel_id).contig_name,
             "start": interval.start(),
             "end": interval.end(),
             "settled": self.automation_is_settled(),
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
         }))
     }
 }

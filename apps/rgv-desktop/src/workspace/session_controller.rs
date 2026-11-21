@@ -11,15 +11,15 @@ use crate::sources::{
 };
 use crate::workspace::alignments::filter_state_from_session;
 use crate::workspace::navigation::{ImportedLocusRequest, RequestedLocus, resolve_requested_locus};
-use crate::workspace::panels::{PanelWorkspace, ViewPanelController};
+use crate::workspace::panels::PanelWorkspace;
 use anyhow::Result;
 use rgv_core::{
-    PanelId, ReferenceDictionary, SessionAlignmentTrack, SessionDocument, SessionFilters,
-    SessionLocus, SessionReadPanelState, SessionViewPanel, TrackConfig, TrackFormat, TrackId,
-    TrackKind, TrackSource, WorkspacePresentation,
+    ReferenceDictionary, SessionAlignmentTrack, SessionDocument, SessionFilters, TrackConfig,
+    TrackFormat, TrackId, TrackKind, TrackSource, WorkspacePresentation,
 };
-use rgv_engine::{ReferenceEngine, TrackSpec, TrackSpecKind};
+use rgv_engine::{TrackSpec, TrackSpecKind};
 use rgv_layout::DisplayList;
+pub(crate) use rgv_session::panels::session_panel_documents;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -47,48 +47,6 @@ fn prepare_session_geometry(
     ))
 }
 
-/// The panel part of a session document: the focused panel's locus, every panel in order, and
-/// which one has focus. This is the persisted projection of the panel workspace, so the action
-/// tests compare it to decide whether two front ends left the same document.
-pub(crate) fn session_panel_documents(
-    panels: &PanelWorkspace,
-) -> (SessionLocus, Vec<SessionViewPanel>, PanelId) {
-    let locus_of = |panel: &ViewPanelController| {
-        let interval = panel.viewport.interval();
-        SessionLocus {
-            contig: panel.contig_name.clone(),
-            start: interval.start(),
-            end: interval.end(),
-        }
-    };
-    let saved = panels
-        .iter()
-        .map(|panel| {
-            let mut saved = SessionViewPanel::new(panel.id, locus_of(panel));
-            saved.vertical_scroll_points = panel.vertical_scroll_points;
-            // Keep the existing per-panel session field as a compatibility
-            // projection of the single workspace annotation camera.
-            saved.annotation_scroll_points = panels.annotation_scroll_points;
-            saved.vertical_content_origin_points = panel.vertical_content_origin_points;
-            saved.read_stack_scroll_points = panel.read_stack_scroll_points;
-            saved.read_panel_states = panel
-                .read_panel_scrolls
-                .iter()
-                .map(|(track_id, state)| SessionReadPanelState {
-                    track_id: *track_id,
-                    scroll_points: state.scroll_points,
-                    content_origin_points: state.content_origin_points,
-                    latent_scroll_fraction: state.latent_scroll_fraction,
-                    content_bottom_points: state.content_bottom_points,
-                    density: state.density,
-                })
-                .collect();
-            saved
-        })
-        .collect();
-    (locus_of(panels.active()), saved, panels.active().id)
-}
-
 impl Viewer {
     /// Replaces an imported IGV session's placeholder locus (see
     /// [`ImportedLocusRequest`]); `None` for every other project.
@@ -97,11 +55,11 @@ impl Viewer {
         request: Option<ImportedLocusRequest>,
     ) -> Result<()> {
         if let Some(request) = &request {
-            self.panels.adopt_imported_locus(request)?;
+            self.session.panels.adopt_imported_locus(request)?;
             self.locus_editor = request.requested_locus().unwrap_or_default();
         }
-        self.imported_locus = request;
-        self.imported_feature_search = None;
+        self.session.imported_locus = request;
+        self.session.imported_feature_search = None;
         Ok(())
     }
 
@@ -114,9 +72,10 @@ impl Viewer {
     ) -> Result<RequestedLocus> {
         resolve_requested_locus(
             dictionary,
-            &self.contig_aliases,
+            &self.session.contig_aliases,
             requested,
-            self.imported_locus
+            self.session
+                .imported_locus
                 .as_ref()
                 .and_then(ImportedLocusRequest::feature_name),
         )
@@ -126,25 +85,25 @@ impl Viewer {
     /// searches the annotations for an imported feature name, or says why
     /// the default locus is showing.
     pub(crate) fn finish_imported_locus(&mut self, feature_search: Option<String>) {
-        if self.imported_locus.take().is_none() {
+        if self.session.imported_locus.take().is_none() {
             return;
         }
         let Some(name) = feature_search else {
             return;
         };
-        for panel in self.panels.iter_mut() {
+        for panel in self.session.panels.iter_mut() {
             if panel.requested_locus.as_deref() == Some(name.as_str()) {
                 panel.requested_locus = None;
             }
         }
         self.locus_editor.clone_from(&name);
-        if self.track_engine.is_none() {
+        if self.session.track_engine.is_none() {
             self.report_warning(format!(
                 "IGV session locus {name} is not a contig; showing the default locus until an \
                  annotation track is open to search for it"
             ));
         }
-        self.imported_feature_search = Some(name);
+        self.session.imported_feature_search = Some(name);
         self.retry_imported_feature_search();
     }
 
@@ -152,33 +111,30 @@ impl Viewer {
     /// annotation engine exists (the built-in Genes track may be installed
     /// after the dictionary that placed the panels).
     pub(crate) fn retry_imported_feature_search(&mut self) {
-        if self.track_engine.is_some()
-            && let Some(name) = self.imported_feature_search.take()
+        if self.session.track_engine.is_some()
+            && let Some(name) = self.session.imported_feature_search.take()
         {
             self.request_annotation_search(&name, true, true);
         }
     }
 
     pub(crate) fn persist_settings(&mut self) {
-        self.remember_current_locus(self.panels.active().id);
+        self.remember_current_locus(self.session.panels.active().id);
         // Serialising, fsyncing and renaming happen on the settings worker;
         // rapid saves collapse into one write of the newest snapshot.
-        self.settings_writer.submit(&self.settings);
+        self.session.submit_settings();
     }
 
     /// Surfaces a settings save that failed on the worker.
     pub(crate) fn poll_settings_writer(&mut self) {
-        if let Some(error) = self.settings_writer.take_failure() {
-            self.report_warning(format!(
-                "Could not save settings to {}: {error}",
-                self.settings_path.display()
-            ));
+        if self.session.poll_settings_writer() {
+            self.window.request_redraw();
         }
     }
 
     /// Blocks until every queued save is on disk; call last at exit.
     pub(crate) fn finish_settings_writer(&mut self) {
-        self.settings_writer.finish();
+        self.session.settings_writer.finish();
     }
 
     pub(crate) fn handle_dropped_file(&mut self, path: &Path) {
@@ -276,7 +232,7 @@ impl Viewer {
             path: path.to_path_buf(),
             kind,
         };
-        if let Some(engine) = &self.track_engine {
+        if let Some(engine) = &self.session.track_engine {
             if query_contig_aliases.is_empty() {
                 engine.try_add(specification)?;
             } else {
@@ -284,17 +240,17 @@ impl Viewer {
             }
         } else {
             // An empty alias map is the no-alias case.
-            self.track_engine = Some(spawn_track_engine(vec![(
+            self.session.track_engine = Some(spawn_track_engine(vec![(
                 specification,
                 query_contig_aliases,
             )]));
         }
         let source_label = config.source.redacted_label();
-        self.tracks.push(config);
+        self.session.tracks.push(config);
         self.invalidate_navigation_contract("auxiliary track added");
         self.reconcile_track_presentation();
-        self.synthetic = false;
-        self.data_status = format!("Opening track {source_label}…");
+        self.session.synthetic = false;
+        self.session.data_status = format!("Opening track {source_label}…");
         Ok(id)
     }
 
@@ -308,6 +264,7 @@ impl Viewer {
             anyhow::bail!("TDF source returned an invalid embedded-channel catalogue");
         }
         let Some(parent_position) = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -315,7 +272,7 @@ impl Viewer {
         else {
             return Ok(());
         };
-        let parent = self.tracks.tracks()[parent_position].clone();
+        let parent = self.session.tracks.tracks()[parent_position].clone();
         if matches!(parent.format, Some(TrackFormat::TdfChannel { .. })) {
             return Ok(());
         }
@@ -328,12 +285,13 @@ impl Viewer {
             build_tdf_channel_expansion(&parent, &path, track_names, selected_index, next_id)?;
         if !expansion.specifications.is_empty() {
             let engine = self
+                .session
                 .track_engine
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("TDF track engine is unavailable"))?;
             engine.try_add_many(expansion.specifications)?;
         }
-        let parent = &mut self.tracks.tracks_mut()[parent_position];
+        let parent = &mut self.session.tracks.tracks_mut()[parent_position];
         parent.name = expansion.selected_name;
         parent.format = Some(TrackFormat::TdfChannel {
             index: selected_index,
@@ -341,13 +299,16 @@ impl Viewer {
         if let Some(largest) = expansion.children.iter().map(|track| track.id.get()).max() {
             self.reserve_track_ids_through(largest);
         }
-        self.tracks.insert_after(parent_id, expansion.children);
+        self.session
+            .tracks
+            .insert_after(parent_id, expansion.children);
         if selected_index > 0 {
-            self.tracks
+            self.session
+                .tracks
                 .move_track(parent_id, parent_position.saturating_add(selected_index));
         }
         self.reconcile_track_presentation();
-        self.data_status = format!(
+        self.session.data_status = format!(
             "Opened {} embedded TDF channels from {}",
             track_names.len(),
             source_label
@@ -424,20 +385,18 @@ impl Viewer {
             &panel_ids,
         )?;
         let reference_engine = if let Some(source) = &session.reference {
-            let engine = ReferenceEngine::spawn(8);
-            if let Err(error) = engine.try_open_with_options(
+            match self.session.start_reference_engine(
                 source_path(source),
                 reference_open_options(session.remote_reference_index_url.clone()),
             ) {
-                if let Some(worker) = engine.retire() {
-                    self.engine_retirement_tasks.push(worker);
+                Ok(engine) => Some(engine),
+                Err(error) => {
+                    for controller in controllers {
+                        self.retire_alignment_track_controller(controller);
+                    }
+                    return Err(error);
                 }
-                for controller in controllers {
-                    self.retire_alignment_track_controller(controller);
-                }
-                return Err(error.into());
             }
-            Some(engine)
         } else {
             None
         };
@@ -449,10 +408,11 @@ impl Viewer {
         if let Some(error) = landmark_error {
             self.landmark_catalogue_error = Some(error);
         }
-        self.reference_open_error = None;
+        self.session.reference_open_error = None;
         self.automation_auxiliary_open_state.clear();
-        self.unresolved_session_sources = session.unresolved_local_sources();
-        self.session_migration_notices
+        self.session.unresolved_session_sources = session.unresolved_local_sources();
+        self.session
+            .session_migration_notices
             .clone_from(&session.migration_notices);
         self.promoted_read = None;
         self.read_name_editor.clear();
@@ -461,72 +421,82 @@ impl Viewer {
         let alignment = primary_alignment_track(session).cloned();
         self.apply_primary_alignment_config(alignment.as_ref(), session.maximum_alignments)
             .expect("session filters were validated during preparation");
-        self.track_presentation = session.presentation.clone();
-        if self.track_presentation.pane_tracks.is_empty()
+        self.session.track_presentation = session.presentation.clone();
+        if self.session.track_presentation.pane_tracks.is_empty()
             && (!session.alignment_tracks.is_empty() || !session.tracks.is_empty())
         {
-            self.track_presentation =
+            self.session.track_presentation =
                 WorkspacePresentation::from_legacy(&session.alignment_tracks, &session.tracks);
         }
-        self.reference_source.clone_from(&session.reference);
-        self.remote_reference_index_url
+        self.session.reference_source.clone_from(&session.reference);
+        self.session
+            .remote_reference_index_url
             .clone_from(&session.remote_reference_index_url);
         self.reference_reverse_complement = session.reference_reverse_complement;
         self.reference_translation_frames
             .clone_from(&session.reference_translation_frames);
         self.reference_genetic_code = session.reference_genetic_code;
-        self.regions_of_interest
+        self.session
+            .regions_of_interest
             .clone_from(&session.regions_of_interest);
-        self.review_items.clone_from(&session.review_items);
-        self.sample_metadata.clone_from(&session.sample_metadata);
+        self.session.review_items.clone_from(&session.review_items);
+        self.session
+            .sample_metadata
+            .clone_from(&session.sample_metadata);
         self.metadata_filter_column = 0;
         self.metadata_filter_value = None;
         self.metadata_selected_tracks.clear();
         self.metadata_remove_armed = false;
         if let Some(name) = &session.genome_name {
-            self.assembly_name.clone_from(name);
+            self.session.assembly_name.clone_from(name);
         }
-        self.assembly_identity
+        self.session
+            .assembly_identity
             .clone_from(&session.assembly_identity);
-        self.assembly
+        self.session
+            .assembly
             .identity
             .clone_from(&session.assembly_identity);
-        self.cytoband_path = cytoband_path;
-        self.contig_aliases.clone_from(&session.contig_aliases);
-        self.suppressed_builtin_gene_bundles
+        self.session.cytoband_path = cytoband_path;
+        self.session
+            .contig_aliases
+            .clone_from(&session.contig_aliases);
+        self.session
+            .suppressed_builtin_gene_bundles
             .clone_from(&session.suppressed_builtin_gene_bundles);
-        self.tracks = tracks;
+        self.session.tracks = tracks;
         self.automation_auxiliary_open_state.extend(
-            self.tracks
+            self.session
+                .tracks
                 .tracks()
                 .iter()
                 .map(|track| (track.id, AutomationAuxiliaryOpenState::Pending)),
         );
         self.retire_track_engine();
-        self.track_engine = track_engine;
-        self.panels = panels;
+        self.session.track_engine = track_engine;
+        self.session.panels = panels;
         // Panel identity replacement and its geometry must be one state
         // transition. Context refresh and display rebuilding call
         // `active_panel_rect`, so they may not observe the previous session's
         // panel list in the committed layout.
         self.synchronize_panel_widths();
-        self.reference_dictionary = None;
-        self.reference_revision = None;
+        self.session.reference_dictionary = None;
+        self.session.reference_revision = None;
         self.retire_reference_engine();
-        self.reference_engine = reference_engine;
+        self.session.reference_engine = reference_engine;
         self.refresh_active_panel_context();
         self.install_alignment_track_controllers(controllers);
         if alignment.is_some() {
-            "Opening alignment tracks…".clone_into(&mut self.data_status);
+            "Opening alignment tracks…".clone_into(&mut self.session.data_status);
         } else {
-            self.panels.active_mut().pending_queries.alignment = false;
-            self.synthetic = false;
-            self.panels.active_mut().display_list = DisplayList::default();
+            self.session.panels.active_mut().pending_queries.alignment = false;
+            self.session.synthetic = false;
+            self.session.panels.active_mut().display_list = DisplayList::default();
             self.rebuild_all_panel_displays();
             self.request_all_panel_queries();
             self.mark_display_dirty("explicit display invalidation");
         }
-        self.current_session_path = None;
+        self.session.current_session_path = None;
         self.replace_document_identity(false);
         Ok(())
     }
@@ -545,7 +515,7 @@ impl Viewer {
     }
 
     pub(crate) fn session_document(&self) -> SessionDocument {
-        let (locus, panels, active_panel) = session_panel_documents(&self.panels);
+        let (locus, panels, active_panel) = session_panel_documents(&self.session.panels);
         let mut alignment_tracks = self
             .alignment_tracks
             .iter()
@@ -562,18 +532,18 @@ impl Viewer {
             active_panel,
             alignment_tracks,
             presentation: self.workspace_presentation_snapshot(),
-            reference: self.reference_source.clone(),
-            remote_reference_index_url: self.remote_reference_index_url.clone(),
-            genome_name: Some(self.assembly_name.clone()),
-            assembly_identity: self.assembly_identity.clone(),
-            cytobands: self.cytoband_path.as_deref().map(track_source),
+            reference: self.session.reference_source.clone(),
+            remote_reference_index_url: self.session.remote_reference_index_url.clone(),
+            genome_name: Some(self.session.assembly_name.clone()),
+            assembly_identity: self.session.assembly_identity.clone(),
+            cytobands: self.session.cytoband_path.as_deref().map(track_source),
             reference_reverse_complement: self.reference_reverse_complement,
             reference_translation_frames: self.reference_translation_frames.clone(),
             reference_genetic_code: self.reference_genetic_code,
-            regions_of_interest: self.regions_of_interest.clone(),
-            review_items: self.review_items.clone(),
-            sample_metadata: self.sample_metadata.clone(),
-            contig_aliases: self.contig_aliases.clone(),
+            regions_of_interest: self.session.regions_of_interest.clone(),
+            review_items: self.session.review_items.clone(),
+            sample_metadata: self.session.sample_metadata.clone(),
+            contig_aliases: self.session.contig_aliases.clone(),
             landmark_context: self
                 .landmark_resolution
                 .as_ref()
@@ -590,8 +560,8 @@ impl Viewer {
                             bundle_version: bundle.version.clone(),
                         })
                 }),
-            suppressed_builtin_gene_bundles: self.suppressed_builtin_gene_bundles.clone(),
-            tracks: self.tracks.tracks().to_vec(),
+            suppressed_builtin_gene_bundles: self.session.suppressed_builtin_gene_bundles.clone(),
+            tracks: self.session.tracks.tracks().to_vec(),
             maximum_alignments: self.workspace_alignment_limit,
         }
     }
@@ -600,6 +570,7 @@ impl Viewer {
 #[cfg(test)]
 mod preparation_tests {
     use super::*;
+    use rgv_core::SessionLocus;
 
     #[test]
     fn unsupported_cytobands_fail_before_any_replacement_is_constructed() {

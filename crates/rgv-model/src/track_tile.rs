@@ -33,7 +33,7 @@ use std::{
 
 use rgv_core::{CopyNumberTrackSettings, InteractionTrackSettings, VariantTrackSettings};
 
-use crate::tracks::{FeatureRecord, Strand};
+use crate::tracks::{FeatureRecord, Strand, VariantRecord};
 
 /// Bases spanned by a level-0 tile; a level-`n` tile spans `TRACK_TILE_BASE_SPAN << n`.
 pub const TRACK_TILE_BASE_SPAN: u64 = 1_024;
@@ -54,6 +54,9 @@ pub const DEFAULT_FEATURE_SUMMARY_FEATURES_PER_POINT: f32 = 0.5;
 /// Default density above which a variant tile is delivered as a count summary: mean variants
 /// per nominal point (more than 1,024 variants in a tile).
 pub const DEFAULT_VARIANT_SUMMARY_VARIANTS_PER_POINT: f32 = 1.0;
+/// Default of [`TrackTileSettings::maximum_feature_rows`]: the rows the legacy feature layout
+/// packs before it marks an overflow (`rgv_layout::TrackLayoutOptions::default().maximum_rows`).
+pub const DEFAULT_TRACK_TILE_FEATURE_ROWS: u32 = 12;
 
 /// One tile of the track pyramid: `index` counts tiles of `1024 << level` bases from zero.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -217,6 +220,11 @@ pub struct TrackTileSettings {
     /// Deliver the per-sample genotype matrix with variant tiles when the source has samples.
     pub genotype_matrix: bool,
     pub custom: Vec<(String, String)>,
+    /// Most packed feature rows a tile's scene draws; see [`TrackTileScene::apply_row_cap`].
+    /// Rows from this one on are left out of the scene's instances and labels and counted in
+    /// [`TrackTileScene::hidden_rows`] and [`TrackTileScene::hidden_features`]. Zero and
+    /// `u32::MAX` mean no cap. Default [`DEFAULT_TRACK_TILE_FEATURE_ROWS`].
+    pub maximum_feature_rows: u32,
 }
 
 impl Default for TrackTileSettings {
@@ -229,11 +237,19 @@ impl Default for TrackTileSettings {
             variant_summary_variants_per_point: DEFAULT_VARIANT_SUMMARY_VARIANTS_PER_POINT,
             genotype_matrix: true,
             custom: Vec::new(),
+            maximum_feature_rows: DEFAULT_TRACK_TILE_FEATURE_ROWS,
         }
     }
 }
 
 impl TrackTileSettings {
+    /// These settings with another feature row cap; see [`Self::maximum_feature_rows`].
+    #[must_use]
+    pub fn with_maximum_feature_rows(mut self, rows: u32) -> Self {
+        self.maximum_feature_rows = rows;
+        self
+    }
+
     /// Stable digest of everything that can change a tile; part of the tile cache key.
     #[must_use]
     pub fn digest(&self) -> u64 {
@@ -311,6 +327,22 @@ impl TrackRecordId {
         Self(digest.finish())
     }
 
+    /// Identity of a variant: its interval, identifier and alleles. This is the identity
+    /// variant tiles give their records.
+    #[must_use]
+    pub fn for_variant(record: &VariantRecord) -> Self {
+        let alternates = record.alternates.join(&b","[..]);
+        Self::from_parts(
+            record.start,
+            record.end,
+            &[
+                record.id.as_deref().unwrap_or_default().as_bytes(),
+                &record.reference,
+                &alternates,
+            ],
+        )
+    }
+
     /// Identity from coordinates and any distinguishing words (allele strings, sample index…).
     #[must_use]
     pub fn from_parts(start: u64, end: u64, parts: &[&[u8]]) -> Self {
@@ -322,6 +354,131 @@ impl TrackRecordId {
             digest.write(part);
         }
         Self(digest.finish())
+    }
+}
+
+/// A complete source record behind a tile's [`TrackRecordId`]: the record types the legacy
+/// queries return and the inspector consumes. Tiles carry only what is drawn; this is what
+/// `TrackTileEngine::lookup_record` resolves an identity to.
+// A feature is the common case and is resolved one at a time behind an `Arc`; boxing it
+// would cost an allocation per lookup for no saving.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum TrackRecord {
+    Feature(FeatureRecord),
+    Variant(Box<VariantRecord>),
+}
+
+impl TrackRecord {
+    /// The identity tiles give this record.
+    #[must_use]
+    pub fn id(&self) -> TrackRecordId {
+        match self {
+            Self::Feature(record) => TrackRecordId::for_feature(record),
+            Self::Variant(record) => TrackRecordId::for_variant(record),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_feature(&self) -> Option<&FeatureRecord> {
+        match self {
+            Self::Feature(record) => Some(record),
+            Self::Variant(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_variant(&self) -> Option<&VariantRecord> {
+        match self {
+            Self::Variant(record) => Some(record),
+            Self::Feature(_) => None,
+        }
+    }
+
+    /// Zero-based half-open interval of the record.
+    #[must_use]
+    pub fn interval(&self) -> (u64, u64) {
+        match self {
+            Self::Feature(record) => (record.start, record.end),
+            Self::Variant(record) => (record.start, record.end),
+        }
+    }
+
+    /// Approximate heap bytes retained, for byte budgets.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        let text = |text: &Option<String>| text.as_ref().map_or(0, String::capacity);
+        match self {
+            Self::Feature(record) => {
+                size_of::<Self>()
+                    + record.contig.capacity()
+                    + text(&record.name)
+                    + text(&record.feature_type)
+                    + record.blocks.capacity() * size_of::<(u64, u64)>()
+                    + record
+                        .attributes
+                        .iter()
+                        .map(|(key, value)| {
+                            size_of::<(String, String)>() + key.capacity() + value.capacity()
+                        })
+                        .sum::<usize>()
+            }
+            // Variant records are not retained with tiles; a flat estimate is enough for the
+            // small resolved-record cache.
+            Self::Variant(record) => {
+                size_of::<Self>()
+                    + size_of::<VariantRecord>()
+                    + record.contig.capacity()
+                    + text(&record.id)
+                    + record.reference.capacity()
+                    + record.alternates.iter().map(Vec::capacity).sum::<usize>()
+            }
+        }
+    }
+}
+
+/// What a source is asked when a record identity is resolved to its complete record: the
+/// record's own interval (known from the tile that showed it) bounds the read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackRecordQuery {
+    /// Contig name as the source spells it.
+    pub contig: String,
+    pub id: TrackRecordId,
+    /// The record's interval, zero-based half-open.
+    pub start: u64,
+    pub end: u64,
+    /// Settings of the view the record was shown in.
+    pub settings: TrackTileSettings,
+}
+
+/// State of a record lookup (`TrackTileEngine::lookup_record`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrackRecordLookup {
+    /// The complete record.
+    Ready(Arc<TrackRecord>),
+    /// A bounded re-read of the source is scheduled or running; ask again (the UI is woken
+    /// when it finishes).
+    Pending,
+    /// No cached tile shows the identity, or the source no longer has a record with it.
+    NotFound,
+    /// The re-read failed.
+    Failed(String),
+}
+
+impl TrackRecordLookup {
+    /// The record, when the lookup is ready.
+    #[must_use]
+    pub fn record(&self) -> Option<&TrackRecord> {
+        match self {
+            Self::Ready(record) => Some(record),
+            Self::Pending | Self::NotFound | Self::Failed(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending)
     }
 }
 
@@ -1090,13 +1247,35 @@ pub struct TrackTileScene {
     pub instances: Vec<TrackSceneInstance>,
     pub records: Vec<TrackSceneRecord>,
     pub labels: Vec<TrackSceneLabel>,
-    /// Rows used by `Row` instances (largest row + 1).
+    /// Rows the layout packed (largest row + 1), including rows a row cap has since hidden.
     pub row_count: u32,
     /// Names of fixed rows (samples), when the rows are not packed.
     pub row_labels: Option<Arc<[String]>>,
     /// Smallest and largest value of the `Value` instances; the lane's value range is the
     /// union over its visible tiles (or a user-fixed range).
     pub value_range: Option<(f32, f32)>,
+    /// The row cap applied by [`Self::apply_row_cap`]; `None` when the scene is uncapped.
+    pub row_cap: Option<u32>,
+    /// Packed rows left out by the row cap: `row_count - row_cap` when positive.
+    pub hidden_rows: u32,
+    /// Records of this tile left out by the row cap (those on a hidden row). They remain in
+    /// `records`, where `row >= row_cap` identifies them; a record spanning several tiles is
+    /// counted in each, so sum over tiles by distinct [`TrackRecordId`].
+    pub hidden_features: u32,
+}
+
+/// What a row cap hid in one scene, or in one lane ([`TrackTileScene::lane_overflow`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TrackSceneOverflow {
+    pub hidden_rows: u32,
+    pub hidden_features: u32,
+}
+
+impl TrackSceneOverflow {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.hidden_rows == 0 && self.hidden_features == 0
+    }
 }
 
 impl TrackTileScene {
@@ -1113,6 +1292,88 @@ impl TrackTileScene {
             row_count: 0,
             row_labels: None,
             value_range: None,
+            row_cap: None,
+            hidden_rows: 0,
+            hidden_features: 0,
+        }
+    }
+
+    /// Hides the packed feature rows from `maximum_rows` on: their instances and labels are
+    /// removed (their records stay, so record indices are unchanged) and what was hidden is
+    /// counted in `hidden_rows` and `hidden_features`. `row_count` keeps the number of rows
+    /// packed. Rows are seam-stable, so a feature hidden in one tile is hidden in every tile.
+    ///
+    /// Only scenes of packed feature rows are capped: scenes with fixed, named rows (samples),
+    /// value-mapped scenes and other renderers are returned untouched, as are `maximum_rows`
+    /// of zero or `u32::MAX` (no cap). Applying a cap twice is the same as applying the
+    /// smaller one; a hidden row cannot be brought back, so lay the tile out again to raise it.
+    pub fn apply_row_cap(&mut self, maximum_rows: u32) -> TrackSceneOverflow {
+        if maximum_rows == 0
+            || maximum_rows == u32::MAX
+            || self.renderer != TrackRendererId::FEATURES
+            || self.row_labels.is_some()
+        {
+            return self.overflow();
+        }
+        let cap = self
+            .row_cap
+            .map_or(maximum_rows, |cap| cap.min(maximum_rows));
+        self.row_cap = Some(cap);
+        if self.row_count > cap {
+            let records = &self.records;
+            self.instances.retain(|instance| {
+                instance.vertical() != TrackSceneVertical::Row
+                    || instance
+                        .record_index()
+                        .and_then(|index| records.get(index as usize))
+                        .map_or(u32::from(instance.row()), |record| record.row)
+                        < cap
+            });
+            self.labels.retain(|label| label.row < cap);
+        }
+        self.hidden_rows = self.row_count.saturating_sub(cap);
+        self.hidden_features = u32::try_from(
+            self.records
+                .iter()
+                .filter(|record| record.row >= cap)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        self.overflow()
+    }
+
+    /// What the row cap hid in this scene.
+    #[must_use]
+    pub const fn overflow(&self) -> TrackSceneOverflow {
+        TrackSceneOverflow {
+            hidden_rows: self.hidden_rows,
+            hidden_features: self.hidden_features,
+        }
+    }
+
+    /// What the row cap hid over `scenes` (the tiles of one lane): the deepest hidden row
+    /// count and the number of distinct hidden records.
+    #[must_use]
+    pub fn lane_overflow<'scene>(
+        scenes: impl IntoIterator<Item = &'scene Self>,
+    ) -> TrackSceneOverflow {
+        let mut hidden = std::collections::BTreeSet::new();
+        let mut hidden_rows = 0;
+        for scene in scenes {
+            hidden_rows = hidden_rows.max(scene.hidden_rows);
+            if let Some(cap) = scene.row_cap {
+                hidden.extend(
+                    scene
+                        .records
+                        .iter()
+                        .filter(|record| record.row >= cap)
+                        .map(|record| record.id),
+                );
+            }
+        }
+        TrackSceneOverflow {
+            hidden_rows,
+            hidden_features: u32::try_from(hidden.len()).unwrap_or(u32::MAX),
         }
     }
 

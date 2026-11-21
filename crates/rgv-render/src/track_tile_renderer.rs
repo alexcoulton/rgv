@@ -24,11 +24,11 @@ use bytemuck::{Pod, Zeroable};
 use rgv_alignment_scene::{
     AllocationClass, AllocationLease, AllocationLedger, LedgerError, ReservationKind,
 };
-use rgv_layout::TrackScenePoint;
+use rgv_layout::{TrackScenePoint, TrackSceneProbe, TrackSceneRowPosition};
 use rgv_model::{
     TRACK_PALETTE_ENTRIES, TRACK_SCENE_FLAG_BIN_MEAN, TRACK_SCENE_FLAG_POINT, TrackColor,
-    TrackColorToken, TrackSceneInstance, TrackSceneShape, TrackSceneVertical, TrackTileKey,
-    TrackTileScene,
+    TrackColorToken, TrackDigest, TrackSceneInstance, TrackSceneShape, TrackSceneVertical,
+    TrackTileKey, TrackTileScene,
 };
 use thiserror::Error;
 
@@ -237,6 +237,43 @@ impl TrackLaneProjection {
                 + f64::from(x - self.rect[0]) / self.points_per_base.max(f64::MIN_POSITIVE),
             row: f64::from(y - self.rect[1] - self.row_offset)
                 / f64::from(self.row_pitch.max(f32::MIN_POSITIVE)),
+            lane_fraction: f64::from(y - self.rect[1])
+                / f64::from(self.rect[3].max(f32::MIN_POSITIVE)),
+        }
+    }
+
+    /// The scene coordinates under a point of the lane in unambiguous units, for
+    /// [`rgv_layout::hit_test_track_scene_at`].
+    ///
+    /// Rows are `row_pitch` apart and their content is `row_height` tall, exactly as
+    /// [`project_track_instance`] places them: row `r` occupies
+    /// `rect.y + row_offset + r * row_pitch .. + row_height`. The probe's row position is the
+    /// row whose content contains `y`, with the fraction measured against `row_height` (the
+    /// unit scenes state vertical extents in). It is `None` above row 0 and in the gap
+    /// between two rows, so the space between rows hits nothing.
+    ///
+    /// [`Self::scene_point`] divides by the pitch instead and is kept for existing callers;
+    /// its `row` fraction is only correct when `row_pitch == row_height`.
+    #[must_use]
+    pub fn scene_probe(&self, x: f32, y: f32) -> TrackSceneProbe {
+        let pitch = f64::from(self.row_pitch);
+        let height = f64::from(self.row_height);
+        let below_first_row = f64::from(y) - f64::from(self.rect[1]) - f64::from(self.row_offset);
+        let row = (below_first_row >= 0.0 && pitch > 0.0 && height > 0.0)
+            .then(|| {
+                let row = (below_first_row / pitch).floor();
+                let within = below_first_row - row * pitch;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                (within <= height && row <= f64::from(u32::MAX)).then(|| TrackSceneRowPosition {
+                    row: row as u32,
+                    content_fraction: (within / height).clamp(0.0, 1.0),
+                })
+            })
+            .flatten();
+        TrackSceneProbe {
+            position: self.camera_start
+                + f64::from(x - self.rect[0]) / self.points_per_base.max(f64::MIN_POSITIVE),
+            row,
             lane_fraction: f64::from(y - self.rect[1])
                 / f64::from(self.rect[3].max(f32::MIN_POSITIVE)),
         }
@@ -523,11 +560,57 @@ pub fn track_fragment_color(
 
 /// Identity of a tile's GPU page: the track, the tile and the digest of the settings the tile
 /// was built with.
+///
+/// A [`TrackTileKey`] is a level and an index; it does not name a contig. Two panels showing
+/// the same tile index of different contigs with the same settings must not share a page, so
+/// build keys with [`Self::for_contig`] (or [`Self::for_scene`]), which make the contig part
+/// of the identity. A key written as a struct literal carries no contig.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TrackTilePageKey {
     pub track: u64,
     pub tile: TrackTileKey,
+    /// Digest of the tile's settings; for a key built by [`Self::for_contig`], the digest of
+    /// the settings digest and the contig name ([`Self::contig_identity`]).
     pub settings_digest: u64,
+}
+
+impl TrackTilePageKey {
+    /// The page of `tile` of `contig` for `track`, built with settings of `settings_digest`.
+    /// Keys of different contigs differ even when the track, tile and settings are equal.
+    ///
+    /// The struct's shape is fixed (callers construct it literally), so the contig is carried
+    /// as a 64-bit FNV-1a digest of `(settings_digest, contig)` in the `settings_digest`
+    /// field rather than as a field of its own: two contigs alias only on a digest collision.
+    #[must_use]
+    pub fn for_contig(track: u64, contig: &str, tile: TrackTileKey, settings_digest: u64) -> Self {
+        Self {
+            track,
+            tile,
+            settings_digest: Self::contig_identity(contig, settings_digest),
+        }
+    }
+
+    /// The page of `scene` (its own contig and tile) for `track`.
+    #[must_use]
+    pub fn for_scene(track: u64, scene: &TrackTileScene, settings_digest: u64) -> Self {
+        Self::for_contig(track, &scene.contig, scene.key, settings_digest)
+    }
+
+    /// The identity word [`Self::for_contig`] stores: stable across runs and platforms.
+    #[must_use]
+    pub fn contig_identity(contig: &str, settings_digest: u64) -> u64 {
+        let mut digest = TrackDigest::new();
+        digest.write_u64(settings_digest);
+        digest.write_text(Some(contig));
+        digest.finish()
+    }
+
+    /// Whether this key is the page [`Self::for_contig`] builds for `contig` and
+    /// `settings_digest`: the way to ask a key which contig it belongs to.
+    #[must_use]
+    pub fn is_for_contig(&self, contig: &str, settings_digest: u64) -> bool {
+        self.settings_digest == Self::contig_identity(contig, settings_digest)
+    }
 }
 
 #[derive(Debug)]
@@ -1118,6 +1201,157 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn page_keys_of_two_contigs_never_alias_for_the_same_tile_and_settings() {
+        let tile = TrackTileKey {
+            level: 3,
+            index: 17,
+        };
+        let key = |contig: &str, digest: u64| TrackTilePageKey::for_contig(4, contig, tile, digest);
+        // Same track, tile and settings; only the contig differs.
+        assert_ne!(key("chr1", 99), key("chr2", 99));
+        assert_ne!(key("chr1", 99), key("1", 99));
+        assert_ne!(key("chr1", 99), key("", 99));
+        // Settings and track still distinguish pages, and equal inputs give equal keys.
+        assert_ne!(key("chr1", 99), key("chr1", 100));
+        assert_ne!(
+            key("chr1", 99),
+            TrackTilePageKey::for_contig(5, "chr1", tile, 99)
+        );
+        assert_eq!(key("chr1", 99), key("chr1", 99));
+        // A key answers for its own contig only.
+        assert!(key("chr1", 99).is_for_contig("chr1", 99));
+        assert!(!key("chr1", 99).is_for_contig("chr2", 99));
+        assert!(!key("chr1", 99).is_for_contig("chr1", 98));
+        // The scene constructor reads the scene's own contig and tile.
+        let scene = |contig: &str| {
+            TrackTileScene::empty(contig, tile, rgv_model::TrackRendererId::FEATURES)
+        };
+        assert_eq!(
+            TrackTilePageKey::for_scene(4, &scene("chr2"), 99),
+            key("chr2", 99)
+        );
+        assert_ne!(
+            TrackTilePageKey::for_scene(4, &scene("chr1"), 99),
+            TrackTilePageKey::for_scene(4, &scene("chr2"), 99)
+        );
+        // No collision among many plausible contig names under one tile and settings digest.
+        let mut identities = std::collections::BTreeSet::new();
+        for prefix in ["", "chr", "Chr", "scaffold_", "NC_0000", "HLA-"] {
+            for number in 0..2_000 {
+                assert!(identities.insert(key(&format!("{prefix}{number}"), 99)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_probe_hits_row_interiors_and_never_the_gap_between_rows() {
+        use rgv_layout::hit_test_track_scene_at;
+        use rgv_model::{TrackRecordId, TrackSceneRecord};
+
+        let tile = TrackTileKey { level: 0, index: 0 };
+        // One full-height box per row, all over the same columns.
+        let rows = 5_u16;
+        let mut scene = TrackTileScene::empty("chr1", tile, rgv_model::TrackRendererId::FEATURES);
+        for row in 0..rows {
+            scene.records.push(TrackSceneRecord {
+                id: TrackRecordId(u64::from(row) + 100),
+                start: 100,
+                end: 400,
+                row: u32::from(row),
+                name: None,
+            });
+            scene.instances.push(TrackSceneInstance::new(
+                tile,
+                100,
+                400,
+                row,
+                TrackSceneShape::Box,
+                TrackSceneVertical::Row,
+                0,
+                (0.0, 1.0),
+                TrackColor::Token(TrackColorToken::FEATURE_FORWARD),
+                u32::from(row),
+            ));
+        }
+        for (row_pitch, row_height, row_offset) in [
+            (20.0_f32, 12.0_f32, 4.0_f32),
+            (10.0, 6.0, 2.0),
+            (26.0, 12.0, 12.0),
+            (14.0, 14.0, 0.0),
+            (9.5, 2.0, -7.25),
+            (40.0, 39.0, 3.5),
+        ] {
+            let lane = TrackLaneProjection {
+                rect: [10.0, 100.0, 800.0, 400.0],
+                camera_start: 0.0,
+                points_per_base: 2.0,
+                row_pitch,
+                row_height,
+                row_offset,
+                value_range: (0.0, 1.0),
+                bin_style: TrackBinStyle::Bars,
+            };
+            let x = lane.x_of(250.0) as f32;
+            let hit = |y: f32| {
+                hit_test_track_scene_at(&scene, lane.scene_probe(x, y), lane.hit_tolerance_bases())
+                    .and_then(|hit| hit.id)
+            };
+            for row in 0..rows {
+                // What the vertex stage draws for this row.
+                let projected =
+                    project_track_instance(&scene.instances[usize::from(row)], 0, &lane);
+                let (top, bottom) = (projected.bounds[1] as f32, projected.bounds[3] as f32);
+                let expected = Some(TrackRecordId(u64::from(row) + 100));
+                for fraction in [0.02_f32, 0.25, 0.5, 0.75, 0.98] {
+                    let y = top + (bottom - top) * fraction;
+                    if y < lane.rect[1] {
+                        continue;
+                    }
+                    assert_eq!(hit(y), expected, "row {row} at {fraction} of {lane:?}");
+                    let probe = lane.scene_probe(x, y).row.unwrap();
+                    assert_eq!(probe.row, u32::from(row));
+                    assert!((probe.content_fraction - f64::from(fraction)).abs() < 0.02);
+                }
+                // The gap below the row, when the pitch leaves one, belongs to no row.
+                let gap = row_pitch - row_height;
+                if gap > 0.5 {
+                    for fraction in [0.2_f32, 0.5, 0.8] {
+                        let y = bottom + gap * fraction;
+                        assert_eq!(hit(y), None, "gap under row {row} of {lane:?}");
+                        assert!(lane.scene_probe(x, y).row.is_none());
+                    }
+                }
+            }
+            // Above row 0 there is no row either.
+            assert!(
+                lane.scene_probe(x, lane.rect[1] + row_offset - 1.0)
+                    .row
+                    .is_none()
+            );
+            // Outside the feature's columns nothing is hit even inside a row.
+            let outside = lane.x_of(900.0) as f32;
+            let y = lane.rect[1] + row_offset.max(0.0) + row_pitch + row_height * 0.5;
+            assert!(
+                hit_test_track_scene_at(
+                    &scene,
+                    lane.scene_probe(outside, y),
+                    lane.hit_tolerance_bases()
+                )
+                .is_none()
+            );
+        }
+        // The pitch-based conversion this replaces does hit the gap: 20-point pitch, 12-point
+        // rows, a point 16 points below the top of row 1 is 4 points into the gap.
+        let lane = lane();
+        let x = lane.x_of(250.0) as f32;
+        let gap_y = lane.rect[1] + lane.row_offset + lane.row_pitch + 16.0;
+        assert!(
+            rgv_layout::hit_test_track_scene(&scene, lane.scene_point(x, gap_y), 0.25).is_some()
+        );
+        assert!(hit_test_track_scene_at(&scene, lane.scene_probe(x, gap_y), 0.25).is_none());
     }
 
     #[test]

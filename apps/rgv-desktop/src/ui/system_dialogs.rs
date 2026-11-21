@@ -59,13 +59,13 @@ pub(crate) fn show_system_dialogs(
     draft: &mut SystemDialogDraft,
 ) {
     // Borrowed, not copied: this runs every frame whether or not any dialog is open.
-    let recent_alignments = &viewer.settings.recent_alignments;
-    let recent_sessions = &viewer.settings.recent_sessions;
-    let recent_loci = &viewer.settings.recent_loci;
-    let settings_path = &viewer.settings_path;
-    let unresolved_session_sources = &viewer.unresolved_session_sources;
-    let session_migration_notices = &viewer.session_migration_notices;
-    let igv_import_report = &viewer.igv_import_report;
+    let recent_alignments = &viewer.session.settings.recent_alignments;
+    let recent_sessions = &viewer.session.settings.recent_sessions;
+    let recent_loci = &viewer.session.settings.recent_loci;
+    let settings_path = &viewer.session.settings_path;
+    let unresolved_session_sources = &viewer.session.unresolved_session_sources;
+    let session_migration_notices = &viewer.session.session_migration_notices;
+    let igv_import_report = &viewer.session.igv_import_report;
     let recovery_candidates = &viewer.recovery_candidates;
 
     if draft.command_palette_open {
@@ -369,13 +369,13 @@ pub(crate) fn show_system_dialogs(
                                 );
                             }
 
-                            let active_panel_id = viewer.panels.active().id;
+                            let active_panel_id = viewer.session.panels.active().id;
                             if let Some(projection) = viewer
                                 .alignment_tracks
                                 .first()
                                 .and_then(|track| track.projection(active_panel_id))
                             {
-                                let viewport = viewer.panels.active().viewport.interval();
+                                let viewport = viewer.session.panels.active().viewport.interval();
                                 let viewport_bases = viewport.len().max(1) as f64;
                                 let prepared = projection
                                     .scene_frame

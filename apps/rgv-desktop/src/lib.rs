@@ -10,9 +10,8 @@ use crate::sources::inferred_desktop_track_kind;
 use crate::workspace::alignments::{
     AlignmentSceneBudgetSnapshot, AlignmentTrackController, EmptyAlignmentState,
 };
-use crate::workspace::navigation::ImportedLocusRequest;
 use crate::workspace::navigation_transaction::NavigationPresentationPhase;
-use crate::workspace::panels::{PanelWorkspace, ViewPanelController};
+use crate::workspace::panels::ViewPanelController;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -45,20 +44,17 @@ use rgv_alignment_scene::{
     AlignmentCamera, AlignmentDerivedLaneKind, AlignmentHandle, AlignmentHit, AlignmentPageKey,
     AlignmentPanelSceneFrame, AlignmentPanelSceneStore, AlignmentSceneCamera,
     AlignmentSceneSnapshot, AllocationLedger, CpuClipRect, LedgerError, LedgerProgressEpoch,
-    LedgerProgressSubscription, ReferenceRevision, SummaryRevision,
+    LedgerProgressSubscription, SummaryRevision,
 };
 use rgv_core::{
-    ContigAliases, DesktopSettings, GeneticCode, GenomeAssembly, GenomeAssemblyIdentity,
-    GenomeLandmarkCatalogue, GenomicInterval, GenomicSourceFormat, IgvImportReport,
-    LandmarkSearchIndex, PanelId, PresentationNodeId, QuantitativeArithmetic, ReferenceDictionary,
-    ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus, SampleMetadataTable,
-    TrackCollection, TrackConfig, TrackId, TrackKind, TrackSource, UnresolvedSessionSource,
-    VariantFieldScope, VariantMissingValueRule, Viewport, WorkspacePresentation,
-    classify_genomic_source,
+    DesktopSettings, GeneticCode, GenomeLandmarkCatalogue, GenomicInterval, GenomicSourceFormat,
+    LandmarkSearchIndex, PanelId, PresentationNodeId, QuantitativeArithmetic,
+    ReferenceTranslationFrame, ReviewStatus, TrackConfig, TrackId, TrackKind, VariantFieldScope,
+    VariantMissingValueRule, Viewport, classify_genomic_source,
 };
 use rgv_engine::{
     AlignmentIndividualReadCapability, AlignmentSceneRequestToken, AlignmentVerticalResidency,
-    ReferenceEngine, TrackEngine, TrackSearchResults, TrackSpecKind,
+    TrackSearchResults, TrackSpecKind,
 };
 use rgv_hts::RemoteIoStats;
 
@@ -1278,9 +1274,10 @@ struct CachedGenomeOverview {
 
 #[allow(clippy::struct_excessive_bools)]
 struct Viewer {
+    /// Session-level state and logic: the document, panels, tracks, the reference and track
+    /// engines, undo history, notifications and settings. Headless; see `rgv-session`.
+    session: rgv_session::Session<ViewPanelController>,
     application_instance_id: String,
-    workspace_revision: u64,
-    document_state: app::document_state::DocumentState,
     next_evidence_revision: u64,
     automation_alignment_handles: HashMap<String, AutomationAlignmentHandleTarget>,
     window: Arc<Window>,
@@ -1323,11 +1320,9 @@ struct Viewer {
     alignment_scene_owner_clock: u64,
     alignment_scene_request_clock: u64,
     alignment_scene_publication_authority: AlignmentScenePublicationAuthority,
-    navigation_stale_result_rejections: u64,
     egui_context: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
-    panels: PanelWorkspace,
     workspace_layout: WorkspaceLayoutSnapshot,
     genomic_canvas_layer_id: Option<egui::LayerId>,
     pane_divider_rect: Option<egui::Rect>,
@@ -1349,41 +1344,17 @@ struct Viewer {
     /// Pyramid pages the GPU ledger refused in the last prepared frame; while non-zero a
     /// pyramid lane is presented as pending, not complete.
     alignment_depth_pyramid_pages_refused: usize,
-    engine_retirement_tasks: Vec<JoinHandle<()>>,
-    reference_engine: Option<ReferenceEngine>,
-    /// Identity of the currently open FASTA handle. A panel slice is usable only when it carries
-    /// this same revision; reopening an equivalent path still creates a distinct authority.
-    reference_revision: Option<ReferenceRevision>,
-    reference_open_error: Option<String>,
-    track_engine: Option<TrackEngine>,
     automation_auxiliary_open_state: HashMap<TrackId, AutomationAuxiliaryOpenState>,
-    tracks: TrackCollection,
-    track_presentation: WorkspacePresentation,
-    reference_source: Option<TrackSource>,
-    remote_reference_index_url: Option<String>,
     reference_remote_io_stats: Option<RemoteIoStats>,
-    reference_dictionary: Option<ReferenceDictionary>,
-    contig_aliases: ContigAliases,
-    assembly: GenomeAssembly,
-    assembly_identity: Option<GenomeAssemblyIdentity>,
-    suggested_assembly_identity: Option<GenomeAssemblyIdentity>,
     landmark_resource_root: Option<PathBuf>,
     landmark_catalogue: Option<GenomeLandmarkCatalogue>,
     landmark_catalogue_error: Option<String>,
     landmark_resolution: Option<rgv_core::AssemblyResolution>,
     landmark_search_index: Option<LandmarkSearchIndex>,
-    suppressed_builtin_gene_bundles: BTreeSet<String>,
-    assembly_name: String,
-    cytoband_path: Option<PathBuf>,
-    data_status: String,
-    busy_status: app::status_activity::BusyStatus,
     announced_status: String,
     reference_reverse_complement: bool,
     reference_translation_frames: Vec<ReferenceTranslationFrame>,
     reference_genetic_code: GeneticCode,
-    regions_of_interest: Vec<RegionOfInterest>,
-    review_items: Vec<ReviewItem>,
-    sample_metadata: Option<SampleMetadataTable>,
     metadata_filter_column: usize,
     metadata_filter_value: Option<String>,
     metadata_selected_tracks: BTreeSet<TrackId>,
@@ -1411,9 +1382,7 @@ struct Viewer {
     hosted_genomes: crate::workspace::genomes::HostedGenomes,
     /// Ephemeral selection ordering; never written to sessions or diagnostics.
     promoted_read: Option<(TrackId, u64)>,
-    synthetic: bool,
     workspace_alignment_limit: usize,
-    navigation_contract_revision: u64,
     display_dirty: bool,
     display_upload_pending_metrics: bool,
     pending_resolution_query_refresh: Option<Instant>,
@@ -1443,24 +1412,13 @@ struct Viewer {
     annotation_navigation_generation: u64,
     annotation_search_results: TrackSearchResults,
     pending_annotation_navigation: Option<String>,
-    settings: DesktopSettings,
     /// Derived strings of the read shown in the inspector, reused across frames.
     read_inspector_derived: std::cell::RefCell<crate::inspection::read::ReadInspectorDerivedCache>,
-    /// Window-shell policy state: unsaved-changes gate, gesture commits, notifications, ….
+    /// Window-shell policy state: unsaved-changes gate, notification window, newer-writer guard.
     shell: app::shell_state::ShellState,
     /// Health of the GPU device this viewer currently owns; shared with the wgpu callbacks.
     gpu_device_health: Arc<rgv_render::GpuDeviceHealth>,
     gpu_recovery: app::viewer_runtime::GpuRecoveryState,
-    settings_path: PathBuf,
-    settings_writer: app::settings_writer::SettingsWriter,
-    current_session_path: Option<PathBuf>,
-    unresolved_session_sources: Vec<UnresolvedSessionSource>,
-    session_migration_notices: Vec<String>,
-    igv_import_report: Option<IgvImportReport>,
-    /// An imported IGV locus still waiting for a dictionary to place it.
-    imported_locus: Option<ImportedLocusRequest>,
-    /// An imported feature name to search for once an annotation engine exists.
-    imported_feature_search: Option<String>,
     next_autosave: Instant,
     recovery_candidates: Vec<PathBuf>,
     recovery_open: bool,

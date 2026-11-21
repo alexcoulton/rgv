@@ -646,15 +646,15 @@ impl Viewer {
         if !self.manual_diagnostic_trace_autostart_pending {
             return;
         }
-        let source_is_ready = self.synthetic
+        let source_is_ready = self.session.synthetic
             || self.alignment_tracks.is_empty()
             || self
                 .alignment_tracks
                 .iter()
                 .any(|track| track.dictionary.is_some());
-        let bootstrap_locus_is_resolved = self.synthetic
+        let bootstrap_locus_is_resolved = self.session.synthetic
             || self.alignment_tracks.is_empty()
-            || self.panels.active().contig_name != "chrSynthetic";
+            || self.session.panels.active().contig_name != "chrSynthetic";
         if source_is_ready && bootstrap_locus_is_resolved {
             self.manual_diagnostic_trace_autostart_pending = false;
             self.start_manual_diagnostic_trace("launch option", true);
@@ -664,8 +664,8 @@ impl Viewer {
     pub(crate) fn start_manual_diagnostic_trace(&mut self, trigger: &str, show_diagnostics: bool) {
         self.diagnostics
             .manual_runtime
-            .reset_for_recording(&self.data_status);
-        let panel = self.panels.active();
+            .reset_for_recording(&self.session.data_status);
+        let panel = self.session.panels.active();
         let source_kinds = self
             .alignment_tracks
             .iter()
@@ -691,8 +691,8 @@ impl Viewer {
             "surface_width_pixels": self.surface_config.width,
             "surface_height_pixels": self.surface_config.height,
             "scale_factor": self.window.scale_factor(),
-            "cache_budget_mib": self.settings.cache_budget_mib,
-            "read_browsing_buffer_percent": self.settings.read_browsing_buffer_percent,
+            "cache_budget_mib": self.session.settings.cache_budget_mib,
+            "read_browsing_buffer_percent": self.session.settings.read_browsing_buffer_percent,
             "workspace_alignment_limit": self.workspace_alignment_limit,
             "active_locus": {
                 "panel_id": panel.id.get(),
@@ -1132,7 +1132,7 @@ impl Viewer {
         if !self.diagnostics.recording() {
             return;
         }
-        let panel = self.panels.panel(panel_id);
+        let panel = self.session.panels.panel(panel_id);
         let causal_interaction_id = self
             .diagnostics
             .manual_runtime
@@ -1421,7 +1421,7 @@ impl Viewer {
         let reference_install_receipt = projection
             .and_then(|projection| projection.scene_owner)
             .and_then(|owner| {
-                self.panels.get(panel_id).and_then(|panel| {
+                self.session.panels.get(panel_id).and_then(|panel| {
                     panel
                         .reference_installs_queued
                         .get(&owner)
@@ -1439,11 +1439,11 @@ impl Viewer {
                 })
             })
             .unwrap_or(serde_json::Value::Null);
-        let panel_reference = self.panels.get(panel_id).map_or(
+        let panel_reference = self.session.panels.get(panel_id).map_or(
             serde_json::Value::Null,
             |panel| {
                 serde_json::json!({
-                    "viewer_revision": diagnostic_optional_reference_revision(self.reference_revision),
+                    "viewer_revision": diagnostic_optional_reference_revision(self.session.reference_revision),
                     "slice_revision": diagnostic_optional_reference_revision(panel.reference_slice_revision),
                     "request_revision": diagnostic_optional_reference_revision(panel.reference_request_revision),
                     "request_interval": panel.reference_request_interval.map(|interval| {
@@ -1538,7 +1538,7 @@ impl Viewer {
         panel_id: PanelId,
         track_id: TrackId,
     ) -> serde_json::Value {
-        let Some(panel) = self.panels.get(panel_id) else {
+        let Some(panel) = self.session.panels.get(panel_id) else {
             return serde_json::json!({ "panel_present": false });
         };
         let desired_target_revision = self
@@ -1662,7 +1662,7 @@ impl Viewer {
         let current_target_revision = self
             .alignment_scene_publication_authority
             .desired_target_revision();
-        self.panels
+        self.session.panels
             .iter()
             .map(|panel| {
                 let tracks = self
@@ -1750,7 +1750,7 @@ impl Viewer {
                     .collect::<Vec<_>>();
                 serde_json::json!({
                     "panel_id": panel.id.get(),
-                    "active": panel.id == self.panels.active().id,
+                    "active": panel.id == self.session.panels.active().id,
                     "contig": panel.contig_name,
                     "start": panel.viewport.interval().start(),
                     "end": panel.viewport.interval().end(),
@@ -1766,7 +1766,7 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     fn manual_diagnostic_state_snapshot(&self) -> serde_json::Value {
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         let tracks = self
             .alignment_tracks
             .iter()
@@ -1892,12 +1892,12 @@ impl Viewer {
                 );
                 let scroll = panel.read_panel_scroll_state(track.config.id);
                 let (clip_top, clip_bottom, actual_content_bottom) = self
-                    .read_panel_metrics(self.panels.active().id, track.config.id)
+                    .read_panel_metrics(self.session.panels.active().id, track.config.id)
                     .unwrap_or((0.0, 0.0, 0.0));
                 let scroll_maximum = self
-                    .read_panel_metrics(self.panels.active().id, track.config.id)
+                    .read_panel_metrics(self.session.panels.active().id, track.config.id)
                     .map_or(0.0, |(_, bottom, _)| {
-                        self.read_panel_presented_scroll_maximum(self.panels.active().id, track.config.id, bottom)
+                        self.read_panel_presented_scroll_maximum(self.session.panels.active().id, track.config.id, bottom)
                     });
                 let presented = self
                     .presented_alignment_lane(panel.id, track.config.id)
@@ -1925,7 +1925,7 @@ impl Viewer {
                     "presented": presented,
                     "filtering": self.alignment_filter_diagnostic_state(panel.id, track.config.id),
                     "base_labels": self.alignment_base_label_diagnostic_state(panel.id, track.config.id),
-                    "row_authority": format!("{:?}", self.read_panel_row_authority(self.panels.active().id, track.config.id)),
+                    "row_authority": format!("{:?}", self.read_panel_row_authority(self.session.panels.active().id, track.config.id)),
                     "scroll_cache_authority": self.manual_read_panel_scroll_cache_diagnostic_state(
                         panel.id,
                         track.config.id,
@@ -2028,8 +2028,8 @@ impl Viewer {
                 "layout_revision": self.workspace_layout.revision,
                 "layout_recomputations": self.workspace_layout_recomputations,
                 "genome_overview_recomputations": self.genome_overview_recomputations,
-                "navigation_contract_revision": self.navigation_contract_revision,
-                "stale_result_rejections": self.navigation_stale_result_rejections,
+                "navigation_contract_revision": self.session.navigation_contract_revision,
+                "stale_result_rejections": self.session.navigation_stale_result_rejections,
                 "surface_width": self.surface_config.width,
                 "surface_height": self.surface_config.height,
                 "scale_factor": self.window.scale_factor(),
@@ -2137,32 +2137,32 @@ impl Viewer {
             },
             "tracks": tracks,
             "panels": panels,
-            "data_status": self.data_status,
+            "data_status": self.session.data_status,
         })
     }
 
     fn record_manual_data_status_change(&mut self) {
-        if manual_trace_status_is_critical(&self.data_status) {
+        if manual_trace_status_is_critical(&self.session.data_status) {
             self.diagnostics
                 .health
                 .0
                 .set_terminal_failure(Some("critical_invariant"));
         }
         if !self.diagnostics.recording()
-            || self.diagnostics.manual_runtime.last_observed_data_status == self.data_status
+            || self.diagnostics.manual_runtime.last_observed_data_status == self.session.data_status
         {
             return;
         }
         let previous = std::mem::replace(
             &mut self.diagnostics.manual_runtime.last_observed_data_status,
-            self.data_status.clone(),
+            self.session.data_status.clone(),
         );
         let fields = object_fields(serde_json::json!({
             "previous": previous,
-            "current": self.data_status,
+            "current": self.session.data_status,
         }));
-        if manual_trace_status_is_critical(&self.data_status) {
-            let message = self.data_status.clone();
+        if manual_trace_status_is_critical(&self.session.data_status) {
+            let message = self.session.data_status.clone();
             self.freeze_manual_diagnostic_trace(
                 "failure",
                 "critical_data_status",

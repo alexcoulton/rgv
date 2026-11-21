@@ -633,15 +633,17 @@ pub(crate) fn pane_layout_snapshot(
 
 impl Viewer {
     pub(crate) fn rebuild_genomic_display(&mut self, panel_id: PanelId) {
-        let annotation_auto_fit = self.track_presentation.annotation_pane_auto_fit;
+        let annotation_auto_fit = self.session.track_presentation.annotation_pane_auto_fit;
         let annotation_content_height = annotation_auto_fit
-            .then(|| annotation_frame_content_height(&self.panels.panel(panel_id).track_frames))
+            .then(|| {
+                annotation_frame_content_height(&self.session.panels.panel(panel_id).track_frames)
+            })
             .flatten();
         let measured_content_height =
             self.rebuild_genomic_display_pass(panel_id, annotation_content_height);
         if annotation_auto_fit
-            && self.track_presentation.annotation_section_expanded
-            && self.track_presentation.read_section_expanded
+            && self.session.track_presentation.annotation_section_expanded
+            && self.session.track_presentation.read_section_expanded
             && annotation_content_height
                 .is_none_or(|previous| (previous - measured_content_height).abs() >= 0.5)
         {
@@ -687,6 +689,7 @@ impl Viewer {
             ));
         }
         let Some((annotation_content_bottom, annotation_clip_top, annotation_clip_bottom)) = self
+            .session
             .panels
             .panel(panel_id)
             .scroll_display_cache
@@ -739,6 +742,7 @@ impl Viewer {
             .alignment_scene_publication_authority
             .desired_target_revision();
         let read_panel_metrics = self
+            .session
             .panels
             .panel(panel_id)
             .scroll_display_cache
@@ -771,6 +775,7 @@ impl Viewer {
             .collect::<Vec<_>>();
         let primary_track_id = self.primary_alignment_track_id();
         let pending_alignment_reveal = self
+            .session
             .panels
             .panel(panel_id)
             .pending_alignment_reveal
@@ -790,20 +795,20 @@ impl Viewer {
                 .ok()?;
                 Some((track_id, row))
             });
-        let annotation_scroll = if self.track_presentation.annotation_section_expanded {
-            self.panels.annotation_scroll_points.clamp(
+        let annotation_scroll = if self.session.track_presentation.annotation_section_expanded {
+            self.session.panels.annotation_scroll_points.clamp(
                 0.0,
                 (annotation_content_bottom - annotation_clip_bottom).max(0.0),
             )
         } else {
             // A folded section has no current scroll extent, but its camera is
             // latent state and must be restored when the section is reopened.
-            self.panels.annotation_scroll_points
+            self.session.panels.annotation_scroll_points
         };
-        if self.track_presentation.annotation_section_expanded {
-            self.panels.annotation_scroll_points = annotation_scroll;
+        if self.session.track_presentation.annotation_section_expanded {
+            self.session.panels.annotation_scroll_points = annotation_scroll;
         }
-        let panel = self.panels.panel_mut(panel_id);
+        let panel = self.session.panels.panel_mut(panel_id);
         panel
             .pane_layout
             .annotation
@@ -830,6 +835,7 @@ impl Viewer {
         ) in &read_panel_metrics
         {
             let state = panel
+                .state
                 .read_panel_scrolls
                 .entry(*track_id)
                 .or_insert_with(|| {
@@ -898,7 +904,7 @@ impl Viewer {
             panel.latent_vertical_scroll_fraction = primary.latent_scroll_fraction;
             panel.content_bottom_points = primary.content_bottom_points;
         }
-        let mut display = std::mem::take(&mut self.panels.panel_mut(panel_id).display_list);
+        let mut display = std::mem::take(&mut self.session.panels.panel_mut(panel_id).display_list);
         let rectangle_capacity = display.rectangles.capacity();
         let text_capacity = display.texts.capacity();
         display.rectangles.clear();
@@ -912,6 +918,7 @@ impl Viewer {
         );
         {
             let cache = self
+                .session
                 .panels
                 .panel(panel_id)
                 .scroll_display_cache
@@ -919,6 +926,7 @@ impl Viewer {
                 .expect("scroll display cache was observed above");
             for read_panel in &cache.read_panels {
                 let scroll = self
+                    .session
                     .panels
                     .panel(panel_id)
                     .read_panel_scroll_state(read_panel.track_id)
@@ -962,13 +970,13 @@ impl Viewer {
         );
         display.texts.extend(native_read_labels);
         let (interaction_enabled, content_revision) = {
-            let presentation = &self.panels.panel(panel_id).navigation_presentation;
+            let presentation = &self.session.panels.panel(panel_id).navigation_presentation;
             (
                 presentation.is_interactive(),
                 presentation.committed_content_revision,
             )
         };
-        let previous_hover = self.panels.panel(panel_id).hovered_junction_arc;
+        let previous_hover = self.session.panels.panel(panel_id).hovered_junction_arc;
         let native_hover_authority = previous_hover.is_some_and(|hover| {
             self.native_junction_lane_is_present(active_panel_id, hover.key.track_id)
         });
@@ -980,7 +988,7 @@ impl Viewer {
                 ..hover
             });
         if valid_hover != previous_hover {
-            self.panels.panel_mut(panel_id).hovered_junction_arc = valid_hover;
+            self.session.panels.panel_mut(panel_id).hovered_junction_arc = valid_hover;
             self.window.set_cursor(if valid_hover.is_some() {
                 CursorIcon::Pointer
             } else {
@@ -988,11 +996,14 @@ impl Viewer {
             });
             if valid_hover.is_none()
                 && matches!(
-                    self.panels.panel(panel_id).hover_inspector_target,
+                    self.session.panels.panel(panel_id).hover_inspector_target,
                     Some(HoverInspectorTarget::Junction(..))
                 )
             {
-                self.panels.panel_mut(panel_id).hover_inspector_target = None;
+                self.session
+                    .panels
+                    .panel_mut(panel_id)
+                    .hover_inspector_target = None;
             }
         }
         self.sashimi_interaction_diagnostics
@@ -1000,7 +1011,8 @@ impl Viewer {
         self.add_region_overlays(panel_id, &mut display);
         let generic_display = display.clone();
         let mut contextual_display = DisplayList::default();
-        self.panels
+        self.session
+            .panels
             .panel(panel_id)
             .context_scene
             .projected
@@ -1027,7 +1039,7 @@ impl Viewer {
                 capacity_grew,
             });
         }
-        let panel = self.panels.panel_mut(panel_id);
+        let panel = self.session.panels.panel_mut(panel_id);
         panel.generic_display_list = generic_display;
         panel.display_list = display;
         true
@@ -1037,6 +1049,7 @@ impl Viewer {
         let refusal = if self.display_dirty {
             Some("display derivative is already dirty")
         } else if !self
+            .session
             .panels
             .panel(panel_id)
             .scroll_display_cache
@@ -1081,7 +1094,7 @@ impl Viewer {
             }
             return false;
         }
-        self.composite_display_list = composite_panel_display_lists(&self.panels);
+        self.composite_display_list = composite_panel_display_lists(&self.session.panels);
         self.prepare_rectangle_renderer();
         true
     }
@@ -1091,20 +1104,27 @@ impl Viewer {
     /// label measurement. Each lane retains independent readiness and contributes only its own
     /// geometry.
     pub(crate) fn reproject_panel_context_lanes(&mut self, panel_id: PanelId) -> bool {
-        if self.synthetic || self.panels.panel(panel_id).scroll_display_cache.is_none() {
+        if self.session.synthetic
+            || self
+                .session
+                .panels
+                .panel(panel_id)
+                .scroll_display_cache
+                .is_none()
+        {
             return false;
         }
-        let target = self.panels.panel(panel_id).viewport;
-        let frames = self.panels.panel(panel_id).track_frames.clone();
+        let target = self.session.panels.panel(panel_id).viewport;
+        let frames = self.session.panels.panel(panel_id).track_frames.clone();
         {
-            let panel = self.panels.panel_mut(panel_id);
+            let panel = self.session.panels.panel_mut(panel_id);
             panel.context_scene.update_target_readiness(target);
             panel.context_scene.project_camera_text(target, &frames);
         }
         if !self.rebuild_panel_from_scroll_cache(panel_id) {
             return false;
         }
-        self.composite_display_list = composite_panel_display_lists(&self.panels);
+        self.composite_display_list = composite_panel_display_lists(&self.session.panels);
         // Generic screen-space chrome is invariant under horizontal genomic movement. Contextual
         // shapes already live in source-coordinate GPU buffers, so only their camera uniforms
         // (plus the bounded text projection above) change on this path.
@@ -1117,7 +1137,7 @@ impl Viewer {
         panel_id: PanelId,
         track_id: TrackId,
     ) -> ReadPanelMaterializationCoverage {
-        let panel = self.panels.panel(panel_id);
+        let panel = self.session.panels.panel(panel_id);
         let Some(cache) = panel.scroll_display_cache.as_ref() else {
             return ReadPanelMaterializationCoverage::Unknown;
         };
@@ -1149,7 +1169,8 @@ impl Viewer {
     }
 
     fn panel_materialization_covers_scroll(&self, panel_id: PanelId) -> bool {
-        self.panels
+        self.session
+            .panels
             .panel(panel_id)
             .scroll_display_cache
             .as_ref()
@@ -1171,14 +1192,17 @@ impl Viewer {
         &mut self,
         requested_scroll: f32,
     ) -> bool {
-        let next = requested_scroll.clamp(0.0, self.panels.maximum_annotation_scroll_points());
-        self.panels.annotation_scroll_points = next;
-        for panel in self.panels.iter_mut() {
+        let next = requested_scroll.clamp(
+            0.0,
+            crate::workspace::panels::maximum_annotation_scroll_points(&self.session.panels),
+        );
+        self.session.panels.annotation_scroll_points = next;
+        for panel in self.session.panels.iter_mut() {
             panel.pane_layout.annotation.reproject_scroll(next);
         }
-        if self.synthetic
+        if self.session.synthetic
             || self.display_dirty
-            || self.panels.iter().any(|panel| {
+            || self.session.panels.iter().any(|panel| {
                 !panel
                     .scroll_display_cache
                     .as_ref()
@@ -1188,13 +1212,18 @@ impl Viewer {
             return false;
         }
 
-        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let panel_ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         for panel_id in panel_ids {
             if !self.rebuild_panel_from_scroll_cache(panel_id) {
                 return false;
             }
         }
-        self.composite_display_list = composite_panel_display_lists(&self.panels);
+        self.composite_display_list = composite_panel_display_lists(&self.session.panels);
         self.prepare_rectangle_renderer();
         true
     }
@@ -1204,16 +1233,22 @@ impl Viewer {
     }
 
     pub(crate) fn add_region_overlays(&self, panel_id: PanelId, display: &mut DisplayList) {
-        let viewport = self.panels.panel(panel_id).viewport.interval();
+        let viewport = self.session.panels.panel(panel_id).viewport.interval();
         let panel = self.panel_rect(panel_id);
-        let bases_per_pixel = self.panels.panel(panel_id).viewport.bases_per_pixel();
+        let bases_per_pixel = self
+            .session
+            .panels
+            .panel(panel_id)
+            .viewport
+            .bases_per_pixel();
         for (region, x, right) in self
+            .session
             .regions_of_interest
             .iter()
             .filter_map(|region| {
                 region_overlay_horizontal_span(
                     region,
-                    &self.panels.panel(panel_id).contig_name,
+                    &self.session.panels.panel(panel_id).contig_name,
                     viewport,
                     bases_per_pixel,
                     panel.left(),
@@ -1259,8 +1294,8 @@ impl Viewer {
         scroll_clip_top: f32,
     ) {
         let panel_rect = self.active_panel_rect();
-        let active_panel_id = self.panels.active().id;
-        let previous_maximum_scroll = (self.panels.active().content_bottom_points
+        let active_panel_id = self.session.panels.active().id;
+        let previous_maximum_scroll = (self.session.panels.active().content_bottom_points
             - self.canvas_geometry().viewport.bottom())
         .max(0.0);
         let density_drag_fraction = self
@@ -1277,26 +1312,38 @@ impl Viewer {
             (self.canvas_geometry().viewport.bottom() - scroll_clip_top).max(1.0),
             self.primary_alignment_filters().alignment_density,
         );
-        self.panels.active_mut().vertical_content_origin_points = self
+        self.session
+            .panels
+            .active_mut()
+            .vertical_content_origin_points = self
+            .session
             .panels
             .active()
             .vertical_content_origin_points
             .clamp(0.0, camera_padding);
-        self.panels.active_mut().content_bottom_points = actual_content_bottom + camera_padding;
-        let maximum_scroll = (self.panels.active().content_bottom_points
+        self.session.panels.active_mut().content_bottom_points =
+            actual_content_bottom + camera_padding;
+        let maximum_scroll = (self.session.panels.active().content_bottom_points
             - self.canvas_geometry().viewport.bottom())
         .max(0.0);
-        let current_scroll = self.panels.active().vertical_scroll_points;
+        let current_scroll = self.session.panels.active().vertical_scroll_points;
         let (scroll, latent_fraction) = reconcile_vertical_scroll(
             current_scroll,
             previous_maximum_scroll,
             maximum_scroll,
-            self.panels.active().latent_vertical_scroll_fraction,
+            self.session.panels.active().latent_vertical_scroll_fraction,
             density_drag_fraction,
         );
-        self.panels.active_mut().vertical_scroll_points = scroll;
-        self.panels.active_mut().latent_vertical_scroll_fraction = latent_fraction;
-        let effective_scroll = self.panels.active().effective_vertical_scroll_points();
+        self.session.panels.active_mut().vertical_scroll_points = scroll;
+        self.session
+            .panels
+            .active_mut()
+            .latent_vertical_scroll_fraction = latent_fraction;
+        let effective_scroll = self
+            .session
+            .panels
+            .active()
+            .effective_vertical_scroll_points();
         display.scroll_and_clip_vertical(
             effective_scroll,
             scroll_clip_top,
@@ -1324,20 +1371,26 @@ impl Viewer {
     }
 
     pub(crate) fn rebuild_all_panel_displays(&mut self) {
-        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let panel_ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         // Alignment and contextual lanes publish independently. No panel-wide transaction may
         // prevent a ready lane from rebuilding its own presentation.
         let rebuildable_panel_ids = panel_ids;
-        let requested_annotation_scroll = self.panels.annotation_scroll_points;
+        let requested_annotation_scroll = self.session.panels.annotation_scroll_points;
         self.shared_annotation_frame_heights.clear();
         for panel_id in &rebuildable_panel_ids {
-            self.panels.annotation_scroll_points = requested_annotation_scroll;
+            self.session.panels.annotation_scroll_points = requested_annotation_scroll;
             self.rebuild_genomic_display(*panel_id);
         }
-        if self.panels.len() > 1 {
-            self.shared_annotation_frame_heights = maximum_annotation_frame_heights(&self.panels);
+        if self.session.panels.len() > 1 {
+            self.shared_annotation_frame_heights =
+                maximum_annotation_frame_heights(&self.session.panels);
             for panel_id in &rebuildable_panel_ids {
-                self.panels.annotation_scroll_points = requested_annotation_scroll;
+                self.session.panels.annotation_scroll_points = requested_annotation_scroll;
                 self.rebuild_genomic_display(*panel_id);
             }
         }
@@ -1345,23 +1398,29 @@ impl Viewer {
         // Layout can reduce the legal range after tracks are hidden, grouped,
         // or collapsed. Clamp once against all panels, then reproject every
         // cache to the exact same workspace offset.
-        let shared_annotation_scroll = if self.track_presentation.annotation_section_expanded {
-            requested_annotation_scroll.clamp(0.0, self.panels.maximum_annotation_scroll_points())
-        } else {
-            requested_annotation_scroll
-        };
-        let needs_scroll_reprojection = self.panels.iter().any(|panel| {
+        let shared_annotation_scroll =
+            if self.session.track_presentation.annotation_section_expanded {
+                requested_annotation_scroll.clamp(
+                    0.0,
+                    crate::workspace::panels::maximum_annotation_scroll_points(
+                        &self.session.panels,
+                    ),
+                )
+            } else {
+                requested_annotation_scroll
+            };
+        let needs_scroll_reprojection = self.session.panels.iter().any(|panel| {
             (panel.pane_layout.annotation.scroll_points - shared_annotation_scroll).abs()
                 > f32::EPSILON
         });
-        self.panels.annotation_scroll_points = shared_annotation_scroll;
+        self.session.panels.annotation_scroll_points = shared_annotation_scroll;
         if needs_scroll_reprojection {
             for panel_id in &rebuildable_panel_ids {
                 let _ = self.rebuild_panel_from_scroll_cache(*panel_id);
             }
         }
 
-        self.composite_display_list = composite_panel_display_lists(&self.panels);
+        self.composite_display_list = composite_panel_display_lists(&self.session.panels);
     }
 
     pub(crate) fn rebuild_display_list(&mut self) {
@@ -1371,16 +1430,18 @@ impl Viewer {
         if !self.display_dirty {
             return;
         }
-        if self.synthetic {
+        if self.session.synthetic {
             let viewport = self.canvas_geometry().viewport;
-            let width = self.panels.active().viewport.pixel_width() as f32;
-            let annotation_section_expanded = self.track_presentation.annotation_section_expanded;
-            let read_section_expanded = self.track_presentation.read_section_expanded;
+            let width = self.session.panels.active().viewport.pixel_width() as f32;
+            let annotation_section_expanded =
+                self.session.track_presentation.annotation_section_expanded;
+            let read_section_expanded = self.session.track_presentation.read_section_expanded;
             let track_visible = self.primary_alignment_visible();
             let annotation_content_visible = track_visible
                 && !self.primary_alignment_collapsed()
                 && annotation_section_expanded
                 && self
+                    .session
                     .track_presentation
                     .effective_track_visibility(
                         ui::TrackPane::Annotation,
@@ -1390,6 +1451,7 @@ impl Viewer {
             let read_content_visible = track_visible
                 && read_section_expanded
                 && self
+                    .session
                     .track_presentation
                     .effective_track_visibility(ui::TrackPane::Reads, SYNTHETIC_ALIGNMENT_TRACK_ID)
                     .unwrap_or(true);
@@ -1408,10 +1470,11 @@ impl Viewer {
             let section_geometry = track_section_geometry(
                 viewport.top(),
                 viewport.bottom(),
-                self.track_presentation.read_pane_height,
+                self.session.track_presentation.read_pane_height,
                 annotation_section_expanded,
                 read_section_expanded,
-                self.track_presentation
+                self.session
+                    .track_presentation
                     .annotation_pane_auto_fit
                     .then_some(annotation_content_height),
             );
@@ -1493,7 +1556,7 @@ impl Viewer {
             }
             let pane_layout = ui::WorkspacePaneLayout {
                 annotation: pane_layout_snapshot(
-                    &self.track_presentation,
+                    &self.session.track_presentation,
                     &frames,
                     ui::TrackPane::Annotation,
                     section_geometry.annotation_clip_top,
@@ -1504,7 +1567,7 @@ impl Viewer {
                     width,
                 ),
                 reads: pane_layout_snapshot(
-                    &self.track_presentation,
+                    &self.session.track_presentation,
                     &frames,
                     ui::TrackPane::Reads,
                     section_geometry.read_clip_top,
@@ -1521,11 +1584,11 @@ impl Viewer {
                 viewport.bottom(),
                 viewport.top(),
             );
-            let panel = self.panels.active_mut();
+            let panel = self.session.panels.active_mut();
             panel.track_frames = frames;
             panel.pane_layout = pane_layout;
             panel.display_list = display;
-            self.composite_display_list = self.panels.active().display_list.clone();
+            self.composite_display_list = self.session.panels.active().display_list.clone();
         } else {
             self.rebuild_all_panel_displays();
         }
@@ -1554,7 +1617,7 @@ impl Viewer {
         }
         let logical_height = self.surface_config.height as f32 / self.window.scale_factor() as f32;
         let logical_width = self.surface_config.width as f32 / self.window.scale_factor() as f32;
-        let render_display = composite_panel_generic_display_lists(&self.panels);
+        let render_display = composite_panel_generic_display_lists(&self.session.panels);
         let mut rectangle_slab_key = 0xcbf2_9ce4_8422_2325_u64;
         for rectangle in &render_display.rectangles {
             mix_rectangle_slab_key(&mut rectangle_slab_key, *rectangle);
@@ -1576,7 +1639,7 @@ impl Viewer {
             RectangleRenderer::maximum_rectangles_per_frame(),
         ) {
             tracing::warn!(%message, "generic rectangle renderer dropped primitives");
-            self.shell.notifications.push(
+            self.session.notifications.push(
                 app::shell_state::NotificationSeverity::Warning,
                 None,
                 message,
@@ -1604,7 +1667,7 @@ impl Viewer {
         let scale_factor = self.window.scale_factor() as f32;
         let logical_height = self.surface_config.height as f32 / scale_factor.max(f32::EPSILON);
         let logical_width = self.surface_config.width as f32 / scale_factor.max(f32::EPSILON);
-        let annotation_scroll = self.panels.annotation_scroll_points;
+        let annotation_scroll = self.session.panels.annotation_scroll_points;
         let surface_width = self.surface_config.width;
         let surface_height = self.surface_config.height;
         let rectangle_resident_bytes = self.rectangle_renderer.resident_bytes();
@@ -1613,6 +1676,7 @@ impl Viewer {
             .saturating_sub(self.alignment_ledger_occupied_bytes())
             .saturating_sub(rectangle_resident_bytes);
         let requests = self
+            .session
             .panels
             .iter()
             .flat_map(|panel| {
@@ -1729,7 +1793,7 @@ impl Viewer {
         drop(requests);
 
         let mut semantic_projection_changed = false;
-        for panel in self.panels.iter_mut() {
+        for panel in self.session.panels.iter_mut() {
             semantic_projection_changed |= panel.context_scene.apply_gpu_publication(
                 panel.id,
                 panel.viewport,
@@ -1739,17 +1803,23 @@ impl Viewer {
         }
         self.context_scene_gpu_frame = report.frame;
         if semantic_projection_changed {
-            let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+            let panel_ids = self
+                .session
+                .panels
+                .iter()
+                .map(|panel| panel.id)
+                .collect::<Vec<_>>();
             for panel_id in panel_ids {
-                let target = self.panels.panel(panel_id).viewport;
-                let frames = self.panels.panel(panel_id).track_frames.clone();
-                self.panels
+                let target = self.session.panels.panel(panel_id).viewport;
+                let frames = self.session.panels.panel(panel_id).track_frames.clone();
+                self.session
+                    .panels
                     .panel_mut(panel_id)
                     .context_scene
                     .project_content(target, &frames);
                 let _ = self.rebuild_panel_from_scroll_cache(panel_id);
             }
-            self.composite_display_list = composite_panel_display_lists(&self.panels);
+            self.composite_display_list = composite_panel_display_lists(&self.session.panels);
         }
     }
 }

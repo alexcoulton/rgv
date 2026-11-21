@@ -86,7 +86,7 @@ impl Viewer {
             remote_cancellations = stats.cancellations;
         }
 
-        let active_panel_id = self.panels.active().id;
+        let active_panel_id = self.session.panels.active().id;
         let alignment_ledger_progress = self.alignment_scene_ledger.progress().ok();
         let alignment_ledger_operations = self.alignment_scene_ledger.operation_counters().ok();
         let read_gpu_operations = self.alignment_gpu_renderer.operation_counters();
@@ -238,17 +238,21 @@ impl Viewer {
 
         let upload = self.rectangle_renderer.last_prepare_stats();
         let context_gpu = self.context_scene_gpu_renderer.last_prepare_stats();
-        let navigation_counters = self.panels.iter().fold([0_u64; 7], |mut counters, panel| {
-            let schedule = &panel.navigation_query_schedule;
-            counters[0] = counters[0].saturating_add(schedule.input_updates);
-            counters[1] = counters[1].saturating_add(schedule.coalesced_updates);
-            counters[2] = counters[2].saturating_add(schedule.dispatched_targets);
-            counters[3] = counters[3].saturating_add(schedule.gesture_end_dispatches);
-            counters[4] = counters[4].saturating_add(schedule.cancelled_targets);
-            counters[5] = counters[5].saturating_add(schedule.committed_targets);
-            counters[6] = counters[6].max(schedule.last_commit_micros);
-            counters
-        });
+        let navigation_counters =
+            self.session
+                .panels
+                .iter()
+                .fold([0_u64; 7], |mut counters, panel| {
+                    let schedule = &panel.navigation_query_schedule;
+                    counters[0] = counters[0].saturating_add(schedule.input_updates);
+                    counters[1] = counters[1].saturating_add(schedule.coalesced_updates);
+                    counters[2] = counters[2].saturating_add(schedule.dispatched_targets);
+                    counters[3] = counters[3].saturating_add(schedule.gesture_end_dispatches);
+                    counters[4] = counters[4].saturating_add(schedule.cancelled_targets);
+                    counters[5] = counters[5].saturating_add(schedule.committed_targets);
+                    counters[6] = counters[6].max(schedule.last_commit_micros);
+                    counters
+                });
         let diagnostic_now = Instant::now();
         let (sashimi_median, sashimi_p95, sashimi_maximum) = self
             .sashimi_interaction_diagnostics
@@ -329,14 +333,14 @@ impl Viewer {
                     self.alignment_tracks
                         .iter()
                         .filter(|track| {
-                            self.track_presentation
+                            self.session.track_presentation
                                 .track_content_exposed(
                                     ui::TrackPane::Annotation,
                                     track.config.id,
                                 )
                                 .unwrap_or(false)
                                 || self
-                                    .track_presentation
+                                    .session.track_presentation
                                     .track_content_exposed(
                                         ui::TrackPane::Reads,
                                         track.config.id,
@@ -345,11 +349,11 @@ impl Viewer {
                         })
                         .count(),
                     self.workspace_alignment_limit,
-                    f32::from(self.settings.read_browsing_buffer_percent) / 100.0,
+                    f32::from(self.session.settings.read_browsing_buffer_percent) / 100.0,
                 )
             }),
             panels: self
-                .panels
+                .session.panels
                 .iter()
                 .map(|panel| {
                     let transaction = if panel.navigation_presentation.is_unsettled() {
@@ -552,7 +556,7 @@ impl Viewer {
                 navigation_counters[4],
                 navigation_counters[5],
                 navigation_counters[6] as f64 / 1_000.0,
-                self.navigation_stale_result_rejections,
+                self.session.navigation_stale_result_rejections,
                 0,
                 0,
             ),

@@ -16,7 +16,7 @@ use rgv_core::{
     GenomeConfiguration, MAXIMUM_ALIGNMENT_TRACKS, PanelId, SessionAlignmentTrack, TrackId,
     TrackSource,
 };
-use rgv_engine::{AlignmentSceneEngine, ReferenceEngine};
+use rgv_engine::AlignmentSceneEngine;
 use rgv_layout::DisplayList;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 impl Viewer {
     pub(crate) fn alignment_track_limit_reached(&mut self) -> bool {
         if self.alignment_tracks.len() >= MAXIMUM_ALIGNMENT_TRACKS {
-            self.data_status =
+            self.session.data_status =
                 format!("A workspace supports at most {MAXIMUM_ALIGNMENT_TRACKS} alignment tracks");
             return true;
         }
@@ -54,11 +54,11 @@ impl Viewer {
             Ok(()) => {
                 self.invalidate_navigation_contract("alignment source set changed");
                 self.begin_all_panel_refresh_transactions();
-                self.panels.active_mut().pending_queries.alignment = false;
-                self.synthetic = false;
-                self.data_status =
+                self.session.panels.active_mut().pending_queries.alignment = false;
+                self.session.synthetic = false;
+                self.session.data_status =
                     format!("Opening {opened_name} and rebalancing alignment-track caches…");
-                self.rebuild_genomic_display(self.panels.active().id);
+                self.rebuild_genomic_display(self.session.panels.active().id);
                 self.mark_display_dirty("explicit display invalidation");
             }
             Err(error) => self.report_error(error.to_string()),
@@ -123,7 +123,7 @@ impl Viewer {
             .collect::<Vec<_>>();
         let config = upsert_primary_alignment_config(
             &mut configs,
-            self.tracks.tracks(),
+            self.session.tracks.tracks(),
             source.clone(),
             &name,
         );
@@ -140,23 +140,28 @@ impl Viewer {
             configs.remove(0),
             cache_bytes,
             self.alignment_scene_ledger.clone(),
-            self.reference_source.as_ref().map(source_path),
-            self.remote_reference_index_url.clone(),
-            &self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>(),
+            self.session.reference_source.as_ref().map(source_path),
+            self.session.remote_reference_index_url.clone(),
+            &self
+                .session
+                .panels
+                .iter()
+                .map(|panel| panel.id)
+                .collect::<Vec<_>>(),
             coverage_sidecar,
         );
         match controller {
             Ok(controller) => {
-                let interval = self.panels.active().viewport.interval();
-                self.panels.active_mut().requested_locus = Some(format!(
+                let interval = self.session.panels.active().viewport.interval();
+                self.session.panels.active_mut().requested_locus = Some(format!(
                     "{}:{}-{}",
-                    self.panels.active().contig_name,
+                    self.session.panels.active().contig_name,
                     interval.start() + 1,
                     interval.end()
                 ));
-                self.panels.active().generation_clock.advance();
+                self.session.panels.active().generation_clock.advance();
                 crate::workspace::alignments::connect_reference_slice_sinks(
-                    self.reference_engine.as_ref(),
+                    self.session.reference_engine.as_ref(),
                     [&controller],
                 );
                 if self.alignment_tracks.is_empty() {
@@ -167,11 +172,11 @@ impl Viewer {
                 self.invalidate_navigation_contract("alignment source changed");
                 self.begin_all_panel_refresh_transactions();
                 self.reconcile_track_presentation();
-                self.panels.active_mut().pending_queries.alignment = false;
-                self.panels.active_mut().selected_chain = None;
-                self.panels.active_mut().display_list = DisplayList::default();
-                self.synthetic = false;
-                self.data_status = format!("Opening {}…", source.redacted_label());
+                self.session.panels.active_mut().pending_queries.alignment = false;
+                self.session.panels.active_mut().selected_chain = None;
+                self.session.panels.active_mut().display_list = DisplayList::default();
+                self.session.synthetic = false;
+                self.session.data_status = format!("Opening {}…", source.redacted_label());
                 self.mark_display_dirty("explicit display invalidation");
             }
             Err(error) => self.report_error(error.to_string()),
@@ -191,54 +196,28 @@ impl Viewer {
             self.report_error(error.to_string());
             return;
         }
-        self.reference_open_error = None;
-        self.remote_reference_index_url = remote_index_url;
+        self.session.reference_open_error = None;
+        self.session.remote_reference_index_url = remote_index_url;
         let source = track_source(path);
         let source_label = source.redacted_label();
-        let engine = ReferenceEngine::spawn(8);
-        if let Err(error) = engine.try_open_with_options(
+        let engine = match self.session.start_reference_engine(
             path.to_path_buf(),
-            reference_open_options(self.remote_reference_index_url.clone()),
+            reference_open_options(self.session.remote_reference_index_url.clone()),
         ) {
-            self.report_error(error.to_string());
-            if let Some(worker) = engine.retire() {
-                self.engine_retirement_tasks.push(worker);
+            Ok(engine) => engine,
+            Err(error) => {
+                self.report_error(error.to_string());
+                return;
             }
-            return;
-        }
-        self.reference_source = Some(source);
-        self.reference_dictionary = None;
-        self.reference_revision = None;
+        };
         self.reference_remote_io_stats = None;
-        self.retire_reference_engine();
+        self.session.install_reference_engine(engine, source);
         // The retired engine took its slice sinks with it: reconnect every scene engine.
         crate::workspace::alignments::connect_reference_slice_sinks(
-            Some(&engine),
+            self.session.reference_engine.as_ref(),
             &self.alignment_tracks,
         );
-        self.reference_engine = Some(engine);
-        let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
-        for id in ids {
-            if let Some(panel) = self.panels.get_mut(id) {
-                let interval = panel.viewport.interval();
-                panel.requested_locus = Some(format!(
-                    "{}:{}-{}",
-                    panel.contig_name,
-                    interval.start().saturating_add(1),
-                    interval.end()
-                ));
-                panel.generation_clock.advance();
-                panel.reference_slice = None;
-                panel.reference_slice_revision = None;
-                panel.reference_slice_generation = None;
-                panel.reference_request_revision = None;
-                panel.reference_request_interval = None;
-                panel.reference_installs_queued.clear();
-                panel.reference_settled_generation = None;
-                panel.reference_query_error_generation = None;
-                panel.pending_queries.reference = false;
-            }
-        }
+        self.session.rerequest_panel_references();
         if !self.alignment_tracks.is_empty() {
             let configs = self
                 .alignment_tracks
@@ -250,9 +229,9 @@ impl Viewer {
                 return;
             }
         }
-        self.synthetic = false;
+        self.session.synthetic = false;
         self.primary_alignment_filters_mut().show_reference = true;
-        self.data_status = format!("Opening reference genome {source_label}…");
+        self.session.data_status = format!("Opening reference genome {source_label}…");
         self.invalidate_navigation_contract("reference source changed");
         self.begin_all_panel_refresh_transactions();
         self.rebuild_all_panel_displays();
@@ -273,7 +252,7 @@ impl Viewer {
             }
         };
         self.apply_genome_configuration(&configuration)?;
-        self.data_status = format!("Opening genome configuration {}…", path.display());
+        self.session.data_status = format!("Opening genome configuration {}…", path.display());
         Ok(())
     }
 
@@ -319,7 +298,7 @@ impl Viewer {
     ) {
         // Covers a session load too: its new reference engine is installed before this call.
         crate::workspace::alignments::connect_reference_slice_sinks(
-            self.reference_engine.as_ref(),
+            self.session.reference_engine.as_ref(),
             &controllers,
         );
         let replaced = std::mem::replace(&mut self.alignment_tracks, controllers);
@@ -339,11 +318,16 @@ impl Viewer {
             self.alignment_retirement_tasks.len() <= rgv_core::MAXIMUM_ALIGNMENT_TRACKS,
             "Previous alignment sources are still closing; retry shortly"
         );
-        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let panel_ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         let controllers = self.prepare_alignment_track_controllers(
             configs,
-            self.reference_source.as_ref().map(source_path),
-            self.remote_reference_index_url.clone(),
+            self.session.reference_source.as_ref().map(source_path),
+            self.session.remote_reference_index_url.clone(),
             &panel_ids,
         )?;
         self.install_alignment_track_controllers(controllers);
@@ -358,6 +342,7 @@ impl Viewer {
             .map(|track| track.config.id)
             .collect::<Vec<_>>();
         self.alignment_panel_scene_stores = self
+            .session
             .panels
             .iter()
             .map(|panel| {
@@ -437,7 +422,7 @@ impl Viewer {
         let removed_track = self.alignment_tracks.remove(index);
         self.retire_alignment_track_controller(removed_track);
         self.reset_alignment_scene_panel_authority();
-        self.track_presentation.remove_source(id);
+        self.session.track_presentation.remove_source(id);
         self.normalize_alignment_track_groups();
         if self
             .promoted_read
@@ -472,7 +457,7 @@ impl Viewer {
         if removed_was_primary {
             self.activate_first_alignment_track()?;
         }
-        for panel in self.panels.iter_mut() {
+        for panel in self.session.panels.iter_mut() {
             clear_removed_alignment_panel_state(panel, id, removed_was_primary);
         }
         for track in &self.alignment_tracks {

@@ -48,7 +48,7 @@ impl Viewer {
         screen_y: f32,
         predicate: impl Fn(&TrackFrame) -> bool,
     ) -> Option<(&TrackFrame, f32)> {
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         panel
             .pane_layout
             .annotation
@@ -78,7 +78,10 @@ impl Viewer {
                                         .effective_scroll_points(),
                             ));
                         }
-                        Some((frame, screen_y + self.panels.annotation_scroll_points))
+                        Some((
+                            frame,
+                            screen_y + self.session.panels.annotation_scroll_points,
+                        ))
                     })
                     .flatten()
             })
@@ -86,13 +89,15 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn select_at_cursor(&mut self) {
-        let scene_selection = self.alignment_scene_hit_at_cursor(self.panels.active().id);
+        let scene_selection = self.alignment_scene_hit_at_cursor(self.session.panels.active().id);
         let scene_selected_chain = scene_selection.and_then(|hit| {
-            let record = self.alignment_scene_record_for_hit(self.panels.active().id, hit)?;
-            selected_supplementary_chain(&record, &self.panels.active().contig_name)
+            let record =
+                self.alignment_scene_record_for_hit(self.session.panels.active().id, hit)?;
+            selected_supplementary_chain(&record, &self.session.panels.active().contig_name)
         });
         if scene_selection.is_none()
             && !self
+                .session
                 .panels
                 .active()
                 .navigation_presentation
@@ -101,106 +106,145 @@ impl Viewer {
             return;
         }
         self.clear_promoted_read();
-        self.panels.active_mut().retained_evidence = None;
-        self.panels.active_mut().pending_read_selection = None;
-        self.panels.active_mut().pending_alignment_reveal = None;
-        self.panels.active_mut().selected_junction_component = None;
-        self.panels.active_mut().selected_feature = None;
-        self.panels.active_mut().selected_variant = None;
-        self.panels.active_mut().selected_gwas = None;
-        self.panels.active_mut().selected_quantitative = None;
-        self.panels.active_mut().selected_copy_number = None;
-        self.panels.active_mut().selected_mutation = None;
-        self.panels.active_mut().selected_interaction = None;
-        self.panels.active_mut().selected_alignment_hit = None;
+        self.session.panels.active_mut().retained_evidence = None;
+        self.session.panels.active_mut().pending_read_selection = None;
+        self.session.panels.active_mut().pending_alignment_reveal = None;
+        self.session.panels.active_mut().selected_junction_component = None;
+        self.session.panels.active_mut().selected_feature = None;
+        self.session.panels.active_mut().selected_variant = None;
+        self.session.panels.active_mut().selected_gwas = None;
+        self.session.panels.active_mut().selected_quantitative = None;
+        self.session.panels.active_mut().selected_copy_number = None;
+        self.session.panels.active_mut().selected_mutation = None;
+        self.session.panels.active_mut().selected_interaction = None;
+        self.session.panels.active_mut().selected_alignment_hit = None;
         if self.select_track_tile_feature_at_cursor() {
             // A feature of a lane drawn by the experimental tile pipeline.
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_alignment_track = None;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some(selection) = self.feature_at_cursor() {
-            self.panels.active_mut().selected_feature = Some(selection);
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_feature = Some(selection);
+            self.session.panels.active_mut().selected_alignment_track = None;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some(selection) = self.variant_at_cursor() {
-            self.panels.active_mut().selected_variant = Some(selection);
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_variant = Some(selection);
+            self.session.panels.active_mut().selected_alignment_track = None;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some(selection) = self.gwas_at_cursor() {
-            self.panels.active_mut().selected_gwas = Some(selection);
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_gwas = Some(selection);
+            self.session.panels.active_mut().selected_alignment_track = None;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some(selection) = self.mutation_at_cursor() {
-            self.panels.active_mut().selected_mutation = Some(selection);
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_mutation = Some(selection);
+            self.session.panels.active_mut().selected_alignment_track = None;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some(selection) = self.copy_number_at_cursor() {
-            self.panels.active_mut().selected_copy_number = Some(selection);
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_copy_number = Some(selection);
+            self.session.panels.active_mut().selected_alignment_track = None;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some(selection) = self.interaction_at_cursor() {
-            self.panels.active_mut().selected_interaction = Some(selection);
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_interaction = Some(selection);
+            self.session.panels.active_mut().selected_alignment_track = None;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some(selection) = self.quantitative_at_cursor() {
-            self.panels.active_mut().selected_quantitative = Some(selection);
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_quantitative = Some(selection);
+            self.session.panels.active_mut().selected_alignment_track = None;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some((track_id, position)) = self.modification_position_at_cursor() {
-            self.panels.active_mut().selected_alignment_track = Some(track_id);
-            self.panels.active_mut().selected_modification_position = Some(position);
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_alignment_track = Some(track_id);
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = Some(position);
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some((track_id, position)) = self.pileup_position_at_cursor() {
-            self.panels.active_mut().selected_alignment_track = Some(track_id);
-            self.panels.active_mut().selected_pileup_position = Some(position);
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_alignment_track = Some(track_id);
+            self.session.panels.active_mut().selected_pileup_position = Some(position);
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some((track_id, start, end, component)) = self.junction_at_cursor() {
-            self.panels.active_mut().selected_alignment_track = Some(track_id);
-            self.panels.active_mut().selected_junction = Some((start, end));
-            self.panels.active_mut().selected_junction_component = Some(component);
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_alignment_track = Some(track_id);
+            self.session.panels.active_mut().selected_junction = Some((start, end));
+            self.session.panels.active_mut().selected_junction_component = Some(component);
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_chain = None;
         } else if let Some(hit) = scene_selection {
-            self.panels.active_mut().selected_alignment_track = Some(hit.track);
-            self.panels.active_mut().selected_alignment_hit = Some(hit);
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = scene_selected_chain;
+            self.session.panels.active_mut().selected_alignment_track = Some(hit.track);
+            self.session.panels.active_mut().selected_alignment_hit = Some(hit);
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = scene_selected_chain;
         } else {
-            self.panels.active_mut().selected_alignment_track = None;
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_chain = None;
+            self.session.panels.active_mut().selected_alignment_track = None;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_chain = None;
         }
         self.retain_active_read_selection_for_query_refresh();
         let cursor_y = (self.cursor.y / self.window.scale_factor()) as f32;
@@ -208,22 +252,38 @@ impl Viewer {
             .visible_track_frame_at_screen_y(cursor_y, |_| true)
             .map(|(frame, _)| (frame.key, frame.channel));
         if let Some((key, channel)) = selected_track {
-            replace_panel_track_selection(self.panels.active_mut(), key, channel);
+            replace_panel_track_selection(self.session.panels.active_mut(), key, channel);
         } else {
-            self.panels.active_mut().selected_track = None;
-            self.panels.active_mut().selected_presentation_nodes.clear();
-            self.panels.active_mut().presentation_selection_anchor = None;
-            self.panels.active_mut().selected_alignment_tracks.clear();
-            self.panels.active_mut().selected_read_tracks.clear();
+            self.session.panels.active_mut().selected_track = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_presentation_nodes
+                .clear();
+            self.session
+                .panels
+                .active_mut()
+                .presentation_selection_anchor = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_alignment_tracks
+                .clear();
+            self.session
+                .panels
+                .active_mut()
+                .selected_read_tracks
+                .clear();
         }
         self.bump_workspace_revision();
         let granularity = self
+            .session
             .panels
             .active()
             .selected_pileup_position
             .map(|_| AutomationSelectionGranularity::VisibleBin);
         self.retain_active_selection(granularity);
-        let panel_id = self.panels.active().id;
+        let panel_id = self.session.panels.active().id;
         self.synchronize_alignment_scene_interactions(panel_id);
         self.prepare_alignment_scene_frame();
         self.mark_display_dirty("explicit display invalidation");
@@ -244,6 +304,7 @@ impl Viewer {
             return None;
         };
         let track = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -256,6 +317,7 @@ impl Viewer {
             && primary_pinned_gene_id(&self.effective_auxiliary_presentation_configs())
                 == Some(track_id);
         let records = self
+            .session
             .panels
             .active()
             .track_snapshots
@@ -279,7 +341,7 @@ impl Viewer {
         let label_widths = measured_feature_label_widths(&self.egui_context, records);
         let display = layout_features_with_label_widths(
             records,
-            self.panels.active().viewport,
+            self.session.panels.active().viewport,
             TrackLayoutOptions {
                 top: frame.top,
                 height: frame.bottom - frame.top,
@@ -318,6 +380,7 @@ impl Viewer {
             return None;
         };
         let query = self
+            .session
             .panels
             .active()
             .track_snapshots
@@ -334,13 +397,14 @@ impl Viewer {
             })?;
         let local_x = f64::from(x - panel_rect.left());
         let position = self
+            .session
             .panels
             .active()
             .viewport
             .genomic_at_pixel(local_x)
             .floor()
             .max(0.0) as u64;
-        let tolerance = (self.panels.active().viewport.bases_per_pixel() * 6.0)
+        let tolerance = (self.session.panels.active().viewport.bases_per_pixel() * 6.0)
             .ceil()
             .max(1.0) as u64;
         query
@@ -376,6 +440,7 @@ impl Viewer {
             return None;
         };
         let track = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -384,6 +449,7 @@ impl Viewer {
             return None;
         }
         let query = self
+            .session
             .panels
             .active()
             .track_snapshots
@@ -396,7 +462,7 @@ impl Viewer {
         let local_x = x - panel_rect.left();
         gwas_record_index_at_point(
             &query.records,
-            self.panels.active().viewport,
+            self.session.panels.active().viewport,
             local_x,
             content_y,
             frame.top,
@@ -424,6 +490,7 @@ impl Viewer {
         };
         let local_x = f64::from(x - panel_rect.left());
         let position = self
+            .session
             .panels
             .active()
             .viewport
@@ -449,6 +516,7 @@ impl Viewer {
             .into_iter()
             .filter_map(|track| {
                 let query = self
+                    .session
                     .panels
                     .active()
                     .track_snapshots
@@ -467,8 +535,8 @@ impl Viewer {
                 let distance = quantitative_track_y_at_position(
                     track,
                     &effective_tracks,
-                    &self.panels.active().track_snapshots,
-                    self.panels.active().viewport,
+                    &self.session.panels.active().track_snapshots,
+                    self.session.panels.active().viewport,
                     position,
                     frame.top,
                     frame.bottom - frame.top,
@@ -502,12 +570,14 @@ impl Viewer {
             return None;
         };
         let settings = self
+            .session
             .tracks
             .tracks()
             .iter()
             .find(|track| track.id == track_id)
             .map(|track| &track.mutation)?;
         let query = self
+            .session
             .panels
             .active()
             .track_snapshots
@@ -532,6 +602,7 @@ impl Viewer {
             return None;
         }
         let position = self
+            .session
             .panels
             .active()
             .viewport
@@ -560,12 +631,14 @@ impl Viewer {
             return None;
         };
         let settings = self
+            .session
             .tracks
             .tracks()
             .iter()
             .find(|track| track.id == track_id)
             .map(|track| &track.copy_number)?;
         let query = self
+            .session
             .panels
             .active()
             .track_snapshots
@@ -593,6 +666,7 @@ impl Viewer {
         );
         let sample_index = *order.get(row_index)?;
         let position = self
+            .session
             .panels
             .active()
             .viewport
@@ -629,6 +703,7 @@ impl Viewer {
             return None;
         };
         let query = self
+            .session
             .panels
             .active()
             .track_snapshots
@@ -644,18 +719,19 @@ impl Viewer {
                 | TrackSnapshotData::Gwas(_) => None,
             })?;
         let position = self
+            .session
             .panels
             .active()
             .viewport
             .genomic_at_pixel(f64::from(x - panel_rect.left()))
             .floor()
             .max(0.0) as u64;
-        let tolerance = (self.panels.active().viewport.bases_per_pixel() * 6.0)
+        let tolerance = (self.session.panels.active().viewport.bases_per_pixel() * 6.0)
             .ceil()
             .max(1.0) as u64;
         interaction_record_index_at_position(
             &query.records,
-            &self.panels.active().contig_name,
+            &self.session.panels.active().contig_name,
             position,
             tolerance,
         )
@@ -667,6 +743,7 @@ impl Viewer {
 
     pub(crate) fn feature_inspector_snapshot(&self) -> Option<FeatureInspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -674,11 +751,12 @@ impl Viewer {
         {
             return None;
         }
-        let selection = self.panels.active().selected_feature?;
+        let selection = self.session.panels.active().selected_feature?;
         if let Some(snapshot) = self.track_tile_feature_inspector_snapshot() {
             return Some(snapshot);
         }
-        self.panels
+        self.session
+            .panels
             .active()
             .track_snapshots
             .iter()
@@ -704,6 +782,7 @@ impl Viewer {
 
     pub(crate) fn interaction_inspector_snapshot(&self) -> Option<InteractionInspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -711,8 +790,9 @@ impl Viewer {
         {
             return None;
         }
-        let selection = self.panels.active().selected_interaction?;
-        self.panels
+        let selection = self.session.panels.active().selected_interaction?;
+        self.session
+            .panels
             .active()
             .track_snapshots
             .iter()
@@ -722,6 +802,7 @@ impl Viewer {
                     if selection.record_index < query.records.len() =>
                 {
                     let settings = self
+                        .session
                         .tracks
                         .tracks()
                         .iter()
@@ -748,6 +829,7 @@ impl Viewer {
 
     pub(crate) fn quantitative_inspector_snapshot(&self) -> Option<QuantitativeInspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -755,8 +837,9 @@ impl Viewer {
         {
             return None;
         }
-        let selection = self.panels.active().selected_quantitative?;
-        self.panels
+        let selection = self.session.panels.active().selected_quantitative?;
+        self.session
+            .panels
             .active()
             .track_snapshots
             .iter()
@@ -766,6 +849,7 @@ impl Viewer {
                     if selection.record_index < query.records.len() =>
                 {
                     let settings = self
+                        .session
                         .tracks
                         .tracks()
                         .iter()
@@ -780,6 +864,7 @@ impl Viewer {
                         selected_position: selection.position,
                         operand: settings.operand_track.map(|operand_id| {
                             let operand_name = self
+                                .session
                                 .tracks
                                 .tracks()
                                 .iter()
@@ -789,6 +874,7 @@ impl Viewer {
                                     |track| track.name.clone(),
                                 );
                             let value = self
+                                .session
                                 .panels
                                 .active()
                                 .track_snapshots
@@ -831,6 +917,7 @@ impl Viewer {
 
     pub(crate) fn gwas_inspector_snapshot(&self) -> Option<GwasInspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -838,8 +925,9 @@ impl Viewer {
         {
             return None;
         }
-        let selection = self.panels.active().selected_gwas?;
-        self.panels
+        let selection = self.session.panels.active().selected_gwas?;
+        self.session
+            .panels
             .active()
             .track_snapshots
             .iter()
@@ -847,6 +935,7 @@ impl Viewer {
             .and_then(|snapshot| match &snapshot.data {
                 TrackSnapshotData::Gwas(query) if selection.record_index < query.records.len() => {
                     let settings = self
+                        .session
                         .tracks
                         .tracks()
                         .iter()
@@ -865,6 +954,7 @@ impl Viewer {
 
     pub(crate) fn copy_number_inspector_snapshot(&self) -> Option<CopyNumberInspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -872,8 +962,9 @@ impl Viewer {
         {
             return None;
         }
-        let selection = self.panels.active().selected_copy_number?;
-        self.panels
+        let selection = self.session.panels.active().selected_copy_number?;
+        self.session
+            .panels
             .active()
             .track_snapshots
             .iter()
@@ -883,6 +974,7 @@ impl Viewer {
                     if selection.segment_index < query.segments.len() =>
                 {
                     let settings = self
+                        .session
                         .tracks
                         .tracks()
                         .iter()
@@ -909,6 +1001,7 @@ impl Viewer {
 
     pub(crate) fn mutation_inspector_snapshot(&self) -> Option<MutationInspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -916,8 +1009,9 @@ impl Viewer {
         {
             return None;
         }
-        let selection = self.panels.active().selected_mutation?;
-        self.panels
+        let selection = self.session.panels.active().selected_mutation?;
+        self.session
+            .panels
             .active()
             .track_snapshots
             .iter()
@@ -928,7 +1022,7 @@ impl Viewer {
                 {
                     Some(MutationInspectorSnapshot {
                         track_name: snapshot.name.clone(),
-                        contig: self.panels.active().contig_name.clone(),
+                        contig: self.session.panels.active().contig_name.clone(),
                         query: Arc::clone(query),
                         record_index: selection.record_index,
                     })
@@ -945,6 +1039,7 @@ impl Viewer {
 
     pub(crate) fn variant_inspector_snapshot(&self) -> Option<VariantInspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -952,8 +1047,9 @@ impl Viewer {
         {
             return None;
         }
-        let selection = self.panels.active().selected_variant?;
-        self.panels
+        let selection = self.session.panels.active().selected_variant?;
+        self.session
+            .panels
             .active()
             .track_snapshots
             .iter()
@@ -963,6 +1059,7 @@ impl Viewer {
                     if selection.record_index < query.records.len() =>
                 {
                     let settings = self
+                        .session
                         .tracks
                         .tracks()
                         .iter()
@@ -994,7 +1091,7 @@ impl Viewer {
             .iter()
             .filter_map(|track| {
                 if let Some(presented) = self
-                    .presented_alignment_lane(self.panels.active().id, track.config.id)
+                    .presented_alignment_lane(self.session.panels.active().id, track.config.id)
                     .filter(|presented| presented.lane.summary_current())
                     && let Some(scene) = presented.lane.snapshot.as_ref()
                 {
@@ -1064,21 +1161,25 @@ impl Viewer {
         position: u64,
         modification: bool,
     ) {
-        self.panels.active_mut().selected_alignment_track = Some(track_id);
+        self.session.panels.active_mut().selected_alignment_track = Some(track_id);
         replace_panel_track_selection(
-            self.panels.active_mut(),
+            self.session.panels.active_mut(),
             TrackFrameKey::Alignment(track_id),
             ui::TrackPane::Annotation,
         );
-        self.panels.active_mut().pending_read_selection = None;
-        self.panels.active_mut().pending_alignment_reveal = None;
-        self.panels.active_mut().selected_alignment_hit = None;
-        self.panels.active_mut().selected_junction = None;
-        self.panels.active_mut().selected_junction_component = None;
-        self.panels.active_mut().selected_chain = None;
-        self.panels.active_mut().selected_pileup_position = (!modification).then_some(position);
-        self.panels.active_mut().selected_modification_position = modification.then_some(position);
-        self.rebuild_genomic_display(self.panels.active().id);
+        self.session.panels.active_mut().pending_read_selection = None;
+        self.session.panels.active_mut().pending_alignment_reveal = None;
+        self.session.panels.active_mut().selected_alignment_hit = None;
+        self.session.panels.active_mut().selected_junction = None;
+        self.session.panels.active_mut().selected_junction_component = None;
+        self.session.panels.active_mut().selected_chain = None;
+        self.session.panels.active_mut().selected_pileup_position =
+            (!modification).then_some(position);
+        self.session
+            .panels
+            .active_mut()
+            .selected_modification_position = modification.then_some(position);
+        self.rebuild_genomic_display(self.session.panels.active().id);
         self.mark_display_dirty("explicit display invalidation");
     }
 
@@ -1091,16 +1192,17 @@ impl Viewer {
             return None;
         }
         let track_id = alignment_lane_in_pane_layout(
-            &self.panels.active().pane_layout.annotation,
+            &self.session.panels.active().pane_layout.annotation,
             "Modifications",
             y,
         )?;
         if let Some(scene) = self
-            .presented_alignment_lane(self.panels.active().id, track_id)
+            .presented_alignment_lane(self.session.panels.active().id, track_id)
             .and_then(|presented| presented.lane.snapshot.as_ref())
         {
             let local_x = f64::from(x - panel_rect.left());
             let position = self
+                .session
                 .panels
                 .active()
                 .viewport
@@ -1144,15 +1246,16 @@ impl Viewer {
             return None;
         }
         let track_id = alignment_lane_in_pane_layout(
-            &self.panels.active().pane_layout.annotation,
+            &self.session.panels.active().pane_layout.annotation,
             "Coverage",
             y,
         )?;
         if let Some(scene) = self
-            .presented_alignment_lane(self.panels.active().id, track_id)
+            .presented_alignment_lane(self.session.panels.active().id, track_id)
             .and_then(|presented| presented.lane.snapshot.as_ref())
         {
             let position = self
+                .session
                 .panels
                 .active()
                 .viewport
@@ -1182,7 +1285,7 @@ impl Viewer {
     }
 
     pub(crate) fn junction_arc_hit_test_at_cursor(&self) -> JunctionArcHitTestResult {
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         if !panel.navigation_presentation.is_interactive() {
             return JunctionArcHitTestResult {
                 gate: SashimiHitTestGate::PresentationUnsettled,
@@ -1247,6 +1350,7 @@ impl Viewer {
             return None;
         }
         let content_revision = self
+            .session
             .panels
             .get(panel_id)?
             .navigation_presentation
@@ -1371,6 +1475,7 @@ impl Viewer {
 
     pub(crate) fn select_visible_read(&mut self, forward: bool) {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -1379,15 +1484,16 @@ impl Viewer {
             return;
         }
         self.clear_promoted_read();
-        self.panels.active_mut().pending_read_selection = None;
-        self.panels.active_mut().pending_alignment_reveal = None;
-        let panel_id = self.panels.active().id;
+        self.session.panels.active_mut().pending_read_selection = None;
+        self.session.panels.active_mut().pending_alignment_reveal = None;
+        let panel_id = self.session.panels.active().id;
         let track_id = self
+            .session
             .panels
             .active()
             .selected_alignment_hit
             .map(|hit| hit.track)
-            .or(self.panels.active().selected_alignment_track)
+            .or(self.session.panels.active().selected_alignment_track)
             .unwrap_or_else(|| self.primary_alignment_track_id());
         let native_scene = self
             .presented_alignment_lane(panel_id, track_id)
@@ -1401,6 +1507,7 @@ impl Viewer {
                 AlignmentTraversalDirection::Previous
             };
             let current = self
+                .session
                 .panels
                 .active()
                 .selected_alignment_hit
@@ -1417,22 +1524,25 @@ impl Viewer {
                 .ok()
                 .flatten()
                 .and_then(|record| {
-                    selected_supplementary_chain(&record, &self.panels.active().contig_name)
+                    selected_supplementary_chain(&record, &self.session.panels.active().contig_name)
                 });
-            self.panels.active_mut().selected_alignment_track = Some(track_id);
-            self.panels.active_mut().selected_alignment_hit = Some(AlignmentHit {
+            self.session.panels.active_mut().selected_alignment_track = Some(track_id);
+            self.session.panels.active_mut().selected_alignment_hit = Some(AlignmentHit {
                 track: track_id,
                 scene_revision: scene.revision(),
                 handle,
                 component: AlignmentComponent::ReadSpan,
             });
-            self.panels.active_mut().selected_pileup_position = None;
-            self.panels.active_mut().selected_modification_position = None;
-            self.panels.active_mut().selected_junction = None;
-            self.panels.active_mut().selected_junction_component = None;
-            self.panels.active_mut().selected_chain = selected_chain;
+            self.session.panels.active_mut().selected_pileup_position = None;
+            self.session
+                .panels
+                .active_mut()
+                .selected_modification_position = None;
+            self.session.panels.active_mut().selected_junction = None;
+            self.session.panels.active_mut().selected_junction_component = None;
+            self.session.panels.active_mut().selected_chain = selected_chain;
             replace_panel_track_selection(
-                self.panels.active_mut(),
+                self.session.panels.active_mut(),
                 TrackFrameKey::Alignment(track_id),
                 ui::TrackPane::Reads,
             );
@@ -1444,27 +1554,31 @@ impl Viewer {
     }
 
     pub(crate) fn clear_semantic_evidence_selection(&mut self) {
-        self.panels.active_mut().pending_read_selection = None;
-        self.panels.active_mut().pending_alignment_reveal = None;
-        self.panels.active_mut().selected_alignment_hit = None;
-        self.panels.active_mut().selected_alignment_track = None;
-        self.panels.active_mut().selected_pileup_position = None;
-        self.panels.active_mut().selected_modification_position = None;
-        self.panels.active_mut().selected_junction = None;
-        self.panels.active_mut().selected_junction_component = None;
-        self.panels.active_mut().selected_feature = None;
-        self.panels.active_mut().selected_variant = None;
-        self.panels.active_mut().selected_gwas = None;
-        self.panels.active_mut().selected_quantitative = None;
-        self.panels.active_mut().selected_copy_number = None;
-        self.panels.active_mut().selected_mutation = None;
-        self.panels.active_mut().selected_interaction = None;
-        self.panels.active_mut().selected_chain = None;
+        self.session.panels.active_mut().pending_read_selection = None;
+        self.session.panels.active_mut().pending_alignment_reveal = None;
+        self.session.panels.active_mut().selected_alignment_hit = None;
+        self.session.panels.active_mut().selected_alignment_track = None;
+        self.session.panels.active_mut().selected_pileup_position = None;
+        self.session
+            .panels
+            .active_mut()
+            .selected_modification_position = None;
+        self.session.panels.active_mut().selected_junction = None;
+        self.session.panels.active_mut().selected_junction_component = None;
+        self.session.panels.active_mut().selected_feature = None;
+        self.session.panels.active_mut().selected_variant = None;
+        self.session.panels.active_mut().selected_gwas = None;
+        self.session.panels.active_mut().selected_quantitative = None;
+        self.session.panels.active_mut().selected_copy_number = None;
+        self.session.panels.active_mut().selected_mutation = None;
+        self.session.panels.active_mut().selected_interaction = None;
+        self.session.panels.active_mut().selected_chain = None;
     }
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn select_loaded_track_evidence(&mut self, forward: bool) {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -1472,21 +1586,22 @@ impl Viewer {
         {
             return;
         }
-        let Some(track_key) = self.panels.active().selected_track else {
-            "Select a track before moving through its evidence".clone_into(&mut self.data_status);
+        let Some(track_key) = self.session.panels.active().selected_track else {
+            "Select a track before moving through its evidence"
+                .clone_into(&mut self.session.data_status);
             return;
         };
         match track_key {
             TrackFrameKey::Group { channel, id } => {
-                self.data_status =
+                self.session.data_status =
                     format!("{channel:?} track group {id} has no discrete evidence records");
             }
             TrackFrameKey::Reference => {
                 "The reference track has no discrete evidence records"
-                    .clone_into(&mut self.data_status);
+                    .clone_into(&mut self.session.data_status);
             }
             TrackFrameKey::Alignment(track_id) => {
-                let panel_id = self.panels.active().id;
+                let panel_id = self.session.panels.active().id;
                 let native_scene = self
                     .presented_alignment_lane(panel_id, track_id)
                     .and_then(|presented| presented.lane.snapshot.as_ref())
@@ -1499,6 +1614,7 @@ impl Viewer {
                         AlignmentTraversalDirection::Previous
                     };
                     let current = self
+                        .session
                         .panels
                         .active()
                         .selected_alignment_hit
@@ -1509,7 +1625,7 @@ impl Viewer {
                         .or_else(|| scene.edge_handle(direction));
                     let Some(handle) = handle else {
                         "The selected alignment track has no complete reads available"
-                            .clone_into(&mut self.data_status);
+                            .clone_into(&mut self.session.data_status);
                         return;
                     };
                     let selected_chain =
@@ -1520,25 +1636,25 @@ impl Viewer {
                             .and_then(|record| {
                                 selected_supplementary_chain(
                                     &record,
-                                    &self.panels.active().contig_name,
+                                    &self.session.panels.active().contig_name,
                                 )
                             });
                     self.clear_promoted_read();
                     self.clear_semantic_evidence_selection();
-                    self.panels.active_mut().selected_alignment_track = Some(track_id);
-                    self.panels.active_mut().selected_alignment_hit = Some(AlignmentHit {
+                    self.session.panels.active_mut().selected_alignment_track = Some(track_id);
+                    self.session.panels.active_mut().selected_alignment_hit = Some(AlignmentHit {
                         track: track_id,
                         scene_revision: scene.revision(),
                         handle,
                         component: AlignmentComponent::ReadSpan,
                     });
-                    self.panels.active_mut().selected_chain = selected_chain;
+                    self.session.panels.active_mut().selected_chain = selected_chain;
                     replace_panel_track_selection(
-                        self.panels.active_mut(),
+                        self.session.panels.active_mut(),
                         TrackFrameKey::Alignment(track_id),
                         ui::TrackPane::Reads,
                     );
-                    self.data_status =
+                    self.session.data_status =
                         format!("Selected complete scene read in track {}", track_id.get());
                     self.synchronize_alignment_scene_interactions(panel_id);
                     self.prepare_alignment_scene_frame();
@@ -1546,10 +1662,11 @@ impl Viewer {
                     return;
                 }
                 "The selected alignment track has no committed complete scene"
-                    .clone_into(&mut self.data_status);
+                    .clone_into(&mut self.session.data_status);
             }
             TrackFrameKey::Auxiliary(track_id) => {
                 let Some(snapshot) = self
+                    .session
                     .panels
                     .active()
                     .track_snapshots
@@ -1557,12 +1674,14 @@ impl Viewer {
                     .find(|snapshot| snapshot.id == track_id)
                     .cloned()
                 else {
-                    "The selected track has no loaded evidence".clone_into(&mut self.data_status);
+                    "The selected track has no loaded evidence"
+                        .clone_into(&mut self.session.data_status);
                     return;
                 };
                 let selection = match snapshot.data {
                     TrackSnapshotData::Features(records) => {
                         let current = self
+                            .session
                             .panels
                             .active()
                             .selected_feature
@@ -1573,6 +1692,7 @@ impl Viewer {
                     }
                     TrackSnapshotData::Variants(query) => {
                         let current = self
+                            .session
                             .panels
                             .active()
                             .selected_variant
@@ -1583,6 +1703,7 @@ impl Viewer {
                     }
                     TrackSnapshotData::Gwas(query) => {
                         let current = self
+                            .session
                             .panels
                             .active()
                             .selected_gwas
@@ -1593,6 +1714,7 @@ impl Viewer {
                     }
                     TrackSnapshotData::Quantitative(query) => {
                         let current = self
+                            .session
                             .panels
                             .active()
                             .selected_quantitative
@@ -1604,6 +1726,7 @@ impl Viewer {
                     }
                     TrackSnapshotData::CopyNumber(query) => {
                         let current = self
+                            .session
                             .panels
                             .active()
                             .selected_copy_number
@@ -1614,6 +1737,7 @@ impl Viewer {
                     }
                     TrackSnapshotData::Mutations(query) => {
                         let current = self
+                            .session
                             .panels
                             .active()
                             .selected_mutation
@@ -1624,6 +1748,7 @@ impl Viewer {
                     }
                     TrackSnapshotData::Interactions(query) => {
                         let current = self
+                            .session
                             .panels
                             .active()
                             .selected_interaction
@@ -1634,34 +1759,37 @@ impl Viewer {
                     }
                 };
                 let Some(selection) = selection else {
-                    "The selected track has no loaded evidence".clone_into(&mut self.data_status);
+                    "The selected track has no loaded evidence"
+                        .clone_into(&mut self.session.data_status);
                     return;
                 };
                 self.clear_semantic_evidence_selection();
                 let (kind, index) = match selection {
                     EvidenceSelection::Feature(index) => {
-                        self.panels.active_mut().selected_feature = Some(FeatureSelection {
-                            track_id,
-                            record_index: index,
-                        });
+                        self.session.panels.active_mut().selected_feature =
+                            Some(FeatureSelection {
+                                track_id,
+                                record_index: index,
+                            });
                         ("feature", index)
                     }
                     EvidenceSelection::Variant(index) => {
-                        self.panels.active_mut().selected_variant = Some(VariantSelection {
-                            track_id,
-                            record_index: index,
-                        });
+                        self.session.panels.active_mut().selected_variant =
+                            Some(VariantSelection {
+                                track_id,
+                                record_index: index,
+                            });
                         ("variant", index)
                     }
                     EvidenceSelection::Gwas(index) => {
-                        self.panels.active_mut().selected_gwas = Some(GwasSelection {
+                        self.session.panels.active_mut().selected_gwas = Some(GwasSelection {
                             track_id,
                             record_index: index,
                         });
                         ("GWAS association", index)
                     }
                     EvidenceSelection::Quantitative(index, position) => {
-                        self.panels.active_mut().selected_quantitative =
+                        self.session.panels.active_mut().selected_quantitative =
                             Some(QuantitativeSelection {
                                 track_id,
                                 record_index: index,
@@ -1670,21 +1798,23 @@ impl Viewer {
                         ("quantitative record", index)
                     }
                     EvidenceSelection::CopyNumber(index) => {
-                        self.panels.active_mut().selected_copy_number = Some(CopyNumberSelection {
-                            track_id,
-                            segment_index: index,
-                        });
+                        self.session.panels.active_mut().selected_copy_number =
+                            Some(CopyNumberSelection {
+                                track_id,
+                                segment_index: index,
+                            });
                         ("copy-number segment", index)
                     }
                     EvidenceSelection::Mutation(index) => {
-                        self.panels.active_mut().selected_mutation = Some(MutationSelection {
-                            track_id,
-                            record_index: index,
-                        });
+                        self.session.panels.active_mut().selected_mutation =
+                            Some(MutationSelection {
+                                track_id,
+                                record_index: index,
+                            });
                         ("mutation", index)
                     }
                     EvidenceSelection::Interaction(index) => {
-                        self.panels.active_mut().selected_interaction =
+                        self.session.panels.active_mut().selected_interaction =
                             Some(InteractionSelection {
                                 track_id,
                                 record_index: index,
@@ -1692,7 +1822,7 @@ impl Viewer {
                         ("interaction", index)
                     }
                 };
-                self.data_status = format!(
+                self.session.data_status = format!(
                     "Selected loaded {kind} {} in track {}",
                     index + 1,
                     track_id.get()
@@ -1704,7 +1834,7 @@ impl Viewer {
     }
 
     pub(crate) fn promote_selected_read_to_top(&mut self) -> bool {
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         let Some(track_id) = panel
             .selected_alignment_hit
             .map(|hit| hit.track)
@@ -1736,7 +1866,7 @@ impl Viewer {
         if name.is_empty() {
             return false;
         }
-        let panel_id = self.panels.active().id;
+        let panel_id = self.session.panels.active().id;
         let native_scene = self
             .presented_alignment_lane(panel_id, track_id)
             .and_then(|presented| presented.lane.snapshot.as_ref())
@@ -1753,28 +1883,31 @@ impl Viewer {
             .ok()
             .flatten()
             .and_then(|record| {
-                selected_supplementary_chain(&record, &self.panels.active().contig_name)
+                selected_supplementary_chain(&record, &self.session.panels.active().contig_name)
             });
         self.clear_promoted_read();
-        self.panels.active_mut().pending_read_selection = None;
-        self.panels.active_mut().pending_alignment_reveal = None;
-        self.panels.active_mut().selected_alignment_hit = Some(AlignmentHit {
+        self.session.panels.active_mut().pending_read_selection = None;
+        self.session.panels.active_mut().pending_alignment_reveal = None;
+        self.session.panels.active_mut().selected_alignment_hit = Some(AlignmentHit {
             track: track_id,
             scene_revision: scene.revision(),
             handle,
             component: AlignmentComponent::ReadSpan,
         });
-        self.panels.active_mut().selected_alignment_track = Some(track_id);
+        self.session.panels.active_mut().selected_alignment_track = Some(track_id);
         replace_panel_track_selection(
-            self.panels.active_mut(),
+            self.session.panels.active_mut(),
             TrackFrameKey::Alignment(track_id),
             ui::TrackPane::Reads,
         );
-        self.panels.active_mut().selected_pileup_position = None;
-        self.panels.active_mut().selected_modification_position = None;
-        self.panels.active_mut().selected_junction = None;
-        self.panels.active_mut().selected_junction_component = None;
-        self.panels.active_mut().selected_chain = chain;
+        self.session.panels.active_mut().selected_pileup_position = None;
+        self.session
+            .panels
+            .active_mut()
+            .selected_modification_position = None;
+        self.session.panels.active_mut().selected_junction = None;
+        self.session.panels.active_mut().selected_junction_component = None;
+        self.session.panels.active_mut().selected_chain = chain;
         self.synchronize_alignment_scene_interactions(panel_id);
         self.prepare_alignment_scene_frame();
         self.mark_display_dirty("explicit display invalidation");

@@ -173,7 +173,7 @@ impl Viewer {
             serde_json::json!({
                 "invocation": invocation,
                 "reason": reason,
-                "active_panel_id": self.panels.active().id.get(),
+                "active_panel_id": self.session.panels.active().id.get(),
                 "cursor_x_pixels": self.cursor.x,
                 "cursor_y_pixels": self.cursor.y,
             }),
@@ -228,6 +228,7 @@ impl Viewer {
             (self.cursor.y / scale) as f32,
         );
         let track_id = self
+            .session
             .panels
             .active()
             .live_read_panel_at_y(point.y)
@@ -247,7 +248,7 @@ impl Viewer {
             return self.reject_alignment_context_menu_open(invocation, "no_alignment_lane");
         };
         let hit = self
-            .alignment_scene_hit_at_cursor(self.panels.active().id)
+            .alignment_scene_hit_at_cursor(self.session.panels.active().id)
             .filter(|hit| hit.track == track_id);
         let Some(presented) = self.presented_alignment_lane(panel_id, track_id) else {
             return self
@@ -373,8 +374,9 @@ impl Viewer {
         };
         self.activate_view_panel(target.panel_id);
         self.clear_promoted_read();
-        let chain = selected_supplementary_chain(&record, &self.panels.active().contig_name);
-        let panel = self.panels.active_mut();
+        let chain =
+            selected_supplementary_chain(&record, &self.session.panels.active().contig_name);
+        let panel = self.session.panels.active_mut();
         panel.selected_alignment_track = Some(target.track_id);
         panel.selected_alignment_hit = Some(hit);
         panel.selected_pileup_position = None;
@@ -396,10 +398,15 @@ impl Viewer {
     }
 
     fn refresh_alignment_context_track(&mut self, track_id: TrackId, reason: &'static str) {
-        self.remember_current_locus(self.panels.active().id);
+        self.remember_current_locus(self.session.panels.active().id);
         self.bump_workspace_revision();
         self.invalidate_navigation_contract(reason);
-        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let panel_ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         for panel_id in panel_ids {
             if let Some(track) = self
                 .alignment_tracks
@@ -442,7 +449,7 @@ impl Viewer {
         );
         if !self.alignment_context_target_is_current(target) {
             "That alignment menu referred to an older view; no action was applied"
-                .clone_into(&mut self.data_status);
+                .clone_into(&mut self.session.data_status);
             self.record_alignment_context_action_result(
                 target,
                 action,
@@ -465,7 +472,7 @@ impl Viewer {
                 if predicate.requires_reference() && !compatible_reference_available
         ) {
             "Substitution predicates require a matching reference FASTA"
-                .clone_into(&mut self.data_status);
+                .clone_into(&mut self.session.data_status);
             self.record_alignment_context_action_result(
                 target,
                 action,
@@ -479,7 +486,8 @@ impl Viewer {
         match action {
             AlignmentContextAction::InspectRead | AlignmentContextAction::SelectRead => {
                 if !self.select_alignment_context_read(target) {
-                    "No read was selected at that position".clone_into(&mut self.data_status);
+                    "No read was selected at that position"
+                        .clone_into(&mut self.session.data_status);
                     action_outcome = "no_op";
                     action_reason = Some("no_read_at_target");
                 }
@@ -528,10 +536,10 @@ impl Viewer {
                 self.egui_context.copy_text(format!(
                     "{}\t{}:{}-{}\tflags=0x{:04x}\tmapq={}\tcigar={}",
                     String::from_utf8_lossy(&record.read_name),
-                    self.panels
+                    self.session
+                        .panels
                         .get(target.panel_id)
-                        .map(|panel| panel.contig_name.as_str())
-                        .unwrap_or("?"),
+                        .map_or("?", |panel| panel.contig_name.as_str()),
                     record.start.saturating_add(1),
                     record.end,
                     record.flags.bits(),
@@ -596,7 +604,7 @@ impl Viewer {
                 if self.select_alignment_context_read(target) {
                     match self.open_all_chain_segments_in_panels() {
                         Ok((opened, requested)) => {
-                            self.data_status = format!(
+                            self.session.data_status = format!(
                                 "Opened {opened} of {requested} supplementary segment panels"
                             );
                         }
@@ -624,6 +632,7 @@ impl Viewer {
                         | AlignmentContextAction::ClearHighlights
                 );
                 let target_contig = self
+                    .session
                     .panels
                     .get(target.panel_id)
                     .map(|panel| panel.contig_name.clone())
@@ -777,9 +786,14 @@ impl Viewer {
                     self.refresh_alignment_highlight_interactions(&[target.track_id]);
                 }
                 if interaction_only_highlight {
-                    self.remember_current_locus(self.panels.active().id);
+                    self.remember_current_locus(self.session.panels.active().id);
                     self.bump_workspace_revision();
-                    let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+                    let panel_ids = self
+                        .session
+                        .panels
+                        .iter()
+                        .map(|panel| panel.id)
+                        .collect::<Vec<_>>();
                     for panel_id in panel_ids {
                         self.synchronize_alignment_scene_interactions(panel_id);
                     }

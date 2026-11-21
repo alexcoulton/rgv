@@ -798,6 +798,70 @@ fn pages_are_charged_exactly_evicted_by_lru_and_refused_whole_never_truncated() 
 }
 
 #[test]
+fn pages_of_two_contigs_with_the_same_tile_and_settings_are_separate_pages() {
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let key = TrackTileKey { level: 0, index: 3 };
+    let scene_on = |contig: &str, features: u64| {
+        let mut scene = feature_scene(
+            key,
+            (0..features)
+                .map(|index| {
+                    feature(
+                        index,
+                        key.start() + index * 4,
+                        key.start() + index * 4 + 2,
+                        Strand::Forward,
+                        0,
+                    )
+                })
+                .collect(),
+        );
+        scene.contig = contig.to_owned();
+        scene
+    };
+    let (first, second) = (scene_on("chr1", 3), scene_on("chr2", 7));
+    let mut renderer =
+        TrackTileRenderer::new(&gpu.device, FORMAT, AllocationLedger::new(1 << 20, 0));
+    let first_key = TrackTilePageKey::for_scene(9, &first, 42);
+    let second_key = TrackTilePageKey::for_scene(9, &second, 42);
+    assert_ne!(first_key, second_key);
+    let admitted = renderer
+        .admit_page(&gpu.device, first_key, &first, &[])
+        .unwrap();
+    assert_eq!((admitted.already_resident, admitted.instances), (false, 3));
+    // The other contig's tile is its own page with its own instances, not the first one's.
+    let admitted = renderer
+        .admit_page(&gpu.device, second_key, &second, &[first_key])
+        .unwrap();
+    assert_eq!((admitted.already_resident, admitted.instances), (false, 7));
+    assert_eq!(renderer.page_count(), 2);
+    assert!(renderer.is_resident(first_key) && renderer.is_resident(second_key));
+    let frame = TrackTileFrame {
+        screen_size: [256.0, 64.0],
+        scale_factor: 1.0,
+        target_size_pixels: [256, 64],
+        lanes: [first_key, second_key]
+            .into_iter()
+            .map(|page| TrackLaneDraw {
+                projection: lane([0.0, 0.0, 256.0, 32.0], key.start() as f64, 0.25),
+                pages: vec![TrackLanePage {
+                    key: page,
+                    selected: None,
+                    hovered: None,
+                }],
+            })
+            .collect(),
+    };
+    let report = renderer.prepare(&gpu.device, &gpu.queue, &frame);
+    assert!(report.missing_pages.is_empty());
+    assert_eq!((report.draws, report.instances), (2, 10));
+    // Contig-less literal keys of the same two tiles are one key: the aliasing this prevents.
+    assert_eq!(page_key(9, &first), page_key(9, &second));
+}
+
+#[test]
 fn many_lanes_draw_in_one_pass_without_any_per_track_limit() {
     let Some(gpu) = test_gpu() else {
         return;

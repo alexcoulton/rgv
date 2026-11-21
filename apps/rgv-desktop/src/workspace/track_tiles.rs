@@ -633,7 +633,7 @@ impl TrackTilePipelineState {
 
 impl Viewer {
     fn track_tile_palette(&self) -> TrackPalette {
-        TrackPalette::for_theme(crate::theme::theme_id(self.settings.theme))
+        TrackPalette::for_theme(crate::theme::theme_id(self.session.settings.theme))
     }
 
     /// Hands the active theme's palette to the tile renderer (one 1 kB upload).
@@ -654,15 +654,15 @@ impl Viewer {
     /// the display is built from. Runs every poll and before every frame; with the setting off
     /// and nothing routed it returns at once.
     pub(crate) fn synchronize_track_tiles(&mut self) {
-        let setting = self.settings.track_pipeline;
+        let setting = self.session.settings.track_pipeline;
         if setting == TrackPipeline::Legacy && self.track_tiles.is_idle() {
             return;
         }
-        let desired = if self.track_engine.is_some() && !self.synthetic {
+        let desired = if self.session.track_engine.is_some() && !self.session.synthetic {
             let pinned = crate::display::primary_pinned_gene_id(
                 &self.effective_auxiliary_presentation_configs(),
             );
-            tile_pipeline_track_ids(setting, self.tracks.tracks(), pinned)
+            tile_pipeline_track_ids(setting, self.session.tracks.tracks(), pinned)
         } else {
             BTreeSet::new()
         };
@@ -704,7 +704,7 @@ impl Viewer {
     /// the legacy per-panel state of those tracks. Returns whether they were routed; a full
     /// legacy queue leaves them on the legacy path until the next poll.
     fn route_track_tiles(&mut self, ids: Vec<TrackId>) -> bool {
-        let Some(legacy) = &self.track_engine else {
+        let Some(legacy) = &self.session.track_engine else {
             return false;
         };
         let engine = self.track_tiles.engine.get_or_insert_with(|| {
@@ -731,7 +731,7 @@ impl Viewer {
             }
         }
         let routed = ids.iter().copied().collect::<HashSet<_>>();
-        for panel in self.panels.iter_mut() {
+        for panel in self.session.panels.iter_mut() {
             panel
                 .track_snapshots
                 .retain(|snapshot| !routed.contains(&snapshot.id));
@@ -787,7 +787,7 @@ impl Viewer {
         state
             .selections
             .retain(|_, selection| !ids.contains(&selection.track_id));
-        for panel in self.panels.iter_mut() {
+        for panel in self.session.panels.iter_mut() {
             panel.selected_feature = panel.selected_feature.filter(|selection| {
                 !(selection.record_index == TRACK_TILE_SELECTION_RECORD_INDEX
                     && ids.contains(&selection.track_id))
@@ -868,7 +868,7 @@ impl Viewer {
     /// and marks the display dirty when a lane's status changes.
     fn synchronize_track_tile_views(&mut self) {
         let mut wanted = BTreeMap::new();
-        for panel in self.panels.iter() {
+        for panel in self.session.panels.iter() {
             let Some(column) = self.panel_column_rect(panel.id) else {
                 continue;
             };
@@ -988,7 +988,7 @@ impl Viewer {
             })
         };
         let mut lanes = Vec::new();
-        for panel in self.panels.iter() {
+        for panel in self.session.panels.iter() {
             let Some(column) = self.panel_column_rect(panel.id) else {
                 continue;
             };
@@ -1103,7 +1103,8 @@ impl Viewer {
             renderer
         });
         let selected_feature = |panel_id: PanelId| {
-            self.panels
+            self.session
+                .panels
                 .get(panel_id)
                 .and_then(|panel| panel.selected_feature)
         };
@@ -1210,7 +1211,7 @@ impl Viewer {
             (self.cursor.x / scale) as f32,
             (self.cursor.y / scale) as f32,
         );
-        let active = self.panels.active().id;
+        let active = self.session.panels.active().id;
         self.track_tiles
             .lanes
             .iter()
@@ -1240,7 +1241,7 @@ impl Viewer {
         let Some(hit) = self.track_tile_feature_at_cursor() else {
             return false;
         };
-        self.panels.active_mut().selected_feature = Some(FeatureSelection {
+        self.session.panels.active_mut().selected_feature = Some(FeatureSelection {
             track_id: hit.track_id,
             record_index: TRACK_TILE_SELECTION_RECORD_INDEX,
         });
@@ -1257,11 +1258,12 @@ impl Viewer {
 
     /// The inspector snapshot of the active panel's tile selection.
     pub(crate) fn track_tile_feature_inspector_snapshot(&self) -> Option<FeatureInspectorSnapshot> {
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         let selection = self
             .track_tiles
             .selection(panel.id, panel.selected_feature)?;
         let track_name = self
+            .session
             .tracks
             .tracks()
             .iter()

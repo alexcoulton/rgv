@@ -191,6 +191,7 @@ fn inspected_panel_item(
 
 fn inspected_panel_items(viewer: &Viewer) -> Vec<InspectedPanelItem> {
     viewer
+        .session
         .panels
         .iter()
         .filter_map(|panel| inspected_panel_item(viewer, panel))
@@ -213,7 +214,7 @@ fn inspected_items_relationship(items: &[InspectedPanelItem]) -> Option<&'static
 
 /// Fixed navigation shown above the scrollable Properties document.
 pub(crate) fn show_inspected_item_switcher(viewer: &Viewer, ui: &mut egui::Ui) -> Option<PanelId> {
-    if viewer.panels.len() <= 1 {
+    if viewer.session.panels.len() <= 1 {
         return None;
     }
     let items = inspected_panel_items(viewer);
@@ -236,7 +237,7 @@ pub(crate) fn show_inspected_item_switcher(viewer: &Viewer, ui: &mut egui::Ui) -
     });
     let mut requested = None;
     for item in items {
-        let active = item.panel_id == viewer.panels.active().id;
+        let active = item.panel_id == viewer.session.panels.active().id;
         let label = if active {
             format!("Panel {} · {} · Viewing", item.panel_id.get(), item.kind)
         } else {
@@ -740,11 +741,11 @@ pub(crate) fn show_properties(
     let copy_number_inspector = viewer.copy_number_inspector_snapshot();
     let mutation_inspector = viewer.mutation_inspector_snapshot();
     let interaction_inspector = viewer.interaction_inspector_snapshot();
-    let chain_inspector = viewer.panels.active().selected_chain.clone();
+    let chain_inspector = viewer.session.panels.active().selected_chain.clone();
     let mate_target_available = viewer.selected_mate_target().is_some();
     let visible_consensus = viewer.visible_consensus();
     let visible_reference_sequence = viewer.visible_reference_sequence();
-    let panel_controls = viewer.panels.iter().map(|_| ()).collect::<Vec<_>>();
+    let panel_controls = viewer.session.panels.iter().map(|_| ()).collect::<Vec<_>>();
     let mut clear_selection = false;
     let mut selected_to_top_requested = false;
     let mut chain_navigation_requested = None;
@@ -790,6 +791,7 @@ pub(crate) fn show_properties(
             format!(
                 "alignment-segment:{:?}",
                 viewer
+                    .session
                     .panels
                     .active()
                     .selected_alignment_hit
@@ -995,7 +997,7 @@ pub(crate) fn show_properties(
             inspector,
             record,
             &variant_alignment_evidence,
-            viewer.sample_metadata.as_ref(),
+            viewer.session.sample_metadata.as_ref(),
             &variant_sample_search,
             MAXIMUM_VIEW_PANELS.saturating_sub(panel_controls.len()),
         );

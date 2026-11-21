@@ -34,7 +34,7 @@ impl Viewer {
                     .and_then(|catalogue| catalogue.bundle(bundle_id))
             });
         let representative_track = bundle.and_then(|bundle| {
-            self.tracks.tracks().iter().find(|track| {
+            self.session.tracks.tracks().iter().find(|track| {
                 track.built_in.as_ref().is_some_and(|identity| {
                     identity.bundle_id == bundle.id
                         && identity.bundle_version == bundle.version
@@ -44,12 +44,16 @@ impl Viewer {
         });
         let automatic_track_loaded = representative_track.is_some();
         let automatic_track_visible = representative_track.is_some_and(|track| {
-            self.track_presentation
+            self.session
+                .track_presentation
                 .track_content_exposed(ui::TrackPane::Annotation, track.id)
                 .unwrap_or(false)
         });
-        let suppressed =
-            bundle.is_some_and(|bundle| self.suppressed_builtin_gene_bundles.contains(&bundle.id));
+        let suppressed = bundle.is_some_and(|bundle| {
+            self.session
+                .suppressed_builtin_gene_bundles
+                .contains(&bundle.id)
+        });
         let failed = self.landmark_catalogue_error.is_some();
         let matched = resolution.is_some_and(|resolution| {
             resolution.status == rgv_core::AssemblyResolutionStatus::Matched
@@ -105,6 +109,7 @@ impl Viewer {
         record: &mut rgv_hts::FeatureRecord,
     ) {
         let Some(identity) = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -200,6 +205,7 @@ impl Viewer {
             return;
         };
         let explicit = self
+            .session
             .assembly_identity
             .as_ref()
             .filter(|identity| {
@@ -258,9 +264,9 @@ impl Viewer {
                     matched_fingerprints: resolution.matched_contigs,
                     expected_primary_contigs: resolution.expected_contigs,
                 };
-                self.assembly_identity = Some(identity.clone());
-                self.assembly.identity = Some(identity);
-                self.suggested_assembly_identity = None;
+                self.session.assembly_identity = Some(identity.clone());
+                self.session.assembly.identity = Some(identity);
+                self.session.suggested_assembly_identity = None;
                 if let Some(bundle_id) = resolution.bundle_id.as_deref()
                     && let Err(error) = self.install_builtin_landmark_context(bundle_id)
                 {
@@ -272,7 +278,7 @@ impl Viewer {
                 }
             }
             rgv_core::AssemblyResolutionStatus::Suggested => {
-                self.suggested_assembly_identity = Some(GenomeAssemblyIdentity {
+                self.session.suggested_assembly_identity = Some(GenomeAssemblyIdentity {
                     stable_id: stable_id.unwrap_or_default(),
                     display_name: display_name.unwrap_or_default(),
                     confidence: rgv_core::AssemblyIdentityConfidence::Unknown,
@@ -284,7 +290,7 @@ impl Viewer {
             rgv_core::AssemblyResolutionStatus::Ambiguous
             | rgv_core::AssemblyResolutionStatus::Unknown
             | rgv_core::AssemblyResolutionStatus::Incompatible => {
-                self.suggested_assembly_identity = None;
+                self.session.suggested_assembly_identity = None;
             }
         }
         self.landmark_resolution = Some(resolution);
@@ -292,6 +298,7 @@ impl Viewer {
 
     fn remove_installed_landmark_context(&mut self, bundle_id: Option<&str>) -> Result<()> {
         let ids = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -304,10 +311,10 @@ impl Viewer {
             .map(|track| track.id)
             .collect::<Vec<_>>();
         self.remove_auxiliary_tracks_with_suppression(&ids, false)?;
-        self.contig_aliases.clear();
-        self.assembly.cytobands.clear();
-        self.cytoband_path = None;
-        self.assembly.default_annotation_count = 0;
+        self.session.contig_aliases.clear();
+        self.session.assembly.cytobands.clear();
+        self.session.cytoband_path = None;
+        self.session.assembly.default_annotation_count = 0;
         self.landmark_search_index = None;
         Ok(())
     }
@@ -334,7 +341,7 @@ impl Viewer {
         let request = LandmarkInstallRequest {
             ticket: self.landmark_install_ticket,
             bundle_id: bundle_id.to_owned(),
-            dictionary: self.assembly.dictionary.clone(),
+            dictionary: self.session.assembly.dictionary.clone(),
         };
         let worker = std::thread::Builder::new()
             .name("rgv-landmark-install".to_owned())
@@ -379,7 +386,7 @@ impl Viewer {
             request,
             self.landmark_install_ticket,
             matched_bundle,
-            &self.assembly.dictionary,
+            &self.session.assembly.dictionary,
         ) {
             tracing::debug!(
                 bundle = %request.bundle_id,
@@ -410,7 +417,7 @@ impl Viewer {
         } = prepared;
         let bundle_id = bundle.id.as_str();
 
-        let has_equivalent = self.tracks.tracks().iter().any(|track| {
+        let has_equivalent = self.session.tracks.tracks().iter().any(|track| {
             track.built_in.as_ref().is_some_and(|identity| {
                 identity.bundle_id == bundle.id
                     && identity.bundle_version == bundle.version
@@ -418,13 +425,17 @@ impl Viewer {
             })
         });
         let has_explicit_gene_track = self
+            .session
             .tracks
             .tracks()
             .iter()
             .any(|track| track.kind == TrackKind::GeneModel && track.built_in.is_none());
-        let suppressed = self.suppressed_builtin_gene_bundles.contains(bundle_id);
-        if let Some(engine) = &self.track_engine {
-            for track in self.tracks.tracks().iter().filter(|track| {
+        let suppressed = self
+            .session
+            .suppressed_builtin_gene_bundles
+            .contains(bundle_id);
+        if let Some(engine) = &self.session.track_engine {
+            for track in self.session.tracks.tracks().iter().filter(|track| {
                 track
                     .built_in
                     .as_ref()
@@ -473,10 +484,10 @@ impl Viewer {
         // Publish the already-verified compact context only after any required
         // track-engine insertion succeeds, so a frame cannot observe a partial
         // bundle installation.
-        self.contig_aliases = contig_bindings.workspace_aliases;
-        self.assembly.cytobands = cytobands;
-        self.cytoband_path = Some(cytobands_path);
-        self.assembly.default_annotation_count = 1;
+        self.session.contig_aliases = contig_bindings.workspace_aliases;
+        self.session.assembly.cytobands = cytobands;
+        self.session.cytoband_path = Some(cytobands_path);
+        self.session.assembly.default_annotation_count = 1;
         self.landmark_search_index = if has_equivalent || added_track.is_some() {
             search_index
         } else {
@@ -491,7 +502,7 @@ impl Viewer {
         }
         self.landmark_catalogue_error = None;
         if added_track.is_some() {
-            self.data_status = format!(
+            self.session.data_status = format!(
                 "Loaded Genes for {} · {}",
                 bundle.assembly.display_name, bundle.release
             );
@@ -507,10 +518,11 @@ impl Viewer {
         let Some(index) = &self.landmark_search_index else {
             return;
         };
-        let Some(track) = self.tracks.tracks().iter().find(|track| {
+        let Some(track) = self.session.tracks.tracks().iter().find(|track| {
             track.built_in.as_ref().is_some_and(|identity| {
                 identity.asset_role == LandmarkAssetRole::RepresentativeGenes
                     && !self
+                        .session
                         .suppressed_builtin_gene_bundles
                         .contains(&identity.bundle_id)
             })
@@ -583,18 +595,20 @@ impl Viewer {
             .filter(|resolution| resolution.status == rgv_core::AssemblyResolutionStatus::Matched)
             .and_then(|resolution| resolution.bundle_id.clone())
             .context("no confidently matched landmark bundle is available")?;
-        self.suppressed_builtin_gene_bundles.remove(&bundle_id);
+        self.session
+            .suppressed_builtin_gene_bundles
+            .remove(&bundle_id);
         self.install_builtin_landmark_context(&bundle_id)
     }
 
     pub(crate) fn show_all_transcripts(&mut self, bundle_id: &str) -> Result<()> {
-        if self.tracks.tracks().iter().any(|track| {
+        if self.session.tracks.tracks().iter().any(|track| {
             track.built_in.as_ref().is_some_and(|identity| {
                 identity.bundle_id == bundle_id
                     && identity.asset_role == LandmarkAssetRole::DetailedTranscripts
             })
         }) {
-            self.data_status = "All transcripts are already open".to_owned();
+            "All transcripts are already open".clone_into(&mut self.session.data_status);
             return Ok(());
         }
         let root = self
@@ -621,7 +635,7 @@ impl Viewer {
             .with_context(|| format!("failed to read {}", aliases_path.display()))?;
         let parsed_aliases = rgv_core::parse_landmark_aliases(&alias_text)?;
         let contig_bindings =
-            landmark_contig_bindings(&bundle, &self.assembly.dictionary, &parsed_aliases)?;
+            landmark_contig_bindings(&bundle, &self.session.assembly.dictionary, &parsed_aliases)?;
         let (spec_kind, format) = match asset.format {
             rgv_core::LandmarkAssetFormat::BigGenePred => {
                 (TrackSpecKind::BigGenePred, Some(TrackFormat::BigGenePred))
@@ -652,12 +666,13 @@ impl Viewer {
         )?;
         self.automation_auxiliary_open_state
             .insert(next_id, AutomationAuxiliaryOpenState::Pending);
-        self.data_status = "Opening all transcripts…".to_owned();
+        "Opening all transcripts…".clone_into(&mut self.session.data_status);
         Ok(())
     }
 
     pub(crate) fn return_to_representative_genes(&mut self, bundle_id: &str) -> Result<()> {
         let detail_ids = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -685,7 +700,7 @@ impl Viewer {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let status = std::process::Command::new("xdg-open").arg(root).status()?;
         anyhow::ensure!(status.success(), "could not open landmark resource folder");
-        self.data_status = format!("Opened landmark resources at {}", root.display());
+        self.session.data_status = format!("Opened landmark resources at {}", root.display());
         Ok(())
     }
 }

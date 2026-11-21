@@ -3,9 +3,8 @@ use crate::automation::{
     AutomationNavigationState, AutomationRunner, AutomationWait, atomic_write_text,
     automation_alignments_export, automation_pileup_export, automation_quantitative_export,
     automation_read_evidence_field_is_public, automation_variants_export,
-    automation_viewport_after_operation, auxiliary_position_snapshot_is_current,
-    cropped_display_list, display_list_svg_export, observed_retained_selection,
-    semantic_export_display_list,
+    auxiliary_position_snapshot_is_current, cropped_display_list, display_list_svg_export,
+    observed_retained_selection, semantic_export_display_list,
 };
 use crate::control_service::ControlRequest;
 use crate::inspection::rna::{AutomationAlignmentExportAuthority, AutomationAlignmentExportTrack};
@@ -22,6 +21,7 @@ use rgv_core::{ContigId, GenomicInterval, PanelId, TrackId, Viewport};
 use rgv_engine::{AlignmentSceneRequestToken, TrackSnapshot, TrackSnapshotData};
 use rgv_layout::{DisplayList, RectPrimitive, Rgba};
 use rgv_render::PrepareStats;
+use rgv_session::navigation::automation_viewport_after_operation;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,9 +48,10 @@ fn settled_auxiliary_snapshot_supports_exact_base_selection_without_refetch() {
         data: TrackSnapshotData::Features(Vec::new()),
     });
     panel.track_snapshot_intervals.insert(track_id, interval);
+    let generation = panel.generation_clock.current().get();
     panel
         .track_snapshot_generations
-        .insert(track_id, panel.generation_clock.current().get());
+        .insert(track_id, generation);
     panel.track_settled_generation = Some(panel.generation_clock.current().get());
 
     assert!(auxiliary_position_snapshot_is_current(

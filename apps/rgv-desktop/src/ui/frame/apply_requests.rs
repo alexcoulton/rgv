@@ -73,6 +73,7 @@ impl Viewer {
         if st.inspect.junction_bed_export_requested {
             let bundle = self.sashimi_export_bundle();
             let selected_id = self
+                .session
                 .panels
                 .active()
                 .selected_alignment_track
@@ -163,12 +164,13 @@ impl Viewer {
         } else if st.inspect.chain_all_panels_requested {
             match self.open_all_chain_segments_in_panels() {
                 Ok((opened, requested)) if opened < requested => {
-                    self.data_status = format!(
+                    self.session.data_status = format!(
                         "Opened {opened} of {requested} supplementary segments; the {MAXIMUM_VIEW_PANELS}-panel workspace cap was reached"
                     );
                 }
                 Ok((opened, _)) => {
-                    self.data_status = format!("Opened {opened} supplementary segment panels");
+                    self.session.data_status =
+                        format!("Opened {opened} supplementary segment panels");
                 }
                 Err(error) => self.report_error(error.to_string()),
             }
@@ -193,15 +195,15 @@ impl Viewer {
         } else if st.nav.zoom_out_requested {
             self.keyboard_zoom(1.25);
         } else if let Some(span) = st.nav.requested_span {
-            let factor = span as f64 / self.panels.active().viewport.span();
-            if let Ok(viewport) = self.panels.active_mut().viewport.zoom_at(
-                self.panels.active_mut().viewport.pixel_width() * 0.5,
+            let factor = span as f64 / self.session.panels.active().viewport.span();
+            if let Ok(viewport) = self.session.panels.active_mut().viewport.zoom_at(
+                self.session.panels.active_mut().viewport.pixel_width() * 0.5,
                 factor,
-                self.panels.active_mut().contig_length,
+                self.session.panels.active_mut().contig_length,
             ) {
                 // A slider drag reports a new span every frame; it is one history entry.
                 self.set_panel_viewport(
-                    self.panels.active().id,
+                    self.session.panels.active().id,
                     viewport,
                     crate::action::ViewportCommit::Step,
                 );
@@ -252,48 +254,52 @@ impl Viewer {
     }
 
     pub(super) fn apply_settings_changes(&mut self, st: &mut ShellFrame) {
-        let autosave_schedule_changed = self.settings.autosave_enabled
+        let autosave_schedule_changed = self.session.settings.autosave_enabled
             != st.commands.autosave_enabled
-            || self.settings.autosave_interval_seconds != st.commands.autosave_interval_seconds;
-        let accessibility_changed = self.settings.interface_scale_percent
+            || self.session.settings.autosave_interval_seconds
+                != st.commands.autosave_interval_seconds;
+        let accessibility_changed = self.session.settings.interface_scale_percent
             != st.commands.interface_scale_percent
-            || self.settings.high_contrast != st.commands.high_contrast
-            || self.settings.theme != st.commands.interface_theme
-            || self.settings.reduced_motion != st.commands.reduced_motion;
-        let read_browsing_buffer_changed =
-            self.settings.read_browsing_buffer_percent != st.commands.read_browsing_buffer_percent;
-        let cache_budget_changed = self.settings.cache_budget_mib != st.commands.cache_budget_mib;
+            || self.session.settings.high_contrast != st.commands.high_contrast
+            || self.session.settings.theme != st.commands.interface_theme
+            || self.session.settings.reduced_motion != st.commands.reduced_motion;
+        let read_browsing_buffer_changed = self.session.settings.read_browsing_buffer_percent
+            != st.commands.read_browsing_buffer_percent;
+        let cache_budget_changed =
+            self.session.settings.cache_budget_mib != st.commands.cache_budget_mib;
         let coverage_cache_changed =
-            self.settings.coverage_cache_enabled != st.commands.coverage_cache_enabled;
-        let track_pipeline_changed = self.settings.track_pipeline != st.commands.track_pipeline;
+            self.session.settings.coverage_cache_enabled != st.commands.coverage_cache_enabled;
+        let track_pipeline_changed =
+            self.session.settings.track_pipeline != st.commands.track_pipeline;
         let settings_changed = cache_budget_changed
             || coverage_cache_changed
             || track_pipeline_changed
             || read_browsing_buffer_changed
-            || self.settings.diagnostics_opt_in != st.commands.diagnostics_opt_in
+            || self.session.settings.diagnostics_opt_in != st.commands.diagnostics_opt_in
             || autosave_schedule_changed
-            || self.settings.autosave_retention != st.commands.autosave_retention
+            || self.session.settings.autosave_retention != st.commands.autosave_retention
             || accessibility_changed;
-        self.settings.cache_budget_mib = st.commands.cache_budget_mib;
-        self.settings.read_browsing_buffer_percent = st.commands.read_browsing_buffer_percent;
-        self.settings.diagnostics_opt_in = st.commands.diagnostics_opt_in;
-        self.settings.autosave_enabled = st.commands.autosave_enabled;
-        self.settings.autosave_interval_seconds = st.commands.autosave_interval_seconds;
-        self.settings.autosave_retention = st.commands.autosave_retention;
-        self.settings.interface_scale_percent = st.commands.interface_scale_percent;
-        self.settings.high_contrast = st.commands.high_contrast;
-        self.settings.theme = st.commands.interface_theme;
-        self.settings.reduced_motion = st.commands.reduced_motion;
-        self.settings.coverage_cache_enabled = st.commands.coverage_cache_enabled;
+        self.session.settings.cache_budget_mib = st.commands.cache_budget_mib;
+        self.session.settings.read_browsing_buffer_percent =
+            st.commands.read_browsing_buffer_percent;
+        self.session.settings.diagnostics_opt_in = st.commands.diagnostics_opt_in;
+        self.session.settings.autosave_enabled = st.commands.autosave_enabled;
+        self.session.settings.autosave_interval_seconds = st.commands.autosave_interval_seconds;
+        self.session.settings.autosave_retention = st.commands.autosave_retention;
+        self.session.settings.interface_scale_percent = st.commands.interface_scale_percent;
+        self.session.settings.high_contrast = st.commands.high_contrast;
+        self.session.settings.theme = st.commands.interface_theme;
+        self.session.settings.reduced_motion = st.commands.reduced_motion;
+        self.session.settings.coverage_cache_enabled = st.commands.coverage_cache_enabled;
         if coverage_cache_changed {
             self.apply_coverage_cache_setting();
         }
-        self.settings.track_pipeline = st.commands.track_pipeline;
+        self.session.settings.track_pipeline = st.commands.track_pipeline;
         if track_pipeline_changed {
             self.apply_track_pipeline_setting();
         }
         if accessibility_changed {
-            apply_accessibility_preferences(&self.egui_context, &self.settings);
+            apply_accessibility_preferences(&self.egui_context, &self.session.settings);
             self.apply_theme_to_renderers();
             self.mark_display_dirty("explicit display invalidation");
         }
@@ -307,7 +313,7 @@ impl Viewer {
             self.request_all_panel_queries();
         }
         if st.commands.clear_recent_requested {
-            self.settings.clear_recent();
+            self.session.settings.clear_recent();
         }
         if settings_changed || st.commands.clear_recent_requested {
             self.persist_settings();
@@ -319,7 +325,7 @@ impl Viewer {
             self.handle_dropped_file(Path::new(&path));
         }
         if let Some(locus) = st.commands.recent_locus_requested.take()
-            && let Err(error) = self.navigate_to_locus(self.panels.active().id, &locus)
+            && let Err(error) = self.navigate_to_locus(self.session.panels.active().id, &locus)
         {
             self.report_error(error.to_string());
         }
@@ -434,7 +440,7 @@ impl Viewer {
             self.handle_dropped_file(&path);
         }
         if st.commands.save_session_requested {
-            if let Some(path) = self.current_session_path.clone() {
+            if let Some(path) = self.session.current_session_path.clone() {
                 self.start_session_save(path);
             } else {
                 st.commands.save_session_as_requested = true;
@@ -450,12 +456,13 @@ impl Viewer {
         }
         if st.commands.export_png_requested
             && self
+                .session
                 .panels
                 .iter()
                 .any(|panel| panel.navigation_presentation.is_unsettled())
         {
             "The target viewport is still being checked; export is available after it settles"
-                .clone_into(&mut self.data_status);
+                .clone_into(&mut self.session.data_status);
         } else if st.commands.export_png_requested
             && let Some(path) = rfd::FileDialog::new()
                 .set_file_name("rgv-view.png")
@@ -495,6 +502,7 @@ impl Viewer {
             self.context_scene_gpu_frame = ContextSceneGpuFrame::default();
             self.alignment_gpu_speculation_gate.reset();
             let budget = self
+                .session
                 .settings
                 .cache_budget_mib
                 .saturating_mul(1024 * 1024)
@@ -503,8 +511,8 @@ impl Viewer {
                 if let Some(engine) = &track.scene_engine {
                     if let Err(error) = engine.try_clear_cache_budget(budget) {
                         crate::app::shell_state::report_error_to(
-                            &mut self.shell.notifications,
-                            &mut self.data_status,
+                            &mut self.session.notifications,
+                            &mut self.session.data_status,
                             error.to_string(),
                         );
                     } else {

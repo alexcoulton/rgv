@@ -975,7 +975,7 @@ impl Viewer {
         let semantic_changed = pending.before_interval != after_interval
             || pending.before_read_scroll != after_read_scroll;
         let viewer_accepted = pending.accepted_by_handler || semantic_changed;
-        let active_panel = self.panels.active();
+        let active_panel = self.session.panels.active();
         let interval = active_panel.viewport.interval();
         let observation = NativeInputObservation {
             sequence: pending.sequence,
@@ -1022,7 +1022,12 @@ impl Viewer {
                     Some(panel_layout.context_rows.ruler),
                 );
             }
-            let Some(panel) = self.panels.iter().find(|panel| panel.id == panel_id) else {
+            let Some(panel) = self
+                .session
+                .panels
+                .iter()
+                .find(|panel| panel.id == panel_id)
+            else {
                 continue;
             };
             for layout in [&panel.pane_layout.reads, &panel.pane_layout.annotation] {
@@ -1110,8 +1115,13 @@ impl Viewer {
             _ => None,
         };
         let panel = panel_id
-            .and_then(|panel_id| self.panels.iter().find(|panel| panel.id == panel_id))
-            .unwrap_or_else(|| self.panels.active());
+            .and_then(|panel_id| {
+                self.session
+                    .panels
+                    .iter()
+                    .find(|panel| panel.id == panel_id)
+            })
+            .unwrap_or_else(|| self.session.panels.active());
         let interval = panel.viewport.interval();
         let read_scroll = match target {
             Some(

@@ -192,7 +192,7 @@ impl Viewer {
                 TrackUiAction::ToggleSection(channel) => {
                     presentation_intents.push(TrackIntent::SetSectionExpanded {
                         channel,
-                        expanded: !self.track_presentation.section_expanded(channel),
+                        expanded: !self.session.track_presentation.section_expanded(channel),
                     });
                     match channel {
                         ui::TrackPane::Annotation => outcome.annotation_geometry_changed = true,
@@ -330,6 +330,7 @@ impl Viewer {
                 }
                 TrackUiAction::ToggleCollapsed(TrackFrameKey::Group { channel, id }) => {
                     if let Some(entry) = self
+                        .session
                         .track_presentation
                         .groups
                         .iter()
@@ -346,6 +347,7 @@ impl Viewer {
                 }
                 TrackUiAction::ToggleCompositeVisibility(TrackFrameKey::Auxiliary(id)) => {
                     let composite_id = self
+                        .session
                         .tracks
                         .tracks()
                         .iter()
@@ -353,6 +355,7 @@ impl Viewer {
                         .and_then(|track| track.quantitative.overlay_group);
                     if let Some(composite_id) = composite_id {
                         let visible = !self
+                            .session
                             .track_presentation
                             .composite_content_visible(ui::TrackPane::Annotation, composite_id);
                         presentation_intents.push(TrackIntent::SetCompositeVisibility {
@@ -383,6 +386,7 @@ impl Viewer {
                 }
                 TrackUiAction::GroupSelectedTracks(pane) => {
                     let selected = self
+                        .session
                         .panels
                         .active()
                         .selected_presentation_nodes
@@ -411,6 +415,7 @@ impl Viewer {
                 }
                 TrackUiAction::ToggleTrackGroup(pane, group) => {
                     if let Some(entry) = self
+                        .session
                         .track_presentation
                         .groups
                         .iter()
@@ -434,6 +439,7 @@ impl Viewer {
                 }
                 TrackUiAction::ToggleTrackGroupVisibility(pane, group) => {
                     if let Some(entry) = self
+                        .session
                         .track_presentation
                         .groups
                         .iter()
@@ -475,7 +481,7 @@ impl Viewer {
                             if outcome.settings_panel == Some(TrackFrameKey::Auxiliary(id)) {
                                 outcome.settings_panel = None;
                             }
-                            "Removed auxiliary track".clone_into(&mut self.data_status);
+                            "Removed auxiliary track".clone_into(&mut self.session.data_status);
                         }
                         Ok(_) => {}
                         Err(error) => self.report_error(error.to_string()),
@@ -486,7 +492,7 @@ impl Viewer {
                 }
                 TrackUiAction::ReorderDropped(target, pointer_y) => {
                     let before = presentation_drop_target(
-                        &self.track_presentation,
+                        &self.session.track_presentation,
                         draft.pane_layout.for_channel(target.channel()),
                         target,
                         pointer_y,
@@ -498,9 +504,11 @@ impl Viewer {
                     }
                 }
                 TrackUiAction::ReorderKeyboard(target, direction) => {
-                    if let Some(before) =
-                        presentation_keyboard_move(&self.track_presentation, target, direction)
-                    {
+                    if let Some(before) = presentation_keyboard_move(
+                        &self.session.track_presentation,
+                        target,
+                        direction,
+                    ) {
                         presentation_intents.push(TrackIntent::MoveNode { target, before });
                         match target.channel() {
                             ui::TrackPane::Annotation => {
@@ -608,7 +616,7 @@ impl Viewer {
                 TrackUiAction::ResizeReadPaneStarted => {
                     let viewport = self.canvas_geometry().viewport;
                     self.resizing_read_pane = Some(read_pane_resize_origin(
-                        self.track_presentation.read_pane_height,
+                        self.session.track_presentation.read_pane_height,
                         viewport.top(),
                         viewport.bottom(),
                         draft.pane_layout.annotation.pane_rect.bottom(),
@@ -633,7 +641,7 @@ impl Viewer {
                 TrackUiAction::ResizeReadPaneKeyboard(delta) => {
                     let viewport = self.canvas_geometry().viewport;
                     let origin = read_pane_resize_origin(
-                        self.track_presentation.read_pane_height,
+                        self.session.track_presentation.read_pane_height,
                         viewport.top(),
                         viewport.bottom(),
                         draft.pane_layout.annotation.pane_rect.bottom(),
@@ -697,6 +705,7 @@ impl Viewer {
     ) {
         if subtrack == AlignmentSubtrack::Reads {
             let visible = !self
+                .session
                 .track_presentation
                 .pane_track_state(ui::TrackPane::Reads, track_id)
                 .is_none_or(|node| node.content_visible);
@@ -747,22 +756,25 @@ impl Viewer {
             AlignmentSubtrack::Reads => unreachable!("reads use pane presentation state"),
         };
 
-        if !visible && self.panels.active().selected_alignment_track == Some(track_id) {
+        if !visible && self.session.panels.active().selected_alignment_track == Some(track_id) {
             match subtrack {
                 AlignmentSubtrack::Coverage => {
-                    self.panels.active_mut().selected_pileup_position = None;
+                    self.session.panels.active_mut().selected_pileup_position = None;
                 }
                 AlignmentSubtrack::Sashimi => {
-                    self.panels.active_mut().selected_junction = None;
-                    self.panels.active_mut().selected_junction_component = None;
+                    self.session.panels.active_mut().selected_junction = None;
+                    self.session.panels.active_mut().selected_junction_component = None;
                 }
                 AlignmentSubtrack::Modifications => {
-                    self.panels.active_mut().selected_modification_position = None;
+                    self.session
+                        .panels
+                        .active_mut()
+                        .selected_modification_position = None;
                 }
                 AlignmentSubtrack::Reads => {
-                    self.panels.active_mut().pending_read_selection = None;
-                    self.panels.active_mut().pending_alignment_reveal = None;
-                    self.panels.active_mut().selected_chain = None;
+                    self.session.panels.active_mut().pending_read_selection = None;
+                    self.session.panels.active_mut().pending_alignment_reveal = None;
+                    self.session.panels.active_mut().selected_chain = None;
                 }
                 AlignmentSubtrack::Reference => {}
             }

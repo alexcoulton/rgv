@@ -36,6 +36,7 @@ impl Viewer {
         maximum_results: usize,
     ) -> Result<serde_json::Value> {
         let presentation_committed = self
+            .session
             .panels
             .get(panel_id)
             .is_some_and(|panel| panel.navigation_presentation.is_interactive());
@@ -97,6 +98,7 @@ impl Viewer {
                 })?;
         }
         let contig_name = self
+            .session
             .panels
             .iter()
             .find(|panel| panel.id == panel_id)
@@ -278,7 +280,7 @@ impl Viewer {
         self.automation_alignment_handles.extend(handle_targets);
         Ok(serde_json::json!({
             "application_instance_id": self.application_instance_id,
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
             "query_generation": generation,
             "query_contig": contig_name,
             "query_start": search_interval.start(),
@@ -299,6 +301,7 @@ impl Viewer {
             .copied()
             .context("alignment handle is stale or unknown")?;
         let presentation_committed = self
+            .session
             .panels
             .get(target.panel_id)
             .is_some_and(|panel| panel.navigation_presentation.is_interactive());
@@ -335,6 +338,7 @@ impl Viewer {
             target.handle,
             &record,
             &self
+                .session
                 .panels
                 .get(target.panel_id)
                 .map(|panel| panel.contig_name.as_str())
@@ -345,26 +349,26 @@ impl Viewer {
             self.activate_view_panel(target.panel_id),
             "alignment panel is unavailable"
         );
-        self.panels.active_mut().clear_selection();
-        self.panels.active_mut().selected_alignment_track = Some(target.track_id);
+        self.session.panels.active_mut().clear_selection();
+        self.session.panels.active_mut().selected_alignment_track = Some(target.track_id);
         replace_panel_track_selection(
-            self.panels.active_mut(),
+            self.session.panels.active_mut(),
             TrackFrameKey::Alignment(target.track_id),
             ui::TrackPane::Reads,
         );
-        self.panels.active_mut().selected_alignment_hit = Some(AlignmentHit {
+        self.session.panels.active_mut().selected_alignment_hit = Some(AlignmentHit {
             track: target.track_id,
             scene_revision,
             handle: target.handle,
             component: AlignmentComponent::ReadSpan,
         });
-        self.panels.active_mut().selected_chain = chain;
-        self.panels.active_mut().pending_read_selection = None;
+        self.session.panels.active_mut().selected_chain = chain;
+        self.session.panels.active_mut().pending_read_selection = None;
         self.bump_workspace_revision();
         self.retain_active_selection(None);
         self.synchronize_alignment_scene_interactions(target.panel_id);
         self.prepare_alignment_scene_frame();
-        self.rebuild_genomic_display(self.panels.active().id);
+        self.rebuild_genomic_display(self.session.panels.active().id);
         let mut navigated = false;
         if reveal != AutomationAlignmentReveal::None {
             let operation = match reveal {
@@ -374,7 +378,7 @@ impl Viewer {
                     end: record.end,
                 },
                 AutomationAlignmentReveal::Center => {
-                    let span = self.panels.active().viewport.interval().len();
+                    let span = self.session.panels.active().viewport.interval().len();
                     let midpoint = record.start.saturating_add(record.end) / 2;
                     let start = midpoint.saturating_sub(span / 2);
                     AutomationViewportOperation::FitInterval {
@@ -384,31 +388,33 @@ impl Viewer {
                 }
             };
             self.apply_automation_viewport_operation(target.panel_id, operation)?;
-            self.panels.active_mut().pending_read_selection =
+            self.session.panels.active_mut().pending_read_selection =
                 PendingReadSelection::for_record(target.track_id, &record);
             navigated = true;
         }
-        let interval = self.panels.active().viewport.interval();
+        let interval = self.session.panels.active().viewport.interval();
         Ok(serde_json::json!({
             "selection": self.automation_selection_snapshot(),
             "reveal": format!("{reveal:?}").to_ascii_lowercase(),
             "navigated": navigated,
             "viewport": {
-                "contig": self.panels.active().contig_name,
+                "contig": self.session.panels.active().contig_name,
                 "start": interval.start(),
                 "end": interval.end(),
             },
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
         }))
     }
 
     pub(crate) fn automation_related_alignments(&self) -> Result<serde_json::Value> {
         let presentation_committed = self
+            .session
             .panels
             .active()
             .navigation_presentation
             .is_interactive();
         let track_id = self
+            .session
             .panels
             .active()
             .selected_alignment_track
@@ -423,13 +429,14 @@ impl Viewer {
             "alignment source is not supported by the unified scene backend"
         );
         let hit = self
+            .session
             .panels
             .active()
             .selected_alignment_hit
             .filter(|hit| hit.track == track_id)
             .context("no scene-backed alignment is selected")?;
         let presented = self
-            .presented_alignment_lane(self.panels.active().id, track_id)
+            .presented_alignment_lane(self.session.panels.active().id, track_id)
             .context("the committed alignment scene is unavailable")?;
         let snapshot = presented
             .lane
@@ -443,30 +450,31 @@ impl Viewer {
         let record = snapshot
             .inspect_retained(hit.handle)?
             .context("the selected alignment is unavailable")?;
-        let segments =
-            self.panels
-                .active()
-                .selected_chain
-                .as_ref()
-                .map_or_else(Vec::new, |chain| {
-                    chain
-                        .segments
-                        .iter()
-                        .enumerate()
-                        .map(|(index, segment)| {
-                            serde_json::json!({
-                                "segment_index": index,
-                                "contig": segment.reference_name,
-                                "start": segment.start,
-                                "end": segment.end,
-                                "current": index == chain.active_segment,
-                            })
+        let segments = self
+            .session
+            .panels
+            .active()
+            .selected_chain
+            .as_ref()
+            .map_or_else(Vec::new, |chain| {
+                chain
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, segment)| {
+                        serde_json::json!({
+                            "segment_index": index,
+                            "contig": segment.reference_name,
+                            "start": segment.start,
+                            "end": segment.end,
+                            "current": index == chain.active_segment,
                         })
-                        .collect()
-                });
+                    })
+                    .collect()
+            });
         Ok(serde_json::json!({
             "application_instance_id": self.application_instance_id,
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
             "mate_available": record.mate_contig.is_some()
                 && record.mate_start.is_some()
                 && !record.flags.is_mate_unmapped(),
@@ -501,13 +509,13 @@ impl Viewer {
                 self.navigate_to_chain_segment(
                     segment_index.context("supplementary segment index is required")?,
                 )?;
-                self.panels.active().id
+                self.session.panels.active().id
             }
         };
         self.bump_workspace_revision();
         Ok(serde_json::json!({
             "panel_id": panel_id.get(),
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
             "settled": self.automation_is_settled(),
         }))
     }
@@ -530,12 +538,13 @@ impl Viewer {
         )
         .then(|| {
             anchor_position.unwrap_or_else(|| {
-                self.panels
+                self.session
+                    .panels
                     .active()
                     .viewport
                     .interval()
                     .start()
-                    .saturating_add(self.panels.active().viewport.interval().len() / 2)
+                    .saturating_add(self.session.panels.active().viewport.interval().len() / 2)
             })
         });
         for track in self
@@ -632,8 +641,9 @@ impl Viewer {
             parse_automation_sam_tag(tag).map(AlignmentSortMode::Tag)
         })?;
         let captured_anchor = if mode == AlignmentSortMode::Base {
-            anchor_position
-                .or_else(|| alignment_sort_position(mode, None, self.panels.active().viewport))
+            anchor_position.or_else(|| {
+                alignment_sort_position(mode, None, self.session.panels.active().viewport)
+            })
         } else {
             None
         };
@@ -756,13 +766,13 @@ impl Viewer {
             }
             AutomationSelection::Track { track_id } => {
                 let key = self.automation_track_key(track_id)?;
-                self.panels.active_mut().clear_selection();
+                self.session.panels.active_mut().clear_selection();
                 self.select_track_key(key, ui::TrackPane::Annotation);
                 self.bump_workspace_revision();
                 self.retain_active_selection(None);
                 Ok(serde_json::json!({
                     "track_id": track_id.get(),
-                    "workspace_revision": self.workspace_revision,
+                    "workspace_revision": self.session.workspace_revision,
                     "selection": self.automation_selection_snapshot(),
                 }))
             }
@@ -779,30 +789,33 @@ impl Viewer {
                 );
                 let key = self.automation_track_key(track_id)?;
                 anyhow::ensure!(
-                    position < self.panels.active().contig_length,
+                    position < self.session.panels.active().contig_length,
                     "position {position} lies beyond contig {} length {}",
-                    self.panels.active().contig_name,
-                    self.panels.active().contig_length
+                    self.session.panels.active().contig_name,
+                    self.session.panels.active().contig_length
                 );
                 if !self
+                    .session
                     .panels
                     .active_mut()
                     .viewport
                     .interval()
                     .contains(position)
                 {
-                    self.panels.active_mut().viewport = self
+                    self.session.panels.active_mut().viewport = self
+                        .session
                         .panels
                         .active()
                         .viewport
-                        .centered_on(position, self.panels.active().contig_length)?;
-                    self.panels.active().generation_clock.advance();
-                    self.request_alignment_query(self.panels.active().id);
-                    self.request_reference_query(self.panels.active().id);
-                    self.request_track_query(self.panels.active().id);
+                        .centered_on(position, self.session.panels.active().contig_length)?;
+                    self.session.panels.active().generation_clock.advance();
+                    self.request_alignment_query(self.session.panels.active().id);
+                    self.request_reference_query(self.session.panels.active().id);
+                    self.request_track_query(self.session.panels.active().id);
                 }
                 let auxiliary_selection = if matches!(key, TrackFrameKey::Auxiliary(_)) {
-                    self.panels
+                    self.session
+                        .panels
                         .active_mut()
                         .track_snapshots
                         .iter()
@@ -842,39 +855,39 @@ impl Viewer {
                 } else {
                     None
                 };
-                self.panels.active_mut().clear_selection();
+                self.session.panels.active_mut().clear_selection();
                 if matches!(key, TrackFrameKey::Alignment(_)) {
-                    self.panels.active_mut().selected_alignment_track = Some(track_id);
+                    self.session.panels.active_mut().selected_alignment_track = Some(track_id);
                     replace_panel_track_selection(
-                        self.panels.active_mut(),
+                        self.session.panels.active_mut(),
                         key,
                         ui::TrackPane::Annotation,
                     );
-                    self.panels.active_mut().selected_pileup_position = Some(position);
+                    self.session.panels.active_mut().selected_pileup_position = Some(position);
                 } else if let Some((feature, variant, quantitative)) = auxiliary_selection {
                     replace_panel_track_selection(
-                        self.panels.active_mut(),
+                        self.session.panels.active_mut(),
                         key,
                         ui::TrackPane::Annotation,
                     );
-                    self.panels.active_mut().selected_feature =
+                    self.session.panels.active_mut().selected_feature =
                         feature.map(|record_index| FeatureSelection {
                             track_id,
                             record_index,
                         });
-                    self.panels.active_mut().selected_variant =
+                    self.session.panels.active_mut().selected_variant =
                         variant.map(|record_index| VariantSelection {
                             track_id,
                             record_index,
                         });
-                    self.panels.active_mut().selected_quantitative =
+                    self.session.panels.active_mut().selected_quantitative =
                         quantitative.map(|record_index| QuantitativeSelection {
                             track_id,
                             record_index,
                             position,
                         });
                 }
-                self.rebuild_genomic_display(self.panels.active().id);
+                self.rebuild_genomic_display(self.session.panels.active().id);
                 self.mark_display_dirty("explicit display invalidation");
                 self.bump_workspace_revision();
                 self.retain_active_selection(Some(granularity));
@@ -882,7 +895,7 @@ impl Viewer {
                     "panel_id": panel_id.get(),
                     "track_id": track_id.get(),
                     "position": position,
-                    "workspace_revision": self.workspace_revision,
+                    "workspace_revision": self.session.workspace_revision,
                     "selection": self.automation_selection_snapshot(),
                 }))
             }
@@ -911,7 +924,8 @@ impl Viewer {
             return available;
         }
 
-        self.panels
+        self.session
+            .panels
             .get(panel_id)
             .is_some_and(|panel| auxiliary_position_snapshot_is_current(panel, track_id, position))
     }
@@ -925,6 +939,7 @@ impl Viewer {
             return Ok(TrackFrameKey::Alignment(track_id));
         }
         if self
+            .session
             .tracks
             .tracks()
             .iter()

@@ -279,6 +279,16 @@ impl TwoBitReference {
             .filter(|(start, end)| start < end)
             .collect::<Vec<_>>();
         unknown_runs.sort_unstable();
+        // A valid file's runs are disjoint. Overlapping ones (a forged or damaged table) are
+        // merged, because `fetch` finds the first run by bisecting on the run ends, which
+        // only disjoint runs keep in order.
+        unknown_runs.dedup_by(|run, merged| {
+            let overlaps = run.0 <= merged.1;
+            if overlaps {
+                merged.1 = merged.1.max(run.1);
+            }
+            overlaps
+        });
         let layout = SequenceLayout {
             length,
             unknown_runs,
@@ -508,6 +518,42 @@ pub(crate) mod tests {
         let intact = TwoBitReference::open(Box::new(Cursor::new(valid.clone()))).unwrap();
         assert_eq!(valid.len(), 43);
         assert_eq!(intact.fetch("chrA", 0, 8).unwrap(), b"ACGTACGT");
+    }
+
+    /// Found by the mutation sweep in `lib.rs` (2bit, seed 0x165667B19E3779F9, iteration
+    /// 179), minimised here. Three unknown-base runs of which the middle one is forged to
+    /// cover the rest of the sequence: the runs were then no longer ordered by their ends,
+    /// the bisection in `fetch` started at a run ending before the request, and the slice
+    /// bounds underflowed.
+    #[test]
+    fn overlapping_unknown_runs_are_merged_instead_of_underflowing() {
+        let mut file = encode_two_bit(&[("chrA", "NANACNACGTACGTAC")], false);
+        // Record at byte 25: length, run count (3), three starts (0, 2, 5), three sizes.
+        let sizes = 25 + 4 + 4 + 12;
+        assert_eq!(file[sizes + 4..sizes + 8], 1_u32.to_le_bytes());
+        file[sizes + 4..sizes + 8].copy_from_slice(&0x7fff_ffff_u32.to_le_bytes());
+        assert_eq!(
+            file,
+            [
+                0x43, 0x27, 0x41, 0x1a, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, b'c', b'h', b'r',
+                b'A', 25, 0, 0, 0, 16, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 5, 0, 0, 0, 1,
+                0, 0, 0, 0xff, 0xff, 0xff, 0x7f, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x22, 0x49,
+                0xc9, 0xc9,
+            ]
+        );
+        for soft_masked in [false, true] {
+            let reader = Box::new(Cursor::new(file.clone()));
+            let reference = if soft_masked {
+                TwoBitReference::open_soft_masked(reader)
+            } else {
+                TwoBitReference::open(reader)
+            }
+            .unwrap();
+            // The forged run reaches the end of the sequence: unknown from base 2 onwards.
+            assert_eq!(reference.fetch("chrA", 8, 16).unwrap(), b"NNNNNNNN");
+            assert_eq!(reference.fetch("chrA", 0, 16).unwrap(), b"NANNNNNNNNNNNNNN");
+            assert_eq!(reference.fetch("chrA", 1, 2).unwrap(), b"A");
+        }
     }
 
     #[test]

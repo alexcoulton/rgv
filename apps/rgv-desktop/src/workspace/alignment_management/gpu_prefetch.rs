@@ -157,7 +157,7 @@ impl Viewer {
     pub(super) fn alignment_optional_work_must_yield(&self) -> bool {
         self.alignment_gpu_publication_retry.is_some()
             || self.alignment_capacity_reclaim.is_some()
-            || self.panels.iter().any(|panel| {
+            || self.session.panels.iter().any(|panel| {
                 panel.navigation_query_schedule.gesture_active
                     || panel.navigation_query_schedule.pending.is_some()
             })
@@ -350,7 +350,7 @@ impl Viewer {
             let reads = self.alignment_gpu_prefetch.read_residency.take();
             let summaries = self.alignment_gpu_prefetch.summary_residency.take();
             if let Some(request) = read_requests.first() {
-                self.data_status = format!(
+                self.session.data_status = format!(
                     "{} complete alignments · all {} rows ready for instant browsing",
                     request.scene.evidence().record_count(),
                     request.scene.atlas().row_count()

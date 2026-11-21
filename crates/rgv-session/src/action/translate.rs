@@ -4,7 +4,7 @@
 //! so the tests can hold the window and the protocol to the same result.
 
 use super::{Action, ViewportCommit};
-use crate::workspace::navigation::split_locus_expression;
+use crate::navigation::split_locus_expression;
 use anyhow::Result;
 use rgv_automation::{
     AutomationCommand, AutomationHistoryNavigation, AutomationSelection, AutomationSetting,
@@ -13,10 +13,7 @@ use rgv_automation::{
 use rgv_core::{PanelId, TrackIntent};
 
 /// `change_viewport` from the automation protocol: one complete, recorded navigation.
-pub(crate) const fn change_viewport(
-    panel_id: PanelId,
-    operation: AutomationViewportOperation,
-) -> Action {
+pub const fn change_viewport(panel_id: PanelId, operation: AutomationViewportOperation) -> Action {
     Action::ChangeViewport {
         panel_id,
         operation,
@@ -25,15 +22,12 @@ pub(crate) const fn change_viewport(
 }
 
 /// `navigate_history` from the automation protocol.
-pub(crate) const fn navigate_history(
-    panel_id: PanelId,
-    step: AutomationHistoryNavigation,
-) -> Action {
+pub const fn navigate_history(panel_id: PanelId, step: AutomationHistoryNavigation) -> Action {
     Action::NavigateHistory { panel_id, step }
 }
 
 /// An arrow-key or overview pan step: a fraction of the panel width, positive to the right.
-pub(crate) const fn keyboard_pan(panel_id: PanelId, fraction: f64) -> Action {
+pub const fn keyboard_pan(panel_id: PanelId, fraction: f64) -> Action {
     Action::ChangeViewport {
         panel_id,
         operation: AutomationViewportOperation::PanFraction { fraction },
@@ -43,7 +37,7 @@ pub(crate) const fn keyboard_pan(panel_id: PanelId, fraction: f64) -> Action {
 
 /// A `+`/`-` or toolbar zoom step about the panel centre. The window speaks in span
 /// multipliers (0.8 zooms in); the protocol's zoom factor is the reciprocal magnification.
-pub(crate) fn keyboard_zoom(panel_id: PanelId, span_factor: f64) -> Action {
+pub fn keyboard_zoom(panel_id: PanelId, span_factor: f64) -> Action {
     Action::ChangeViewport {
         panel_id,
         operation: AutomationViewportOperation::Zoom {
@@ -55,7 +49,7 @@ pub(crate) fn keyboard_zoom(panel_id: PanelId, span_factor: f64) -> Action {
 }
 
 /// The locus box: one locus retargets `focused`; several lay the workspace out as those loci.
-pub(crate) fn locus_box(focused: PanelId, expression: &str) -> Result<Action> {
+pub fn locus_box(focused: PanelId, expression: &str) -> Result<Action> {
     let loci = split_locus_expression(expression)?
         .into_iter()
         .map(str::to_owned)
@@ -68,7 +62,7 @@ pub(crate) fn locus_box(focused: PanelId, expression: &str) -> Result<Action> {
 
 /// The panel strip's deferred requests for one frame, in the order they are applied: a move,
 /// then a close, else an activation.
-pub(crate) fn panel_strip_requests(
+pub fn panel_strip_requests(
     panel_to_move: Option<(PanelId, usize)>,
     panel_to_close: Option<PanelId>,
     panel_to_activate: Option<PanelId>,
@@ -87,7 +81,7 @@ pub(crate) fn panel_strip_requests(
 
 /// The arrangement settings of the automation protocol as track intents. `None` for settings
 /// that are not track-arrangement edits.
-pub(crate) fn setting_track_intents(setting: &AutomationSetting) -> Option<Vec<TrackIntent>> {
+pub fn setting_track_intents(setting: &AutomationSetting) -> Option<Vec<TrackIntent>> {
     Some(vec![match setting {
         AutomationSetting::PresentationSectionExpanded { channel, value } => {
             TrackIntent::SetSectionExpanded {
@@ -147,7 +141,7 @@ pub(crate) fn setting_track_intents(setting: &AutomationSetting) -> Option<Vec<T
 ///
 /// `change_viewport` and `navigate_history` document that their panel becomes the focused
 /// panel, so they translate to a focus change followed by the navigation.
-pub(crate) fn automation_command_actions(
+pub fn automation_command_actions(
     command: &AutomationCommand,
     focused: PanelId,
 ) -> Option<Result<Vec<Action>>> {

@@ -70,10 +70,10 @@ impl Viewer {
         {
             return false;
         }
-        if self.reference_engine.is_some() && self.reference_dictionary.is_none() {
+        if self.session.reference_engine.is_some() && self.session.reference_dictionary.is_none() {
             return false;
         }
-        for panel in self.panels.iter() {
+        for panel in self.session.panels.iter() {
             if panel.navigation_presentation.is_unsettled()
                 || panel.navigation_query_schedule.pending.is_some()
             {
@@ -82,16 +82,16 @@ impl Viewer {
             if panel.pending_queries.reference || panel.pending_queries.tracks {
                 return false;
             }
-            if self.track_engine.is_some()
+            if self.session.track_engine.is_some()
                 && panel.track_settled_generation != Some(panel.generation_clock.current().get())
             {
                 return false;
             }
             if !reference_dependency_is_settled(
-                self.reference_engine.is_some()
+                self.session.reference_engine.is_some()
                     && panel.viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL,
                 panel.generation_clock.current().get(),
-                self.reference_revision,
+                self.session.reference_revision,
                 panel.reference_slice_revision,
                 panel.reference_slice.as_ref().map(|slice| slice.interval),
                 panel.viewport.interval(),
@@ -148,10 +148,10 @@ impl Viewer {
         if self.pending_resolution_query_refresh.is_some() {
             reasons.push("resolution_refresh_pending".to_owned());
         }
-        if self.reference_engine.is_some() && self.reference_dictionary.is_none() {
+        if self.session.reference_engine.is_some() && self.session.reference_dictionary.is_none() {
             reasons.push("reference_opening".to_owned());
         }
-        for panel in self.panels.iter() {
+        for panel in self.session.panels.iter() {
             if panel.navigation_presentation.is_unsettled() {
                 reasons.push(format!(
                     "panel{}_presentation={:?}",
@@ -234,21 +234,21 @@ impl Viewer {
             match worker.join() {
                 Ok(Ok(())) => {
                     if let Some(path) = &runner.report_path {
-                        self.data_status =
+                        self.session.data_status =
                             format!("Automation report written to {}", path.display());
                     }
                 }
                 Ok(Err(error)) => {
                     crate::app::shell_state::report_error_to(
-                        &mut self.shell.notifications,
-                        &mut self.data_status,
+                        &mut self.session.notifications,
+                        &mut self.session.data_status,
                         format!("Could not write automation report: {error}"),
                     );
                 }
                 Err(_) => {
                     crate::app::shell_state::report_error_to(
-                        &mut self.shell.notifications,
-                        &mut self.data_status,
+                        &mut self.session.notifications,
+                        &mut self.session.data_status,
                         "Automation-report worker failed",
                     );
                 }
@@ -315,12 +315,12 @@ impl Viewer {
                 command_index,
                 deadline,
             }) => {
-                if let Some(error) = self.reference_open_error.clone() {
+                if let Some(error) = self.session.reference_open_error.clone() {
                     self.finish_automation_command(
                         command_index,
                         Err((AutomationErrorCode::ResourceNotFound, error)),
                     );
-                } else if self.reference_dictionary.is_some() {
+                } else if self.session.reference_dictionary.is_some() {
                     self.finish_automation_command(
                         command_index,
                         Ok((
@@ -534,7 +534,7 @@ impl Viewer {
         for task in &mut self.session_load_tasks {
             if task.automation_command.take().is_some() {
                 task.deadline = None;
-                self.document_state.cancel_load(task.ticket);
+                self.session.document_state.cancel_load(task.ticket);
             }
         }
         self.pending_native_window_capture = None;
@@ -557,7 +557,7 @@ impl Viewer {
         };
         let command_count = request.batch.commands.len();
         self.automation = Some(AutomationRunner::for_control(request));
-        self.data_status =
+        self.session.data_status =
             format!("Running authenticated local-control batch ({command_count} commands)…");
         self.mark_display_dirty("explicit display invalidation");
     }
@@ -575,7 +575,7 @@ impl Viewer {
                 );
                 object.insert(
                     "workspace_revision".to_owned(),
-                    serde_json::json!(self.workspace_revision),
+                    serde_json::json!(self.session.workspace_revision),
                 );
             }
             (message, data)
@@ -615,9 +615,9 @@ impl Viewer {
             let succeeded = report.succeeded;
             if reply.send(report).is_err() {
                 "Local-control client disconnected before receiving the result"
-                    .clone_into(&mut self.data_status);
+                    .clone_into(&mut self.session.data_status);
             } else {
-                self.data_status = if succeeded {
+                self.session.data_status = if succeeded {
                     "Authenticated local-control batch completed".to_owned()
                 } else {
                     "Authenticated local-control batch failed; a structured result was returned"
@@ -633,8 +633,8 @@ impl Viewer {
             Ok(json) => json,
             Err(error) => {
                 crate::app::shell_state::report_error_to(
-                    &mut self.shell.notifications,
-                    &mut self.data_status,
+                    &mut self.session.notifications,
+                    &mut self.session.data_status,
                     format!("Could not serialize automation report: {error}"),
                 );
                 runner.finished = true;
@@ -643,7 +643,7 @@ impl Viewer {
             }
         };
         let Some(path) = runner.report_path.clone() else {
-            "Automation has no report destination".clone_into(&mut self.data_status);
+            "Automation has no report destination".clone_into(&mut self.session.data_status);
             runner.finished = true;
             self.automation_exit_requested = runner.exit_after_report;
             return;
@@ -655,8 +655,8 @@ impl Viewer {
             Ok(worker) => Some(worker),
             Err(error) => {
                 crate::app::shell_state::report_error_to(
-                    &mut self.shell.notifications,
-                    &mut self.data_status,
+                    &mut self.session.notifications,
+                    &mut self.session.data_status,
                     format!("Could not start automation-report writer: {error}"),
                 );
                 None

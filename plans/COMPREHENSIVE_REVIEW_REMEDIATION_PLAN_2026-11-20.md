@@ -225,9 +225,11 @@ annotation tracks. Nothing in this wave has been checked in the running applicat
         and absent from non-GPU exports
 - [~] ARCH-2 / ARCH-7 headless `rgv-session` crate (workspace state, `Action` reducer, engines,
       scene publication); desktop, CLI snapshot, MCP and automation drive it
-      — `Action` model and reducer in the desktop for navigation, panels, track arrangement
-        and region/review edits, shared by UI and automation, with undo/redo; track load,
-        display settings, session open/save and preferences not converted; no separate crate
+      — `rgv-session` exists and owns document, panels, tracks, reference engine and
+        lifecycle, track-engine polling, settings, notifications and undo (43 fields;
+        `Viewer` 180 → 144). Remaining: track load, reference query dispatch, routing track
+        events into panels, alignment dispatch/settlement, the `PanelPresentation`
+        boundary, the remaining `Action` domains, and the headless `rgv-snapshot`
 - [~] ARCH-4 explicit `(PanelId, TrackId)` throughout
       — all 37 activate-swaps removed; ~55 functions take a panel; `inspection/selection.rs`
         and wheel/junction hover still use the focused panel

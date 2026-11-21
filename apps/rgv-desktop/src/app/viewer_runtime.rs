@@ -855,9 +855,72 @@ impl Viewer {
             });
         let start_diagnostic_trace = options.start_diagnostic_trace;
         let mut viewer = Self {
+            session: rgv_session::Session {
+                workspace_revision: 1,
+                document_state: app::document_state::DocumentState::default(),
+                navigation_stale_result_rejections: 0,
+                panels,
+                engine_retirement_tasks: Vec::new(),
+                reference_engine,
+                reference_revision: None,
+                reference_open_error: None,
+                track_engine,
+                tracks,
+                track_presentation,
+                reference_source,
+                remote_reference_index_url,
+                reference_dictionary: None,
+                contig_aliases,
+                assembly,
+                assembly_identity,
+                suggested_assembly_identity: None,
+                suppressed_builtin_gene_bundles: options
+                    .loaded_session
+                    .as_ref()
+                    .map_or_else(BTreeSet::new, |session| {
+                        session.suppressed_builtin_gene_bundles.clone()
+                    }),
+                assembly_name: options.genome_name,
+                cytoband_path: options.cytobands,
+                data_status,
+                busy_status: app::status_activity::BusyStatus::default(),
+                regions_of_interest: options
+                    .loaded_session
+                    .as_ref()
+                    .map_or_else(Vec::new, |session| session.regions_of_interest.clone()),
+                review_items: options
+                    .loaded_session
+                    .as_ref()
+                    .map_or_else(Vec::new, |session| session.review_items.clone()),
+                sample_metadata: options
+                    .loaded_session
+                    .as_ref()
+                    .and_then(|session| session.sample_metadata.clone()),
+                synthetic,
+                navigation_contract_revision: 0,
+                settings,
+                settings_writer: app::settings_writer::SettingsWriter::new(settings_path.clone()),
+                settings_path,
+                current_session_path: options.session,
+                unresolved_session_sources: options
+                    .loaded_session
+                    .as_ref()
+                    .map_or_else(Vec::new, SessionDocument::unresolved_local_sources),
+                session_migration_notices: options
+                    .loaded_session
+                    .as_ref()
+                    .map_or_else(Vec::new, |session| session.migration_notices.clone()),
+                igv_import_report: options.loaded_igv_report,
+                imported_locus: options.loaded_igv_locus,
+                imported_feature_search: None,
+                undo: rgv_session::action::history::UndoHistory::default(),
+                notifications: app::shell_state::NotificationLog::default(),
+                navigation_gesture: app::shell_state::NavigationGestureCommit::default(),
+                track_ids: app::shell_state::TrackIdAllocator::default(),
+                last_autosaved: None,
+                skipped_lines: rgv_session::track_diagnostics::SkippedLineReporter::default(),
+            },
             application_instance_id,
-            workspace_revision: 1,
-            document_state: app::document_state::DocumentState::default(),
             shell: app::shell_state::ShellState::default(),
             read_inspector_derived: std::cell::RefCell::default(),
             gpu_device_health,
@@ -894,11 +957,9 @@ impl Viewer {
             alignment_scene_owner_clock: 0,
             alignment_scene_request_clock: 0,
             alignment_scene_publication_authority: AlignmentScenePublicationAuthority::default(),
-            navigation_stale_result_rejections: 0,
             egui_context,
             egui_state,
             egui_renderer,
-            panels,
             workspace_layout,
             genomic_canvas_layer_id: None,
             pane_divider_rect: None,
@@ -920,37 +981,13 @@ impl Viewer {
             alignment_depth_pyramid_gpu_renderer,
             alignment_depth_pyramid_gpu_frame: None,
             alignment_depth_pyramid_pages_refused: 0,
-            engine_retirement_tasks: Vec::new(),
-            reference_engine,
-            reference_revision: None,
-            reference_open_error: None,
-            track_engine,
             automation_auxiliary_open_state,
-            tracks,
-            track_presentation,
-            reference_source,
-            remote_reference_index_url,
             reference_remote_io_stats: None,
-            reference_dictionary: None,
-            contig_aliases,
-            assembly,
-            assembly_identity,
-            suggested_assembly_identity: None,
             landmark_resource_root: options.landmark_resource_root.clone(),
             landmark_catalogue: options.loaded_landmark_catalogue.clone(),
             landmark_catalogue_error: options.landmark_catalogue_error.clone(),
             landmark_resolution: None,
             landmark_search_index: None,
-            suppressed_builtin_gene_bundles: options
-                .loaded_session
-                .as_ref()
-                .map_or_else(BTreeSet::new, |session| {
-                    session.suppressed_builtin_gene_bundles.clone()
-                }),
-            assembly_name: options.genome_name,
-            cytoband_path: options.cytobands,
-            data_status,
-            busy_status: app::status_activity::BusyStatus::default(),
             announced_status: String::new(),
             reference_reverse_complement: options
                 .loaded_session
@@ -968,18 +1005,6 @@ impl Viewer {
                 .map_or_else(GeneticCode::default, |session| {
                     session.reference_genetic_code
                 }),
-            regions_of_interest: options
-                .loaded_session
-                .as_ref()
-                .map_or_else(Vec::new, |session| session.regions_of_interest.clone()),
-            review_items: options
-                .loaded_session
-                .as_ref()
-                .map_or_else(Vec::new, |session| session.review_items.clone()),
-            sample_metadata: options
-                .loaded_session
-                .as_ref()
-                .and_then(|session| session.sample_metadata.clone()),
             metadata_filter_column: 0,
             metadata_filter_value: None,
             metadata_selected_tracks: BTreeSet::new(),
@@ -1005,9 +1030,7 @@ impl Viewer {
             landmark_install_ticket: 0,
             hosted_genomes: crate::workspace::genomes::HostedGenomes::default(),
             promoted_read: None,
-            synthetic,
             workspace_alignment_limit,
-            navigation_contract_revision: 0,
             display_dirty: true,
             display_upload_pending_metrics: false,
             pending_resolution_query_refresh: None,
@@ -1042,21 +1065,6 @@ impl Viewer {
             annotation_navigation_generation: 0,
             annotation_search_results: TrackSearchResults::default(),
             pending_annotation_navigation: None,
-            settings,
-            settings_writer: app::settings_writer::SettingsWriter::new(settings_path.clone()),
-            settings_path,
-            current_session_path: options.session,
-            unresolved_session_sources: options
-                .loaded_session
-                .as_ref()
-                .map_or_else(Vec::new, SessionDocument::unresolved_local_sources),
-            session_migration_notices: options
-                .loaded_session
-                .as_ref()
-                .map_or_else(Vec::new, |session| session.migration_notices.clone()),
-            igv_import_report: options.loaded_igv_report,
-            imported_locus: options.loaded_igv_locus,
-            imported_feature_search: None,
             next_autosave,
             recovery_candidates: options.recovery_candidates,
             recovery_open,
@@ -1082,18 +1090,23 @@ impl Viewer {
             suppress_horizontal_overview_click: false,
             alignment_context_menu: None,
         };
-        if start_diagnostic_trace && (viewer.synthetic || viewer.alignment_tracks.is_empty()) {
+        if start_diagnostic_trace
+            && (viewer.session.synthetic || viewer.alignment_tracks.is_empty())
+        {
             viewer.manual_diagnostic_trace_autostart_pending = false;
             viewer.start_manual_diagnostic_trace("launch option", true);
         }
         viewer
+            .session
             .document_state
             .replace(viewer.session_document(), true);
-        let launch_session_path = viewer.current_session_path.clone();
+        let launch_session_path = viewer.session.current_session_path.clone();
         viewer.arm_newer_writer_guard(launch_session_path.as_deref());
         if let Some(recovery) = &options_settings_recovery {
-            let notice =
-                app::settings_writer::settings_recovery_notice(&viewer.settings_path, recovery);
+            let notice = app::settings_writer::settings_recovery_notice(
+                &viewer.session.settings_path,
+                recovery,
+            );
             viewer.report_warning(notice);
         }
         Ok(viewer)
@@ -1449,7 +1462,7 @@ impl Viewer {
             // settled immediately after this submission, so its pixels are not
             // labelled as a still-active transaction.
             task.automation_data["navigation_transaction_active"] =
-                serde_json::Value::Bool(self.panels.iter().any(|panel| {
+                serde_json::Value::Bool(self.session.panels.iter().any(|panel| {
                     panel.navigation_presentation.is_unsettled()
                         && panel.navigation_presentation.phase
                             != NavigationPresentationPhase::Committing
@@ -1616,7 +1629,7 @@ impl Viewer {
                 "error": failure.message,
                 "committed_target_revision": self.alignment_scene_publication_authority.target_revision,
                 "desired_target_revision": self.alignment_scene_publication_authority.desired_target_revision(),
-                "scroll_cache_authority": self.manual_scroll_cache_diagnostic_state(self.panels.active().id),
+                "scroll_cache_authority": self.manual_scroll_cache_diagnostic_state(self.session.panels.active().id),
             }));
             self.queue_manual_diagnostic_trace_failure(
                 "alignment_renderer",
@@ -1672,7 +1685,7 @@ impl Viewer {
             // display cache now that the frame is authoritative. Without this
             // handoff, visible sashimi curves remain non-interactive until an
             // unrelated layout or scroll rebuild happens.
-            if !self.refresh_panel_scroll_display(self.panels.active().id) {
+            if !self.refresh_panel_scroll_display(self.session.panels.active().id) {
                 self.mark_display_dirty("explicit display invalidation");
                 self.window.request_redraw();
             }
@@ -1715,7 +1728,7 @@ impl Viewer {
             .as_ref()
             .and_then(AutomationRunner::pending_navigation_target)
             .and_then(|(panel_id, target)| {
-                let panel = self.panels.get(panel_id)?;
+                let panel = self.session.panels.get(panel_id)?;
                 (panel.viewport.interval() == target).then(|| {
                     let authoritative = panel.navigation_presentation.is_interactive()
                         && self.panel_navigation_data_is_settled(panel_id);

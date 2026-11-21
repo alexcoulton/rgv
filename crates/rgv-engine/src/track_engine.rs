@@ -1397,6 +1397,26 @@ pub(crate) fn open_tile_source(
     })
 }
 
+/// The feature records the legacy query returns for `[start, end)`: what the legacy
+/// inspector is given, for tests that compare another path with it.
+#[cfg(test)]
+pub(crate) fn legacy_feature_records(
+    specification: &TrackSpec,
+    contig: &str,
+    start: u64,
+    end: u64,
+) -> Vec<FeatureRecord> {
+    let mut track = open_track(specification).expect("the fixture opens");
+    match track
+        .source
+        .query(contig, start, end, TrackQuerySettings::default())
+        .expect("the fixture is readable")
+    {
+        TrackSnapshotData::Features(records) => records,
+        other => panic!("not a feature track: {other:?}"),
+    }
+}
+
 #[cfg(test)]
 fn open_track(specification: &TrackSpec) -> Result<OpenTrack, String> {
     open_track_cached(specification, &mut HashMap::new())

@@ -546,3 +546,81 @@ fn gpu_pages_are_charged_to_the_shared_ledger_exactly_and_released_with_the_page
     assert_eq!(used, renderer.ledger_charged_bytes().unwrap());
     assert!(used <= budget);
 }
+
+#[test]
+fn a_refused_page_is_reported_for_the_lane_that_needed_it_and_no_other() {
+    use rgv_alignment_scene::AllocationOwner;
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let level = 2;
+    let tile_bases = parameters().tile_bases(level).unwrap();
+    let first = 200_000_000 / tile_bases;
+    let mut store = store_with((first..first + 12).map(|index| synthetic_tile(level, index)));
+    // Two lanes of one frame over disjoint tiles.
+    let camera_a = camera(200_000_000, 100.0, 0.37);
+    let camera_b = camera(200_000_000 + 8 * tile_bases, 100.0, 0.0);
+    let lane_a = store.lane(&view(camera_a));
+    let lane_b = store.lane(&view(camera_b));
+    let transform = CoverageScaleTransform::Linear;
+    let request = |lane, camera| AlignmentDepthPyramidGpuRequest {
+        lane,
+        camera,
+        screen_size_points: [TARGET[0] as f32, TARGET[1] as f32],
+        scissor: SCISSOR,
+        scale_maximum: 60,
+        transform,
+    };
+    for (first, second) in [
+        ((&lane_a, camera_a), (&lane_b, camera_b)),
+        ((&lane_b, camera_b), (&lane_a, camera_a)),
+    ] {
+        // What the first lane alone charges: its pages and the page table.
+        let roomy = AllocationLedger::new(64 << 20, 0);
+        let mut renderer = AlignmentDepthPyramidGpuRenderer::new(&gpu.device, FORMAT);
+        renderer.set_ledger(roomy.clone());
+        let (frame, alone) = renderer
+            .prepare(&gpu.device, &gpu.queue, &[request(first.0, first.1)])
+            .unwrap();
+        assert!(alone.pages_uploaded >= 1);
+        assert_eq!(frame.pages_refused_by_request(), [0]);
+        let first_charge = roomy.owner_usage(AllocationOwner::Gpu).unwrap().charged;
+        let (_, both) = renderer
+            .prepare(
+                &gpu.device,
+                &gpu.queue,
+                &[request(first.0, first.1), request(second.0, second.1)],
+            )
+            .unwrap();
+        assert!(both.pages_uploaded >= 1, "the lanes share no page");
+
+        // Room for exactly that and not one page more: the second lane is refused, and only
+        // the second lane is reported refused.
+        let tight = AllocationLedger::new(first_charge + 64, 0);
+        let mut renderer = AlignmentDepthPyramidGpuRenderer::new(&gpu.device, FORMAT);
+        renderer.set_ledger(tight);
+        let (frame, stats) = renderer
+            .prepare(
+                &gpu.device,
+                &gpu.queue,
+                &[request(first.0, first.1), request(second.0, second.1)],
+            )
+            .unwrap();
+        assert_eq!(stats.pages_uploaded, alone.pages_uploaded);
+        assert_eq!(stats.pages_refused, both.pages_uploaded);
+        assert_eq!(
+            frame.pages_refused_by_request(),
+            [0, both.pages_uploaded],
+            "{stats:?}"
+        );
+        assert_eq!(frame.request_pages_refused(0), 0);
+        assert_eq!(frame.request_pages_refused(1), both.pages_uploaded);
+        assert_eq!(frame.request_pages_refused(2), 0);
+        assert_eq!(
+            frame.pages_refused_by_request().iter().sum::<usize>(),
+            stats.pages_refused
+        );
+        // The first lane is drawn whole.
+        assert_eq!(frame.draw_count(), alone.draws);
+    }
+}

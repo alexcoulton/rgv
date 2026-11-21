@@ -11,7 +11,7 @@ use rgv_hts::AlignmentRecord;
 
 impl Viewer {
     fn selected_mate_record(&self) -> Option<(TrackId, AlignmentRecord, &ReferenceDictionary)> {
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         let track_id = panel
             .selected_alignment_hit
             .map(|hit| hit.track)
@@ -25,17 +25,23 @@ impl Viewer {
     pub(crate) fn visible_consensus(&self) -> Option<BoundedSequenceCopy> {
         let track_id = self.primary_alignment_track_id();
         if let Some(presented) = self
-            .presented_alignment_lane(self.panels.active().id, track_id)
+            .presented_alignment_lane(self.session.panels.active().id, track_id)
             .filter(|presented| presented.lane.summary_current())
             && let Some(snapshot) = presented.lane.snapshot.as_ref()
         {
             let visible = snapshot
                 .prepared_interval()
-                .intersection(self.panels.active().viewport.interval())?;
-            let reference = self.panels.active().reference_slice.as_deref().filter(|_| {
-                snapshot.reads().presentation().reference
-                    == self.panels.active().reference_slice_revision
-            });
+                .intersection(self.session.panels.active().viewport.interval())?;
+            let reference = self
+                .session
+                .panels
+                .active()
+                .reference_slice
+                .as_deref()
+                .filter(|_| {
+                    snapshot.reads().presentation().reference
+                        == self.session.panels.active().reference_slice_revision
+                });
             let mut bases = Vec::with_capacity(usize::try_from(visible.len()).ok()?);
             for position in visible.start()..visible.end() {
                 let support = snapshot
@@ -75,12 +81,17 @@ impl Viewer {
 
     pub(crate) fn visible_reference_sequence(&self) -> Option<BoundedSequenceCopy> {
         let reference = self
+            .session
             .panels
             .active()
             .reference_slice
             .as_deref()
-            .filter(|_| self.panels.active().reference_slice_revision == self.reference_revision)?;
+            .filter(|_| {
+                self.session.panels.active().reference_slice_revision
+                    == self.session.reference_revision
+            })?;
         let visible = self
+            .session
             .panels
             .active()
             .viewport
@@ -99,7 +110,7 @@ impl Viewer {
         let locus = mate_locus(
             &record,
             dictionary,
-            self.panels.active().viewport.interval().len(),
+            self.session.panels.active().viewport.interval().len(),
         )?;
         Some((PendingReadSelection::for_mate(track_id, &record)?, locus))
     }
@@ -109,7 +120,7 @@ impl Viewer {
     ) -> Option<(PendingReadSelection, Viewport, String, u64)> {
         let (track_id, record, dictionary) = self.selected_mate_record()?;
         let (viewport, contig_name, contig_length) =
-            mate_viewport(&record, dictionary, self.panels.active().viewport)?;
+            mate_viewport(&record, dictionary, self.session.panels.active().viewport)?;
         Some((
             PendingReadSelection::for_mate(track_id, &record)?,
             viewport,
@@ -129,6 +140,7 @@ impl Viewer {
         self.retain_active_read_selection_for_query_refresh();
         let id = self.add_view_panel(&locus)?;
         let panel = self
+            .session
             .panels
             .get_mut(id)
             .context("new mate panel is unavailable")?;
@@ -152,12 +164,13 @@ impl Viewer {
             .selected_mate_viewport_target()
             .context("the selected read has no mapped mate location")?;
         let track_id = pending_selection.track_id;
-        let panel_id = self.panels.active().id;
+        let panel_id = self.session.panels.active().id;
 
         self.retain_active_read_selection_for_query_refresh();
         self.navigate_to_viewport(viewport, contig_name, contig_length);
 
         let panel = self
+            .session
             .panels
             .get_mut(panel_id)
             .context("the mate destination panel is unavailable")?;
@@ -183,7 +196,7 @@ impl Viewer {
     ) -> Result<PanelId> {
         let dictionary = self
             .primary_alignment_dictionary()
-            .unwrap_or(&self.assembly.dictionary);
+            .unwrap_or(&self.session.assembly.dictionary);
         let contig_id = dictionary
             .id_by_name(contig_name)
             .with_context(|| format!("the active genome has no contig named {contig_name}"))?;
@@ -195,6 +208,7 @@ impl Viewer {
             "requested evidence position is outside its contig"
         );
         let span = self
+            .session
             .panels
             .active()
             .viewport
@@ -211,11 +225,13 @@ impl Viewer {
 
     pub(crate) fn open_chain_segment_in_new_panel(&mut self, index: usize) -> Result<PanelId> {
         let track_id = self
+            .session
             .panels
             .active()
             .selected_alignment_track
             .context("supplementary-chain track is unavailable")?;
         let mut chain = self
+            .session
             .panels
             .active()
             .selected_chain
@@ -235,6 +251,7 @@ impl Viewer {
         let read_name = chain.read_name.clone();
         let id = self.add_view_panel(&locus)?;
         let panel = self
+            .session
             .panels
             .get_mut(id)
             .context("new supplementary panel is unavailable")?;
@@ -251,13 +268,15 @@ impl Viewer {
     }
 
     pub(crate) fn open_all_chain_segments_in_panels(&mut self) -> Result<(usize, usize)> {
-        let origin = self.panels.active().id;
+        let origin = self.session.panels.active().id;
         let track_id = self
+            .session
             .panels
             .active()
             .selected_alignment_track
             .context("supplementary-chain track is unavailable")?;
         let chain = self
+            .session
             .panels
             .active()
             .selected_chain
@@ -267,7 +286,7 @@ impl Viewer {
             .filter(|index| *index != chain.active_segment)
             .collect::<Vec<_>>();
         let requested = segment_indices.len();
-        let available = MAXIMUM_VIEW_PANELS.saturating_sub(self.panels.len());
+        let available = MAXIMUM_VIEW_PANELS.saturating_sub(self.session.panels.len());
         let mut opened = 0;
         for index in segment_indices.into_iter().take(available) {
             let segment = &chain.segments[index];
@@ -281,6 +300,7 @@ impl Viewer {
             let mut destination_chain = chain.clone();
             destination_chain.active_segment = index;
             let panel = self
+                .session
                 .panels
                 .get_mut(id)
                 .context("new supplementary panel is unavailable")?;

@@ -155,9 +155,9 @@ impl ApplicationHandler for Application {
             }
             WindowEvent::CursorLeft { .. } => {
                 // Read hover may sit in any panel, so leaving the window clears every panel's.
-                let focused = viewer.panels.active().id;
+                let focused = viewer.session.panels.active().id;
                 if !crate::ui::interaction::retarget_alignment_hover(
-                    &mut viewer.panels,
+                    &mut viewer.session.panels,
                     focused,
                     None,
                 )
@@ -166,8 +166,9 @@ impl ApplicationHandler for Application {
                     viewer.mark_display_dirty("runtime window invalidation");
                     viewer.window.request_redraw();
                 }
-                viewer.panels.active_mut().hover_inspector_target = None;
+                viewer.session.panels.active_mut().hover_inspector_target = None;
                 if viewer
+                    .session
                     .panels
                     .active_mut()
                     .hovered_junction_arc
@@ -175,8 +176,8 @@ impl ApplicationHandler for Application {
                     .is_some()
                 {
                     viewer.window.set_cursor(CursorIcon::Default);
-                    if viewer.synthetic
-                        || !viewer.refresh_panel_scroll_display(viewer.panels.active().id)
+                    if viewer.session.synthetic
+                        || !viewer.refresh_panel_scroll_display(viewer.session.panels.active().id)
                     {
                         viewer.mark_display_dirty("runtime window invalidation");
                     }
@@ -192,12 +193,13 @@ impl ApplicationHandler for Application {
                 viewer.last_cursor = None;
                 viewer.press_cursor = None;
                 let cleared_junction_hover = viewer
+                    .session
                     .panels
                     .active_mut()
                     .hovered_junction_arc
                     .take()
                     .is_some();
-                viewer.panels.active_mut().hover_inspector_target = None;
+                viewer.session.panels.active_mut().hover_inspector_target = None;
                 viewer.window.set_cursor(CursorIcon::Default);
                 if cleared_junction_hover {
                     viewer.sashimi_interaction_diagnostics.clears = viewer
@@ -208,8 +210,8 @@ impl ApplicationHandler for Application {
                         .sashimi_interaction_diagnostics
                         .hover_redraws
                         .saturating_add(1);
-                    if viewer.synthetic
-                        || !viewer.refresh_panel_scroll_display(viewer.panels.active().id)
+                    if viewer.session.synthetic
+                        || !viewer.refresh_panel_scroll_display(viewer.session.panels.active().id)
                     {
                         viewer.mark_display_dirty("runtime window invalidation");
                     }
@@ -218,7 +220,7 @@ impl ApplicationHandler for Application {
                 viewer.drag_origin_interval = None;
                 viewer.end_navigation_gesture();
                 if was_canvas_dragging {
-                    viewer.finish_navigation_gesture(viewer.panels.active().id);
+                    viewer.finish_navigation_gesture(viewer.session.panels.active().id);
                 }
             }
             WindowEvent::Focused(true) => {
@@ -259,7 +261,8 @@ impl ApplicationHandler for Application {
                         viewer.activate_view_panel(panel_id);
                     }
                     viewer.dragging = true;
-                    viewer.drag_origin_interval = Some(viewer.panels.active().viewport.interval());
+                    viewer.drag_origin_interval =
+                        Some(viewer.session.panels.active().viewport.interval());
                     viewer.press_cursor = Some(viewer.cursor);
                 } else if state == ElementState::Released {
                     viewer.finish_overview_capture();
@@ -275,7 +278,7 @@ impl ApplicationHandler for Application {
                     if viewer.drag_origin_interval.take().is_some() {
                         // One history entry and one recent locus for the whole drag.
                         viewer.end_navigation_gesture();
-                        viewer.finish_navigation_gesture(viewer.panels.active().id);
+                        viewer.finish_navigation_gesture(viewer.session.panels.active().id);
                     }
                     // `press_cursor` is only recorded for the unobstructed GPU canvas.
                     // The surrounding egui panel reports ordinary canvas presses as
@@ -324,7 +327,7 @@ impl ApplicationHandler for Application {
                         winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
                     )
                 {
-                    viewer.finish_navigation_gesture(viewer.panels.active().id);
+                    viewer.finish_navigation_gesture(viewer.session.panels.active().id);
                 }
             }
             WindowEvent::PinchGesture { delta, phase, .. }
@@ -339,7 +342,7 @@ impl ApplicationHandler for Application {
                     phase,
                     winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
                 ) {
-                    viewer.finish_navigation_gesture(viewer.panels.active().id);
+                    viewer.finish_navigation_gesture(viewer.session.panels.active().id);
                 }
             }
             WindowEvent::DroppedFile(path) => viewer.handle_dropped_file(&path),
@@ -405,8 +408,8 @@ impl ApplicationHandler for Application {
             viewer.commit_due_navigation_gesture(now);
             viewer.capture_status_notification();
             let engines_open = viewer.has_alignment_engine()
-                || viewer.reference_engine.is_some()
-                || viewer.track_engine.is_some();
+                || viewer.session.reference_engine.is_some()
+                || viewer.session.track_engine.is_some();
             let polled_work_in_flight = !viewer.export_tasks.is_empty()
                 || viewer.pending_native_window_capture.is_some()
                 || !viewer.session_save_tasks.is_empty()
@@ -415,7 +418,7 @@ impl ApplicationHandler for Application {
                 || !viewer.genome_tasks.is_empty()
                 || !viewer.alignment_retirement_tasks.is_empty()
                 || !viewer.alignment_coverage_retirement_tasks.is_empty()
-                || !viewer.engine_retirement_tasks.is_empty()
+                || !viewer.session.engine_retirement_tasks.is_empty()
                 || viewer
                     .automation
                     .as_ref()
@@ -426,6 +429,7 @@ impl ApplicationHandler for Application {
                     viewer.next_egui_repaint,
                     viewer.pending_resolution_query_refresh,
                     viewer
+                        .session
                         .settings
                         .autosave_enabled
                         .then_some(viewer.next_autosave),

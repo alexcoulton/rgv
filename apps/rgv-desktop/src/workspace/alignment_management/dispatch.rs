@@ -56,14 +56,24 @@ impl Viewer {
     /// Existing immutable scene pages are captured against this camera immediately by
     /// `prepare_alignment_scene_frame`; source acquisition remains asynchronous and latest-wins.
     pub(crate) fn dispatch_alignment_query(&mut self, panel_id: PanelId) {
-        if !self.panels.panel(panel_id).pending_queries.alignment {
+        if !self
+            .session
+            .panels
+            .panel(panel_id)
+            .pending_queries
+            .alignment
+        {
             return;
         }
         if self.alignment_tracks.is_empty() {
-            self.panels.panel_mut(panel_id).pending_queries.alignment = false;
+            self.session
+                .panels
+                .panel_mut(panel_id)
+                .pending_queries
+                .alignment = false;
             return;
         }
-        let viewport = self.panels.panel(panel_id).viewport;
+        let viewport = self.session.panels.panel(panel_id).viewport;
         let resolution = AlignmentSceneResolution::for_viewport(viewport);
         if !resolution.requires_alignment_records() {
             let mut settled = 0_usize;
@@ -94,7 +104,7 @@ impl Viewer {
             }
             let primary_track_id = self.primary_alignment_track_id();
             for track_id in retired_tracks {
-                let panel = self.panels.panel_mut(panel_id);
+                let panel = self.session.panels.panel_mut(panel_id);
                 panel
                     .read_panel_scrolls
                     .entry(track_id)
@@ -113,21 +123,24 @@ impl Viewer {
                     panel.content_bottom_points = 0.0;
                 }
             }
-            self.panels.panel_mut(panel_id).pending_queries.alignment =
-                self.alignment_tracks.iter().any(|track| {
-                    track
-                        .projection(panel_id)
-                        .is_some_and(|projection| projection.navigation.is_queued())
-                });
+            self.session
+                .panels
+                .panel_mut(panel_id)
+                .pending_queries
+                .alignment = self.alignment_tracks.iter().any(|track| {
+                track
+                    .projection(panel_id)
+                    .is_some_and(|projection| projection.navigation.is_queued())
+            });
             if settled > 0 {
-                self.data_status = format!(
+                self.session.data_status = format!(
                     "Overview for {settled} alignment track(s): coverage only, reads are not loaded"
                 );
             }
             self.prepare_alignment_scene_frame();
             return;
         }
-        let contig_name = self.panels.panel(panel_id).contig_name.clone();
+        let contig_name = self.session.panels.panel(panel_id).contig_name.clone();
         let mut sent = 0_usize;
         for track_index in 0..self.alignment_tracks.len() {
             if matches!(
@@ -168,7 +181,7 @@ impl Viewer {
             else {
                 let message = format!(
                     "{} is not available in this alignment",
-                    self.panels.panel(panel_id).contig_name
+                    self.session.panels.panel(panel_id).contig_name
                 );
                 self.alignment_tracks[track_index].mark_unavailable(panel_id, message);
                 continue;
@@ -203,7 +216,7 @@ impl Viewer {
             let authority_discontinuity = contig_changed || atlas_disjoint;
             let primary_track_id = self.primary_alignment_track_id();
             let scroll_reset = {
-                let panel = self.panels.panel_mut(panel_id);
+                let panel = self.session.panels.panel_mut(panel_id);
                 let reset = panel
                     .read_panel_scrolls
                     .entry(track_id)
@@ -271,7 +284,7 @@ impl Viewer {
             };
             let preparation_camera = lane_capture.preparation_camera;
             let policy = alignment_scene_preparation_policy(
-                self.settings.read_browsing_buffer_percent,
+                self.session.settings.read_browsing_buffer_percent,
                 preparation_camera,
             );
             let complete_read_limit = self.alignment_tracks[track_index]
@@ -419,7 +432,7 @@ impl Viewer {
                     projection.scene_policy = Some(policy);
                 }
             }
-            if contract_replaced && let Some(panel) = self.panels.get_mut(panel_id) {
+            if contract_replaced && let Some(panel) = self.session.panels.get_mut(panel_id) {
                 // The receipt acknowledges delivery to the previous coordinator contract epoch.
                 // A replacement may preserve compatible authority, but it may also retire it.
                 // Invalidate the receipt in either case so a still-pending exact requirement can
@@ -482,16 +495,26 @@ impl Viewer {
                 }
             }
         }
-        self.panels.panel_mut(panel_id).pending_queries.alignment =
-            self.alignment_tracks.iter().any(|track| {
-                track
-                    .projection(panel_id)
-                    .is_some_and(|projection| projection.navigation.is_queued())
-            });
+        self.session
+            .panels
+            .panel_mut(panel_id)
+            .pending_queries
+            .alignment = self.alignment_tracks.iter().any(|track| {
+            track
+                .projection(panel_id)
+                .is_some_and(|projection| projection.navigation.is_queued())
+        });
         if sent > 0 {
-            self.data_status = format!("Updating {sent} alignment scene(s)…");
-        } else if self.panels.panel(panel_id).pending_queries.alignment {
-            "Alignment queues busy; retrying the latest locus…".clone_into(&mut self.data_status);
+            self.session.data_status = format!("Updating {sent} alignment scene(s)…");
+        } else if self
+            .session
+            .panels
+            .panel(panel_id)
+            .pending_queries
+            .alignment
+        {
+            "Alignment queues busy; retrying the latest locus…"
+                .clone_into(&mut self.session.data_status);
         }
         // Camera-only movement is visible before the worker produces another event. The capture
         // keeps the latest immutable snapshot and computes its truthful intersection with the

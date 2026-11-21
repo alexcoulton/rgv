@@ -1268,11 +1268,17 @@ impl Viewer {
         &self,
         alignment: &ReferenceDictionary,
     ) -> Option<ReferenceRevision> {
-        self.reference_revision.filter(|_| {
-            self.reference_dictionary.as_ref().is_some_and(|reference| {
-                alignment_reference_compatibility(alignment, reference, &self.contig_aliases)
-                    == AlignmentReferenceCompatibility::Compatible
-            })
+        self.session.reference_revision.filter(|_| {
+            self.session
+                .reference_dictionary
+                .as_ref()
+                .is_some_and(|reference| {
+                    alignment_reference_compatibility(
+                        alignment,
+                        reference,
+                        &self.session.contig_aliases,
+                    ) == AlignmentReferenceCompatibility::Compatible
+                })
         })
     }
 
@@ -1284,9 +1290,9 @@ impl Viewer {
         panel_id: PanelId,
     ) -> Result<Option<String>, String> {
         let (Some(_revision), Some(reference), Some(panel)) = (
-            self.reference_revision,
-            self.reference_dictionary.as_ref(),
-            self.panels.get(panel_id),
+            self.session.reference_revision,
+            self.session.reference_dictionary.as_ref(),
+            self.session.panels.get(panel_id),
         ) else {
             return Ok(None);
         };
@@ -1296,7 +1302,7 @@ impl Viewer {
         compatible_reference_contig_name(
             alignment,
             reference,
-            &self.contig_aliases,
+            &self.session.contig_aliases,
             &panel.contig_name,
         )
         .map(Some)
@@ -1306,8 +1312,9 @@ impl Viewer {
         &self,
         alignment: &ReferenceDictionary,
     ) -> Option<String> {
-        let reference = self.reference_dictionary.as_ref()?;
-        match alignment_reference_compatibility(alignment, reference, &self.contig_aliases) {
+        let reference = self.session.reference_dictionary.as_ref()?;
+        match alignment_reference_compatibility(alignment, reference, &self.session.contig_aliases)
+        {
             AlignmentReferenceCompatibility::Compatible => None,
             AlignmentReferenceCompatibility::Incompatible(reason) => Some(reason),
         }
@@ -1347,7 +1354,7 @@ impl Viewer {
             };
         let changed = (filters.alignment_density - density).abs() > f32::EPSILON;
         filters.alignment_density = density;
-        for panel in &mut self.panels.panels {
+        for panel in &mut self.session.panels.panels {
             if let Some(state) = panel.read_panel_scrolls.get_mut(&track_id) {
                 state.density = None;
             }
@@ -1363,7 +1370,8 @@ impl Viewer {
         panel_id: PanelId,
         track_id: TrackId,
     ) -> f32 {
-        self.panels
+        self.session
+            .panels
             .get(panel_id)
             .and_then(|panel| panel.read_panel_scrolls.get(&track_id))
             .and_then(|state| state.density)
@@ -1378,7 +1386,7 @@ impl Viewer {
     ) -> bool {
         let density = density.clamp(MIN_VERTICAL_DENSITY, MAX_VERTICAL_DENSITY);
         let default_density = self.alignment_filters_for_track(track_id).alignment_density;
-        let Some(panel) = self.panels.get_mut(panel_id) else {
+        let Some(panel) = self.session.panels.get_mut(panel_id) else {
             return false;
         };
         let state = panel.read_panel_scrolls.entry(track_id).or_default();

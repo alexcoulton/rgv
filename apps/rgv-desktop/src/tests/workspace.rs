@@ -44,7 +44,6 @@ use crate::workspace::navigation::{
     parse_contig_aliases, preferred_annotation_search_hit, resolve_initial_locus,
     resolve_requested_locus, split_locus_expression, standalone_locus,
 };
-use crate::workspace::navigation_controller::{LociNavigationPlan, loci_navigation_plan};
 use crate::workspace::navigation_transaction::{
     NAVIGATION_NOTICE_DELAY, NAVIGATION_QUERY_IDLE_DELAY, NAVIGATION_QUERY_MAX_CADENCE,
     NavigationPresentation, NavigationPresentationPhase, NavigationQuerySchedule,
@@ -107,6 +106,7 @@ use rgv_render::{
     AlignmentGpuCameraCaptureError, AlignmentGpuPrepareError,
     AlignmentSummaryGpuCameraCaptureError, AlignmentSummaryGpuPrepareError, export_png,
 };
+use rgv_session::navigation::{LociNavigationPlan, loci_navigation_plan};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -2236,12 +2236,10 @@ fn auxiliary_removal_clears_every_track_owned_panel_reference() {
         },
     ];
     for id in [removed_id, surviving_id] {
-        panel
-            .track_snapshot_intervals
-            .insert(id, panel.viewport.interval());
-        panel
-            .track_snapshot_generations
-            .insert(id, panel.generation_clock.current().get());
+        let interval = panel.viewport.interval();
+        let generation = panel.generation_clock.current().get();
+        panel.track_snapshot_intervals.insert(id, interval);
+        panel.track_snapshot_generations.insert(id, generation);
     }
     for id in [removed_id, surviving_id] {
         panel.track_frames.push(TrackFrame {
@@ -3102,7 +3100,10 @@ fn workspace_annotation_camera_uses_the_range_available_to_every_panel() {
     let mut workspace = PanelWorkspace::new(first);
     assert!(workspace.push(second));
 
-    assert_eq!(workspace.maximum_annotation_scroll_points(), 120.0);
+    assert_eq!(
+        crate::workspace::panels::maximum_annotation_scroll_points(&workspace),
+        120.0
+    );
     workspace.annotation_scroll_points = 95.0;
     assert_eq!(workspace.annotation_scroll_points, 95.0);
 }

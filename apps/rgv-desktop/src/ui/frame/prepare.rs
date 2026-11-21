@@ -31,13 +31,13 @@ use std::time::{Duration, Instant};
 impl Viewer {
     /// Active-panel status, diagnostics and inspector snapshots.
     pub(super) fn prepare_frame_snapshot(&mut self) -> FrameSnapshot {
-        let interval = self.panels.active().viewport.interval();
-        let bases_per_pixel = self.panels.active().viewport.bases_per_pixel();
-        let detail = self.panels.active().viewport.detail_level();
-        let contig_name = self.panels.active().contig_name.clone();
-        let navigation = &self.panels.active().navigation_presentation;
+        let interval = self.session.panels.active().viewport.interval();
+        let bases_per_pixel = self.session.panels.active().viewport.bases_per_pixel();
+        let detail = self.session.panels.active().viewport.detail_level();
+        let contig_name = self.session.panels.active().contig_name.clone();
+        let navigation = &self.session.panels.active().navigation_presentation;
         let alignment_navigation_status = self.alignment_tracks.iter().find_map(|track| {
-            let projection = track.projection(self.panels.active().id)?;
+            let projection = track.projection(self.session.panels.active().id)?;
             (!projection
                 .navigation
                 .is_current_settled(projection.clock.current().get()))
@@ -68,15 +68,15 @@ impl Viewer {
                     )
                 })
             } else if navigation.source_status.is_empty() {
-                (self.data_status.clone(), self.status_activity())
+                (self.session.data_status.clone(), self.status_activity())
             } else {
                 (navigation.source_status.clone(), navigation.source_activity)
             }
         } else {
-            (self.data_status.clone(), self.status_activity())
+            (self.session.data_status.clone(), self.status_activity())
         };
         let announce_status = self.announced_status != data_status;
-        let active_panel_id = self.panels.active().id;
+        let active_panel_id = self.session.panels.active().id;
         let diagnostics_started = Instant::now();
         // Building the diagnostics report walks every engine and formats dozens of strings;
         // it is only shown in the Diagnostics window.
@@ -189,7 +189,8 @@ impl Viewer {
             })
             .or_else(|| {
                 editing_auxiliary_id.and_then(|id| {
-                    self.tracks
+                    self.session
+                        .tracks
                         .tracks()
                         .iter()
                         .find(|track| track.id == id)
@@ -251,6 +252,7 @@ impl Viewer {
         let sashimi_count_mode = settings_filters.sashimi_count_mode;
         let show_junction_labels = settings_filters.show_junction_labels;
         let initial_show_reads = self
+            .session
             .track_presentation
             .pane_track_state(ui::TrackPane::Reads, settings_alignment_id)
             .is_none_or(|node| node.content_visible);
@@ -284,7 +286,7 @@ impl Viewer {
         let (bulk_alignment_ids, bulk_alignment_pane) = editing_alignment_id.map_or_else(
             || (Vec::new(), None),
             |id| {
-                let panel = self.panels.active();
+                let panel = self.session.panels.active();
                 if panel.selected_alignment_tracks.len() > 1
                     && panel.selected_alignment_tracks.contains(&id)
                 {
@@ -341,6 +343,7 @@ impl Viewer {
         let read_name_editor = self.read_name_editor.clone();
         let select_read_name_requested = false;
         let annotation_presentation_state = self
+            .session
             .track_presentation
             .pane_track_state(ui::TrackPane::Annotation, settings_alignment_id);
         let alignment_visible =
@@ -354,7 +357,7 @@ impl Viewer {
             .and_then(|state| state.preferred_height)
             .unwrap_or(120.0);
         let reference_configured = self.primary_alignment_dictionary().map_or_else(
-            || self.reference_revision.is_some(),
+            || self.session.reference_revision.is_some(),
             |dictionary| {
                 self.compatible_alignment_reference_revision(dictionary)
                     .is_some()
@@ -446,6 +449,7 @@ impl Viewer {
         primary_alignment_id: TrackId,
     ) -> TrackControlsDraft {
         let builtin_track_identities = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -463,6 +467,7 @@ impl Viewer {
             .iter()
             .map(|track| {
                 let state = self
+                    .session
                     .track_presentation
                     .pane_track_state(ui::TrackPane::Annotation, track.config.id);
                 let visible = state.is_none_or(|state| state.content_visible);
@@ -496,11 +501,13 @@ impl Viewer {
             })
             .collect::<Vec<_>>();
         let track_controls = self
+            .session
             .tracks
             .tracks()
             .iter()
             .map(|track| {
                 let state = self
+                    .session
                     .track_presentation
                     .pane_track_state(ui::TrackPane::Annotation, track.id);
                 let visible = state.is_none_or(|state| state.content_visible);
@@ -519,6 +526,7 @@ impl Viewer {
             })
             .collect::<Vec<_>>();
         let feature_settings_controls = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -526,6 +534,7 @@ impl Viewer {
             .map(|track| (track.id, track.feature.clone()))
             .collect::<Vec<_>>();
         let natural_row_height_tracks = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -533,6 +542,7 @@ impl Viewer {
             .map(|track| track.id)
             .collect::<BTreeSet<_>>();
         let variant_settings_controls = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -540,6 +550,7 @@ impl Viewer {
             .map(|track| (track.id, track.variant.clone()))
             .collect::<Vec<_>>();
         let gwas_settings_controls = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -547,6 +558,7 @@ impl Viewer {
             .map(|track| (track.id, track.gwas.clone()))
             .collect::<Vec<_>>();
         let quantitative_settings_controls = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -554,6 +566,7 @@ impl Viewer {
             .map(|track| (track.id, track.quantitative.clone()))
             .collect::<Vec<_>>();
         let copy_number_settings_controls = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -561,6 +574,7 @@ impl Viewer {
             .map(|track| (track.id, track.copy_number.clone()))
             .collect::<Vec<_>>();
         let mutation_settings_controls = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -568,11 +582,12 @@ impl Viewer {
             .map(|track| (track.id, track.mutation.clone()))
             .collect::<Vec<_>>();
         let copy_number_sort_locus = CopyNumberSortLocus {
-            contig: self.panels.active().contig_name.clone(),
-            start: self.panels.active().viewport.interval().start(),
-            end: self.panels.active().viewport.interval().end(),
+            contig: self.session.panels.active().contig_name.clone(),
+            start: self.session.panels.active().viewport.interval().start(),
+            end: self.session.panels.active().viewport.interval().end(),
         };
         let quantitative_track_choices = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -580,6 +595,7 @@ impl Viewer {
             .map(|track| (track.id, track.name.clone()))
             .collect::<Vec<_>>();
         let interaction_settings_controls = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -587,6 +603,7 @@ impl Viewer {
             .map(|track| (track.id, track.interaction.clone()))
             .collect::<Vec<_>>();
         let variant_settings_queries = self
+            .session
             .panels
             .active()
             .track_snapshots
@@ -602,6 +619,7 @@ impl Viewer {
             })
             .collect::<Vec<_>>();
         let track_counts = self
+            .session
             .panels
             .active()
             .track_snapshots
@@ -651,9 +669,10 @@ impl Viewer {
 
     fn prepare_shell_ui_draft(&mut self) -> super::shell_dialogs::ShellUiDraft {
         let shell = &mut self.shell;
+        let notifications = &mut self.session.notifications;
         if shell.notifications_open {
             // Everything listed in the open window has been seen.
-            shell.notifications.mark_seen();
+            notifications.mark_seen();
         }
         super::shell_dialogs::ShellUiDraft {
             unsaved_prompt: shell
@@ -662,11 +681,11 @@ impl Viewer {
                 .map(crate::app::shell_state::GuardedAction::prompt),
             unsaved_choice: None,
             notifications_open: shell.notifications_open,
-            error_count: shell.notifications.error_count(),
-            unseen_error_count: shell.notifications.unseen_error_count(),
+            error_count: notifications.error_count(),
+            unseen_error_count: notifications.unseen_error_count(),
             // The log is bounded and copied only while its window is open.
             notifications: if shell.notifications_open {
-                shell.notifications.entries().rev().cloned().collect()
+                notifications.entries().rev().cloned().collect()
             } else {
                 Vec::new()
             },
@@ -709,27 +728,27 @@ impl Viewer {
         let remote_source_request = None;
         let settings_open = self.open_panel == Some(UiPanel::Settings);
         let project_issues_open = self.open_panel == Some(UiPanel::ProjectIssues);
-        let unresolved_session_sources = self.unresolved_session_sources.clone();
-        let session_migration_notices = self.session_migration_notices.clone();
+        let unresolved_session_sources = self.session.unresolved_session_sources.clone();
+        let session_migration_notices = self.session.session_migration_notices.clone();
         let igv_report_open = self.open_panel == Some(UiPanel::IgvImportReport);
-        let igv_import_report = self.igv_import_report.clone();
+        let igv_import_report = self.session.igv_import_report.clone();
         let recovery_open = self.recovery_open;
         let recovery_requested = None;
         let dismiss_recovery = false;
-        let cache_budget_mib = self.settings.cache_budget_mib;
-        let read_browsing_buffer_percent = self.settings.read_browsing_buffer_percent;
-        let diagnostics_opt_in = self.settings.diagnostics_opt_in;
-        let autosave_enabled = self.settings.autosave_enabled;
-        let autosave_interval_seconds = self.settings.autosave_interval_seconds;
-        let autosave_retention = self.settings.autosave_retention;
-        let interface_scale_percent = self.settings.interface_scale_percent;
-        let high_contrast = self.settings.high_contrast;
-        let interface_theme = self.settings.theme;
-        let reduced_motion = self.settings.reduced_motion;
-        let coverage_cache_enabled = self.settings.coverage_cache_enabled;
-        let track_pipeline = self.settings.track_pipeline;
-        let recent_loci = self.settings.recent_loci.clone();
-        let current_session_path = self.current_session_path.clone();
+        let cache_budget_mib = self.session.settings.cache_budget_mib;
+        let read_browsing_buffer_percent = self.session.settings.read_browsing_buffer_percent;
+        let diagnostics_opt_in = self.session.settings.diagnostics_opt_in;
+        let autosave_enabled = self.session.settings.autosave_enabled;
+        let autosave_interval_seconds = self.session.settings.autosave_interval_seconds;
+        let autosave_retention = self.session.settings.autosave_retention;
+        let interface_scale_percent = self.session.settings.interface_scale_percent;
+        let high_contrast = self.session.settings.high_contrast;
+        let interface_theme = self.session.settings.theme;
+        let reduced_motion = self.session.settings.reduced_motion;
+        let coverage_cache_enabled = self.session.settings.coverage_cache_enabled;
+        let track_pipeline = self.session.settings.track_pipeline;
+        let recent_loci = self.session.settings.recent_loci.clone();
+        let current_session_path = self.session.current_session_path.clone();
         let clear_recent_requested = false;
         let recent_alignment_requested = None;
         let recent_session_requested = None;
@@ -816,30 +835,36 @@ impl Viewer {
         let previous_workspace_layout = self.workspace_layout.clone();
         let new_workspace_layout = previous_workspace_layout.clone();
         let native_properties_resize_active = false;
-        let pane_layout = self.panels.active().pane_layout.clone();
+        let pane_layout = self.session.panels.active().pane_layout.clone();
         let track_frames = pane_layout.frames().cloned().collect::<Vec<_>>();
         let annotation_track_count = self
+            .session
             .track_presentation
             .pane_tracks
             .iter()
             .filter(|node| node.channel == ui::TrackPane::Annotation)
             .count()
-            + usize::from(self.reference_engine.is_some());
+            + usize::from(self.session.reference_engine.is_some());
         let read_track_count = self
+            .session
             .track_presentation
             .pane_tracks
             .iter()
             .filter(|node| node.channel == ui::TrackPane::Reads)
             .count();
-        let shared_annotation_maximum = self.panels.maximum_annotation_scroll_points();
-        let shared_annotation_offset = if self.track_presentation.annotation_section_expanded {
-            self.panels
-                .annotation_scroll_points
-                .clamp(0.0, shared_annotation_maximum)
-        } else {
-            self.panels.annotation_scroll_points
-        };
+        let shared_annotation_maximum =
+            crate::workspace::panels::maximum_annotation_scroll_points(&self.session.panels);
+        let shared_annotation_offset =
+            if self.session.track_presentation.annotation_section_expanded {
+                self.session
+                    .panels
+                    .annotation_scroll_points
+                    .clamp(0.0, shared_annotation_maximum)
+            } else {
+                self.session.panels.annotation_scroll_points
+            };
         let selected_annotation_track_ids = self
+            .session
             .panels
             .active()
             .selected_presentation_nodes
@@ -871,6 +896,7 @@ impl Viewer {
             .alignment_scene_publication_authority
             .desired_target_revision();
         let workspace_scrollbars = self
+            .session
             .panels
             .iter()
             .enumerate()
@@ -953,7 +979,7 @@ impl Viewer {
         // still reported so recorded traces keep their shape.
         self.diagnostics
             .frame_phase(ManualDiagnosticFramePhase::ShellTextCopy, Duration::ZERO);
-        let selected_track = self.panels.active().selected_track;
+        let selected_track = self.session.panels.active().selected_track;
         let overview_interaction = ui::OverviewInteraction::default();
         let overview_panel_id = active_panel_id;
         let genomic_canvas_layer_id = None;
@@ -986,7 +1012,7 @@ impl Viewer {
     pub(super) fn prepare_navigation_draft(&self) -> NavigationDraft {
         let locus_editor = self.locus_editor.clone();
         let navigate_requested = false;
-        let assembly_label = self.assembly.context_label();
+        let assembly_label = self.session.assembly.context_label();
         let requested_contig = None;
         let previous_feature_requested = false;
         let next_feature_requested = false;
@@ -1010,6 +1036,7 @@ impl Viewer {
         let zoom_out_requested = false;
         let requested_span = None;
         let panel_controls = self
+            .session
             .panels
             .iter()
             .enumerate()
@@ -1057,6 +1084,7 @@ impl Viewer {
     pub(super) fn prepare_panel_contexts(&mut self) -> Vec<PanelContext> {
         let overview_projection_started = Instant::now();
         let panel_overview_inputs = self
+            .session
             .panels
             .iter()
             .map(|panel| {
@@ -1098,7 +1126,10 @@ impl Viewer {
         // menu or inspector request made while they are closed loads them at commit.
         let lists_loaded = regions_open || review_open;
         let (regions, review_items) = if lists_loaded {
-            (self.regions_of_interest.clone(), self.review_items.clone())
+            (
+                self.session.regions_of_interest.clone(),
+                self.session.review_items.clone(),
+            )
         } else {
             (Vec::new(), Vec::new())
         };
@@ -1120,7 +1151,7 @@ impl Viewer {
         // Read by the metadata window and by the sample pickers in track settings.
         let sample_metadata =
             if metadata_open || matches!(self.open_panel, Some(UiPanel::TrackSettings(_))) {
-                self.sample_metadata.clone()
+                self.session.sample_metadata.clone()
             } else {
                 None
             };
@@ -1153,7 +1184,7 @@ impl Viewer {
                     TrackKind::Alignment,
                 )
             })
-            .chain(self.tracks.tracks().iter().map(|track| {
+            .chain(self.session.tracks.tracks().iter().map(|track| {
                 (
                     track.id,
                     track.name.clone(),
@@ -1255,7 +1286,7 @@ impl Viewer {
                     && record.mate_start.is_some()
             });
             let supplementary_segments_available = record.as_ref().is_some_and(|record| {
-                selected_supplementary_chain(record, &self.panels.active().contig_name)
+                selected_supplementary_chain(record, &self.session.panels.active().contig_name)
                     .is_some_and(|chain| chain.segments.len() > 1)
             });
             let sequence_available = record
@@ -1269,6 +1300,7 @@ impl Viewer {
             Some(AlignmentContextMenuView {
                 filters: track.config.filters.clone(),
                 contig_name: self
+                    .session
                     .panels
                     .get(menu.target.panel_id)
                     .map(|panel| panel.contig_name.clone())

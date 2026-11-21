@@ -31,10 +31,29 @@
 //! A request that reports exact read-derived depth as ready is answered with
 //! [`DepthLaneAuthority::ExactReadEvidence`] and schedules no work. Resident tiles are charged
 //! to the shared ledger's Summary owner by [`DepthPyramidStore`], within its own cap.
+//!
+//! # File descriptors
+//!
+//! Every alignment track already holds the scene engine's handle, and the macOS default soft
+//! limit is 256 descriptors, so this engine does not hold its own source open while idle:
+//!
+//! * The first open captures the source's reference dictionary and source stamp; nothing
+//!   else needs the handle. A caller that already knows both (the scene engine does) states
+//!   them in [`AlignmentCoverageEngineConfig::known_dictionary`] and
+//!   [`AlignmentCoverageEngineConfig::known_source_stamp`]; a request fully served from the
+//!   sidecar cache then opens nothing at all.
+//! * The handle is (re)opened for a decode burst (consecutive units decoded without the
+//!   worker going idle) and closed once the worker has been idle for
+//!   [`AlignmentCoverageEngineConfig::source_idle_close`] (2 s by default) for a local file,
+//!   or [`AlignmentCoverageEngineConfig::remote_source_idle_close`] (30 s by default) for a
+//!   remote object, whose reopen costs a header and index transfer.
+//! * A reopen compares the stamp (and dictionary) with the captured ones. A change means the
+//!   file was rewritten: resident tiles, publications and the sidecar key are dropped and the
+//!   engine restarts from the new revision instead of mixing tiles of the two.
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -49,9 +68,10 @@ use rgv_alignment_scene::{
 };
 use rgv_core::{ContigId, ReferenceDictionary};
 use rgv_hts::{
-    AlignmentOpenOptions, AlignmentSource as _, CoverageEligibility, CoveragePyramidParameters,
-    CoverageSidecarCache, CoverageSidecarKey, CoverageTile, CoverageTileId, CoverageTileOutcome,
-    CoverageTileRequest, ProductionAlignmentSource, RemoteCancellation, RemoteTransferBudget,
+    AlignmentOpenOptions, AlignmentSource as _, AlignmentSourceStamp, CoverageEligibility,
+    CoveragePyramidParameters, CoverageSidecarCache, CoverageSidecarKey, CoverageTile,
+    CoverageTileId, CoverageTileOutcome, CoverageTileRequest, ProductionAlignmentSource,
+    RemoteCancellation, RemoteTransferBudget,
 };
 
 use crate::{
@@ -85,7 +105,24 @@ pub struct AlignmentCoverageEngineConfig {
     pub production_unit_bases: u64,
     /// Transfer bound of one decode unit of a remote source.
     pub remote_unit_transfer_budget: RemoteTransferBudget,
+    /// The source's reference dictionary, when the caller already has it (the scene engine
+    /// opened the same source). With it the engine opens the source only to decode.
+    pub known_dictionary: Option<ReferenceDictionary>,
+    /// The source's stamp, with [`Self::known_dictionary`]: keys the sidecar cache without
+    /// an open. Ignored without a dictionary. A stale stamp is harmless: the first decode
+    /// reopens the source, sees the difference and starts again from the current revision.
+    pub known_source_stamp: Option<AlignmentSourceStamp>,
+    /// How long a local source's handle stays open once the worker is idle. Default 2 s.
+    pub source_idle_close: Duration,
+    /// How long a remote source's handle stays open once the worker is idle. Default 30 s:
+    /// reopening a remote object transfers its header and index again.
+    pub remote_source_idle_close: Duration,
 }
+
+/// Default of [`AlignmentCoverageEngineConfig::source_idle_close`].
+const SOURCE_IDLE_CLOSE: Duration = Duration::from_secs(2);
+/// Default of [`AlignmentCoverageEngineConfig::remote_source_idle_close`].
+const REMOTE_SOURCE_IDLE_CLOSE: Duration = Duration::from_secs(30);
 
 impl AlignmentCoverageEngineConfig {
     #[must_use]
@@ -103,7 +140,24 @@ impl AlignmentCoverageEngineConfig {
             resident_byte_limit: ALIGNMENT_COVERAGE_DEFAULT_RESIDENT_BYTES,
             production_unit_bases: DEPTH_PYRAMID_PRODUCTION_UNIT_BASES,
             remote_unit_transfer_budget: ALIGNMENT_COVERAGE_REMOTE_UNIT_TRANSFER_BUDGET,
+            known_dictionary: None,
+            known_source_stamp: None,
+            source_idle_close: SOURCE_IDLE_CLOSE,
+            remote_source_idle_close: REMOTE_SOURCE_IDLE_CLOSE,
         }
+    }
+
+    /// This configuration with the source's dictionary and stamp stated by the caller; see
+    /// [`Self::known_dictionary`].
+    #[must_use]
+    pub fn with_known_source(
+        mut self,
+        dictionary: ReferenceDictionary,
+        stamp: Option<AlignmentSourceStamp>,
+    ) -> Self {
+        self.known_dictionary = Some(dictionary);
+        self.known_source_stamp = stamp;
+        self
     }
 }
 
@@ -185,7 +239,17 @@ pub struct AlignmentCoverageTelemetry {
     pub resident_bytes: usize,
     /// Largest depth-state working set of any unit, in bytes.
     pub peak_unit_working_bytes: usize,
+    /// The source has been opened at least once.
     pub source_opened: bool,
+    /// Times the source was opened (the first open and every reopen for a decode burst).
+    pub source_opens: u64,
+    /// Times the idle handle was closed.
+    pub source_closes: u64,
+    /// The engine holds an open source handle now.
+    pub source_handle_open: bool,
+    /// Reopens that found the source rewritten (another stamp or dictionary): resident
+    /// tiles and publications were dropped and coverage restarted from the new revision.
+    pub source_revision_changes: u64,
     /// Units decoded with every mate counted independently because the count-once window
     /// overflowed; also counted in `units_decoded`.
     pub units_mate_overlap_not_collapsed: u64,
@@ -252,6 +316,14 @@ impl AlignmentCoverageEngine {
         config: AlignmentCoverageEngineConfig,
         allowance: Arc<DecodeAllowance>,
     ) -> std::io::Result<Self> {
+        Self::spawn_with_opener(config, allowance, Box::new(ProductionOpener))
+    }
+
+    pub(crate) fn spawn_with_opener(
+        config: AlignmentCoverageEngineConfig,
+        allowance: Arc<DecodeAllowance>,
+        opener: Box<dyn CoverageSourceOpener>,
+    ) -> std::io::Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(SharedState::default()),
             work: Condvar::new(),
@@ -263,7 +335,7 @@ impl AlignmentCoverageEngine {
         let worker_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("rgv-alignment-coverage".to_owned())
-            .spawn(move || Worker::new(config, worker_shared).run())?;
+            .spawn(move || Worker::new(config, worker_shared, opener).run())?;
         Ok(Self {
             shared,
             worker: Some(worker),
@@ -509,17 +581,97 @@ impl UnitProbe {
     }
 }
 
-struct OpenSource {
-    source: ProductionAlignmentSource,
+/// An open source, as the engine uses it: its identity and the coverage producer.
+pub(crate) trait CoverageSourceHandle {
+    fn dictionary(&self) -> &ReferenceDictionary;
+    fn stamp(&self) -> Option<AlignmentSourceStamp>;
+    /// Remote handles are kept open longer while idle.
+    fn is_remote(&self) -> bool;
+    fn coverage_tiles(
+        &mut self,
+        request: &CoverageTileRequest,
+        transfer_budget: Option<RemoteTransferBudget>,
+        cancellation: &RemoteCancellation,
+    ) -> Result<CoverageTileOutcome, String>;
+}
+
+/// Opens the engine's source; the seam tests count opens and closes through.
+pub(crate) trait CoverageSourceOpener: Send {
+    fn open(
+        &self,
+        path: &Path,
+        options: &AlignmentOpenOptions,
+    ) -> Result<Box<dyn CoverageSourceHandle>, String>;
+}
+
+struct ProductionOpener;
+
+impl CoverageSourceOpener for ProductionOpener {
+    fn open(
+        &self,
+        path: &Path,
+        options: &AlignmentOpenOptions,
+    ) -> Result<Box<dyn CoverageSourceHandle>, String> {
+        ProductionAlignmentSource::open(path, options)
+            .map(|source| Box::new(source) as Box<dyn CoverageSourceHandle>)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl CoverageSourceHandle for ProductionAlignmentSource {
+    fn dictionary(&self) -> &ReferenceDictionary {
+        self.reference_dictionary()
+    }
+
+    fn stamp(&self) -> Option<AlignmentSourceStamp> {
+        self.source_stamp()
+    }
+
+    fn is_remote(&self) -> bool {
+        Self::is_remote(self)
+    }
+
+    fn coverage_tiles(
+        &mut self,
+        request: &CoverageTileRequest,
+        transfer_budget: Option<RemoteTransferBudget>,
+        cancellation: &RemoteCancellation,
+    ) -> Result<CoverageTileOutcome, String> {
+        Self::coverage_tiles(self, request, transfer_budget, cancellation)
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// What the engine knows of its source without holding it open.
+#[derive(Clone, Debug, PartialEq)]
+struct SourceIdentity {
     dictionary: ReferenceDictionary,
-    sidecar_key_stamp: Option<rgv_hts::AlignmentSourceStamp>,
+    stamp: Option<AlignmentSourceStamp>,
+}
+
+struct OpenHandle {
+    source: Box<dyn CoverageSourceHandle>,
+    /// When the handle was last opened or used for a unit.
+    last_used: Instant,
+    remote: bool,
+}
+
+/// Why a unit was not decoded before it started.
+enum UnitStart {
+    Ready,
+    /// The reopened source is another revision; everything was dropped.
+    SourceChanged,
 }
 
 struct Worker {
     config: AlignmentCoverageEngineConfig,
     shared: Arc<Shared>,
     store: DepthPyramidStore,
-    source: Option<Result<OpenSource, Arc<str>>>,
+    opener: Box<dyn CoverageSourceOpener>,
+    /// Captured at the first open (or stated by the caller); `Err` when the first open failed.
+    identity: Option<Result<SourceIdentity, Arc<str>>>,
+    /// Open only for a decode burst and an idle grace period after it.
+    handle: Option<OpenHandle>,
     /// Settings the resident tiles were built under.
     eligibility: Option<CoverageEligibility>,
     sidecar_key: Option<CoverageSidecarKey>,
@@ -547,7 +699,11 @@ struct ActiveView {
 }
 
 impl Worker {
-    fn new(config: AlignmentCoverageEngineConfig, shared: Arc<Shared>) -> Self {
+    fn new(
+        config: AlignmentCoverageEngineConfig,
+        shared: Arc<Shared>,
+        opener: Box<dyn CoverageSourceOpener>,
+    ) -> Self {
         let store = DepthPyramidStore::new(
             config.parameters,
             config.ledger.clone(),
@@ -558,7 +714,9 @@ impl Worker {
             config,
             shared,
             store,
-            source: None,
+            opener,
+            identity: None,
+            handle: None,
             eligibility: None,
             sidecar_key: None,
             sidecar_absent: HashSet::new(),
@@ -580,11 +738,28 @@ impl Worker {
                         state.idle = true;
                         self.shared.published.notify_all();
                     }
+                    // An idle worker holds its source handle only for the grace period.
+                    let Some(deadline) = self.handle_deadline() else {
+                        state = self
+                            .shared
+                            .work
+                            .wait(state)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        continue;
+                    };
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        drop(state);
+                        self.close_handle();
+                        state = self.shared.lock();
+                        continue;
+                    }
                     state = self
                         .shared
                         .work
-                        .wait(state)
-                        .unwrap_or_else(PoisonError::into_inner);
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
                 }
                 if state.shutdown {
                     return;
@@ -645,11 +820,17 @@ impl Worker {
         }
         let eligibility = newest.eligibility.clone();
 
-        if self.source.is_none() {
-            self.source = Some(self.open_source());
+        if self.identity.is_none() {
+            self.identity = Some(match self.config.known_dictionary.clone() {
+                Some(dictionary) => Ok(SourceIdentity {
+                    dictionary,
+                    stamp: self.config.known_source_stamp,
+                }),
+                None => self.open_handle(),
+            });
         }
-        let dictionary = match self.source.as_ref() {
-            Some(Ok(open)) => open.dictionary.clone(),
+        let dictionary = match self.identity.as_ref() {
+            Some(Ok(identity)) => identity.dictionary.clone(),
             Some(Err(message)) => {
                 let message = Arc::clone(message);
                 for (owner, request, _) in &pyramid_requests {
@@ -667,8 +848,8 @@ impl Worker {
             None => return false,
         };
         if self.sidecar_key.is_none()
-            && let Some(Ok(open)) = &self.source
-            && let Some(stamp) = open.sidecar_key_stamp
+            && let Some(Ok(identity)) = &self.identity
+            && let Some(stamp) = identity.stamp
         {
             self.sidecar_key = Some(CoverageSidecarKey::new(
                 stamp,
@@ -728,7 +909,10 @@ impl Worker {
             self.note_store();
             return false;
         };
-        self.decode_unit(unit, contig_length, &eligibility);
+        if let UnitStart::SourceChanged = self.decode_unit(unit, contig_length, &eligibility) {
+            // Start over against the new revision: its dictionary may differ too.
+            return true;
+        }
         for active in &views {
             self.obtain_without_decoding(&active.view);
         }
@@ -737,17 +921,95 @@ impl Worker {
         true
     }
 
-    fn open_source(&self) -> Result<OpenSource, Arc<str>> {
-        let source = ProductionAlignmentSource::open(&self.config.path, &self.config.open_options)
+    /// Opens the source and keeps the handle; returns what it says it is.
+    fn open_handle(&mut self) -> Result<SourceIdentity, Arc<str>> {
+        let source = self
+            .opener
+            .open(&self.config.path, &self.config.open_options)
             .map_err(|error| Arc::<str>::from(format!("coverage source did not open: {error}")))?;
-        let dictionary = source.reference_dictionary().clone();
-        let sidecar_key_stamp = source.source_stamp();
-        self.shared.lock().telemetry.source_opened = true;
-        Ok(OpenSource {
+        let identity = SourceIdentity {
+            dictionary: source.dictionary().clone(),
+            stamp: source.stamp(),
+        };
+        let remote = source.is_remote();
+        self.handle = Some(OpenHandle {
             source,
-            dictionary,
-            sidecar_key_stamp,
-        })
+            last_used: Instant::now(),
+            remote,
+        });
+        let mut state = self.shared.lock();
+        state.telemetry.source_opened = true;
+        state.telemetry.source_opens += 1;
+        state.telemetry.source_handle_open = true;
+        Ok(identity)
+    }
+
+    /// When the idle handle is to be closed; `None` when none is open.
+    fn handle_deadline(&self) -> Option<Instant> {
+        let handle = self.handle.as_ref()?;
+        let grace = if handle.remote {
+            self.config.remote_source_idle_close
+        } else {
+            self.config.source_idle_close
+        };
+        Some(
+            handle
+                .last_used
+                .checked_add(grace)
+                .unwrap_or(handle.last_used),
+        )
+    }
+
+    fn close_handle(&mut self) {
+        if self.handle.take().is_some() {
+            let mut state = self.shared.lock();
+            state.telemetry.source_closes += 1;
+            state.telemetry.source_handle_open = false;
+        }
+    }
+
+    /// The handle for a decode burst: the open one, or a reopened one whose stamp and
+    /// dictionary are checked against what the engine has been serving.
+    fn handle_for_unit(&mut self) -> Result<UnitStart, Arc<str>> {
+        if let Some(handle) = &mut self.handle {
+            handle.last_used = Instant::now();
+            return Ok(UnitStart::Ready);
+        }
+        let identity = self.open_handle()?;
+        if self.identity.as_ref().and_then(|known| known.as_ref().ok()) == Some(&identity) {
+            return Ok(UnitStart::Ready);
+        }
+        self.source_changed(identity);
+        Ok(UnitStart::SourceChanged)
+    }
+
+    /// The source is another revision than the tiles were built from: every resident tile,
+    /// every publication and the sidecar key go, and the engine serves the new revision.
+    fn source_changed(&mut self, identity: SourceIdentity) {
+        tracing::info!(
+            path = %self.config.path.display(),
+            "the alignment source changed; its coverage is rebuilt"
+        );
+        self.store.clear();
+        self.sidecar_absent.clear();
+        self.failed_units.clear();
+        self.uncollapsed_units.clear();
+        self.sidecar_key = None;
+        self.identity = Some(Ok(identity));
+        self.last_signatures.clear();
+        let mut state = self.shared.lock();
+        state.telemetry.source_revision_changes += 1;
+        // A lane of the old revision is never shown again; the next round republishes.
+        let before = state.publications.len();
+        state
+            .publications
+            .retain(|_, publication| publication.authority != DepthLaneAuthority::Pyramid);
+        if state.publications.len() != before {
+            state.sequence += 1;
+        }
+        drop(state);
+        self.shared.published.notify_all();
+        crate::mailbox::wake_ui();
     }
 
     /// Step 2: every target tile under the view and margin that can be had from the resident
@@ -817,7 +1079,17 @@ impl Worker {
         unit: CoverageTileId,
         contig_length: u64,
         eligibility: &CoverageEligibility,
-    ) {
+    ) -> UnitStart {
+        match self.handle_for_unit() {
+            Ok(UnitStart::Ready) => {}
+            Ok(UnitStart::SourceChanged) => return UnitStart::SourceChanged,
+            Err(message) => {
+                // The source was readable before; the unit fails until a retry.
+                self.failed_units.insert(unit, message);
+                self.shared.lock().telemetry.units_failed += 1;
+                return UnitStart::Ready;
+            }
+        }
         let parameters = self.config.parameters;
         let probe_eligibility = eligibility.clone();
         let started_epoch = self.shared.epoch.load(Ordering::Acquire);
@@ -863,7 +1135,7 @@ impl Worker {
         });
         if !probe.acquire() {
             self.shared.lock().telemetry.units_cancelled += 1;
-            return;
+            return UnitStart::Ready;
         }
         let cancellation: RemoteCancellation = {
             let probe = Arc::clone(&probe);
@@ -877,12 +1149,15 @@ impl Worker {
             eligibility: eligibility.clone(),
         };
         let budget = self.config.remote_unit_transfer_budget;
-        let outcome = match self.source.as_mut() {
-            Some(Ok(open)) => open
-                .source
-                .coverage_tiles(&request, Some(budget), &cancellation),
-            _ => return,
+        let Some(handle) = self.handle.as_mut() else {
+            probe.release();
+            return UnitStart::Ready;
         };
+        let outcome = handle
+            .source
+            .coverage_tiles(&request, Some(budget), &cancellation);
+        // The burst goes on from here: the grace period counts from the end of the unit.
+        handle.last_used = Instant::now();
         probe.release();
         let yields = probe.yields.load(Ordering::Relaxed);
         let mut failure = None;
@@ -955,6 +1230,7 @@ impl Worker {
             telemetry.units_decoded += 1;
             telemetry.units_mate_overlap_not_collapsed += u64::from(uncollapsed);
         }
+        UnitStart::Ready
     }
 
     fn publish_views(&mut self, views: &[ActiveView]) {
@@ -1061,3 +1337,6 @@ impl Worker {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod handle_tests;

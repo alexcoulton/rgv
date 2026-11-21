@@ -3,10 +3,8 @@ use crate::inspection::model::SelectedSupplementaryChain;
 use crate::inspection::rna::selected_supplementary_chain;
 use anyhow::Result;
 use rgv_alignment_scene::{AlignmentHandle, AlignmentPresentationScene};
-use rgv_automation::{
-    AutomationReadPresentationState, AutomationSelectionSnapshot, AutomationViewportOperation,
-};
-use rgv_core::{GenomicInterval, TrackSource, Viewport};
+use rgv_automation::{AutomationReadPresentationState, AutomationSelectionSnapshot};
+use rgv_core::{GenomicInterval, TrackSource};
 use rgv_engine::AlignmentIndividualReadCapability;
 use rgv_hts::{AlignmentRecord, AuxValue, SupplementarySegment};
 use sha2::{Digest as _, Sha256};
@@ -219,36 +217,4 @@ pub(crate) fn observed_retained_selection(
             .and_then(|(start, end)| GenomicInterval::new(viewport.contig(), start, end).ok())
             .is_some_and(|evidence| viewport.contains_interval(evidence));
     snapshot
-}
-
-pub(crate) fn automation_viewport_after_operation(
-    current: Viewport,
-    contig_length: u64,
-    operation: AutomationViewportOperation,
-) -> Result<Viewport> {
-    Ok(match operation {
-        AutomationViewportOperation::PanBases { delta } => {
-            current.pan_pixels(delta as f64 / current.bases_per_pixel(), contig_length)?
-        }
-        AutomationViewportOperation::PanFraction { fraction } => {
-            current.pan_pixels(current.pixel_width() * fraction, contig_length)?
-        }
-        AutomationViewportOperation::Zoom {
-            factor,
-            anchor_position,
-        } => {
-            let anchor_x = anchor_position.map_or(current.pixel_width() / 2.0, |position| {
-                current.pixel_at_genomic(position)
-            });
-            current.zoom_at(anchor_x, factor.recip(), contig_length)?
-        }
-        AutomationViewportOperation::FitInterval { start, end } => {
-            let bounded_length = contig_length.max(1);
-            let start = start.min(bounded_length.saturating_sub(1));
-            let end = end.min(bounded_length).max(start.saturating_add(1));
-            let interval =
-                GenomicInterval::bounded(current.interval().contig(), start, end, contig_length)?;
-            Viewport::new(interval, current.pixel_width())?
-        }
-    })
 }

@@ -151,12 +151,12 @@ impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(super) fn genomes_menu_ui(&self, ui: &mut egui::Ui, st: &mut ShellFrame) {
         ui.label(&st.nav.assembly_label);
-        if let Some(identity) = &self.assembly.identity {
+        if let Some(identity) = &self.session.assembly.identity {
             ui.small(format!(
                 "{} · {:?} · {} fingerprint matches",
                 identity.stable_id, identity.confidence, identity.matched_fingerprints
             ));
-        } else if let Some(suggestion) = &self.suggested_assembly_identity {
+        } else if let Some(suggestion) = &self.session.suggested_assembly_identity {
             ui.colored_label(
                 crate::theme::adapt(egui::Color32::from_rgb(150, 92, 20)),
                 format!(
@@ -169,15 +169,17 @@ impl Viewer {
         }
         ui.small(format!(
             "Reference: {} contigs · cytobands: {} · default annotations: {}",
-            self.assembly.reference_contig_count,
-            if self.assembly.has_cytobands() {
+            self.session.assembly.reference_contig_count,
+            if self.session.assembly.has_cytobands() {
                 "loaded"
             } else {
                 "missing"
             },
-            self.assembly.default_annotation_count,
+            self.session.assembly.default_annotation_count,
         ));
-        if !self.assembly.has_cytobands() || self.assembly.default_annotation_count == 0 {
+        if !self.session.assembly.has_cytobands()
+            || self.session.assembly.default_annotation_count == 0
+        {
             ui.colored_label(
                 crate::theme::adapt(egui::Color32::from_rgb(150, 92, 20)),
                 "Genome context incomplete — open a genome configuration",
@@ -208,7 +210,11 @@ impl Viewer {
             .landmark_resolution
             .as_ref()
             .and_then(|resolution| resolution.bundle_id.as_ref())
-            .is_some_and(|bundle_id| self.suppressed_builtin_gene_bundles.contains(bundle_id))
+            .is_some_and(|bundle_id| {
+                self.session
+                    .suppressed_builtin_gene_bundles
+                    .contains(bundle_id)
+            })
             && ui.button("Restore default genes").clicked()
         {
             st.commands.restore_default_genes_requested = true;
@@ -227,7 +233,7 @@ impl Viewer {
             .id_salt("genome-contig-list")
             .max_height(420.0)
             .show(ui, |ui| {
-                for contig in self.assembly.dictionary.iter() {
+                for contig in self.session.assembly.dictionary.iter() {
                     if ui.button(contig.name()).clicked() {
                         st.nav.requested_contig = Some(contig.id());
                         ui.close();
@@ -296,7 +302,7 @@ impl Viewer {
             ui.close();
         }
         ui.separator();
-        if self.alignment_tracks.is_empty() && self.synthetic {
+        if self.alignment_tracks.is_empty() && self.session.synthetic {
             let id = self.primary_alignment_track_id();
             let filters = self.live_session_filters();
             ui.menu_button(self.alignment_track_name(), |ui| {
@@ -343,7 +349,8 @@ impl Viewer {
                     ui,
                     control.id,
                     &filters,
-                    self.track_presentation
+                    self.session
+                        .track_presentation
                         .pane_track_state(ui::TrackPane::Reads, control.id)
                         .is_none_or(|node| node.content_visible),
                     control.id == st.align.primary_alignment_id,

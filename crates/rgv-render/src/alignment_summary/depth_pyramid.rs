@@ -20,7 +20,8 @@
 //! they hold, through the [`PagedGpuCache`] the summary and track-tile renderers use; the GPU
 //! owner's accounting then includes this lane. A page that does not fit the GPU budget even
 //! after this renderer's idle pages are evicted is not uploaded: its segment is left out of
-//! the frame and counted in [`AlignmentDepthPyramidGpuPrepareStats::pages_refused`]. Without
+//! the frame and counted in [`AlignmentDepthPyramidGpuPrepareStats::pages_refused`] and, per
+//! lane, in [`AlignmentDepthPyramidGpuFrame::pages_refused_by_request`]. Without
 //! a ledger the pages are bounded by the byte cap alone, as before.
 
 use std::sync::atomic::AtomicU64;
@@ -292,9 +293,31 @@ pub struct AlignmentDepthPyramidGpuFrame {
     draws: Vec<PreparedPyramidDraw>,
     revision: u64,
     device_generation: u64,
+    /// Pages refused per request, in request order.
+    refused_by_request: Vec<usize>,
 }
 
 impl AlignmentDepthPyramidGpuFrame {
+    /// Pages the ledger refused for each request of the `prepare` call that built this frame,
+    /// indexed like its `requests` slice. A refused page's segment is missing from that
+    /// request's lane only; the sum over requests is
+    /// [`AlignmentDepthPyramidGpuPrepareStats::pages_refused`].
+    ///
+    /// A page is refused where it is first needed: a later request of the same frame that
+    /// needs the same page is refused it too, and is counted too.
+    #[must_use]
+    pub fn pages_refused_by_request(&self) -> &[usize] {
+        &self.refused_by_request
+    }
+
+    /// Pages refused for request `index` of the `prepare` call; zero for an index it did not
+    /// have. A lane whose request has zero refusals is drawn whole whatever another lane of
+    /// the same frame was refused.
+    #[must_use]
+    pub fn request_pages_refused(&self, index: usize) -> usize {
+        self.refused_by_request.get(index).copied().unwrap_or(0)
+    }
+
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
@@ -549,7 +572,8 @@ impl AlignmentDepthPyramidGpuRenderer {
         let mut stats = AlignmentDepthPyramidGpuPrepareStats::default();
         let mut draws = Vec::new();
         let mut uniforms = Vec::<DepthPyramidGpuUniform>::new();
-        for request in requests {
+        let mut refused_by_request = vec![0_usize; requests.len()];
+        for (request_index, request) in requests.iter().enumerate() {
             let camera = request.camera;
             let bases_per_pixel = camera.bases_per_pixel();
             if !bases_per_pixel.is_finite() || bases_per_pixel <= 0.0 {
@@ -572,6 +596,7 @@ impl AlignmentDepthPyramidGpuRenderer {
                     let bytes = size_of_val(instances.as_slice());
                     let Ok(allocation) = self.charge_page(bytes, revision, &mut stats) else {
                         stats.pages_refused += 1;
+                        refused_by_request[request_index] += 1;
                         continue;
                     };
                     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -702,6 +727,7 @@ impl AlignmentDepthPyramidGpuRenderer {
                 draws,
                 revision,
                 device_generation: self.device_generation,
+                refused_by_request,
             },
             stats,
         ))

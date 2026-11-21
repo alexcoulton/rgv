@@ -41,8 +41,10 @@ impl Viewer {
                 self.review_status_filter = st.lists.review_status_filter;
                 return;
             }
-            st.lists.regions.clone_from(&self.regions_of_interest);
-            st.lists.review_items.clone_from(&self.review_items);
+            st.lists
+                .regions
+                .clone_from(&self.session.regions_of_interest);
+            st.lists.review_items.clone_from(&self.session.review_items);
             st.lists.lists_loaded = true;
         }
         if st.lists.add_current_region {
@@ -161,8 +163,8 @@ impl Viewer {
         }
         // The edited drafts are committed whole, through the action path, so a region or
         // review edit is one undoable step.
-        if (st.lists.regions != self.regions_of_interest
-            || st.lists.review_items != self.review_items)
+        if (st.lists.regions != self.session.regions_of_interest
+            || st.lists.review_items != self.session.review_items)
             && let Err(error) = self.apply_action(crate::action::Action::SetWorkspaceLists {
                 regions: std::mem::take(&mut st.lists.regions),
                 review_items: std::mem::take(&mut st.lists.review_items),
@@ -176,11 +178,11 @@ impl Viewer {
     /// Commits the sample-metadata filter and selection; returns whether the selection changed.
     pub(super) fn apply_metadata_selection(&mut self, st: &mut ShellFrame) -> bool {
         if st.lists.metadata_remove_requested {
-            self.sample_metadata = None;
+            self.session.sample_metadata = None;
             st.lists.metadata_filter_value = None;
             st.lists.metadata_selected_tracks.clear();
             "Removed sample metadata; stable track/sample assignments were retained"
-                .clone_into(&mut self.data_status);
+                .clone_into(&mut self.session.data_status);
         }
         if st.lists.metadata_select_requested
             && let (Some(table), Some(value)) = (
@@ -194,7 +196,7 @@ impl Viewer {
                 st.lists.metadata_filter_column,
                 value,
             );
-            self.data_status = format!(
+            self.session.data_status = format!(
                 "Selected {} tracks whose {} is {value:?}",
                 st.lists.metadata_selected_tracks.len(),
                 table.columns[st.lists.metadata_filter_column]
@@ -222,6 +224,7 @@ impl Viewer {
                 .map(|track| track.config.id)
                 .collect::<Vec<_>>();
             let selected_auxiliary_tracks = self
+                .session
                 .tracks
                 .tracks()
                 .iter()
@@ -229,6 +232,7 @@ impl Viewer {
                 .map(|track| track.id)
                 .collect::<BTreeSet<_>>();
             let selected_nodes = self
+                .session
                 .track_presentation
                 .pane_root_nodes(ui::TrackPane::Annotation)
                 .into_iter()
@@ -240,7 +244,7 @@ impl Viewer {
                     PresentationNodeId::Reference | PresentationNodeId::Group { .. } => false,
                 })
                 .collect::<Vec<_>>();
-            let panel = self.panels.active_mut();
+            let panel = self.session.panels.active_mut();
             panel.selected_alignment_tracks = selected_alignment_tracks;
             panel.selected_read_tracks.clear();
             panel.read_selection_anchor = None;
@@ -287,7 +291,7 @@ impl Viewer {
                 .add_filter("BED regions", &["bed"])
                 .save_file()
         {
-            self.start_export(path, region_bed_export(&self.regions_of_interest));
+            self.start_export(path, region_bed_export(&self.session.regions_of_interest));
         }
         if st.lists.review_import_requested
             && let Some(path) = rfd::FileDialog::new()
@@ -302,10 +306,10 @@ impl Viewer {
                 .add_filter("RGV review queue", &["tsv"])
                 .save_file()
         {
-            self.start_export(path, review_tsv_export(&self.review_items));
+            self.start_export(path, review_tsv_export(&self.session.review_items));
         }
         if let Some(locus) = st.lists.managed_locus_requested.take()
-            && let Err(error) = self.navigate_to_locus(self.panels.active().id, &locus)
+            && let Err(error) = self.navigate_to_locus(self.session.panels.active().id, &locus)
         {
             self.report_error(error.to_string());
         }

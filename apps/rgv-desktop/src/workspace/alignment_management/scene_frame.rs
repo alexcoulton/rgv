@@ -146,7 +146,7 @@ impl Viewer {
                     "desired_target_revision": self.alignment_scene_publication_authority.desired_target_revision(),
                     "committed_target_revision": self.alignment_scene_publication_authority.target_revision,
                     "candidate_lanes": lane_diagnostics,
-                    "scroll_cache_authorities": self.manual_scroll_cache_diagnostic_state(self.panels.active().id),
+                    "scroll_cache_authorities": self.manual_scroll_cache_diagnostic_state(self.session.panels.active().id),
                 }),
             );
             return;
@@ -163,7 +163,7 @@ impl Viewer {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     self.alignment_gpu_publication_retry = None;
-                    self.data_status =
+                    self.session.data_status =
                         format!("Could not inspect deferred alignment GPU capacity: {error}");
                     return;
                 }
@@ -486,9 +486,9 @@ impl Viewer {
             AlignmentGpuCameraCaptureOutcome::Terminal(error) => {
                 self.alignment_gpu_prefetch.clear();
                 self.fail_alignment_navigation_gpu_candidates(&navigation_candidates, &error);
-                self.data_status =
+                self.session.data_status =
                     format!("Could not capture the current alignment camera presentation: {error}");
-                let message = self.data_status.clone();
+                let message = self.session.data_status.clone();
                 self.freeze_manual_diagnostic_trace(
                     "alignment_publication",
                     "camera_capture_terminal",
@@ -508,9 +508,9 @@ impl Viewer {
         let protected_read_pages = match AlignmentGpuRenderer::mandatory_page_keys(&read_requests) {
             Ok(keys) => keys,
             Err(error) => {
-                self.data_status =
+                self.session.data_status =
                     format!("Could not inventory mandatory alignment GPU pages: {error}");
-                let message = self.data_status.clone();
+                let message = self.session.data_status.clone();
                 self.freeze_manual_diagnostic_trace(
                     "alignment_publication",
                     "read_page_inventory_failed",
@@ -529,9 +529,9 @@ impl Viewer {
             match AlignmentSummaryGpuRenderer::mandatory_page_keys(&summary_requests) {
                 Ok(keys) => keys,
                 Err(error) => {
-                    self.data_status =
+                    self.session.data_status =
                         format!("Could not inventory mandatory summary GPU pages: {error}");
-                    let message = self.data_status.clone();
+                    let message = self.session.data_status.clone();
                     self.freeze_manual_diagnostic_trace(
                         "alignment_publication",
                         "summary_page_inventory_failed",
@@ -560,7 +560,7 @@ impl Viewer {
             Ok(snapshot) => snapshot.budget,
             Err(error) => {
                 self.report_error(format!("Could not inspect alignment GPU budget: {error}"));
-                let message = self.data_status.clone();
+                let message = self.session.data_status.clone();
                 self.freeze_manual_diagnostic_trace(
                     "alignment_publication",
                     "ledger_inspection_failed",
@@ -769,7 +769,7 @@ impl Viewer {
                 );
                 self.fail_alignment_navigation_gpu_candidates(&navigation_candidates, &message);
                 self.report_error(message);
-                let message = self.data_status.clone();
+                let message = self.session.data_status.clone();
                 self.freeze_manual_diagnostic_trace(
                     "alignment_publication",
                     "content_replacement_terminal",
@@ -792,7 +792,12 @@ impl Viewer {
         camera_revision: u64,
     ) -> std::result::Result<CapturedAlignmentPanelSceneEpoch, AlignmentPanelSceneEpochCaptureFailure>
     {
-        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let panel_ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         let mut captured = HashMap::new();
         let mut lane_sources = Vec::new();
         let mut critical_capture_failure = None;
@@ -802,6 +807,7 @@ impl Viewer {
         let mut panel_scene_stores = self.alignment_panel_scene_stores.clone();
         for panel_id in panel_ids {
             let Some((stored_panel_viewport, contig_name)) = self
+                .session
                 .panels
                 .get(panel_id)
                 .map(|panel| (panel.viewport, panel.contig_name.clone()))
@@ -979,7 +985,7 @@ impl Viewer {
                 self.report_error(format!("Could not resolve alignment scene lanes: {error}"));
                 critical_capture_failure.get_or_insert_with(|| {
                     (
-                        self.data_status.clone(),
+                        self.session.data_status.clone(),
                         object_fields(serde_json::json!({
                             "panel_id": panel_id.get(),
                             "panel_contig": contig_name,
@@ -1035,7 +1041,7 @@ impl Viewer {
             let coherence_groups = match coherence_groups {
                 Ok(groups) => groups,
                 Err(error) => {
-                    self.data_status =
+                    self.session.data_status =
                         format!("Could not resolve alignment coherence groups: {error}");
                     continue;
                 }
@@ -1187,7 +1193,7 @@ impl Viewer {
                     self.report_error(format!("Could not capture alignment scene: {error}"));
                     critical_capture_failure.get_or_insert_with(|| {
                         (
-                            self.data_status.clone(),
+                            self.session.data_status.clone(),
                             object_fields(serde_json::json!({
                                 "error": format!("{error:?}"),
                                 "panel_id": panel_id.get(),

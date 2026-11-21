@@ -82,7 +82,7 @@ impl Viewer {
         &mut self,
         track_id: TrackId,
     ) -> Vec<ModificationCode> {
-        let panel_id = self.panels.active().id;
+        let panel_id = self.session.panels.active().id;
         let Some(authority) = self
             .alignment_tracks
             .iter()
@@ -118,7 +118,7 @@ impl Viewer {
         &self,
         track_id: TrackId,
     ) -> Option<rgv_hts::PairSummary> {
-        let panel_id = self.panels.active().id;
+        let panel_id = self.session.panels.active().id;
         let track = self
             .alignment_tracks
             .iter()

@@ -436,7 +436,7 @@ impl Viewer {
     /// The dictionary a locus typed without a panel is resolved in.
     fn automation_feature_dictionary(&self) -> Option<&ReferenceDictionary> {
         self.primary_alignment_dictionary()
-            .or(self.reference_dictionary.as_ref())
+            .or(self.session.reference_dictionary.as_ref())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -452,6 +452,7 @@ impl Viewer {
         now: Instant,
     ) -> AutomationExecution {
         let tracks = self
+            .session
             .tracks
             .tracks()
             .iter()
@@ -463,7 +464,7 @@ impl Viewer {
         };
         let (interval, contig) = match resolve_feature_interval(
             self.automation_feature_dictionary(),
-            &self.contig_aliases,
+            &self.session.contig_aliases,
             contig,
             start,
             end,
@@ -471,7 +472,7 @@ impl Viewer {
             Ok(resolved) => resolved,
             Err((code, message)) => return automation_failure(code, message),
         };
-        let Some(engine) = &self.track_engine else {
+        let Some(engine) = &self.session.track_engine else {
             return automation_failure(
                 AutomationErrorCode::ResourceNotFound,
                 "no feature or gene-model track is loaded",
@@ -522,15 +523,15 @@ impl Viewer {
     ) -> AutomationExecution {
         // The focused panel is read once, here; the navigation is addressed to this ID even if
         // focus moves while the search runs.
-        let panel_id = panel_id.unwrap_or_else(|| self.panels.active().id);
-        if self.panels.get(panel_id).is_none() {
+        let panel_id = panel_id.unwrap_or_else(|| self.session.panels.active().id);
+        if self.session.panels.get(panel_id).is_none() {
             return automation_failure(
                 AutomationErrorCode::ResourceNotFound,
                 format!("panel {} was not found", panel_id.get()),
             );
         }
         let query = query.trim();
-        let Some(engine) = &self.track_engine else {
+        let Some(engine) = &self.session.track_engine else {
             return automation_failure(
                 AutomationErrorCode::ResourceNotFound,
                 "no searchable annotation tracks are open",
@@ -681,14 +682,14 @@ impl Viewer {
             }
         };
         let panel_id = wait.panel_id;
-        if self.panels.get(panel_id).is_none() {
+        if self.session.panels.get(panel_id).is_none() {
             return Err((
                 AutomationErrorCode::ResourceNotFound,
                 format!("panel {} was closed during the search", panel_id.get()),
             ));
         }
         let contig_length = self.automation_feature_dictionary().and_then(|dictionary| {
-            resolve_contig_name(dictionary, &self.contig_aliases, &hit.record.contig)
+            resolve_contig_name(dictionary, &self.session.contig_aliases, &hit.record.contig)
                 .ok()
                 .flatten()
                 .and_then(|id| dictionary.get(id))
@@ -713,7 +714,7 @@ impl Viewer {
         );
         let result = AutomationGeneNavigationResult {
             panel_id: panel_id.get(),
-            contig: self.panels.panel(panel_id).contig_name.clone(),
+            contig: self.session.panels.panel(panel_id).contig_name.clone(),
             start: outcome.interval.map_or(start, GenomicInterval::start),
             end: outcome.interval.map_or(end, GenomicInterval::end),
             hit: AutomationGeneHit {

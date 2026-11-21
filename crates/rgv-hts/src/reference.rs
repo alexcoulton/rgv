@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{Read, Seek, SeekFrom},
     path::Path,
     sync::Mutex,
@@ -46,7 +47,7 @@ pub struct FastaReference {
 }
 
 enum FastaReader {
-    Local(faidx::Reader),
+    Local(faidx::Reader, Box<LocalFastaGuard>),
     Remote(Box<RemoteFastaReference>),
     TwoBit(Box<TwoBitReference>),
 }
@@ -168,8 +169,9 @@ impl FastaReference {
                     })
                     .collect::<Vec<_>>(),
             )?;
+            let guard = LocalFastaGuard::open(path)?;
             Ok(Self {
-                reader: FastaReader::Local(reader),
+                reader: FastaReader::Local(reader, Box::new(guard)),
                 dictionary,
             })
         }
@@ -274,7 +276,7 @@ impl FastaReference {
 
     pub fn remote_io_stats(&self) -> Option<RemoteIoStats> {
         match &self.reader {
-            FastaReader::Local(_) | FastaReader::TwoBit(_) => None,
+            FastaReader::Local(..) | FastaReader::TwoBit(_) => None,
             FastaReader::Remote(remote) => Some(remote.remote_io_stats()),
         }
     }
@@ -302,7 +304,7 @@ impl FastaReference {
         end: u64,
     ) -> Result<Vec<u8>, AlignmentError> {
         match &self.reader {
-            FastaReader::Local(reader) => {
+            FastaReader::Local(reader, guard) => {
                 // Only a non-empty window inside a known contig is asked of `HTSlib`.
                 let length = self
                     .dictionary
@@ -315,6 +317,8 @@ impl FastaReference {
                 }
                 let requested =
                     usize::try_from(end - start).map_err(|_| AlignmentError::CoordinateOverflow)?;
+                // Refused here if `HTSlib` could not serve it: see `LocalFastaGuard`.
+                guard.ensure_fetchable(contig_name, start, end)?;
                 let start =
                     usize::try_from(start).map_err(|_| AlignmentError::CoordinateOverflow)?;
                 let inclusive_end = usize::try_from(end.saturating_sub(1))
@@ -335,6 +339,191 @@ impl FastaReference {
             FastaReader::TwoBit(two_bit) => two_bit.fetch(contig_name, start, end),
         }
     }
+}
+
+/// Where one sequence's bases lie in a FASTA file, as `HTSlib` reads a `.fai` line.
+#[derive(Clone, Copy)]
+struct LocalFastaGeometry {
+    length: u64,
+    offset: u64,
+    line_bases: u64,
+    line_width: u64,
+}
+
+/// The bytes of a local FASTA, addressed by offset in the uncompressed text.
+enum LocalFastaStream {
+    Plain(std::fs::File),
+    Bgzf {
+        reader: Box<noodles::bgzf::io::Reader<std::fs::File>>,
+        index: noodles::bgzf::gzi::Index,
+    },
+}
+
+impl LocalFastaStream {
+    /// Whether at least `needed` printable bytes (what `HTSlib` keeps as bases) lie at or
+    /// after `offset`.
+    fn holds_bases(&mut self, offset: u64, mut needed: u64) -> std::io::Result<bool> {
+        if needed == 0 {
+            return Ok(true);
+        }
+        match self {
+            Self::Plain(file) => {
+                file.seek(SeekFrom::Start(offset))?;
+            }
+            Self::Bgzf { reader, index } => {
+                reader.seek_by_uncompressed_position(index, offset)?;
+            }
+        }
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = match self {
+                Self::Plain(file) => file.read(&mut buffer)?,
+                Self::Bgzf { reader, .. } => reader.read(&mut buffer)?,
+            };
+            if read == 0 {
+                return Ok(false);
+            }
+            let bases = buffer[..read]
+                .iter()
+                .filter(|byte| byte.is_ascii_graphic())
+                .count() as u64;
+            if bases >= needed {
+                return Ok(true);
+            }
+            needed -= bases;
+        }
+    }
+}
+
+/// RGV's own reading of a local FASTA and its `.fai`, consulted before every `HTSlib` fetch.
+///
+/// `faidx_fetch_seq64` returns null when the index sends it past the end of the file (a stale,
+/// truncated or forged `.fai`), and `rust-htslib` builds a `Vec` from that pointer without
+/// looking at it: an abort in a build with debug assertions, undefined behaviour in one
+/// without. So a fetch `HTSlib` could not serve is refused here, before it is asked for.
+struct LocalFastaGuard {
+    stream: Mutex<LocalFastaStream>,
+    /// By sequence name; `None` for a line `HTSlib` may read differently from RGV.
+    geometry: HashMap<Vec<u8>, Option<LocalFastaGeometry>>,
+}
+
+impl LocalFastaGuard {
+    fn open(path: &Path) -> Result<Self, AlignmentError> {
+        let beside = |extension: &str| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(extension);
+            std::path::PathBuf::from(name)
+        };
+        let geometry = htslib_fasta_geometry(&std::fs::read(beside(".fai"))?);
+        let mut file = std::fs::File::open(path)?;
+        let mut magic = [0_u8; 2];
+        let compressed = file.read_exact(&mut magic).is_ok() && magic == [0x1f, 0x8b];
+        file.seek(SeekFrom::Start(0))?;
+        let stream = if compressed {
+            let index = noodles::bgzf::gzi::io::Reader::new(std::io::BufReader::new(
+                std::fs::File::open(beside(".gzi"))?,
+            ))
+            .read_index()
+            .map_err(|error| {
+                AlignmentError::InvalidFastaIndex(format!("invalid .gzi block index: {error}"))
+            })?;
+            LocalFastaStream::Bgzf {
+                reader: Box::new(noodles::bgzf::io::Reader::new(file)),
+                index,
+            }
+        } else {
+            LocalFastaStream::Plain(file)
+        };
+        Ok(Self {
+            stream: Mutex::new(stream),
+            geometry,
+        })
+    }
+
+    /// Fails unless `HTSlib` can read `start..end` of `name`: the index line is one RGV reads
+    /// exactly as `HTSlib` does, and the file holds the bases where that line puts them.
+    fn ensure_fetchable(&self, name: &str, start: u64, end: u64) -> Result<(), AlignmentError> {
+        let refused = || {
+            AlignmentError::InvalidFastaIndex(format!(
+                "{name}:{start}-{end} could not be read from the FASTA file: its .fai index \
+                 does not describe the file"
+            ))
+        };
+        let Some(Some(geometry)) = self.geometry.get(name.as_bytes()) else {
+            return Err(refused());
+        };
+        if geometry.line_bases == 0 {
+            return Err(refused());
+        }
+        // `HTSlib` clamps both ends to the indexed length.
+        let first = start.min(geometry.length);
+        let needed = end.min(geometry.length).saturating_sub(first);
+        let offset = (first / geometry.line_bases)
+            .checked_mul(geometry.line_width)
+            .and_then(|offset| offset.checked_add(first % geometry.line_bases))
+            .and_then(|offset| offset.checked_add(geometry.offset))
+            .filter(|offset| i64::try_from(*offset).is_ok())
+            .ok_or_else(refused)?;
+        let mut stream = self.stream.lock().map_err(|_| {
+            AlignmentError::InvalidFastaIndex("local FASTA lock was poisoned".to_owned())
+        })?;
+        match stream.holds_bases(offset, needed) {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(refused()),
+        }
+    }
+}
+
+/// Reads a `.fai` as `HTSlib`'s `fai_read` does, keeping the geometry of only those lines
+/// RGV is sure to read identically: tab-separated, plain decimal fields. Any other line maps
+/// its name to `None`. The first line of a name wins, as in `HTSlib`.
+fn htslib_fasta_geometry(index: &[u8]) -> HashMap<Vec<u8>, Option<LocalFastaGeometry>> {
+    /// `HTSlib` reads the index in pieces of this many bytes, so a longer line is several.
+    const HTSLIB_LINE_BYTES: usize = 0x1_0000;
+    let mut geometry = HashMap::new();
+    let lines = index.split(|byte| *byte == b'\n');
+    // `HTSlib` also ends a name at a NUL and goes on reading after it.
+    if index.contains(&0)
+        || lines
+            .clone()
+            .any(|line| line.len() + 2 >= HTSLIB_LINE_BYTES)
+    {
+        return geometry;
+    }
+    // C `isspace`, which ends the name.
+    let is_space = |byte: &u8| matches!(*byte, b' ' | 0x09..=0x0d);
+    let number = |field: Option<&[u8]>, maximum: u64| {
+        let field = field?;
+        if field.is_empty() || !field.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(field)
+            .ok()?
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value <= maximum)
+    };
+    for line in lines {
+        let name_end = line.iter().position(is_space).unwrap_or(line.len());
+        let name = &line[..name_end];
+        let parsed = (|| {
+            let mut fields = line
+                .strip_suffix(b"\r")
+                .unwrap_or(line)
+                .split(|b| *b == b'\t');
+            if fields.next()? != name || name.is_empty() {
+                return None;
+            }
+            Some(LocalFastaGeometry {
+                length: number(fields.next(), u64::MAX)?,
+                offset: number(fields.next(), u64::MAX)?,
+                line_bases: number(fields.next(), u64::from(u32::MAX))?,
+                line_width: number(fields.next(), u64::from(u32::MAX))?,
+            })
+        })();
+        geometry.entry(name.to_vec()).or_insert(parsed);
+    }
+    geometry
 }
 
 /// Whether a local path or URL (ignoring its query string and fragment) ends in `extension`.
@@ -569,6 +758,51 @@ mod tests {
     use tiny_http::{Header, Response, Server, StatusCode};
 
     use super::*;
+
+    /// Found by the mutation sweep in `lib.rs` (FASTA index, seed 0xBF58476D1CE4E5B9,
+    /// iteration 6; index bytes 636872310933300931320932300936310a). A `.fai` whose line
+    /// width is overstated sends `HTSlib` past the end of the FASTA, where it returns null;
+    /// `rust-htslib` built a `Vec` from that null, which aborts a debug build.
+    #[test]
+    fn a_local_fetch_the_index_sends_past_the_file_is_refused() {
+        const FASTA: &[u8] =
+            b">chr1 first\nACGTACGTACGTACGTACGT\nACGTACGTAC\n>chr2\nNNNNNNNNNN\nacgtacgt\n";
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("reference.fa");
+        let index_path = directory.path().join("reference.fa.fai");
+        fs::write(&path, FASTA).unwrap();
+        let fetch = |index: &[u8], contig: u32, start: u64, end: u64| {
+            fs::write(&index_path, index).unwrap();
+            FastaReference::open(&path)
+                .unwrap()
+                .fetch(GenomicInterval::new(ContigId::new(contig), start, end).unwrap())
+        };
+        // The honest index serves both sequences.
+        let honest = b"chr1\t30\t12\t20\t21\nchr2\t18\t50\t10\t11\n";
+        assert_eq!(
+            fetch(honest, 0, 0, 30).unwrap(),
+            b"ACGTACGTACGTACGTACGTACGTACGTAC"
+        );
+        assert_eq!(fetch(honest, 1, 8, 18).unwrap(), b"NNacgtacgt");
+
+        // Line width 61 instead of 21: the second line of chr1 would start at byte 73 of a
+        // 70-byte file. A fetch from the first line is still where the index says (`HTSlib`
+        // seeks once and then reads through).
+        let overstated = b"chr1\t30\t12\t20\t61\n";
+        assert_eq!(
+            fetch(overstated, 0, 0, 20).unwrap(),
+            b"ACGTACGTACGTACGTACGT"
+        );
+        for (start, end) in [(20, 30), (23, 30), (29, 30)] {
+            let error = fetch(overstated, 0, start, end).unwrap_err().to_string();
+            assert!(error.contains("does not describe the file"), "{error}");
+        }
+        // A forged length and a forged offset, each asking for bases the file does not hold.
+        assert!(fetch(b"chr1\t4000\t12\t20\t21\n", 0, 3_000, 4_000).is_err());
+        assert!(fetch(b"chr1\t30\t4294967295\t20\t21\n", 0, 0, 30).is_err());
+        // A line `HTSlib` accepts (space-separated) but RGV does not vouch for.
+        assert!(fetch(b"chr1 30 12 20 21\n", 0, 0, 30).is_err());
+    }
 
     #[test]
     fn two_bit_references_open_behind_the_fasta_interface() {

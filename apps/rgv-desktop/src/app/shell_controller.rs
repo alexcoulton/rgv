@@ -79,7 +79,7 @@ impl Viewer {
 
     fn request_guarded(&mut self, action: GuardedAction) -> Option<GuardedAction> {
         self.observe_document_changes();
-        let dirty = self.document_state.is_dirty();
+        let dirty = self.session.document_state.is_dirty();
         match self.shell.unsaved_gate.request(action, dirty) {
             GateOutcome::Proceed(action) => Some(action),
             GateOutcome::Prompt | GateOutcome::SaveFirst | GateOutcome::Stay => {
@@ -134,7 +134,7 @@ impl Viewer {
         match self.shell.unsaved_gate.resolve(choice) {
             GateOutcome::Proceed(action) => self.run_guarded_action(action),
             GateOutcome::SaveFirst => {
-                let destination = self.current_session_path.clone().or_else(|| {
+                let destination = self.session.current_session_path.clone().or_else(|| {
                     rfd::FileDialog::new()
                         .set_file_name("rgv-project.json")
                         .add_filter("RGV project", &["json"])
@@ -162,7 +162,7 @@ impl Viewer {
         if !self.shell.unsaved_gate.awaiting_save() {
             return;
         }
-        let still_dirty = self.document_state.is_dirty();
+        let still_dirty = self.session.document_state.is_dirty();
         if let GateOutcome::Proceed(action) = self
             .shell
             .unsaved_gate
@@ -177,7 +177,7 @@ impl Viewer {
 
     /// Shows the active viewport in the locus field without recording a recent locus.
     pub(crate) fn sync_locus_editor(&mut self) {
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         let interval = panel.viewport.interval();
         self.locus_editor = format!(
             "{}:{}-{}",
@@ -189,7 +189,7 @@ impl Viewer {
 
     /// One step of a continuous navigation gesture happened in the active panel.
     pub(crate) fn note_navigation_gesture(&mut self, panel: PanelId) {
-        if let Some(previous) = self.shell.navigation_gesture.touch(panel, Instant::now()) {
+        if let Some(previous) = self.session.navigation_gesture.touch(panel, Instant::now()) {
             self.record_panel_navigation(previous);
         }
     }
@@ -197,7 +197,7 @@ impl Viewer {
     /// Records the pending gesture, if any, as one history entry and one recent locus. Called
     /// before every discrete navigation so the gesture's end point is not lost.
     pub(crate) fn commit_navigation_gesture(&mut self) {
-        if let Some(panel) = self.shell.navigation_gesture.take() {
+        if let Some(panel) = self.session.navigation_gesture.take() {
             self.record_panel_navigation(panel);
         }
     }
@@ -205,7 +205,7 @@ impl Viewer {
     /// The pointer or key driving the gesture was released.
     pub(crate) fn end_navigation_gesture(&mut self) {
         let now = Instant::now();
-        self.shell.navigation_gesture.end_now(now);
+        self.session.navigation_gesture.end_now(now);
         self.commit_due_navigation_gesture(now);
     }
 
@@ -214,7 +214,7 @@ impl Viewer {
             || self.horizontal_overview_drag.is_some()
             || self.overview_capture.is_some();
         if let Some(panel) = self
-            .shell
+            .session
             .navigation_gesture
             .take_due(now, pointer_gesture_active)
         {
@@ -223,11 +223,11 @@ impl Viewer {
     }
 
     pub(crate) fn navigation_gesture_deadline(&self) -> Option<Instant> {
-        self.shell.navigation_gesture.deadline()
+        self.session.navigation_gesture.deadline()
     }
 
     fn record_panel_navigation(&mut self, panel_id: PanelId) {
-        let Some(panel) = self.panels.get_mut(panel_id) else {
+        let Some(panel) = self.session.panels.get_mut(panel_id) else {
             return;
         };
         let interval = panel.viewport.interval();
@@ -238,7 +238,7 @@ impl Viewer {
             interval.start() + 1,
             interval.end()
         );
-        self.settings.remember_locus(locus);
+        self.session.settings.remember_locus(locus);
     }
 
     // ----- Wheel, trackpad and pinch (UI-2) --------------------------------------------------
@@ -262,13 +262,14 @@ impl Viewer {
             }
             ScrollIntent::Pan { points } => {
                 if let Ok(viewport) = self
+                    .session
                     .panels
                     .active()
                     .viewport
-                    .pan_pixels(points, self.panels.active().contig_length)
+                    .pan_pixels(points, self.session.panels.active().contig_length)
                 {
                     self.set_panel_viewport(
-                        self.panels.active().id,
+                        self.session.panels.active().id,
                         viewport,
                         crate::action::ViewportCommit::Gesture,
                     );
@@ -293,7 +294,8 @@ impl Viewer {
     // ----- Track ids (APP-14) ----------------------------------------------------------------
 
     fn largest_live_track_id(&self) -> u64 {
-        self.tracks
+        self.session
+            .tracks
             .tracks()
             .iter()
             .map(|track| track.id.get())
@@ -310,16 +312,16 @@ impl Viewer {
     /// worker events for a removed track may still be in flight.
     pub(crate) fn allocate_track_id(&mut self) -> TrackId {
         let largest_live = self.largest_live_track_id();
-        self.shell.track_ids.allocate(largest_live)
+        self.session.track_ids.allocate(largest_live)
     }
 
     /// First id of a caller-numbered block; `reserve_track_ids_through` records its end.
     pub(crate) fn peek_track_id(&self) -> Option<u64> {
-        self.shell.track_ids.peek(self.largest_live_track_id())
+        self.session.track_ids.peek(self.largest_live_track_id())
     }
 
     pub(crate) fn reserve_track_ids_through(&mut self, id: u64) {
-        self.shell.track_ids.reserve_through(id);
+        self.session.track_ids.reserve_through(id);
     }
 
     // ----- Notifications (APP-7) -------------------------------------------------------------
@@ -328,10 +330,10 @@ impl Viewer {
     /// later progress message cannot overwrite it.
     pub(crate) fn report_error(&mut self, message: impl Into<String>) {
         let message = message.into();
-        self.shell
+        self.session
             .notifications
             .push_reported(NotificationSeverity::Error, None, &message);
-        self.data_status = message;
+        self.session.data_status = message;
         self.window.request_redraw();
     }
 
@@ -339,10 +341,10 @@ impl Viewer {
     /// and kept in the notification log as a warning.
     pub(crate) fn report_warning(&mut self, message: impl Into<String>) {
         let message = message.into();
-        self.shell
+        self.session
             .notifications
             .push_reported(NotificationSeverity::Warning, None, &message);
-        self.data_status = message;
+        self.session.data_status = message;
         self.window.request_redraw();
     }
 
@@ -350,7 +352,7 @@ impl Viewer {
     /// status line. Used for failures in panels other than the active one, which previously
     /// left no trace at all.
     pub(crate) fn log_track_error(&mut self, track: Option<TrackId>, message: &str) {
-        self.shell
+        self.session
             .notifications
             .push_reported(NotificationSeverity::Error, track, message);
         self.window.request_redraw();
@@ -360,7 +362,11 @@ impl Viewer {
     /// Called after every batch of work that may have written `data_status`, so failures from
     /// call sites that only set the status text are still retained.
     pub(crate) fn capture_status_notification(&mut self) {
-        if self.shell.notifications.observe_status(&self.data_status) {
+        if self
+            .session
+            .notifications
+            .observe_status(&self.session.data_status)
+        {
             self.window.request_redraw();
         }
     }

@@ -153,7 +153,7 @@ pub(crate) const fn mate_visibility_label(value: rgv_hts::MateVisibility) -> &'s
 impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn inspector_snapshot(&self) -> Option<InspectorSnapshot> {
-        let panel = self.panels.active();
+        let panel = self.session.panels.active();
         let scene_hit = panel.selected_alignment_hit;
         if scene_hit.is_none() && !panel.navigation_presentation.is_interactive() {
             return None;
@@ -228,7 +228,7 @@ impl Viewer {
             .pair_length_bounds;
         let pair = pair_evidence(
             &record,
-            self.panels.active().viewport.interval(),
+            self.session.panels.active().viewport.interval(),
             pair_bounds,
         );
         let pair_bounds_label = match (pair_bounds.minimum, pair_bounds.maximum) {
@@ -263,7 +263,7 @@ impl Viewer {
                 "Position".to_owned(),
                 format!(
                     "{}:{}-{}",
-                    self.panels.active().contig_name,
+                    self.session.panels.active().contig_name,
                     record.start + 1,
                     record.end
                 ),
@@ -595,7 +595,7 @@ impl Viewer {
                 operation_index,
                 operation_offset,
                 reference,
-                &self.panels.active().contig_name,
+                &self.session.panels.active().contig_name,
             )?;
             fields.extend(details.fields);
             details.copy_sequence
@@ -612,6 +612,7 @@ impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn pileup_inspector_snapshot(&self) -> Option<InspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -619,19 +620,20 @@ impl Viewer {
         {
             return None;
         }
-        if let Some(retained) = &self.panels.active().retained_evidence
+        if let Some(retained) = &self.session.panels.active().retained_evidence
             && retained.selection.kind == AutomationSelectionKind::Pileup
         {
             return retained.inspector.clone();
         }
-        let position = self.panels.active().selected_pileup_position?;
+        let position = self.session.panels.active().selected_pileup_position?;
         let track_id = self
+            .session
             .panels
             .active()
             .selected_alignment_track
             .unwrap_or_else(|| self.primary_alignment_track_id());
         let scene = self
-            .presented_alignment_lane(self.panels.active().id, track_id)
+            .presented_alignment_lane(self.session.panels.active().id, track_id)
             .and_then(|presented| presented.lane.snapshot.as_ref())?;
         let site = scene.pileup_site_at(position)?;
         let contract = scene.summaries().contract();
@@ -675,13 +677,13 @@ impl Viewer {
         let interval_label = if bin_interval.len() == 1 {
             format!(
                 "{}:{}",
-                self.panels.active().contig_name,
+                self.session.panels.active().contig_name,
                 bin_interval.start() + 1
             )
         } else {
             format!(
                 "{}:{}-{}",
-                self.panels.active().contig_name,
+                self.session.panels.active().contig_name,
                 bin_interval.start() + 1,
                 bin_interval.end()
             )
@@ -793,6 +795,7 @@ impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn modification_inspector_snapshot(&self) -> Option<InspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -800,19 +803,24 @@ impl Viewer {
         {
             return None;
         }
-        if let Some(retained) = &self.panels.active().retained_evidence
+        if let Some(retained) = &self.session.panels.active().retained_evidence
             && retained.selection.kind == AutomationSelectionKind::Modification
         {
             return retained.inspector.clone();
         }
-        let position = self.panels.active().selected_modification_position?;
+        let position = self
+            .session
+            .panels
+            .active()
+            .selected_modification_position?;
         let track_id = self
+            .session
             .panels
             .active()
             .selected_alignment_track
             .unwrap_or_else(|| self.primary_alignment_track_id());
         let scene = self
-            .presented_alignment_lane(self.panels.active().id, track_id)
+            .presented_alignment_lane(self.session.panels.active().id, track_id)
             .and_then(|presented| presented.lane.snapshot.as_ref())?;
         let (summary_interval, summary) = scene.summaries().modification_summary_at(position)?;
         let index = summary.bin_index_at(summary_interval, position)?;
@@ -820,13 +828,13 @@ impl Viewer {
         let locus = if interval.len() == 1 {
             format!(
                 "{}:{}",
-                self.panels.active().contig_name,
+                self.session.panels.active().contig_name,
                 interval.start() + 1
             )
         } else {
             format!(
                 "{}:{}-{}",
-                self.panels.active().contig_name,
+                self.session.panels.active().contig_name,
                 interval.start() + 1,
                 interval.end()
             )
@@ -912,6 +920,7 @@ impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn junction_inspector_snapshot(&self) -> Option<InspectorSnapshot> {
         if !self
+            .session
             .panels
             .active()
             .navigation_presentation
@@ -919,35 +928,36 @@ impl Viewer {
         {
             return None;
         }
-        let hovered = match self.panels.active().hover_inspector_target {
+        let hovered = match self.session.panels.active().hover_inspector_target {
             Some(HoverInspectorTarget::Junction(track_id, start, end, component)) => {
                 Some((track_id, start, end, component))
             }
             _ => None,
         };
         if hovered.is_none()
-            && let Some(retained) = &self.panels.active().retained_evidence
+            && let Some(retained) = &self.session.panels.active().retained_evidence
             && retained.selection.kind == AutomationSelectionKind::Junction
         {
             return retained.inspector.clone();
         }
         let (track_id, start, end, focused_component) = hovered.map_or_else(
             || {
-                let (start, end) = self.panels.active().selected_junction?;
+                let (start, end) = self.session.panels.active().selected_junction?;
                 Some((
-                    self.panels
+                    self.session
+                        .panels
                         .active()
                         .selected_alignment_track
                         .unwrap_or_else(|| self.primary_alignment_track_id()),
                     start,
                     end,
-                    self.panels.active().selected_junction_component,
+                    self.session.panels.active().selected_junction_component,
                 ))
             },
             |(track_id, start, end, component)| Some((track_id, start, end, Some(component))),
         )?;
         let scene = self
-            .presented_alignment_lane(self.panels.active().id, track_id)
+            .presented_alignment_lane(self.session.panels.active().id, track_id)
             .and_then(|presented| presented.lane.snapshot.as_ref())?;
         let interval = GenomicInterval::new(scene.prepared_interval().contig(), start, end).ok()?;
         let junction = scene
@@ -986,10 +996,10 @@ impl Viewer {
         let focused_component = focused_component
             .map(|component| focused_junction_component_value(component, &junction));
         let annotation_context = junction_annotation_context(
-            &self.tracks,
-            &self.panels.active().track_snapshots,
-            &self.panels.active().track_snapshot_intervals,
-            self.panels.active().viewport.interval(),
+            &self.session.tracks,
+            &self.session.panels.active().track_snapshots,
+            &self.session.panels.active().track_snapshot_intervals,
+            self.session.panels.active().viewport.interval(),
         );
         let annotation_status = annotation_context.status(start, end);
         let annotation = match annotation_status {
@@ -1012,7 +1022,12 @@ impl Viewer {
             ),
             (
                 "Skipped interval".to_owned(),
-                format!("{}:{}-{}", self.panels.active().contig_name, start + 1, end),
+                format!(
+                    "{}:{}-{}",
+                    self.session.panels.active().contig_name,
+                    start + 1,
+                    end
+                ),
             ),
             ("Intron length".to_owned(), format!("{} bp", end - start)),
             ("Depth".to_owned(), junction.depth.to_string()),

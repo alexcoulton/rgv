@@ -13,43 +13,45 @@
 //! Undo and Back disagree about what "the previous place" is.
 
 use super::Action;
+use rgv_core::TrackIntent;
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 /// Most undo steps kept. Entries are a few hundred bytes to a few kilobytes each.
-pub(crate) const MAXIMUM_UNDO_ENTRIES: usize = 128;
+pub const MAXIMUM_UNDO_ENTRIES: usize = 128;
 
 /// Edits of the same kind and target closer together than this are one gesture: a divider
 /// drag reports a new height every frame and must be one undo step.
-pub(crate) const UNDO_COALESCE_WINDOW: Duration = Duration::from_millis(800);
+pub const UNDO_COALESCE_WINDOW: Duration = Duration::from_millis(800);
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct UndoEntry {
+pub struct UndoEntry {
     /// Shown in the Edit menu.
-    pub(crate) label: &'static str,
+    pub label: &'static str,
     /// What was applied, in order.
-    pub(crate) redo: Vec<Action>,
+    pub redo: Vec<Action>,
     /// What puts the document back, in order.
-    pub(crate) undo: Vec<Action>,
+    pub undo: Vec<Action>,
     /// Identity of the gesture this edit may belong to; `None` never coalesces.
-    pub(crate) coalesce: Option<String>,
+    pub coalesce: Option<String>,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct UndoHistory {
+pub struct UndoHistory {
     undo: VecDeque<(UndoEntry, Option<Instant>)>,
     redo: Vec<UndoEntry>,
 }
 
 impl UndoHistory {
     /// Records a fresh edit. Any redo branch is discarded: the document has moved on.
-    pub(crate) fn record(&mut self, entry: UndoEntry, now: Instant) {
+    pub fn record(&mut self, entry: UndoEntry, now: Instant) {
         self.redo.clear();
         self.push(entry, now);
     }
 
     /// Records a redone edit, keeping the rest of the redo branch.
-    pub(crate) fn record_redone(&mut self, mut entry: UndoEntry) {
+    pub fn record_redone(&mut self, mut entry: UndoEntry) {
         // A redone step is complete; a later edit of the same kind is a new step.
         entry.coalesce = None;
         self.push_bounded(entry, None);
@@ -76,36 +78,62 @@ impl UndoHistory {
         self.undo.push_back((entry, at));
     }
 
-    pub(crate) fn take_undo(&mut self) -> Option<UndoEntry> {
+    pub fn take_undo(&mut self) -> Option<UndoEntry> {
         self.undo.pop_back().map(|(entry, _)| entry)
     }
 
-    pub(crate) fn push_redo(&mut self, entry: UndoEntry) {
+    pub fn push_redo(&mut self, entry: UndoEntry) {
         self.redo.push(entry);
     }
 
-    pub(crate) fn take_redo(&mut self) -> Option<UndoEntry> {
+    pub fn take_redo(&mut self) -> Option<UndoEntry> {
         self.redo.pop()
     }
 
-    pub(crate) fn undo_label(&self) -> Option<&'static str> {
+    pub fn undo_label(&self) -> Option<&'static str> {
         self.undo.back().map(|(entry, _)| entry.label)
     }
 
-    pub(crate) fn redo_label(&self) -> Option<&'static str> {
+    pub fn redo_label(&self) -> Option<&'static str> {
         self.redo.last().map(|entry| entry.label)
     }
 
     /// Forgets everything: the document was replaced (new workspace, session opened).
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
     }
 
     #[cfg(test)]
-    pub(crate) fn undo_len(&self) -> usize {
+    pub fn undo_len(&self) -> usize {
         self.undo.len()
     }
+}
+
+/// The gesture a track-arrangement edit may be one sample of. Divider drags report a new
+/// height every frame; edits with the same key that arrive close together are one undo step.
+/// Toggles, moves and grouping are complete edits and never coalesce.
+pub fn track_intents_coalesce_key(intents: &[TrackIntent]) -> Option<String> {
+    let mut key = String::new();
+    for intent in intents {
+        match intent {
+            TrackIntent::ResizeNode { target, .. } => {
+                let _ = write!(key, "resize:{target:?};");
+            }
+            TrackIntent::ResizeReadPane { .. } => key.push_str("resize-read-pane;"),
+            TrackIntent::SetSectionExpanded { .. }
+            | TrackIntent::SetPaneRowsExpanded { .. }
+            | TrackIntent::ResetPaneRowHeights { .. }
+            | TrackIntent::SetNodeVisibility { .. }
+            | TrackIntent::SetGroupExpanded { .. }
+            | TrackIntent::SetGroupVisibility { .. }
+            | TrackIntent::SetCompositeVisibility { .. }
+            | TrackIntent::GroupNodes { .. }
+            | TrackIntent::Ungroup { .. }
+            | TrackIntent::MoveNode { .. } => return None,
+        }
+    }
+    (!key.is_empty()).then_some(key)
 }
 
 #[cfg(test)]

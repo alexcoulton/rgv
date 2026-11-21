@@ -509,13 +509,71 @@ pub struct TrackSceneHit {
     pub id: Option<TrackRecordId>,
 }
 
+/// Where a pointer is vertically, relative to the rows of a lane.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackSceneRowPosition {
+    /// Row index.
+    pub row: u32,
+    /// Fraction down the row's **content height** (not its pitch), in `0.0..=1.0`: the unit
+    /// `Row` instances state their vertical extent in ([`TrackSceneInstance`]'s `y0`/`y1`).
+    pub content_fraction: f64,
+}
+
+/// A pointer position in unambiguous scene units, for [`hit_test_track_scene_at`].
+///
+/// Unlike [`TrackScenePoint`], whose `row` is a single number that cannot say whether the
+/// fraction is of the row pitch or of the row height, the row position here is explicit and
+/// is absent when the pointer is not over any row's content (above row 0, or in the gap
+/// between two rows when the pitch exceeds the height).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrackSceneProbe {
+    /// Genomic position, in bases.
+    pub position: f64,
+    /// The row content under the pointer; `None` in a gap.
+    pub row: Option<TrackSceneRowPosition>,
+    /// Fraction down the whole lane.
+    pub lane_fraction: f64,
+}
+
 /// Topmost record-bearing instance under `point`. `tolerance_bases` is half the renderer's
 /// one-point minimum width expressed in bases (`0.5 / points_per_base`), so anything that is
 /// drawn can be hit.
+///
+/// `point.row` is read as row index plus the fraction down that row's *content height*. A
+/// caller that derives it by dividing by the row pitch hits the gap between rows; prefer
+/// [`hit_test_track_scene_at`], whose argument cannot be misread.
 #[must_use]
 pub fn hit_test_track_scene(
     scene: &TrackTileScene,
     point: TrackScenePoint,
+    tolerance_bases: f64,
+) -> Option<TrackSceneHit> {
+    let row = point.row.floor();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let row_position =
+        (row >= 0.0 && row <= f64::from(u32::MAX)).then_some(TrackSceneRowPosition {
+            row: row as u32,
+            content_fraction: point.row - row,
+        });
+    hit_test_track_scene_at(
+        scene,
+        TrackSceneProbe {
+            position: point.position,
+            row: row_position,
+            lane_fraction: point.lane_fraction,
+        },
+        tolerance_bases,
+    )
+}
+
+/// Topmost record-bearing instance under `probe`; see [`hit_test_track_scene`] for the
+/// tolerance. A `Row` instance is hit only when the probe is over the content of its row and
+/// inside the instance's vertical extent there (connector lines take the whole content
+/// height); a probe in a gap between rows hits no `Row` instance.
+#[must_use]
+pub fn hit_test_track_scene_at(
+    scene: &TrackTileScene,
+    probe: TrackSceneProbe,
     tolerance_bases: f64,
 ) -> Option<TrackSceneHit> {
     #[allow(clippy::cast_precision_loss)]
@@ -534,15 +592,13 @@ pub fn hit_test_track_scene(
             } else {
                 tolerance_bases * 8.0
             };
-            if point.position < start - tolerance || point.position >= end + tolerance {
+            if probe.position < start - tolerance || probe.position >= end + tolerance {
                 return None;
             }
             let (y0, y1) = (f64::from(instance.y0), f64::from(instance.y1));
             let inside = match instance.vertical() {
-                TrackSceneVertical::Row => {
-                    let row = point.row.floor();
-                    let fraction = point.row - row;
-                    (row - f64::from(instance.row())).abs() < 0.5
+                TrackSceneVertical::Row => probe.row.is_some_and(|position| {
+                    position.row == u32::from(instance.row())
                         && (matches!(
                             instance.shape(),
                             Some(
@@ -550,17 +606,18 @@ pub fn hit_test_track_scene(
                                     | TrackSceneShape::LineChevronLeft
                                     | TrackSceneShape::LineChevronRight
                             )
-                        ) || (fraction >= y0 && fraction <= y1))
-                }
+                        ) || (position.content_fraction >= y0
+                            && position.content_fraction <= y1))
+                }),
                 // The value axis is the lane's to define; a bin is hit by its column.
                 TrackSceneVertical::Value => true,
                 TrackSceneVertical::Lane => {
                     if instance.shape() == Some(TrackSceneShape::Arc) {
-                        let t = ((point.position - start) / (end - start).max(1.0)).clamp(0.0, 1.0);
+                        let t = ((probe.position - start) / (end - start).max(1.0)).clamp(0.0, 1.0);
                         let curve = y1 + (y0 - y1) * (1.0 - 4.0 * (t - 0.5) * (t - 0.5));
-                        (point.lane_fraction - curve).abs() <= 0.06
+                        (probe.lane_fraction - curve).abs() <= 0.06
                     } else {
-                        point.lane_fraction >= y0 && point.lane_fraction <= y1
+                        probe.lane_fraction >= y0 && probe.lane_fraction <= y1
                     }
                 }
             };
@@ -976,6 +1033,158 @@ mod tests {
         assert_eq!(hit_test_track_scene(&scene, at(115.0, 0.5), 20.0).unwrap().id, Some(id(5)));
         assert_eq!(hit_test_track_scene(&scene, at(250.0, 1.2), 0.0).unwrap().id, Some(id(6)));
         assert!(hit_test_track_scene(&scene, at(250.0, 2.2), 0.0).is_none());
+    }
+
+    #[test]
+    fn a_row_cap_hides_rows_beyond_it_and_reports_exactly_what_it_hid() {
+        // The default cap is the legacy feature layout's row count.
+        assert_eq!(
+            rgv_model::DEFAULT_TRACK_TILE_FEATURE_ROWS as usize,
+            crate::TrackLayoutOptions::default().maximum_rows
+        );
+        assert_eq!(
+            rgv_model::TrackTileSettings::default().maximum_feature_rows,
+            rgv_model::DEFAULT_TRACK_TILE_FEATURE_ROWS
+        );
+        let key = TrackTileKey { level: 0, index: 0 };
+        // Twenty features stacked on twenty rows, each with a block structure and a label.
+        let features = (0..20_u32)
+            .map(|row| {
+                let mut stacked = feature(u64::from(row), 100, 600, Some(row));
+                stacked.blocks = vec![
+                    TileFeatureBlock { start: 100, end: 200, thick: true },
+                    TileFeatureBlock { start: 500, end: 600, thick: false },
+                ];
+                stacked
+            })
+            .collect::<Vec<_>>();
+        let lay_out = || {
+            lay_out_feature_tile(&tile(
+                key,
+                TrackTilePayload::Features(FeatureTile {
+                    features: features.clone(),
+                    rows: FeatureRowAxis::Packed,
+                }),
+            ))
+            .unwrap()
+        };
+        let whole = lay_out();
+        assert_eq!((whole.row_count, whole.row_cap), (20, None));
+        assert!(whole.overflow().is_empty());
+        assert_eq!(whole.instances.len(), 60);
+
+        for (cap, hidden) in [(12_u32, 8_u32), (1, 19), (19, 1), (20, 0), (64, 0)] {
+            let mut scene = lay_out();
+            let overflow = scene.apply_row_cap(cap);
+            assert_eq!(
+                (overflow.hidden_rows, overflow.hidden_features),
+                (hidden, hidden),
+                "cap {cap}"
+            );
+            assert_eq!(scene.overflow(), overflow);
+            assert_eq!(scene.row_cap, Some(cap));
+            // The packed row count and the records are kept; only what is drawn shrinks.
+            assert_eq!((scene.row_count, scene.records.len()), (20, 20));
+            let shown = (20 - hidden) as usize;
+            assert_eq!(scene.instances.len(), shown * 3);
+            assert_eq!(scene.labels.len(), shown);
+            assert!(scene.instances.iter().all(|instance| u32::from(instance.row()) < cap));
+            assert!(scene.labels.iter().all(|label| label.row < cap));
+            // Every surviving instance still names its own record, and a hidden record is
+            // no longer hit where it used to be drawn.
+            for instance in &scene.instances {
+                let record = &scene.records[instance.record_index().unwrap() as usize];
+                assert_eq!(record.row, u32::from(instance.row()));
+            }
+            let probe = |row| TrackSceneProbe {
+                position: 150.0,
+                row: Some(TrackSceneRowPosition { row, content_fraction: 0.5 }),
+                lane_fraction: 0.5,
+            };
+            assert_eq!(
+                hit_test_track_scene_at(&scene, probe(19), 0.0).is_some(),
+                cap > 19
+            );
+            assert_eq!(hit_test_track_scene_at(&scene, probe(0), 0.0).unwrap().id, Some(id(0)));
+        }
+
+        // No cap: zero and `u32::MAX` leave the scene exactly as laid out.
+        for cap in [0, u32::MAX] {
+            let mut scene = lay_out();
+            assert!(scene.apply_row_cap(cap).is_empty());
+            assert_eq!(scene, whole);
+        }
+        // A second, smaller cap tightens; a larger one cannot bring rows back.
+        let mut scene = lay_out();
+        scene.apply_row_cap(12);
+        assert_eq!(scene.apply_row_cap(16).hidden_rows, 8);
+        assert_eq!(scene.apply_row_cap(4).hidden_rows, 16);
+        assert_eq!(scene.instances.len(), 12);
+
+        // Over the tiles of a lane a feature present in two tiles is one hidden feature.
+        let mut left = lay_out();
+        let mut right = lay_out();
+        left.apply_row_cap(12);
+        right.apply_row_cap(12);
+        let lane = TrackTileScene::lane_overflow([&left, &right]);
+        assert_eq!((lane.hidden_rows, lane.hidden_features), (8, 8));
+
+        // Fixed (sample) rows and value-mapped scenes are never capped.
+        let labels: Arc<[String]> = (0..20).map(|row| format!("s{row}")).collect();
+        let mut fixed = lay_out_feature_tile(&tile(
+            key,
+            TrackTilePayload::Features(FeatureTile {
+                features: features.clone(),
+                rows: FeatureRowAxis::Fixed { labels },
+            }),
+        ))
+        .unwrap();
+        let before = fixed.clone();
+        assert!(fixed.apply_row_cap(12).is_empty());
+        assert_eq!(fixed, before);
+    }
+
+    #[test]
+    fn a_probe_states_its_row_in_content_units_and_a_gap_hits_nothing() {
+        let key = TrackTileKey { level: 0, index: 0 };
+        let mut structured = feature(7, 100, 400, Some(1));
+        structured.blocks = vec![
+            TileFeatureBlock { start: 100, end: 150, thick: false },
+            TileFeatureBlock { start: 300, end: 400, thick: true },
+        ];
+        let scene = lay_out_feature_tile(&tile(
+            key,
+            TrackTilePayload::Features(FeatureTile {
+                features: vec![feature(5, 100, 400, Some(0)), structured],
+                rows: FeatureRowAxis::Packed,
+            }),
+        ))
+        .unwrap();
+        let probe = |position, row: Option<(u32, f64)>| TrackSceneProbe {
+            position,
+            row: row.map(|(row, content_fraction)| TrackSceneRowPosition { row, content_fraction }),
+            lane_fraction: 0.5,
+        };
+        let hit = |position, row| hit_test_track_scene_at(&scene, probe(position, row), 0.0);
+        // Anywhere down a row's content, including both edges, is that row's feature.
+        for fraction in [0.0, 0.5, 1.0] {
+            assert_eq!(hit(250.0, Some((0, fraction))).unwrap().id, Some(id(5)));
+        }
+        // A gap between rows (no row position) hits no row instance, whatever the column.
+        assert!(hit(250.0, None).is_none());
+        assert!(hit(120.0, None).is_none());
+        // A thin block covers the middle half of the content; its connector the whole of it.
+        assert_eq!(hit(120.0, Some((1, 0.5))).unwrap().id, Some(id(7)));
+        assert_eq!(hit(120.0, Some((1, 0.1))).unwrap().id, Some(id(7)));
+        assert_eq!(hit(200.0, Some((1, 0.9))).unwrap().id, Some(id(7)));
+        // Another row is another row.
+        assert!(hit(250.0, Some((2, 0.5))).is_none());
+        // The legacy entry point is the same test with `row = index + content fraction`.
+        let legacy = TrackScenePoint { position: 250.0, row: 1.5, lane_fraction: 0.5 };
+        assert_eq!(
+            hit_test_track_scene(&scene, legacy, 0.0),
+            hit(250.0, Some((1, 0.5)))
+        );
     }
 
     #[test]

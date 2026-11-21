@@ -153,7 +153,7 @@ impl Viewer {
                             (AlignmentSummaryGpuLaneOptions::Sashimi(*options), None)
                         }
                     };
-                    let panel = self.panels.get(*panel_id);
+                    let panel = self.session.panels.get(*panel_id);
                     let hovered_junction = panel
                         .and_then(|panel| panel.hovered_junction_arc)
                         .filter(|hover| hover.key.track_id == lane.track_id)

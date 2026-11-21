@@ -17,9 +17,13 @@ use std::sync::Arc;
 
 impl Viewer {
     pub(crate) fn synchronize_alignment_scene_interactions(&mut self, panel_id: PanelId) {
-        let (hovered, selected) = self.panels.get(panel_id).map_or((None, None), |panel| {
-            (panel.hovered_alignment_hit, panel.selected_alignment_hit)
-        });
+        let (hovered, selected) = self
+            .session
+            .panels
+            .get(panel_id)
+            .map_or((None, None), |panel| {
+                (panel.hovered_alignment_hit, panel.selected_alignment_hit)
+            });
         let track_ids = self
             .alignment_tracks
             .iter()
@@ -105,7 +109,7 @@ impl Viewer {
         let compatible_revision =
             self.compatible_alignment_reference_revision(&metadata.dictionary);
         let target = snapshot.prepared_interval();
-        let reference = self.panels.get(panel_id).and_then(|panel| {
+        let reference = self.session.panels.get(panel_id).and_then(|panel| {
             let revision = panel.reference_slice_revision?;
             let slice = panel.reference_slice.as_deref()?;
             (Some(revision) == compatible_revision).then_some((revision, slice))
@@ -193,6 +197,7 @@ impl Viewer {
             return;
         };
         let resolutions = self
+            .session
             .panels
             .iter()
             .filter_map(|panel| {
@@ -218,7 +223,7 @@ impl Viewer {
         }
         let mut resolved_panels = Vec::with_capacity(resolutions.len());
         for (panel_id, track_id, scene_revision, handle, chain, retained, reveal) in resolutions {
-            let Some(panel) = self.panels.get_mut(panel_id) else {
+            let Some(panel) = self.session.panels.get_mut(panel_id) else {
                 continue;
             };
             panel.pending_read_selection = Some(retained);

@@ -40,12 +40,15 @@ impl Viewer {
                 "alignment refresh requested",
             );
         }
-        self.panels.panel_mut(panel_id).pending_queries.alignment =
-            self.alignment_tracks.iter().any(|track| {
-                track
-                    .projection(panel_id)
-                    .is_some_and(|projection| projection.navigation.is_queued())
-            });
+        self.session
+            .panels
+            .panel_mut(panel_id)
+            .pending_queries
+            .alignment = self.alignment_tracks.iter().any(|track| {
+            track
+                .projection(panel_id)
+                .is_some_and(|projection| projection.navigation.is_queued())
+        });
         self.dispatch_alignment_query(panel_id);
     }
 
@@ -73,7 +76,11 @@ impl Viewer {
             false,
             "alignment row camera changed",
         );
-        self.panels.panel_mut(panel_id).pending_queries.alignment = true;
+        self.session
+            .panels
+            .panel_mut(panel_id)
+            .pending_queries
+            .alignment = true;
         self.dispatch_alignment_query(panel_id);
     }
 
@@ -88,7 +95,7 @@ impl Viewer {
         contig_length: u64,
         reference_backed_alleles: bool,
     ) -> Result<Option<AlignmentPanelLaneCapture>> {
-        let Some(panel) = self.panels.get(panel_id) else {
+        let Some(panel) = self.session.panels.get(panel_id) else {
             return Ok(None);
         };
         if panel.viewport.detail_level() == DetailLevel::Overview {
@@ -184,10 +191,15 @@ impl Viewer {
     /// track expansion, and window-scale changes alter only camera/clip state; they must not wait
     /// for an unrelated genomic navigation transaction or rebuild alignment evidence.
     pub(crate) fn refresh_alignment_scene_cameras_after_layout(&mut self) {
-        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let panel_ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         let mut changed_by_panel = Vec::<(PanelId, Vec<TrackId>)>::new();
         for panel_id in panel_ids {
-            let Some(panel) = self.panels.get(panel_id) else {
+            let Some(panel) = self.session.panels.get(panel_id) else {
                 continue;
             };
             let contig_name = panel.contig_name.clone();
@@ -255,7 +267,11 @@ impl Viewer {
                     "alignment pane geometry changed",
                 );
             }
-            self.panels.panel_mut(panel_id).pending_queries.alignment = true;
+            self.session
+                .panels
+                .panel_mut(panel_id)
+                .pending_queries
+                .alignment = true;
             self.dispatch_alignment_query(panel_id);
         }
     }
@@ -353,7 +369,12 @@ impl Viewer {
     }
 
     pub(crate) fn synchronize_alignment_pending_mirrors(&mut self) {
-        let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+        let panel_ids = self
+            .session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .collect::<Vec<_>>();
         for panel_id in panel_ids {
             let pending = self.alignment_tracks.iter().any(|track| {
                 matches!(track.lifecycle, AlignmentTrackLifecycle::Ready)
@@ -363,7 +384,7 @@ impl Viewer {
                             .is_current_settled(projection.clock.current().get())
                     })
             });
-            if let Some(panel) = self.panels.get_mut(panel_id) {
+            if let Some(panel) = self.session.panels.get_mut(panel_id) {
                 panel.pending_queries.alignment = pending;
             }
         }
@@ -541,7 +562,7 @@ impl Viewer {
                         && drag.density_dragging
                 })
                 .map(|drag| drag.virtual_scroll_fraction);
-            let Some(panel) = self.panels.get_mut(update.panel_id) else {
+            let Some(panel) = self.session.panels.get_mut(update.panel_id) else {
                 needs_rebuild = true;
                 continue;
             };
@@ -714,6 +735,7 @@ impl Viewer {
                 scene_contig: None,
             };
             let state = panel
+                .state
                 .read_panel_scrolls
                 .entry(update.track_id)
                 .or_insert_with(|| {
@@ -747,10 +769,10 @@ impl Viewer {
                 );
             }
             if update.track_id == primary_track_id {
-                panel.vertical_scroll_points = state.scroll_points;
-                panel.vertical_content_origin_points = state.content_origin_points;
-                panel.latent_vertical_scroll_fraction = state.latent_scroll_fraction;
-                panel.content_bottom_points = state.content_bottom_points;
+                panel.state.vertical_scroll_points = state.scroll_points;
+                panel.state.vertical_content_origin_points = state.content_origin_points;
+                panel.state.latent_vertical_scroll_fraction = state.latent_scroll_fraction;
+                panel.state.content_bottom_points = state.content_bottom_points;
             }
             needs_rebuild |= display_derivative_before
                 != read_panel_display_derivative_authority(

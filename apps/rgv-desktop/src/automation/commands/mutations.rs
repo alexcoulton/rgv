@@ -35,12 +35,11 @@ pub(crate) fn automation_alignment_target(
 
 impl Viewer {
     pub(crate) fn bump_workspace_revision(&mut self) -> u64 {
-        self.workspace_revision = self.workspace_revision.saturating_add(1);
-        self.workspace_revision
+        self.session.bump_workspace_revision()
     }
 
     pub(crate) fn mark_retained_evidence_stale(&mut self, reason: &str) {
-        for panel in self.panels.iter_mut() {
+        for panel in self.session.panels.iter_mut() {
             if let Some(retained) = &mut panel.retained_evidence {
                 retained.selection.stale = true;
                 retained.selection.stale_reason = Some(bounded_automation_text(reason, 512));
@@ -53,12 +52,12 @@ impl Viewer {
         granularity: Option<AutomationSelectionGranularity>,
     ) {
         let Some(mut selection) = self.live_automation_selection_snapshot() else {
-            self.panels.active_mut().retained_evidence = None;
+            self.session.panels.active_mut().retained_evidence = None;
             return;
         };
         selection.selection_id = uuid::Uuid::new_v4().to_string();
         selection.evidence_revision = self.next_evidence_revision;
-        selection.workspace_revision_at_selection = self.workspace_revision;
+        selection.workspace_revision_at_selection = self.session.workspace_revision;
         selection.granularity = granularity;
         if let Some(track_id) = selection.track_id
             && let Some((authority, generation)) = self
@@ -115,7 +114,7 @@ impl Viewer {
             },
             automation_inspector_export,
         );
-        self.panels.active_mut().retained_evidence = Some(RetainedEvidenceSnapshot {
+        self.session.panels.active_mut().retained_evidence = Some(RetainedEvidenceSnapshot {
             selection,
             inspector,
             export,
@@ -129,7 +128,7 @@ impl Viewer {
         &mut self,
         command: &rgv_automation::AutomationCommand,
     ) -> Result<crate::action::ActionOutcome> {
-        let focused = self.panels.active().id;
+        let focused = self.session.panels.active().id;
         let actions = crate::action::translate::automation_command_actions(command, focused)
             .ok_or_else(|| anyhow::anyhow!("the command is not an action translation"))??;
         let mut outcome = crate::action::ActionOutcome::default();
@@ -158,7 +157,7 @@ impl Viewer {
     ) -> Result<serde_json::Value> {
         let navigation_started = Instant::now();
         anyhow::ensure!(
-            self.panels.get(panel_id).is_some(),
+            self.session.panels.get(panel_id).is_some(),
             "panel {} was not found",
             panel_id.get()
         );
@@ -173,7 +172,7 @@ impl Viewer {
                 panel_id, operation,
             ))?
         };
-        let next = self.panels.panel(panel_id).viewport;
+        let next = self.session.panels.panel(panel_id).viewport;
         let interval = outcome.interval.unwrap_or_else(|| next.interval());
         if let Some(runner) = self.automation.as_mut() {
             runner.begin_navigation(panel_id, interval, &navigation_state, navigation_started);
@@ -181,12 +180,12 @@ impl Viewer {
         self.bump_workspace_revision();
         Ok(serde_json::json!({
             "panel_id": panel_id.get(),
-            "locus": automation_locus(&self.panels.panel(panel_id).contig_name, interval),
-            "contig": self.panels.panel(panel_id).contig_name,
+            "locus": automation_locus(&self.session.panels.panel(panel_id).contig_name, interval),
+            "contig": self.session.panels.panel(panel_id).contig_name,
             "start": interval.start(),
             "end": interval.end(),
             "detail_level": next.detail_level(),
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
         }))
     }
 
@@ -371,6 +370,7 @@ impl Viewer {
                     .iter()
                     .any(|track| track.config.id == track_id)
                     || self
+                        .session
                         .tracks
                         .tracks()
                         .iter()
@@ -424,6 +424,7 @@ impl Viewer {
                     }
                     self.rebuild_all_panel_displays();
                 } else if let Some(track) = self
+                    .session
                     .tracks
                     .tracks_mut()
                     .iter_mut()
@@ -443,7 +444,7 @@ impl Viewer {
                 // The panel-level `vertical_scroll_points` field mirrors the primary track only.
                 let mirrors_primary = alignment_track == self.primary_alignment_track_id();
                 let primary_track_id = alignment_track;
-                if self.panels.get(panel_id).is_none() {
+                if self.session.panels.get(panel_id).is_none() {
                     anyhow::bail!("panel {} was not found", panel_id.get());
                 }
                 match key {
@@ -451,6 +452,7 @@ impl Viewer {
                         let scroll = automation_f32(value, key)?;
                         anyhow::ensure!(scroll >= 0.0, "{key} must be non-negative");
                         let panel = self
+                            .session
                             .panels
                             .get_mut(panel_id)
                             .expect("panel existence was checked above");
@@ -483,8 +485,10 @@ impl Viewer {
                     "annotation_scroll_points" => {
                         let scroll = automation_f32(value, key)?;
                         anyhow::ensure!(scroll >= 0.0, "{key} must be non-negative");
-                        self.panels.annotation_scroll_points =
-                            scroll.min(self.panels.maximum_annotation_scroll_points());
+                        self.session.panels.annotation_scroll_points =
+                            scroll.min(crate::workspace::panels::maximum_annotation_scroll_points(
+                                &self.session.panels,
+                            ));
                     }
                     _ => anyhow::bail!("unknown panel option {key}"),
                 }
@@ -525,16 +529,17 @@ impl Viewer {
                 self.window.request_redraw();
             }
             AutomationSetting::ReadBrowsingBufferPercent { value } => {
-                deferred_shell_change = self.settings.read_browsing_buffer_percent != *value;
-                self.settings.read_browsing_buffer_percent = *value;
+                deferred_shell_change =
+                    self.session.settings.read_browsing_buffer_percent != *value;
+                self.session.settings.read_browsing_buffer_percent = *value;
                 if deferred_shell_change {
                     self.persist_settings();
                     self.request_all_panel_queries();
                 }
             }
             AutomationSetting::TotalCacheBudgetMib { value } => {
-                deferred_shell_change = self.settings.cache_budget_mib != *value;
-                self.settings.cache_budget_mib = *value;
+                deferred_shell_change = self.session.settings.cache_budget_mib != *value;
+                self.session.settings.cache_budget_mib = *value;
                 if deferred_shell_change {
                     self.apply_live_cache_budget(*value);
                     self.persist_settings();
@@ -542,9 +547,9 @@ impl Viewer {
                 }
             }
             AutomationSetting::TrackPipeline { value } => {
-                deferred_shell_change = self.settings.track_pipeline != *value;
+                deferred_shell_change = self.session.settings.track_pipeline != *value;
                 if deferred_shell_change {
-                    self.settings.track_pipeline = *value;
+                    self.session.settings.track_pipeline = *value;
                     self.persist_settings();
                     self.apply_track_pipeline_setting();
                 }
@@ -686,7 +691,7 @@ impl Viewer {
             AutomationSetting::AlignmentViewFilter { track_ids, value } => {
                 self.ensure_automation_alignment_tracks(track_ids)?;
                 anyhow::ensure!(
-                    self.reference_source.is_some()
+                    self.session.reference_source.is_some()
                         || !value
                             .all
                             .iter()
@@ -707,7 +712,7 @@ impl Viewer {
             AutomationSetting::AlignmentHighlightFilter { track_ids, value } => {
                 self.ensure_automation_alignment_tracks(track_ids)?;
                 anyhow::ensure!(
-                    self.reference_source.is_some()
+                    self.session.reference_source.is_some()
                         || !value
                             .all
                             .iter()
@@ -759,7 +764,7 @@ impl Viewer {
             } => {
                 self.ensure_automation_alignment_tracks(track_ids)?;
                 anyhow::ensure!(
-                    self.panels.get(*panel_id).is_some(),
+                    self.session.panels.get(*panel_id).is_some(),
                     "panel {} was not found",
                     panel_id.get()
                 );
@@ -836,7 +841,7 @@ impl Viewer {
                     &serde_json::json!(value),
                 )?,
             AutomationSetting::ReadStackScrollPoints { panel_id, value } => {
-                let Some(panel) = self.panels.get_mut(*panel_id) else {
+                let Some(panel) = self.session.panels.get_mut(*panel_id) else {
                     anyhow::bail!("panel {} was not found", panel_id.get());
                 };
                 let maximum = (panel.pane_layout.reads.content_bottom
@@ -851,7 +856,7 @@ impl Viewer {
                 value,
             } => {
                 self.ensure_automation_alignment_tracks(&[*track_id])?;
-                let Some(panel) = self.panels.get_mut(*panel_id) else {
+                let Some(panel) = self.session.panels.get_mut(*panel_id) else {
                     anyhow::bail!("panel {} was not found", panel_id.get());
                 };
                 let maximum = panel
@@ -884,7 +889,7 @@ impl Viewer {
             } => {
                 self.ensure_automation_alignment_tracks(&[*track_id])?;
                 anyhow::ensure!(
-                    self.panels.get(*panel_id).is_some(),
+                    self.session.panels.get(*panel_id).is_some(),
                     "panel {} was not found",
                     panel_id.get()
                 );
@@ -910,7 +915,7 @@ impl Viewer {
                 panel_id,
                 track_id: Some(track_id),
                 ..
-            } => self.panels.get(*panel_id).map(|panel| {
+            } => self.session.panels.get(*panel_id).map(|panel| {
                 serde_json::json!(panel.read_panel_scroll_state(*track_id).scroll_points)
             }),
             AutomationSetting::AnnotationScrollPoints { panel_id, .. } => workspace
@@ -981,7 +986,7 @@ impl Viewer {
             "clamped": clamped,
             "reason": clamped.then_some("requested value was constrained by the rendered layout"),
             "application_instance_id": self.application_instance_id,
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
         }))
     }
 }

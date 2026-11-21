@@ -16,6 +16,7 @@ members = [
     "crates/rgv-layout",
     "crates/rgv-model",
     "crates/rgv-render",
+    "crates/rgv-session",
     "tools/interaction-stress",
 ]
 # `benchmarks/alignment-io` is the only member that pulls the benchmark-only
@@ -38,6 +39,7 @@ default-members = [
     "crates/rgv-layout",
     "crates/rgv-model",
     "crates/rgv-render",
+    "crates/rgv-session",
     "tools/interaction-stress",
 ]
 resolver = "2"

@@ -18,6 +18,7 @@ impl Viewer {
                 .iter()
                 .map(|(id, name, length, viewport, _)| {
                     let cytobands = if self
+                        .session
                         .assembly
                         .cytobands_for(viewport.interval().contig())
                         .next()
@@ -81,7 +82,7 @@ impl Viewer {
             {
                 let interaction = ui::paint_genome_context(
                     ui,
-                    &self.assembly,
+                    &self.session.assembly,
                     name,
                     *length,
                     *viewport,
@@ -114,7 +115,7 @@ impl Viewer {
                 ui,
                 geometry,
                 &st.layout.track_frames,
-                self.panels.annotation_scroll_points,
+                self.session.panels.annotation_scroll_points,
                 0.0,
                 // Section chrome belongs to the current pane-layout
                 // revision. A scroll display cache can legitimately lag
@@ -125,11 +126,14 @@ impl Viewer {
                 st.layout.pane_annotation_bottom,
                 st.layout.selected_track,
                 &st.layout.selected_annotation_track_ids,
-                &self.panels.active().selected_read_tracks,
+                &self.session.panels.active().selected_read_tracks,
                 &st.layout.track_groups,
                 ui::TrackSectionChrome {
-                    annotation_expanded: self.track_presentation.annotation_section_expanded,
-                    reads_expanded: self.track_presentation.read_section_expanded,
+                    annotation_expanded: self
+                        .session
+                        .track_presentation
+                        .annotation_section_expanded,
+                    reads_expanded: self.session.track_presentation.read_section_expanded,
                     annotation_track_count: st.layout.annotation_track_count,
                     read_track_count: st.layout.read_track_count,
                     annotation_content_top: st.layout.pane_layout.annotation.pane_rect.top(),

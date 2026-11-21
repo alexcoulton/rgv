@@ -210,12 +210,12 @@ impl Viewer {
             "native window uses composed capture"
         );
         if scope == AutomationSnapshotScope::FullActivePanel {
-            let panel = self.panels.active();
+            let panel = self.session.panels.active();
             // We may only promise a complete scope if every lane is already
             // resident and unscrolled. Acquiring unseen pages requires a separate
             // bounded source request, never a mutation of the live UI camera.
             anyhow::ensure!(
-                self.panels.annotation_scroll_points.abs() < f32::EPSILON
+                self.session.panels.annotation_scroll_points.abs() < f32::EPSILON
                     && panel.read_stack_scroll_points.abs() < f32::EPSILON
                     && panel.read_stack_content_bottom_points <= bounds.bottom()
                     && panel
@@ -230,9 +230,10 @@ impl Viewer {
         let mut panels = Vec::new();
         let mut interactions = HashMap::new();
         for panel in self
+            .session
             .panels
             .iter()
-            .filter(|panel| !active_only || panel.id == self.panels.active().id)
+            .filter(|panel| !active_only || panel.id == self.session.panels.active().id)
         {
             anyhow::ensure!(
                 panel.navigation_presentation.is_interactive(),
@@ -297,7 +298,7 @@ impl Viewer {
             "export height exceeds its resource limit"
         );
         let generic = if active_only {
-            &self.panels.active().display_list
+            &self.session.panels.active().display_list
         } else {
             &self.composite_display_list
         };

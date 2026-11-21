@@ -47,6 +47,7 @@ impl Viewer {
             let width = self.surface_config.width;
             let height = self.surface_config.height;
             let navigation_transaction_active = self
+                .session
                 .panels
                 .iter()
                 .any(|panel| panel.navigation_presentation.is_unsettled());
@@ -60,7 +61,7 @@ impl Viewer {
                     "scope_description": "native window client area",
                     "truncated": false,
                     "application_instance_id": self.application_instance_id,
-                    "workspace_revision": self.workspace_revision,
+                    "workspace_revision": self.session.workspace_revision,
                     "navigation_transaction_active": navigation_transaction_active,
                     "selection_id": self.automation_selection_snapshot().map(|selection| selection.selection_id),
                     "evidence_revision": self.automation_selection_snapshot().map(|selection| selection.evidence_revision),
@@ -75,17 +76,17 @@ impl Viewer {
         let height = capture.height;
         let scope_label = capture.scope_label.clone();
         let mut metadata = automation_snapshot_metadata(
-            &self.assembly_name,
-            &self.panels,
+            &self.session.assembly_name,
+            &self.session.panels,
             &self.alignment_tracks,
-            &self.tracks,
-            &self.track_presentation,
+            &self.session.tracks,
+            &self.session.track_presentation,
             &scope_label,
         );
         let _ = write!(
             metadata,
             "; application instance {}; workspace revision {}",
-            self.application_instance_id, self.workspace_revision
+            self.application_instance_id, self.session.workspace_revision
         );
         if let Some(selection) = self.automation_selection_snapshot() {
             let _ = write!(
@@ -104,7 +105,7 @@ impl Viewer {
             "scope_description": scope_label,
             "truncated": truncated,
             "application_instance_id": self.application_instance_id,
-            "workspace_revision": self.workspace_revision,
+            "workspace_revision": self.session.workspace_revision,
             "selection_id": self.automation_selection_snapshot().map(|selection| selection.selection_id),
             "evidence_revision": self.automation_selection_snapshot().map(|selection| selection.evidence_revision),
         });
@@ -124,23 +125,23 @@ impl Viewer {
         path: PathBuf,
         kind: AutomationExportKind,
     ) -> Result<()> {
-        let assembly = self.assembly_name.clone();
-        let contig = self.panels.active().contig_name.clone();
-        let interval = self.panels.active().viewport.interval();
+        let assembly = self.session.assembly_name.clone();
+        let contig = self.session.panels.active().contig_name.clone();
+        let interval = self.session.panels.active().viewport.interval();
         match kind {
             AutomationExportKind::Regions => {
-                let regions = self.regions_of_interest.clone();
+                let regions = self.session.regions_of_interest.clone();
                 self.start_automation_export_job(command_index, path, move |path| {
                     std::fs::write(path, region_bed_export(&regions))
                 })
             }
             AutomationExportKind::TrackNames => {
                 let contents = automation_track_names_export(
-                    &self.assembly_name,
-                    &self.panels,
+                    &self.session.assembly_name,
+                    &self.session.panels,
                     &self.alignment_tracks,
-                    &self.tracks,
-                    &self.track_presentation,
+                    &self.session.tracks,
+                    &self.session.track_presentation,
                 );
                 self.start_automation_export_job(command_index, path, move |path| {
                     std::fs::write(path, contents)
@@ -153,6 +154,7 @@ impl Viewer {
             | AutomationExportKind::Modifications
             | AutomationExportKind::Junctions => {
                 let presentation_committed = self
+                    .session
                     .panels
                     .active()
                     .navigation_presentation
@@ -163,10 +165,12 @@ impl Viewer {
                 );
                 let mut tracks = Vec::new();
                 for track in self.alignment_tracks.iter().filter(|track| {
-                    self.track_presentation
+                    self.session
+                        .track_presentation
                         .track_content_exposed(ui::TrackPane::Annotation, track.config.id)
                         .unwrap_or(false)
                         || self
+                            .session
                             .track_presentation
                             .track_content_exposed(ui::TrackPane::Reads, track.config.id)
                             .unwrap_or(false)
@@ -177,7 +181,7 @@ impl Viewer {
                         track.config.name
                     );
                     let presented = self
-                        .presented_alignment_lane(self.panels.active().id, track.config.id)
+                        .presented_alignment_lane(self.session.panels.active().id, track.config.id)
                         .context("the committed alignment scene is unavailable")?;
                     anyhow::ensure!(
                         presented.lane.summary_current()
@@ -247,17 +251,20 @@ impl Viewer {
             }
             AutomationExportKind::Variants | AutomationExportKind::Quantitative => {
                 let visible_ids = self
+                    .session
                     .tracks
                     .tracks()
                     .iter()
                     .filter(|track| {
-                        self.track_presentation
+                        self.session
+                            .track_presentation
                             .track_content_exposed(ui::TrackPane::Annotation, track.id)
                             .unwrap_or(false)
                     })
                     .map(|track| track.id)
                     .collect::<BTreeSet<_>>();
                 let snapshots = self
+                    .session
                     .panels
                     .active()
                     .track_snapshots
@@ -288,7 +295,7 @@ impl Viewer {
                 })
             }
             AutomationExportKind::SelectedEvidence => {
-                if let Some(retained) = self.panels.active().retained_evidence.clone()
+                if let Some(retained) = self.session.panels.active().retained_evidence.clone()
                     && !retained.export.is_empty()
                 {
                     anyhow::ensure!(
@@ -302,7 +309,7 @@ impl Viewer {
                     let data = serde_json::json!({
                         "selection_id": retained.selection.selection_id,
                         "evidence_revision": retained.selection.evidence_revision,
-                        "workspace_revision": self.workspace_revision,
+                        "workspace_revision": self.session.workspace_revision,
                         "bytes": retained.export.len(),
                         "sha256": digest,
                     });
@@ -381,7 +388,7 @@ impl Viewer {
             automation_data: Some(completion_data),
             worker,
         });
-        self.data_status = format!("Automation is exporting {display_path}…");
+        self.session.data_status = format!("Automation is exporting {display_path}…");
         Ok(())
     }
 

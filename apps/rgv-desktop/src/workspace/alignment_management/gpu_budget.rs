@@ -49,7 +49,7 @@ impl Viewer {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.alignment_gpu_publication_retry = None;
-                self.data_status =
+                self.session.data_status =
                     format!("Could not inspect deferred alignment GPU capacity: {error}");
                 return;
             }
@@ -88,7 +88,7 @@ impl Viewer {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.alignment_capacity_reclaim = None;
-                self.data_status =
+                self.session.data_status =
                     format!("Could not inspect aggregate alignment capacity: {error}");
                 return;
             }
@@ -136,7 +136,8 @@ impl Viewer {
             released_bytes: 0,
             relinquished_cache_entries: 0,
         });
-        self.data_status = "Reclaiming inactive alignment cache for the current view…".to_owned();
+        "Reclaiming inactive alignment cache for the current view…"
+            .clone_into(&mut self.session.data_status);
         self.finish_alignment_capacity_reclaim_if_complete();
     }
 
@@ -191,7 +192,7 @@ impl Viewer {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.alignment_gpu_publication_retry = None;
-                self.data_status =
+                self.session.data_status =
                     format!("Could not inspect aggregate alignment capacity: {error}");
                 return;
             }
@@ -276,7 +277,7 @@ impl Viewer {
             occupied_bytes,
         );
         if let Some(status) = alignment_partial_residency_status(deferred_pages) {
-            self.data_status = status;
+            self.session.data_status = status;
         }
         deferred_pages
     }
@@ -331,7 +332,7 @@ impl Viewer {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.alignment_gpu_publication_retry = None;
-                self.data_status =
+                self.session.data_status =
                     format!("Could not inspect deferred alignment GPU capacity: {error}");
                 return;
             }
@@ -566,7 +567,8 @@ impl Viewer {
     }
 
     pub(crate) fn aggregate_cache_budget_bytes(&self) -> usize {
-        self.settings
+        self.session
+            .settings
             .cache_budget_mib
             .saturating_mul(1024 * 1024)
             .max(1)
