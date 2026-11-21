@@ -1913,6 +1913,18 @@ struct SessionVersionProbe {
     writer: Option<SessionWriter>,
 }
 
+const NEWER_WRITER_NOTICE_PREFIX: &str = "This project was written by a newer RGV";
+
+/// The newer-writer data-loss warning among `migration_notices`, if any (see
+/// [`SessionDocument::newer_writer_notice`]).
+#[must_use]
+pub fn newer_writer_notice(migration_notices: &[String]) -> Option<&str> {
+    migration_notices
+        .iter()
+        .map(String::as_str)
+        .find(|notice| notice.starts_with(NEWER_WRITER_NOTICE_PREFIX))
+}
+
 /// Identifies the build that wrote a session so a reader can tell "corrupt"
 /// from "written by a newer RGV". Persisted as the trailing `writer` object.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -2150,7 +2162,7 @@ impl SessionDocument {
             // The document parsed, but fields this build does not model were
             // dropped and will be lost if the project is saved from here.
             document.migration_notices.push(format!(
-                "This project was written by a newer RGV ({}). Settings this version does not understand were ignored and will be lost if the project is saved.",
+                "{NEWER_WRITER_NOTICE_PREFIX} ({}). Settings this version does not understand were ignored and will be lost if the project is saved.",
                 writer.describe()
             ));
         }
@@ -2228,6 +2240,15 @@ impl SessionDocument {
             track.collapsed = false;
             track.height = 120.0;
         }
+    }
+
+    /// The data-loss warning recorded when this document was read from a file
+    /// written by a newer RGV: saving it back over that file discards the
+    /// settings this build could not model. Callers must show it before
+    /// overwriting the original.
+    #[must_use]
+    pub fn newer_writer_notice(&self) -> Option<&str> {
+        newer_writer_notice(&self.migration_notices)
     }
 
     fn legacy_presentation_migration_notices(&self) -> Vec<String> {

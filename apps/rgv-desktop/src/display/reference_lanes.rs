@@ -1,5 +1,30 @@
 use super::*;
 
+/// Appends one 20-point lane per translation frame. Reverse frames are
+/// phased from the contig end, so the contig length is required.
+pub(crate) fn append_reference_translation_lanes(
+    display: &mut DisplayList,
+    reference: &ReferenceSlice,
+    viewport: Viewport,
+    translation_top: f32,
+    frames: &[ReferenceTranslationFrame],
+    genetic_code: GeneticCode,
+    contig_length: u64,
+) {
+    for (index, frame) in frames.iter().copied().enumerate() {
+        let translation = layout_reference_translation_in_contig(
+            reference,
+            viewport,
+            translation_top + index as f32 * 20.0,
+            frame,
+            genetic_code,
+            Some(contig_length),
+        );
+        display.rectangles.extend(translation.rectangles);
+        display.texts.extend(translation.texts);
+    }
+}
+
 impl Viewer {
     /// Reference sequence lane: bases, translation frames, and its frame.
     #[allow(clippy::too_many_lines)]
@@ -71,22 +96,15 @@ impl Viewer {
                     self.reference_reverse_complement,
                 );
                 let mut lane_display = reference_display;
-                for (index, frame) in self
-                    .reference_translation_frames
-                    .iter()
-                    .copied()
-                    .enumerate()
-                {
-                    let translation = layout_reference_translation(
-                        reference,
-                        source_viewport,
-                        translation_top + index as f32 * 20.0,
-                        frame,
-                        self.reference_genetic_code,
-                    );
-                    lane_display.rectangles.extend(translation.rectangles);
-                    lane_display.texts.extend(translation.texts);
-                }
+                append_reference_translation_lanes(
+                    &mut lane_display,
+                    reference,
+                    source_viewport,
+                    translation_top,
+                    &self.reference_translation_frames,
+                    self.reference_genetic_code,
+                    self.panels.active().contig_length,
+                );
                 context_lane_drafts.push(ContextLaneDraft {
                     key: ContextLaneKey::Reference,
                     generation: self
@@ -169,6 +187,7 @@ impl Viewer {
         let pending_context_lanes = &mut pass.pending_context_lanes;
         let unavailable_context_lanes = &mut pass.unavailable_context_lanes;
         let context_lane_drafts = &mut pass.context_lane_drafts;
+        let object_ids = &mut pass.object_ids;
         let mut top = pass.top;
         // Gene models are reference context, so keep them immediately above the
         // primary alignment instead of placing them below an arbitrarily tall
@@ -242,22 +261,22 @@ impl Viewer {
                         .selected_feature
                         .filter(|selection| selection.track_id == config.id)
                         .map(|selection| selection.record_index),
-                    object_id_base: 1_000_000_u32.saturating_add(
-                        u32::try_from(config.id.get())
-                            .unwrap_or(u32::MAX)
-                            .saturating_mul(100_000),
-                    ),
                     feature_display_mode: config.feature.display_mode,
                     ..TrackLayoutOptions::default()
                 };
+                let (options, object_id_range) =
+                    track_options_with_object_ids(object_ids, records.len(), options);
                 let label_widths = measured_feature_label_widths(&self.egui_context, records);
-                let gene_display = layout_features_with_label_widths(
+                let mut gene_display = layout_features_with_label_widths(
                     records,
                     source_viewport,
                     options,
                     Some(&label_widths),
                 )
                 .0;
+                if object_id_range.is_none() {
+                    strip_object_ids(&mut gene_display);
+                }
                 context_lane_drafts.push(ContextLaneDraft {
                     key: ContextLaneKey::Auxiliary(config.id),
                     generation: self

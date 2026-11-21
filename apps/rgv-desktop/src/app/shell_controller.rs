@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use rgv_core::{PanelId, TrackId};
+use rgv_core::{Locus, LocusRange, PanelId, TrackId};
 
 use super::shell_state::{
     EscapeAction, EscapeContext, GateOutcome, GuardedAction, NotificationSeverity, ScrollIntent,
@@ -13,10 +13,17 @@ use super::tasks::SessionLoadKind;
 use crate::{TrackSearchResults, UiPanel, Viewer};
 
 /// Whether the annotation-search popup is shown under the locus field.
-pub(crate) fn search_popup_visible(locus_editor: &str, results_query: &str, has_hits: bool) -> bool {
+pub(crate) fn search_popup_visible(
+    locus_editor: &str,
+    results_query: &str,
+    has_hits: bool,
+) -> bool {
     let typed = locus_editor.trim();
+    // A coordinate locus navigates; a colon alone does not make one, so
+    // variant IDs such as `chr1:12345:A:G` keep their search results.
+    let coordinates = Locus::parse(typed).is_ok_and(|locus| locus.range != LocusRange::WholeContig);
     has_hits
-        && !locus_editor.contains(':')
+        && !coordinates
         && !typed.is_empty()
         && results_query.trim().eq_ignore_ascii_case(typed)
 }
@@ -30,7 +37,7 @@ impl Viewer {
             repeat,
             egui_consumed,
             context_menu_open: self.alignment_context_menu.is_some(),
-            unsaved_prompt_open: self.document_state.shell.unsaved_gate.prompt().is_some(),
+            unsaved_prompt_open: self.shell.unsaved_gate.prompt().is_some(),
             exit_prompt_open: self.exit_confirmation_open,
             search_popup_open: search_popup_visible(
                 &self.locus_editor,
@@ -38,7 +45,7 @@ impl Viewer {
                 !self.annotation_search_results.hits.is_empty(),
             ),
             command_palette_open: self.open_panel == Some(UiPanel::CommandPalette),
-            notifications_open: self.document_state.shell.notifications_open,
+            notifications_open: self.shell.notifications_open,
             other_panel_open: self
                 .open_panel
                 .is_some_and(|panel| panel != UiPanel::CommandPalette),
@@ -49,10 +56,7 @@ impl Viewer {
                 self.close_alignment_context_menu("escape");
             }
             EscapeAction::CancelUnsavedPrompt => {
-                self.document_state
-                    .shell
-                    .unsaved_gate
-                    .resolve(UnsavedChoice::Cancel);
+                self.shell.unsaved_gate.resolve(UnsavedChoice::Cancel);
             }
             EscapeAction::CloseExitPrompt => self.exit_confirmation_open = false,
             EscapeAction::CloseSearchPopup => {
@@ -60,7 +64,7 @@ impl Viewer {
                 self.pending_annotation_navigation = None;
             }
             EscapeAction::CloseNotifications => {
-                self.document_state.shell.notifications_open = false;
+                self.shell.notifications_open = false;
             }
             EscapeAction::ClosePanel => {
                 self.open_panel = None;
@@ -75,7 +79,7 @@ impl Viewer {
     fn request_guarded(&mut self, action: GuardedAction) -> Option<GuardedAction> {
         self.observe_document_changes();
         let dirty = self.document_state.is_dirty();
-        match self.document_state.shell.unsaved_gate.request(action, dirty) {
+        match self.shell.unsaved_gate.request(action, dirty) {
             GateOutcome::Proceed(action) => Some(action),
             GateOutcome::Prompt | GateOutcome::SaveFirst | GateOutcome::Stay => {
                 self.exit_confirmation_open = false;
@@ -94,7 +98,7 @@ impl Viewer {
     /// Cmd/Ctrl+W. Unsaved changes open the Save / Discard / Cancel prompt; a clean document
     /// keeps the press-again confirmation. Returns whether the application may exit now.
     pub(crate) fn request_exit_from_shortcut(&mut self) -> bool {
-        if self.document_state.shell.unsaved_gate.prompt().is_some() {
+        if self.shell.unsaved_gate.prompt().is_some() {
             // The prompt is already asking; a repeated shortcut must not discard the document.
             return false;
         }
@@ -126,7 +130,7 @@ impl Viewer {
     }
 
     pub(crate) fn resolve_unsaved_choice(&mut self, choice: UnsavedChoice) {
-        match self.document_state.shell.unsaved_gate.resolve(choice) {
+        match self.shell.unsaved_gate.resolve(choice) {
             GateOutcome::Proceed(action) => self.run_guarded_action(action),
             GateOutcome::SaveFirst => {
                 let destination = self.current_session_path.clone().or_else(|| {
@@ -135,17 +139,16 @@ impl Viewer {
                         .add_filter("RGV project", &["json"])
                         .save_file()
                 });
-                let started = destination.is_some_and(|path| {
-                    match self.try_start_session_save(path, None) {
+                let started =
+                    destination.is_some_and(|path| match self.try_start_session_save(path, None) {
                         Ok(()) => true,
                         Err(error) => {
                             self.report_error(format!("Could not start project save: {error}"));
                             false
                         }
-                    }
-                });
+                    });
                 if !started {
-                    self.document_state.shell.unsaved_gate.save_abandoned();
+                    self.shell.unsaved_gate.save_abandoned();
                 }
             }
             GateOutcome::Prompt | GateOutcome::Stay => {}
@@ -155,12 +158,11 @@ impl Viewer {
 
     /// Called when a manual project save finishes; resumes the action that was waiting for it.
     pub(crate) fn unsaved_gate_save_finished(&mut self, succeeded: bool) {
-        if !self.document_state.shell.unsaved_gate.awaiting_save() {
+        if !self.shell.unsaved_gate.awaiting_save() {
             return;
         }
         let still_dirty = self.document_state.is_dirty();
         if let GateOutcome::Proceed(action) = self
-            .document_state
             .shell
             .unsaved_gate
             .save_finished(succeeded, still_dirty)
@@ -187,12 +189,7 @@ impl Viewer {
     /// One step of a continuous navigation gesture happened in the active panel.
     pub(crate) fn note_navigation_gesture(&mut self) {
         let panel = self.panels.active().id;
-        if let Some(previous) = self
-            .document_state
-            .shell
-            .navigation_gesture
-            .touch(panel, Instant::now())
-        {
+        if let Some(previous) = self.shell.navigation_gesture.touch(panel, Instant::now()) {
             self.record_panel_navigation(previous);
         }
     }
@@ -200,7 +197,7 @@ impl Viewer {
     /// Records the pending gesture, if any, as one history entry and one recent locus. Called
     /// before every discrete navigation so the gesture's end point is not lost.
     pub(crate) fn commit_navigation_gesture(&mut self) {
-        if let Some(panel) = self.document_state.shell.navigation_gesture.take() {
+        if let Some(panel) = self.shell.navigation_gesture.take() {
             self.record_panel_navigation(panel);
         }
     }
@@ -208,7 +205,7 @@ impl Viewer {
     /// The pointer or key driving the gesture was released.
     pub(crate) fn end_navigation_gesture(&mut self) {
         let now = Instant::now();
-        self.document_state.shell.navigation_gesture.end_now(now);
+        self.shell.navigation_gesture.end_now(now);
         self.commit_due_navigation_gesture(now);
     }
 
@@ -217,7 +214,6 @@ impl Viewer {
             || self.horizontal_overview_drag.is_some()
             || self.overview_capture.is_some();
         if let Some(panel) = self
-            .document_state
             .shell
             .navigation_gesture
             .take_due(now, pointer_gesture_active)
@@ -227,7 +223,7 @@ impl Viewer {
     }
 
     pub(crate) fn navigation_gesture_deadline(&self) -> Option<Instant> {
-        self.document_state.shell.navigation_gesture.deadline()
+        self.shell.navigation_gesture.deadline()
     }
 
     fn record_panel_navigation(&mut self, panel_id: PanelId) {
@@ -235,7 +231,7 @@ impl Viewer {
             return;
         };
         let interval = panel.viewport.interval();
-        panel.navigation_history.visit(interval);
+        panel.visit_history(interval);
         let locus = format!(
             "{}:{}-{}",
             panel.contig_name,
@@ -311,19 +307,16 @@ impl Viewer {
     /// worker events for a removed track may still be in flight.
     pub(crate) fn allocate_track_id(&mut self) -> TrackId {
         let largest_live = self.largest_live_track_id();
-        self.document_state.shell.track_ids.allocate(largest_live)
+        self.shell.track_ids.allocate(largest_live)
     }
 
     /// First id of a caller-numbered block; `reserve_track_ids_through` records its end.
     pub(crate) fn peek_track_id(&self) -> Option<u64> {
-        self.document_state
-            .shell
-            .track_ids
-            .peek(self.largest_live_track_id())
+        self.shell.track_ids.peek(self.largest_live_track_id())
     }
 
     pub(crate) fn reserve_track_ids_through(&mut self, id: u64) {
-        self.document_state.shell.track_ids.reserve_through(id);
+        self.shell.track_ids.reserve_through(id);
     }
 
     // ----- Notifications (APP-7) -------------------------------------------------------------
@@ -332,11 +325,20 @@ impl Viewer {
     /// later progress message cannot overwrite it.
     pub(crate) fn report_error(&mut self, message: impl Into<String>) {
         let message = message.into();
-        self.document_state.shell.notifications.push_reported(
-            NotificationSeverity::Error,
-            None,
-            &message,
-        );
+        self.shell
+            .notifications
+            .push_reported(NotificationSeverity::Error, None, &message);
+        self.data_status = message;
+        self.window.request_redraw();
+    }
+
+    /// Reports something the user should know that is not a failure: shown on the status line
+    /// and kept in the notification log as a warning.
+    pub(crate) fn report_warning(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.shell
+            .notifications
+            .push_reported(NotificationSeverity::Warning, None, &message);
         self.data_status = message;
         self.window.request_redraw();
     }
@@ -345,11 +347,9 @@ impl Viewer {
     /// status line. Used for failures in panels other than the active one, which previously
     /// left no trace at all.
     pub(crate) fn log_track_error(&mut self, track: Option<TrackId>, message: &str) {
-        self.document_state.shell.notifications.push_reported(
-            NotificationSeverity::Error,
-            track,
-            message,
-        );
+        self.shell
+            .notifications
+            .push_reported(NotificationSeverity::Error, track, message);
         self.window.request_redraw();
     }
 
@@ -357,12 +357,7 @@ impl Viewer {
     /// Called after every batch of work that may have written `data_status`, so failures from
     /// call sites that only set the status text are still retained.
     pub(crate) fn capture_status_notification(&mut self) {
-        if self
-            .document_state
-            .shell
-            .notifications
-            .observe_status(&self.data_status)
-        {
+        if self.shell.notifications.observe_status(&self.data_status) {
             self.window.request_redraw();
         }
     }
@@ -378,6 +373,11 @@ mod tests {
         assert!(search_popup_visible(" TP53 ", "tp53", true));
         assert!(!search_popup_visible("TP5", "tp53", true), "stale results");
         assert!(!search_popup_visible("chr1:1-2", "chr1:1-2", true));
+        assert!(search_popup_visible(
+            "chr1:12345:A:G",
+            "chr1:12345:a:g",
+            true
+        ));
         assert!(!search_popup_visible("  ", "", true));
     }
 }

@@ -93,6 +93,26 @@ impl AutomationBatch {
         Ok(())
     }
 
+    /// Refuses remote sources a control client may not make the viewer fetch
+    /// (see [`check_automation_remote_url`]). Local sources are covered by
+    /// [`Self::resolve_paths_within`].
+    pub fn check_remote_sources(&self, allow_private_network: bool) -> Result<(), AutomationError> {
+        for command in &self.commands {
+            if let AutomationCommand::SetGenome {
+                source: TrackSource::Remote { url },
+                ..
+            }
+            | AutomationCommand::LoadTrack {
+                source: TrackSource::Remote { url },
+                ..
+            } = command
+            {
+                check_automation_remote_url(url, allow_private_network)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), AutomationError> {
         if !(MINIMUM_AUTOMATION_SCHEMA_VERSION..=AUTOMATION_SCHEMA_VERSION)
             .contains(&self.schema_version)
@@ -542,22 +562,7 @@ impl AutomationCommand {
 
     fn resolve_paths_within(&mut self, root: &ControlRoot<'_>) -> Result<(), AutomationError> {
         let resolve = |value: &mut String| -> Result<(), AutomationError> {
-            let path = Path::new(value);
-            let outside = || AutomationError::PathOutsideControlRoot(path.display().to_string());
-            let candidate = if path.is_relative() {
-                root.lexical.join(path)
-            } else {
-                path.to_owned()
-            };
-            let resolved = normalize_automation_path(&candidate);
-            // A lexical prefix test is defeated by a symbolic link inside the
-            // root (and wrongly refuses the root's own real spelling), so the
-            // real location is what must lie inside the real root.
-            let real = real_automation_path(&resolved).map_err(|_| outside())?;
-            if !real.starts_with(root.real) {
-                return Err(outside());
-            }
-            *value = resolved.display().to_string();
+            *value = root.contain(value)?.display().to_string();
             Ok(())
         };
         match self {
@@ -1944,10 +1949,143 @@ pub struct AutomationAlignmentSearchResult {
     pub truncated: bool,
 }
 
+/// Checks a URL that automation asked the viewer to fetch.
+///
+/// A control client is confined to a filesystem root; without this it could
+/// still use the viewer as a proxy to read `file:` URLs or services that only
+/// the user's machine or network can reach. Only `http` and `https` are
+/// accepted, and, unless `allow_private_network` is set (the
+/// `--control-allow-private-urls` launch flag), the host may not be
+/// `localhost` or a loopback, private, link-local, shared-address-space or
+/// unspecified address literal. Host names are not resolved here.
+pub fn check_automation_remote_url(
+    url: &str,
+    allow_private_network: bool,
+) -> Result<(), AutomationError> {
+    let refused = |reason: &str| AutomationError::RemoteSourceRefused {
+        url: crate::TrackSource::Remote {
+            url: url.to_owned(),
+        }
+        .redacted_label(),
+        reason: reason.to_owned(),
+    };
+    let parsed = url::Url::parse(url).map_err(|_| refused("it is not a valid URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(refused("only http and https URLs are accepted"));
+    }
+    if allow_private_network {
+        return Ok(());
+    }
+    let private = match parsed.host() {
+        None => return Err(refused("it has no host")),
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        Some(url::Host::Ipv4(address)) => ipv4_is_private_network(address),
+        Some(url::Host::Ipv6(address)) => {
+            let segments = address.segments();
+            address.is_loopback()
+                || address.is_unspecified()
+                // Unique local fc00::/7 and link-local fe80::/10.
+                || segments[0] & 0xfe00 == 0xfc00
+                || segments[0] & 0xffc0 == 0xfe80
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(ipv4_is_private_network)
+        }
+    };
+    if private {
+        return Err(refused(
+            "loopback, link-local and private-network addresses are not reachable from \
+             automation unless RGV was started with --control-allow-private-urls",
+        ));
+    }
+    Ok(())
+}
+
+fn ipv4_is_private_network(address: std::net::Ipv4Addr) -> bool {
+    let octets = address.octets();
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_broadcast()
+        // Shared address space 100.64.0.0/10.
+        || (octets[0] == 100 && octets[1] & 0xc0 == 64)
+}
+
+/// Applies the control-root rules to every source a project names, for a
+/// project opened by a control client: local sources must really lie inside
+/// `root` (symbolic links resolved, as in
+/// [`AutomationBatch::resolve_paths_within`]) and remote ones must pass
+/// [`check_automation_remote_url`]. Relative local sources must already have
+/// been resolved against the project's directory, as `SessionDocument::read`
+/// does.
+pub fn check_session_sources_within(
+    document: &crate::SessionDocument,
+    root: impl AsRef<Path>,
+    allow_private_network: bool,
+) -> Result<(), AutomationError> {
+    let root = normalize_automation_path(&std::path::absolute(root)?);
+    let real_root = real_automation_path(&root)?;
+    let roots = ControlRoot {
+        lexical: &root,
+        real: &real_root,
+    };
+    let sources = document
+        .reference
+        .iter()
+        .chain(&document.cytobands)
+        .chain(document.alignment_tracks.iter().map(|track| &track.source))
+        .chain(document.tracks.iter().map(|track| &track.source));
+    for source in sources {
+        match source {
+            TrackSource::Local { path } => {
+                roots.contain(path)?;
+            }
+            TrackSource::Remote { url } => check_automation_remote_url(url, allow_private_network)?,
+        }
+    }
+    let index_urls = document.remote_reference_index_url.iter().chain(
+        document
+            .alignment_tracks
+            .iter()
+            .filter_map(|track| track.remote_index_url.as_ref()),
+    );
+    for url in index_urls {
+        check_automation_remote_url(url, allow_private_network)?;
+    }
+    Ok(())
+}
+
 /// A control root as the caller named it and as the filesystem resolves it.
 struct ControlRoot<'a> {
     lexical: &'a Path,
     real: &'a Path,
+}
+
+impl ControlRoot<'_> {
+    /// The lexical absolute form of `value` under the root, provided its real
+    /// location is inside the real root.
+    fn contain(&self, value: &str) -> Result<PathBuf, AutomationError> {
+        let path = Path::new(value);
+        let outside = || AutomationError::PathOutsideControlRoot(path.display().to_string());
+        let candidate = if path.is_relative() {
+            self.lexical.join(path)
+        } else {
+            path.to_owned()
+        };
+        let resolved = normalize_automation_path(&candidate);
+        // A lexical prefix test is defeated by a symbolic link inside the
+        // root (and wrongly refuses the root's own real spelling), so the
+        // real location is what must lie inside the real root.
+        let real = real_automation_path(&resolved).map_err(|_| outside())?;
+        if !real.starts_with(self.real) {
+            return Err(outside());
+        }
+        Ok(resolved)
+    }
 }
 
 /// Resolves symbolic links in the deepest existing ancestor of an absolute,
@@ -2405,6 +2543,8 @@ pub enum AutomationError {
     InvalidCommand { index: usize, reason: String },
     #[error("automation path {0} is outside the selected local-control root")]
     PathOutsideControlRoot(String),
+    #[error("automation may not open {url}: {reason}")]
+    RemoteSourceRefused { url: String, reason: String },
 }
 
 #[cfg(test)]
@@ -3257,5 +3397,179 @@ mod tests {
             batch.commands.last(),
             Some(AutomationCommand::Exit)
         ));
+    }
+
+    #[test]
+    fn automation_remote_urls_are_http_only_and_not_private_network_literals() {
+        for accepted in [
+            "https://example.org/reads.bam",
+            "http://data.example.org:8080/a.bw",
+            "https://8.8.8.8/x.bam",
+            "https://[2001:db8::1]/x.bam",
+            "https://100.128.0.1/x.bam",
+        ] {
+            assert!(
+                check_automation_remote_url(accepted, false).is_ok(),
+                "{accepted}"
+            );
+        }
+        for scheme in [
+            "file:///etc/passwd",
+            "ftp://example.org/a.bam",
+            "s3://bucket/a.bam",
+            "gopher://example.org/",
+            "not a url",
+        ] {
+            // The scheme rule holds even when private addresses are allowed.
+            assert!(
+                check_automation_remote_url(scheme, false).is_err(),
+                "{scheme}"
+            );
+            assert!(
+                check_automation_remote_url(scheme, true).is_err(),
+                "{scheme}"
+            );
+        }
+        for private in [
+            "http://localhost:9000/a.bam",
+            "http://LOCALHOST./a.bam",
+            "http://api.localhost/a.bam",
+            "http://127.0.0.1/a.bam",
+            "http://127.8.9.10/a.bam",
+            "http://10.1.2.3/a.bam",
+            "http://172.16.0.1/a.bam",
+            "http://192.168.1.1/a.bam",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.64.0.1/a.bam",
+            "http://0.0.0.0/a.bam",
+            "http://[::1]/a.bam",
+            "http://[fe80::1]/a.bam",
+            "http://[fd00::1]/a.bam",
+            "http://[::ffff:127.0.0.1]/a.bam",
+            "http://[::ffff:10.0.0.1]/a.bam",
+            // Alternative spellings of 127.0.0.1 that URL parsing canonicalises.
+            "http://2130706433/a.bam",
+            "http://0x7f.1/a.bam",
+        ] {
+            assert!(
+                matches!(
+                    check_automation_remote_url(private, false),
+                    Err(AutomationError::RemoteSourceRefused { .. })
+                ),
+                "{private}"
+            );
+            assert!(
+                check_automation_remote_url(private, true).is_ok(),
+                "{private}"
+            );
+        }
+        // Credentials never reach the error text.
+        let error = check_automation_remote_url("http://user:hunter2@127.0.0.1/a.bam", false)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("hunter2"), "{error}");
+    }
+
+    #[test]
+    fn control_batches_cannot_load_refused_remote_sources() {
+        let batch = |url: &str| AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![
+                AutomationCommand::DescribeWorkspace,
+                AutomationCommand::LoadTrack {
+                    source: TrackSource::Remote {
+                        url: url.to_owned(),
+                    },
+                    kind: Some(TrackKind::Alignment),
+                    name: None,
+                },
+            ],
+        };
+        assert!(
+            batch("https://example.org/a.bam")
+                .check_remote_sources(false)
+                .is_ok()
+        );
+        assert!(
+            batch("http://127.0.0.1:8000/a.bam")
+                .check_remote_sources(false)
+                .is_err()
+        );
+        assert!(
+            batch("http://127.0.0.1:8000/a.bam")
+                .check_remote_sources(true)
+                .is_ok()
+        );
+        assert!(
+            batch("file:///tmp/a.bam")
+                .check_remote_sources(true)
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sources_named_by_a_control_opened_project_obey_the_control_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("allowed");
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(root.join("reads.bam"), b"inside").unwrap();
+        std::fs::write(outside.join("private.bam"), b"secret").unwrap();
+        symlink(outside.join("private.bam"), root.join("linked.bam")).unwrap();
+
+        let project = |source: TrackSource| {
+            let mut document = crate::SessionDocument::new(crate::SessionLocus {
+                contig: "chr1".to_owned(),
+                start: 0,
+                end: 100,
+            });
+            document.reference = Some(source);
+            document
+        };
+        let local = |path: &Path| TrackSource::Local {
+            path: path.display().to_string(),
+        };
+        let remote = |url: &str| TrackSource::Remote {
+            url: url.to_owned(),
+        };
+        let check = |document: &crate::SessionDocument| {
+            check_session_sources_within(document, &root, false)
+        };
+
+        assert!(check(&project(local(&root.join("reads.bam")))).is_ok());
+        // A source that does not exist yet is judged by where it would be.
+        assert!(check(&project(local(&root.join("missing.bam")))).is_ok());
+        assert!(check(&project(remote("https://example.org/ref.fa"))).is_ok());
+        for refused in [
+            local(&outside.join("private.bam")),
+            // Inside the root by name, outside it in fact.
+            local(&root.join("linked.bam")),
+            local(&root.join("../outside/private.bam")),
+        ] {
+            assert!(
+                matches!(
+                    check(&project(refused.clone())),
+                    Err(AutomationError::PathOutsideControlRoot(_))
+                ),
+                "{refused:?}"
+            );
+        }
+        assert!(matches!(
+            check(&project(remote("http://169.254.169.254/latest/"))),
+            Err(AutomationError::RemoteSourceRefused { .. })
+        ));
+
+        // Every source-bearing field is covered, not only the reference.
+        let mut document = project(local(&root.join("reads.bam")));
+        document.cytobands = Some(local(&outside.join("private.bam")));
+        assert!(check(&document).is_err());
+        let mut document = project(local(&root.join("reads.bam")));
+        document.remote_reference_index_url = Some("http://10.0.0.1/ref.fa.fai".to_owned());
+        assert!(check(&document).is_err());
+        assert!(check_session_sources_within(&document, &root, true).is_ok());
     }
 }

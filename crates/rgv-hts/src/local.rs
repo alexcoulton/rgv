@@ -625,6 +625,17 @@ pub fn derive_alignment_query_with_summary_index_and_phase(
     ))
 }
 
+/// Builds the dictionary of an alignment or reference header.
+///
+/// A contig name that occurs twice is an error rather than a silently shadowed entry: records
+/// and regions are resolved by name, so the second contig could never be reached by its name
+/// and everything addressed to it would be attributed to the first.
+pub(crate) fn header_reference_dictionary(
+    contigs: impl IntoIterator<Item = (String, u64)>,
+) -> Result<ReferenceDictionary, AlignmentError> {
+    Ok(ReferenceDictionary::try_from_contigs(contigs)?)
+}
+
 fn duration_micros(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -994,12 +1005,12 @@ impl LocalAlignmentSource {
         let header = reader.header();
         let metadata = Arc::new(alignment_header_metadata_from_sam(header.as_bytes()));
         let dictionary =
-            ReferenceDictionary::from_contigs(header.target_names().into_iter().enumerate().map(
+            header_reference_dictionary(header.target_names().into_iter().enumerate().map(
                 |(index, name)| {
                     let length = header.target_len(index as u32).unwrap_or_default();
                     (String::from_utf8_lossy(name).into_owned(), length)
                 },
-            ));
+            ))?;
         let index_overview =
             load_local_alignment_index_overview(path, options.index_path.as_deref(), &dictionary);
         let (source_stamp, source_guard) = if remote_url.is_none() {
@@ -1920,6 +1931,8 @@ pub enum AlignmentError {
     InvalidFastaIndex(String),
     #[error("invalid CRAM index: {0}")]
     InvalidCramIndex(String),
+    #[error("the header names contig {} more than once", .0.name)]
+    DuplicateContig(#[from] rgv_core::DuplicateContigError),
     #[error("reference interval {contig}:{start}-{end} exceeds contig length {length}")]
     ReferenceIntervalOutOfBounds {
         contig: String,
@@ -1934,6 +1947,60 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn a_header_naming_a_contig_twice_is_rejected() {
+        let duplicated = [
+            ("chr1".to_owned(), 1_000),
+            ("chr2".to_owned(), 500),
+            ("chr1".to_owned(), 2_000),
+        ];
+        let error = header_reference_dictionary(duplicated).unwrap_err();
+        assert!(
+            matches!(&error, AlignmentError::DuplicateContig(duplicate) if duplicate.name == "chr1"),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "the header names contig chr1 more than once"
+        );
+
+        let distinct =
+            header_reference_dictionary([("chr1".to_owned(), 1_000), ("chr2".to_owned(), 500)])
+                .unwrap();
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(distinct.id_by_name("chr2"), Some(ContigId::new(1)));
+    }
+
+    #[test]
+    fn opening_a_bam_whose_reference_list_repeats_a_name_fails() {
+        use std::io::Write as _;
+
+        // A BAM with no header text and a binary reference list `chr1` (1000), `chr1` (2000).
+        let mut header = b"BAM\x01".to_vec();
+        header.extend_from_slice(&0_u32.to_le_bytes());
+        header.extend_from_slice(&2_u32.to_le_bytes());
+        for length in [1_000_u32, 2_000] {
+            header.extend_from_slice(&5_u32.to_le_bytes());
+            header.extend_from_slice(b"chr1\0");
+            header.extend_from_slice(&length.to_le_bytes());
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duplicate.bam");
+        let mut writer = rust_htslib::bgzf::Writer::from_path(&path).unwrap();
+        writer.write_all(&header).unwrap();
+        drop(writer);
+        let index = PathBuf::from(format!("{}.bai", path.display()));
+        bam::index::build(&path, Some(&index), bam::index::Type::Bai, 1).unwrap();
+
+        let error = LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default())
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&error, AlignmentError::DuplicateContig(duplicate) if duplicate.name == "chr1"),
+            "{error:?}"
+        );
+    }
 
     fn write_placed_unmapped_fixture(path: &Path) {
         use rust_htslib::bam::{

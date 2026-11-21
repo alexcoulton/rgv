@@ -4,7 +4,7 @@ pub(crate) mod auxiliary;
 mod auxiliary_lanes;
 mod genomic_pass;
 pub(crate) mod hit_test;
-mod reference_lanes;
+pub(crate) mod reference_lanes;
 
 use super::*;
 use genomic_pass::GenomicDisplayPass;
@@ -1536,6 +1536,20 @@ impl Viewer {
             Some(rectangle_slab_key),
             self.context_lane_gpu_budget_bytes,
         );
+        // REND-14: an over-budget display list is drawn truncated. Say so
+        // once when that starts, not on every frame it persists.
+        if let Some(message) = self.shell.dropped_rectangles.observe(
+            self.rectangle_renderer.dropped_rectangles(),
+            RectangleRenderer::maximum_rectangles_per_frame(),
+        ) {
+            tracing::warn!(%message, "generic rectangle renderer dropped primitives");
+            self.shell.notifications.push(
+                app::shell_state::NotificationSeverity::Warning,
+                None,
+                message,
+            );
+            self.window.request_redraw();
+        }
         // A newly admitted slab becomes part of the next decoded/layout
         // allowance immediately rather than waiting for another interaction.
         self.refresh_alignment_scene_budget();
@@ -1672,10 +1686,10 @@ impl Viewer {
                 )
             }
             Err(ContextSceneGpuCameraCaptureError::InvalidCamera { key }) => {
-                self.data_status = format!(
+                self.report_error(format!(
                     "Could not capture contextual lane {} camera state",
                     key.lane
-                );
+                ));
                 return;
             }
         };

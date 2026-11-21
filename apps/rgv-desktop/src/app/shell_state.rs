@@ -2,10 +2,10 @@
 //! unsaved-changes gate, per-gesture history commits, wheel/trackpad interpretation, the
 //! notification log, track-id allocation and autosave bookkeeping.
 //!
-//! `ShellState` is owned by `DocumentState` so that it is constructed with the document identity.
+//! `ShellState` is a field of `Viewer` (`Viewer::shell`).
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rgv_core::{PanelId, TrackId};
@@ -82,7 +82,10 @@ pub(crate) const fn escape_action(context: EscapeContext) -> EscapeAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum GuardedAction {
     Exit,
-    LoadSession { path: PathBuf, kind: SessionLoadKind },
+    LoadSession {
+        path: PathBuf,
+        kind: SessionLoadKind,
+    },
 }
 
 impl GuardedAction {
@@ -229,7 +232,11 @@ impl NavigationGestureCommit {
 
     /// Takes the panel to commit when the quiet period has elapsed and no pointer gesture is
     /// still being held.
-    pub(crate) fn take_due(&mut self, now: Instant, pointer_gesture_active: bool) -> Option<PanelId> {
+    pub(crate) fn take_due(
+        &mut self,
+        now: Instant,
+        pointer_gesture_active: bool,
+    ) -> Option<PanelId> {
         match self.pending {
             Some((panel, deadline)) if !pointer_gesture_active && deadline <= now => {
                 self.pending = None;
@@ -258,11 +265,17 @@ const ZOOM_STEP_FACTOR: f64 = 0.85;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ScrollIntent {
     /// Multiply the visible span by this factor around the cursor.
-    Zoom { factor: f64 },
+    Zoom {
+        factor: f64,
+    },
     /// Pan the viewport by this many logical points (positive moves towards higher coordinates).
-    Pan { points: f64 },
+    Pan {
+        points: f64,
+    },
     /// Scroll the track stack under the cursor by this many logical points.
-    ScrollTracks { points: f32 },
+    ScrollTracks {
+        points: f32,
+    },
     Ignore,
 }
 
@@ -627,6 +640,147 @@ pub(crate) fn next_wake(
         .min()
 }
 
+/// [`crate::Viewer::report_error`] for call sites that hold a borrow of another `Viewer` field
+/// and so cannot call a `&mut self` method: logs the failure and shows it on the status line.
+pub(crate) fn report_error_to(
+    notifications: &mut NotificationLog,
+    data_status: &mut String,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    notifications.push_reported(NotificationSeverity::Error, None, &message);
+    *data_status = message;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Incomplete-frame reporting (REND-14)
+// ---------------------------------------------------------------------------------------------
+
+/// Turns the renderer's per-frame dropped-rectangle count into one notification per episode:
+/// reported when frames start being incomplete, silent while they stay so, re-armed once a
+/// complete frame is drawn.
+#[derive(Debug, Default)]
+pub(crate) struct DroppedRectangleReporter {
+    dropping: bool,
+}
+
+impl DroppedRectangleReporter {
+    /// `dropped` rectangles of the frame just prepared could not be drawn; the renderer draws at
+    /// most `maximum` per frame. Returns the message to log on the transition into dropping.
+    pub(crate) fn observe(&mut self, dropped: usize, maximum: usize) -> Option<String> {
+        let was_dropping = std::mem::replace(&mut self.dropping, dropped > 0);
+        (dropped > 0 && !was_dropping).then(|| {
+            format!(
+                "The view is incomplete: {dropped} annotation and overlay marks exceed the \
+                 {maximum} the renderer draws per frame and were left out. Zoom in, or hide or \
+                 collapse dense tracks, to see everything."
+            )
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Skipped input lines
+// ---------------------------------------------------------------------------------------------
+
+/// Reports a text track's skipped (malformed) lines once per track load. Indexed sources keep
+/// counting as queries meet more of the file, so later, larger counts for the same track are
+/// not reported again.
+#[derive(Debug, Default)]
+pub(crate) struct SkippedLineReporter {
+    reported: std::collections::BTreeSet<TrackId>,
+}
+
+impl SkippedLineReporter {
+    /// `malformed_lines` were skipped in `track` so far; `first` is the one-based line number
+    /// and parse error of the first. Returns the warning to log the first time a track reports
+    /// any.
+    pub(crate) fn observe(
+        &mut self,
+        track: TrackId,
+        track_name: &str,
+        malformed_lines: usize,
+        first: Option<&(usize, String)>,
+    ) -> Option<String> {
+        if malformed_lines == 0 || !self.reported.insert(track) {
+            return None;
+        }
+        let lines = if malformed_lines == 1 {
+            "line"
+        } else {
+            "lines"
+        };
+        Some(match first {
+            Some((line, error)) => format!(
+                "{track_name}: {malformed_lines} malformed {lines} skipped, first at line {line} \
+                 ({error})"
+            ),
+            None => format!("{track_name}: {malformed_lines} malformed {lines} skipped"),
+        })
+    }
+
+    /// Forget every track: the engine (and with it every track load) was replaced.
+    pub(crate) fn reset(&mut self) {
+        self.reported.clear();
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Newer-writer overwrite guard (CORE-9)
+// ---------------------------------------------------------------------------------------------
+
+/// What a save must do about a project that a newer RGV wrote.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum NewerWriterSave {
+    /// Nothing to warn about: save.
+    Proceed,
+    /// The save would discard the newer RGV's settings and the user has not yet been told.
+    /// Show `warning` first; asking again proceeds.
+    ConfirmFirst { warning: String },
+}
+
+/// Remembers that the open project was read from a file written by a newer RGV, so the first
+/// save back over that file is held until the data-loss warning has been shown.
+#[derive(Debug, Default)]
+pub(crate) struct NewerWriterGuard {
+    armed: Option<(PathBuf, String)>,
+}
+
+impl NewerWriterGuard {
+    /// Call when a project replaces the workspace. `origin` is the file it was read from when a
+    /// plain save would go back to it; `notice` is the document's newer-writer notice.
+    pub(crate) fn project_opened(&mut self, origin: Option<&Path>, notice: Option<&str>) {
+        self.armed = origin
+            .zip(notice)
+            .map(|(origin, notice)| (origin.to_owned(), notice.to_owned()));
+    }
+
+    /// Decides a save to `destination`. `same_file` compares two destinations. A warning is
+    /// issued once: the repeated request is the user's confirmation.
+    pub(crate) fn before_save(
+        &mut self,
+        destination: &Path,
+        same_file: impl Fn(&Path, &Path) -> bool,
+    ) -> NewerWriterSave {
+        match self.armed.take() {
+            Some((origin, notice)) if same_file(&origin, destination) => {
+                NewerWriterSave::ConfirmFirst {
+                    warning: format!(
+                        "{notice} Save again to overwrite {}, or use Save project as… to keep \
+                         the original.",
+                        destination.display()
+                    ),
+                }
+            }
+            // Saving elsewhere leaves the original intact and the guard armed.
+            armed => {
+                self.armed = armed;
+                NewerWriterSave::Proceed
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Aggregate
 // ---------------------------------------------------------------------------------------------
@@ -639,12 +793,98 @@ pub(crate) struct ShellState {
     pub(crate) notifications_open: bool,
     pub(crate) track_ids: TrackIdAllocator,
     pub(crate) last_autosaved: Option<AutosaveMarker>,
+    pub(crate) newer_writer_guard: NewerWriterGuard,
+    pub(crate) dropped_rectangles: DroppedRectangleReporter,
+    pub(crate) skipped_lines: SkippedLineReporter,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use winit::dpi::PhysicalPosition;
+
+    #[test]
+    fn skipped_lines_are_reported_once_per_track_load() {
+        let (bed, gff) = (TrackId::new(4), TrackId::new(5));
+        let first = (17_usize, "expected 3 columns".to_owned());
+        let mut reporter = SkippedLineReporter::default();
+        assert_eq!(reporter.observe(bed, "peaks.bed", 0, None), None);
+        assert_eq!(
+            reporter
+                .observe(bed, "peaks.bed", 3, Some(&first))
+                .as_deref(),
+            Some("peaks.bed: 3 malformed lines skipped, first at line 17 (expected 3 columns)")
+        );
+        // Later events, and a count that grows as an indexed source is queried, stay silent.
+        assert_eq!(reporter.observe(bed, "peaks.bed", 3, Some(&first)), None);
+        assert_eq!(reporter.observe(bed, "peaks.bed", 40, Some(&first)), None);
+        // Another track reports for itself.
+        assert_eq!(
+            reporter.observe(gff, "genes.gff", 1, None).as_deref(),
+            Some("genes.gff: 1 malformed line skipped")
+        );
+        // Replacing the engine starts every track load afresh. (Track ids are never reused
+        // within one engine's lifetime, so a re-added track has a new id.)
+        reporter.reset();
+        assert!(
+            reporter
+                .observe(bed, "peaks.bed", 3, Some(&first))
+                .is_some()
+        );
+        assert!(reporter.observe(gff, "genes.gff", 1, None).is_some());
+    }
+
+    #[test]
+    fn dropped_rectangles_are_reported_once_per_episode() {
+        let mut reporter = DroppedRectangleReporter::default();
+        assert_eq!(reporter.observe(0, 1_000), None);
+        let message = reporter
+            .observe(250, 1_000)
+            .expect("entering the dropping state reports");
+        assert!(
+            message.contains("250") && message.contains("1000"),
+            "{message}"
+        );
+        // Every following incomplete frame is silent, whatever its count.
+        assert_eq!(reporter.observe(250, 1_000), None);
+        assert_eq!(reporter.observe(9_000, 1_000), None);
+        // A complete frame re-arms the report.
+        assert_eq!(reporter.observe(0, 1_000), None);
+        assert!(reporter.observe(1, 1_000).is_some());
+    }
+
+    #[test]
+    fn the_newer_writer_warning_is_shown_before_the_original_is_overwritten() {
+        let same = |left: &Path, right: &Path| left == right;
+        let origin = Path::new("/projects/study.rgv.json");
+        let notice = "This project was written by a newer RGV (rgv 9.9.9). Settings … lost.";
+        let mut guard = NewerWriterGuard::default();
+        assert_eq!(guard.before_save(origin, same), NewerWriterSave::Proceed);
+
+        guard.project_opened(Some(origin), Some(notice));
+        // Saving a copy elsewhere is harmless and does not use up the warning.
+        assert_eq!(
+            guard.before_save(Path::new("/projects/copy.rgv.json"), same),
+            NewerWriterSave::Proceed
+        );
+        let NewerWriterSave::ConfirmFirst { warning } = guard.before_save(origin, same) else {
+            panic!("the first overwrite must be held");
+        };
+        assert!(warning.starts_with(notice), "{warning}");
+        assert!(warning.contains("Save again to overwrite /projects/study.rgv.json"));
+        // The repeated request is the confirmation.
+        assert_eq!(guard.before_save(origin, same), NewerWriterSave::Proceed);
+
+        // A project from this version, or one with no file to overwrite, never warns.
+        guard.project_opened(Some(origin), None);
+        assert_eq!(guard.before_save(origin, same), NewerWriterSave::Proceed);
+        guard.project_opened(None, Some(notice));
+        assert_eq!(guard.before_save(origin, same), NewerWriterSave::Proceed);
+        // Opening another project replaces an unconfirmed warning.
+        guard.project_opened(Some(origin), Some(notice));
+        guard.project_opened(Some(Path::new("/other.rgv.json")), None);
+        assert_eq!(guard.before_save(origin, same), NewerWriterSave::Proceed);
+    }
 
     #[test]
     fn escape_never_exits_and_closes_only_the_topmost_transient_surface() {

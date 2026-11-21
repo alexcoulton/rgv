@@ -47,7 +47,7 @@ pub use source_actor::{
 };
 pub use track_engine::{
     TrackEngine, TrackEngineEvent, TrackSearchHit, TrackSearchResults, TrackSnapshot,
-    TrackSnapshotData, TrackSpec, TrackSpecKind,
+    TrackSnapshotData, TrackSourceDiagnostics, TrackSpec, TrackSpecKind,
 };
 
 #[cfg(test)]

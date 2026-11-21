@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     mem::size_of,
     num::{NonZeroU64, NonZeroUsize},
     sync::{
@@ -1593,15 +1593,13 @@ impl AlignmentGpuRenderer {
                 let interaction_buffer_index = if request.interaction.is_empty() {
                     None
                 } else {
-                    let flags = interaction_page_instances(page, request.interaction);
+                    let (flags, active) = interaction_page_instances(page, request.interaction);
                     if flags.len() != instance_count as usize
                         || flags.len() > plan.interaction_capacity
                     {
                         return Err(AlignmentGpuReplacementError::RequestChangedAfterPlan);
                     }
-                    interaction_instances = interaction_instances.saturating_add(
-                        flags.iter().filter(|instance| instance.flags != 0).count(),
-                    );
+                    interaction_instances = interaction_instances.saturating_add(active);
                     let index = u32::try_from(interaction_pages.len())
                         .map_err(|_| AlignmentGpuPrepareError::TooManyOverlayPrimitives)?;
                     interaction_pages.push(flags);
@@ -2146,11 +2144,9 @@ impl AlignmentGpuRenderer {
         let mut resident_pages = 0_usize;
         let mut maximum_instances = 0_usize;
         let mut retained_bytes = 0_usize;
-        for (index, page) in pages.iter().enumerate() {
-            if pages[..index]
-                .iter()
-                .any(|candidate| candidate.key() == page.key())
-            {
+        let mut seen = HashSet::with_capacity(pages.len());
+        for page in pages {
+            if !seen.insert(page.key()) {
                 return Err(AlignmentGpuPageAdmissionError::DuplicatePageKey(page.key()));
             }
             if self.page_index(page.key()).is_some() {
@@ -2348,40 +2344,25 @@ impl AlignmentGpuRenderer {
             })
             .collect::<Result<Vec<_>, AlignmentGpuPrepareError>>()?;
         let mut mandatory_pages = 0_usize;
-        let mut maximum_interactions = 0_usize;
         let mut maximum_page_instances = 0_usize;
         let mut page_cache_hits = 0_usize;
         let mut page_cache_misses = 0_usize;
-        for (request, pages) in requests.iter().zip(&visible_pages) {
-            for page in pages {
-                mandatory_pages = mandatory_pages.saturating_add(1);
-                if self.page_index(page.key()).is_none() {
-                    page_cache_misses = page_cache_misses.saturating_add(1);
-                    continue;
-                }
-                page_cache_hits = page_cache_hits.saturating_add(1);
-                maximum_page_instances = maximum_page_instances.max(non_text_primitive_count(page));
-                if !request.interaction.is_empty() {
-                    maximum_interactions = maximum_interactions.saturating_add(
-                        page.primitives()
-                            .iter()
-                            .filter(|primitive| {
-                                let token = request.interaction.token(primitive.handle);
-                                !matches!(primitive.component, AlignmentComponent::Label { .. })
-                                    && interaction_token_is_active(token)
-                            })
-                            .count(),
-                    );
-                }
+        // Active interaction instances are counted by the single pass which builds the per-page
+        // flag buffers below, rather than by a separate walk of every visible primitive here.
+        for page in visible_pages.iter().flatten() {
+            mandatory_pages = mandatory_pages.saturating_add(1);
+            if self.page_index(page.key()).is_none() {
+                page_cache_misses = page_cache_misses.saturating_add(1);
+                continue;
             }
+            page_cache_hits = page_cache_hits.saturating_add(1);
+            maximum_page_instances = maximum_page_instances.max(non_text_primitive_count(page));
         }
         if page_cache_misses > 0 {
             return Err(AlignmentGpuPrepareError::MissingMandatoryPages {
                 missing: page_cache_misses,
             });
         }
-        u32::try_from(maximum_interactions)
-            .map_err(|_| AlignmentGpuPrepareError::TooManyOverlayPrimitives)?;
         let uniform_bytes = mandatory_pages.saturating_mul(self.camera_stride);
         if mandatory_pages > 0 {
             u32::try_from((mandatory_pages - 1).saturating_mul(self.camera_stride))
@@ -2476,13 +2457,11 @@ impl AlignmentGpuRenderer {
                 let interaction_buffer_index = if request.interaction.is_empty() {
                     None
                 } else {
-                    let flags = interaction_page_instances(page, request.interaction);
+                    let (flags, active) = interaction_page_instances(page, request.interaction);
                     if flags.len() != resident.instance_count as usize {
                         return Err(AlignmentGpuPrepareError::InvalidFrameGeometry);
                     }
-                    interaction_instances = interaction_instances.saturating_add(
-                        flags.iter().filter(|instance| instance.flags != 0).count(),
-                    );
+                    interaction_instances = interaction_instances.saturating_add(active);
                     let index = u32::try_from(interaction_pages.len())
                         .map_err(|_| AlignmentGpuPrepareError::TooManyOverlayPrimitives)?;
                     interaction_pages.push(flags);
@@ -2501,7 +2480,8 @@ impl AlignmentGpuRenderer {
             }
         }
         debug_assert_eq!(page_requests.len(), mandatory_pages);
-        debug_assert_eq!(interaction_instances, maximum_interactions);
+        u32::try_from(interaction_instances)
+            .map_err(|_| AlignmentGpuPrepareError::TooManyOverlayPrimitives)?;
 
         let mut uniforms = vec![0_u8; uniform_bytes];
         let mut draws = Vec::with_capacity(mandatory_pages);
@@ -3136,6 +3116,7 @@ impl AlignmentGpuRenderer {
         self.page_table_allocation = None;
         self.page_table_capacity = 0;
         self.frame_buffers.clear();
+        self.pending_geometry_uploaded_bytes = 0;
         self.device_generation = self.device_generation.saturating_add(1).max(1);
     }
 
@@ -3945,17 +3926,24 @@ fn interaction_flags(token: rgv_alignment_scene::AlignmentInteractionToken) -> u
         | (u32::from(token.highlighted) << 3)
 }
 
+/// Builds one page's interaction flags and counts its active (non-zero) instances in the same
+/// walk.
 fn interaction_page_instances(
     page: &AlignmentSemanticPage,
     interaction: &AlignmentInteractionState,
-) -> Vec<AlignmentGpuInteractionInstance> {
-    page.primitives()
+) -> (Vec<AlignmentGpuInteractionInstance>, usize) {
+    let mut active = 0_usize;
+    let mut instances = Vec::with_capacity(non_text_primitive_count(page));
+    for primitive in page
+        .primitives()
         .iter()
         .filter(|primitive| !matches!(primitive.component, AlignmentComponent::Label { .. }))
-        .map(|primitive| AlignmentGpuInteractionInstance {
-            flags: interaction_flags(interaction.token(primitive.handle)),
-        })
-        .collect()
+    {
+        let flags = interaction_flags(interaction.token(primitive.handle));
+        active += usize::from(flags != 0);
+        instances.push(AlignmentGpuInteractionInstance { flags });
+    }
+    (instances, active)
 }
 
 pub(crate) fn reference_interaction_color(

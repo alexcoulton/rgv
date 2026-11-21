@@ -621,7 +621,7 @@ impl Viewer {
                 &st.align.bulk_alignment_ids,
             )
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         for (track_id, subtrack) in alignment_subtracks_to_toggle {
             self.toggle_alignment_subtrack(track_id, subtrack);
@@ -647,7 +647,7 @@ impl Viewer {
         if st.lists.metadata_bulk_alignment_settings_requested
             && let Err(error) = self.apply_metadata_bulk_alignment_settings(&metadata_selected)
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         if st.lists.metadata_bulk_auxiliary_appearance_requested
             && apply_compatible_auxiliary_appearance(self.tracks.tracks_mut(), &metadata_selected)
@@ -676,13 +676,13 @@ impl Viewer {
                 Ok(removed) => {
                     self.data_status = format!("Removed {removed} selected tracks");
                 }
-                Err(error) => self.data_status = error.to_string(),
+                Err(error) => self.report_error(error.to_string()),
             }
         }
         if let Some(id) = alignment_track_to_remove
             && let Err(error) = self.remove_alignment_track(id)
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         if let Some((target, action)) = st.alignment_context_action.take() {
             self.apply_alignment_context_action(target, action);

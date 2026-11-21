@@ -256,7 +256,7 @@ impl Viewer {
                         "Built-in landmark bundle {bundle_id} could not be installed: {error}"
                     );
                     self.landmark_catalogue_error = Some(message.clone());
-                    self.data_status = message;
+                    self.report_error(message);
                 }
             }
             rgv_core::AssemblyResolutionStatus::Suggested => {
@@ -300,6 +300,9 @@ impl Viewer {
         Ok(())
     }
 
+    /// Starts installing a built-in landmark bundle. Verifying (SHA-256),
+    /// reading and decoding its assets runs on a worker (APP-3); the context
+    /// is applied by [`Self::finish_landmark_install`] when that completes.
     pub(crate) fn install_builtin_landmark_context(&mut self, bundle_id: &str) -> Result<()> {
         let root = self
             .landmark_resource_root
@@ -309,51 +312,91 @@ impl Viewer {
         let catalogue = self
             .landmark_catalogue
             .as_ref()
-            .context("built-in landmark catalogue is unavailable")?;
-        let bundle = catalogue
-            .bundle(bundle_id)
-            .with_context(|| format!("landmark bundle {bundle_id} is not installed"))?
+            .context("built-in landmark catalogue is unavailable")?
             .clone();
-
-        // Verify the complete compact context before publishing any of it to
-        // the workspace. The optional search index remains failure-isolated.
-        let genes_path =
-            catalogue.verify_asset(&root, bundle_id, LandmarkAssetRole::RepresentativeGenes)?;
-        let aliases_path =
-            catalogue.verify_asset(&root, bundle_id, LandmarkAssetRole::ContigAliases)?;
-        let cytobands_path =
-            catalogue.verify_asset(&root, bundle_id, LandmarkAssetRole::Cytobands)?;
-
-        let alias_text = std::fs::read_to_string(&aliases_path)
-            .with_context(|| format!("failed to read {}", aliases_path.display()))?;
-        let parsed_aliases = rgv_core::parse_landmark_aliases(&alias_text)?;
-        let contig_bindings =
-            landmark_contig_bindings(&bundle, &self.assembly.dictionary, &parsed_aliases)?;
-        let cytoband_text = std::fs::read_to_string(&cytobands_path)
-            .with_context(|| format!("failed to read {}", cytobands_path.display()))?;
-        let cytobands = rgv_core::parse_ucsc_cytobands_with_aliases(
-            &cytoband_text,
-            &self.assembly.dictionary,
-            &contig_bindings.workspace_aliases,
-        )?;
-
-        let search_index = match catalogue.verify_asset(
-            &root,
-            bundle_id,
-            LandmarkAssetRole::GeneSearch,
-        ) {
-            Ok(path) => match read_landmark_search(&path) {
-                Ok(index) => Some(index),
-                Err(error) => {
-                    tracing::warn!(bundle = bundle_id, %error, "landmark search index unavailable");
-                    None
-                }
-            },
-            Err(error) => {
-                tracing::warn!(bundle = bundle_id, %error, "landmark search index unavailable");
-                None
-            }
+        anyhow::ensure!(
+            catalogue.bundle(bundle_id).is_some(),
+            "landmark bundle {bundle_id} is not installed"
+        );
+        self.landmark_install_ticket = self.landmark_install_ticket.saturating_add(1);
+        let request = LandmarkInstallRequest {
+            ticket: self.landmark_install_ticket,
+            bundle_id: bundle_id.to_owned(),
+            dictionary: self.assembly.dictionary.clone(),
         };
+        let worker = std::thread::Builder::new()
+            .name("rgv-landmark-install".to_owned())
+            .spawn({
+                let request = request.clone();
+                move || {
+                    prepare_landmark_context(
+                        &root,
+                        &catalogue,
+                        &request.bundle_id,
+                        &request.dictionary,
+                    )
+                    .map(|prepared| {
+                        crate::workspace::genomes::GenomeTaskOutcome::Landmark(Box::new(prepared))
+                    })
+                    .map_err(|error| format!("{error:#}"))
+                }
+            })
+            .context("could not start the landmark install worker")?;
+        self.genome_tasks
+            .push(crate::workspace::genomes::GenomeTask {
+                label: format!("landmark bundle {bundle_id}"),
+                is_list: false,
+                landmark: Some(request),
+                worker,
+            });
+        Ok(())
+    }
+
+    /// Applies or discards a finished landmark preparation.
+    pub(crate) fn finish_landmark_install(
+        &mut self,
+        request: &LandmarkInstallRequest,
+        outcome: std::result::Result<Box<PreparedLandmarkContext>, String>,
+    ) {
+        let matched_bundle = self
+            .landmark_resolution
+            .as_ref()
+            .filter(|resolution| resolution.status == rgv_core::AssemblyResolutionStatus::Matched)
+            .and_then(|resolution| resolution.bundle_id.as_deref());
+        if !landmark_install_is_current(
+            request,
+            self.landmark_install_ticket,
+            matched_bundle,
+            &self.assembly.dictionary,
+        ) {
+            tracing::debug!(
+                bundle = %request.bundle_id,
+                "discarding a landmark context prepared for a superseded assembly"
+            );
+            return;
+        }
+        let bundle_id = &request.bundle_id;
+        if let Err(error) = outcome
+            .map_err(anyhow::Error::msg)
+            .and_then(|prepared| self.apply_prepared_landmark_context(*prepared))
+        {
+            let message =
+                format!("Built-in landmark bundle {bundle_id} could not be installed: {error}");
+            self.landmark_catalogue_error = Some(message.clone());
+            self.report_error(message);
+        }
+    }
+
+    fn apply_prepared_landmark_context(&mut self, prepared: PreparedLandmarkContext) -> Result<()> {
+        let PreparedLandmarkContext {
+            bundle,
+            genes_path,
+            cytobands_path,
+            contig_bindings,
+            cytobands,
+            search_index,
+        } = prepared;
+        let bundle_id = bundle.id.as_str();
 
         let has_equivalent = self.tracks.tracks().iter().any(|track| {
             track.built_in.as_ref().is_some_and(|identity| {
@@ -428,6 +471,7 @@ impl Viewer {
             None
         };
         self.refresh_active_panel_context();
+        self.retry_imported_feature_search();
         if added_track.is_some() {
             self.request_all_panel_queries();
         } else {
@@ -632,6 +676,97 @@ impl Viewer {
         self.data_status = format!("Opened landmark resources at {}", root.display());
         Ok(())
     }
+}
+
+/// Identifies what a landmark preparation was computed for.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LandmarkInstallRequest {
+    pub(crate) ticket: u64,
+    pub(crate) bundle_id: String,
+    /// The workspace dictionary the contig bindings and cytobands were bound to.
+    pub(crate) dictionary: ReferenceDictionary,
+}
+
+/// Whether a finished preparation may still be applied. It is stale when a
+/// later install was requested, when the workspace no longer matches that
+/// bundle, or when the assembly dictionary it was bound to has been replaced:
+/// its aliases and cytobands would then name another assembly's contigs.
+pub(crate) fn landmark_install_is_current(
+    request: &LandmarkInstallRequest,
+    latest_ticket: u64,
+    matched_bundle: Option<&str>,
+    dictionary: &ReferenceDictionary,
+) -> bool {
+    request.ticket == latest_ticket
+        && matched_bundle == Some(request.bundle_id.as_str())
+        && *dictionary == request.dictionary
+}
+
+/// A verified, fully decoded landmark bundle, ready to publish.
+#[derive(Debug)]
+pub(crate) struct PreparedLandmarkContext {
+    bundle: rgv_core::GenomeLandmarkBundle,
+    genes_path: PathBuf,
+    cytobands_path: PathBuf,
+    contig_bindings: LandmarkContigBindings,
+    cytobands: Vec<rgv_core::Cytoband>,
+    search_index: Option<LandmarkSearchIndex>,
+}
+
+/// The blocking half of a landmark install: integrity checks, file reads and
+/// the gzip-compressed search index. Touches no workspace state.
+fn prepare_landmark_context(
+    root: &Path,
+    catalogue: &GenomeLandmarkCatalogue,
+    bundle_id: &str,
+    dictionary: &ReferenceDictionary,
+) -> Result<PreparedLandmarkContext> {
+    let bundle = catalogue
+        .bundle(bundle_id)
+        .with_context(|| format!("landmark bundle {bundle_id} is not installed"))?
+        .clone();
+
+    // Verify the complete compact context before publishing any of it to
+    // the workspace. The optional search index remains failure-isolated.
+    let genes_path =
+        catalogue.verify_asset(root, bundle_id, LandmarkAssetRole::RepresentativeGenes)?;
+    let aliases_path = catalogue.verify_asset(root, bundle_id, LandmarkAssetRole::ContigAliases)?;
+    let cytobands_path = catalogue.verify_asset(root, bundle_id, LandmarkAssetRole::Cytobands)?;
+
+    let alias_text = std::fs::read_to_string(&aliases_path)
+        .with_context(|| format!("failed to read {}", aliases_path.display()))?;
+    let parsed_aliases = rgv_core::parse_landmark_aliases(&alias_text)?;
+    let contig_bindings = landmark_contig_bindings(&bundle, dictionary, &parsed_aliases)?;
+    let cytoband_text = std::fs::read_to_string(&cytobands_path)
+        .with_context(|| format!("failed to read {}", cytobands_path.display()))?;
+    let cytobands = rgv_core::parse_ucsc_cytobands_with_aliases(
+        &cytoband_text,
+        dictionary,
+        &contig_bindings.workspace_aliases,
+    )?;
+
+    let search_index = match catalogue.verify_asset(root, bundle_id, LandmarkAssetRole::GeneSearch)
+    {
+        Ok(path) => match read_landmark_search(&path) {
+            Ok(index) => Some(index),
+            Err(error) => {
+                tracing::warn!(bundle = bundle_id, %error, "landmark search index unavailable");
+                None
+            }
+        },
+        Err(error) => {
+            tracing::warn!(bundle = bundle_id, %error, "landmark search index unavailable");
+            None
+        }
+    };
+    Ok(PreparedLandmarkContext {
+        bundle,
+        genes_path,
+        cytobands_path,
+        contig_bindings,
+        cytobands,
+        search_index,
+    })
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -920,6 +1055,47 @@ fn read_landmark_search(path: &Path) -> Result<LandmarkSearchIndex> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn landmark_preparations_for_a_superseded_assembly_are_discarded() {
+        let grch38 = ReferenceDictionary::from_contigs([("chr1".to_owned(), 248_956_422)]);
+        let grch37 = ReferenceDictionary::from_contigs([("1".to_owned(), 249_250_621)]);
+        let request = LandmarkInstallRequest {
+            ticket: 3,
+            bundle_id: "grch38-genes".to_owned(),
+            dictionary: grch38.clone(),
+        };
+        assert!(landmark_install_is_current(
+            &request,
+            3,
+            Some("grch38-genes"),
+            &grch38
+        ));
+        // The assembly changed while the bundle was being verified: its
+        // aliases and cytobands are bound to the old dictionary.
+        assert!(!landmark_install_is_current(
+            &request,
+            3,
+            Some("grch38-genes"),
+            &grch37
+        ));
+        // The workspace now matches another bundle, or none.
+        assert!(!landmark_install_is_current(
+            &request,
+            3,
+            Some("grch37-genes"),
+            &grch38
+        ));
+        assert!(!landmark_install_is_current(&request, 3, None, &grch38));
+        // A later request for the same bundle supersedes this one, so two
+        // completions cannot both add a Genes track.
+        assert!(!landmark_install_is_current(
+            &request,
+            4,
+            Some("grch38-genes"),
+            &grch38
+        ));
+    }
+
     use super::*;
 
     fn raw_hit() -> TrackSearchHit {

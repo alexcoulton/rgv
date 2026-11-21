@@ -1,5 +1,5 @@
 mod commands;
-mod export;
+pub(crate) mod export;
 mod runner;
 
 #[cfg(test)]

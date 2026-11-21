@@ -49,36 +49,34 @@ fn alignment_track_configs_for_launch(
     configured_tracks
 }
 
-/// Health record for the process's GPU device. `Viewer` owns exactly one device at a time; the
-/// record is process-wide so the wgpu callbacks, which outlive any borrow of the viewer, can
-/// reach it. Each (re)created device is registered with [`rgv_render::GpuDeviceHealth::watch`].
-static GPU_DEVICE_HEALTH: std::sync::LazyLock<Arc<rgv_render::GpuDeviceHealth>> =
-    std::sync::LazyLock::new(|| Arc::new(rgv_render::GpuDeviceHealth::new()));
-
-/// Bookkeeping for device recovery and error reporting, so a persistently failing GPU neither
-/// spins the event loop nor floods the notification log.
+/// Bookkeeping for device recovery and error reporting (`Viewer::gpu_recovery`), so a
+/// persistently failing GPU neither spins the event loop nor floods the notification log.
+/// The health record itself is `Viewer::gpu_device_health`: an `Arc` shared with the wgpu
+/// callbacks, which outlive any borrow of the viewer. Each (re)created device is registered
+/// with [`rgv_render::GpuDeviceHealth::watch`].
 #[derive(Debug, Default)]
-struct GpuRecoveryState {
+pub(crate) struct GpuRecoveryState {
     last_attempt: Option<Instant>,
     loss_reported: bool,
     uncaptured_errors_reported: u32,
 }
-
-static GPU_RECOVERY_STATE: std::sync::Mutex<GpuRecoveryState> =
-    std::sync::Mutex::new(GpuRecoveryState {
-        last_attempt: None,
-        loss_reported: false,
-        uncaptured_errors_reported: 0,
-    });
 
 /// Minimum spacing between attempts to recreate a lost GPU device.
 const GPU_RECOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Uncaptured GPU errors shown to the user per device; all of them are always logged.
 const MAX_REPORTED_UNCAPTURED_GPU_ERRORS: u32 = 3;
 
+/// When the event loop must next redraw so that a lost device is retried without waiting for
+/// user input: immediately if no attempt has been made, otherwise one retry interval after
+/// the last one. `None` while the device is healthy.
+fn gpu_recovery_wake(lost: bool, last_attempt: Option<Instant>, now: Instant) -> Option<Instant> {
+    lost.then(|| last_attempt.map_or(now, |last| last + GPU_RECOVERY_RETRY_INTERVAL))
+}
+
 /// Whether enough time has passed since the previous recovery attempt to try again.
 fn gpu_recovery_attempt_is_due(last_attempt: Option<Instant>, now: Instant) -> bool {
-    last_attempt.is_none_or(|last| now.saturating_duration_since(last) >= GPU_RECOVERY_RETRY_INTERVAL)
+    last_attempt
+        .is_none_or(|last| now.saturating_duration_since(last) >= GPU_RECOVERY_RETRY_INTERVAL)
 }
 
 /// One step of the adapter fallback chain.
@@ -147,7 +145,10 @@ fn required_gpu_limits(adapter_limits: wgpu::Limits) -> wgpu::Limits {
 fn choose_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
     // Within each class the surface's own ordering, which is its preference, is kept.
     let first_of = |class: [wgpu::TextureFormat; 2]| {
-        formats.iter().copied().find(|format| class.contains(format))
+        formats
+            .iter()
+            .copied()
+            .find(|format| class.contains(format))
     };
     first_of([
         wgpu::TextureFormat::Bgra8Unorm,
@@ -213,8 +214,12 @@ async fn gpu_adapter_candidates(
 /// Creates the surface for `window` and the first adapter and device in the fallback chain that
 /// can present to it. Honours `WGPU_BACKEND` (and wgpu's other instance variables),
 /// `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF`. The returned device is already watched by
-/// [`GPU_DEVICE_HEALTH`].
-async fn create_gpu_context(window: &Arc<Window>, size: PhysicalSize<u32>) -> Result<GpuContext> {
+/// `health`.
+async fn create_gpu_context(
+    window: &Arc<Window>,
+    size: PhysicalSize<u32>,
+    health: &Arc<rgv_render::GpuDeviceHealth>,
+) -> Result<GpuContext> {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let surface = instance
@@ -272,7 +277,7 @@ async fn create_gpu_context(window: &Arc<Window>, size: PhysicalSize<u32>) -> Re
                     surface_format = ?format,
                     "selected GPU adapter"
                 );
-                GPU_DEVICE_HEALTH.watch(&device);
+                health.watch(&device);
                 return Ok(GpuContext {
                     surface,
                     adapter_info: info,
@@ -308,13 +313,14 @@ impl Viewer {
     ) -> Result<Self> {
         let application_instance_id = uuid::Uuid::new_v4().to_string();
         let size = window.inner_size();
+        let gpu_device_health = Arc::new(rgv_render::GpuDeviceHealth::new());
         let GpuContext {
             surface,
             adapter_info,
             device,
             queue,
             surface_config,
-        } = create_gpu_context(&window, size).await?;
+        } = create_gpu_context(&window, size, &gpu_device_health).await?;
         surface.configure(&device, &surface_config);
 
         let rectangle_renderer = RectangleRenderer::new(&device, surface_config.format);
@@ -370,6 +376,7 @@ impl Viewer {
         );
         let canvas_geometry = bootstrap_layout.canvas_geometry();
         let mut settings = options.loaded_settings.clone();
+        let options_settings_recovery = options.loaded_settings_recovery.clone();
         apply_accessibility_preferences(&egui_context, &settings);
         if let Some(path) = options.session.as_ref().or(options.import_igv.as_ref()) {
             settings.remember_session(path.display().to_string());
@@ -448,14 +455,18 @@ impl Viewer {
         panel.content_bottom_points = canvas_geometry.viewport.top();
         let mut panels = options.loaded_session.as_ref().map_or_else(
             || Ok(PanelWorkspace::new(panel)),
-            |session| {
+            |session| -> Result<PanelWorkspace> {
                 let panel_count = session.panels.len().max(1);
                 let panel_canvas_width = bootstrap_layout.projected_canvas_width(panel_count);
-                PanelWorkspace::from_session(
+                let mut panels = PanelWorkspace::from_session(
                     session,
                     panel_canvas_width,
                     canvas_geometry.viewport.top(),
-                )
+                )?;
+                if let Some(request) = &options.loaded_igv_locus {
+                    panels.adopt_imported_locus(request)?;
+                }
+                Ok(panels)
             },
         )?;
         let initial_panel_inputs = panels
@@ -508,8 +519,8 @@ impl Viewer {
             active_interval.end()
         );
         let panel_ids = panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
-        let track_engine =
-            (!track_specifications.is_empty()).then(|| TrackEngine::spawn(track_specifications, 8));
+        let track_engine = (!track_specifications.is_empty())
+            .then(|| spawn_track_engine_without_aliases(track_specifications));
         let automation_auxiliary_open_state = tracks
             .tracks()
             .iter()
@@ -692,6 +703,16 @@ impl Viewer {
             )
         });
         let stress_health = Arc::new(StressHealthPublisher::new(application_instance_id.clone()));
+        // Everything a control client makes RGV open is held to these rules (APP-8).
+        let control_source_policy = options.control_port.and_then(|_| {
+            options
+                .control_root
+                .clone()
+                .map(|root| app::tasks::ControlSourcePolicy {
+                    root,
+                    allow_private_network_urls: options.control_allow_private_urls,
+                })
+        });
         let control_service = if let Some(port) = options.control_port {
             let root = options
                 .control_root
@@ -712,6 +733,7 @@ impl Viewer {
                     surface_height_pixels: surface_config.height,
                     scale_factor: window.scale_factor(),
                     stress_health: Arc::clone(&stress_health),
+                    allow_private_network_urls: options.control_allow_private_urls,
                 },
             )
             .map_err(anyhow::Error::msg)?;
@@ -747,6 +769,10 @@ impl Viewer {
             stress_health,
             workspace_revision: 1,
             document_state: app::document_state::DocumentState::default(),
+            shell: app::shell_state::ShellState::default(),
+            read_inspector_derived: std::cell::RefCell::default(),
+            gpu_device_health,
+            gpu_recovery: GpuRecoveryState::default(),
             next_evidence_revision: 1,
             automation_alignment_handles: HashMap::new(),
             window,
@@ -877,6 +903,7 @@ impl Viewer {
             session_load_tasks: Vec::new(),
             workspace_list_import_tasks: Vec::new(),
             genome_tasks: Vec::new(),
+            landmark_install_ticket: 0,
             hosted_genomes: crate::workspace::genomes::HostedGenomes::default(),
             promoted_read: None,
             synthetic,
@@ -919,6 +946,7 @@ impl Viewer {
             annotation_search_results: TrackSearchResults::default(),
             pending_annotation_navigation: None,
             settings,
+            settings_writer: app::settings_writer::SettingsWriter::new(settings_path.clone()),
             settings_path,
             current_session_path: options.session,
             unresolved_session_sources: options
@@ -930,11 +958,14 @@ impl Viewer {
                 .as_ref()
                 .map_or_else(Vec::new, |session| session.migration_notices.clone()),
             igv_import_report: options.loaded_igv_report,
+            imported_locus: options.loaded_igv_locus,
+            imported_feature_search: None,
             next_autosave,
             recovery_candidates: options.recovery_candidates,
             recovery_open,
             automation,
             control_service,
+            control_source_policy,
             automation_exit_requested: false,
             exit_confirmation_open: false,
             user_exit_requested: false,
@@ -960,6 +991,13 @@ impl Viewer {
         viewer
             .document_state
             .replace(viewer.session_document(), true);
+        let launch_session_path = viewer.current_session_path.clone();
+        viewer.arm_newer_writer_guard(launch_session_path.as_deref());
+        if let Some(recovery) = &options_settings_recovery {
+            let notice =
+                app::settings_writer::settings_recovery_notice(&viewer.settings_path, recovery);
+            viewer.report_warning(notice);
+        }
         Ok(viewer)
     }
 
@@ -995,13 +1033,11 @@ impl Viewer {
     /// successful recovery. While recovery keeps failing the window simply stops updating and
     /// the failure is shown once in the status line and notification log.
     pub(crate) fn ensure_gpu_device(&mut self) -> bool {
-        let health = &*GPU_DEVICE_HEALTH;
+        let health = Arc::clone(&self.gpu_device_health);
         if let Some(error) = health.take_last_error() {
             tracing::error!(%error, "uncaptured GPU error");
             let report = {
-                let mut state = GPU_RECOVERY_STATE
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let state = &mut self.gpu_recovery;
                 let report = state.uncaptured_errors_reported < MAX_REPORTED_UNCAPTURED_GPU_ERRORS;
                 state.uncaptured_errors_reported =
                     state.uncaptured_errors_reported.saturating_add(1);
@@ -1016,9 +1052,7 @@ impl Viewer {
         }
         let now = Instant::now();
         let (due, first_report) = {
-            let mut state = GPU_RECOVERY_STATE
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = &mut self.gpu_recovery;
             let due = gpu_recovery_attempt_is_due(state.last_attempt, now);
             if due {
                 state.last_attempt = Some(now);
@@ -1038,12 +1072,7 @@ impl Viewer {
         }
         match self.recover_gpu_device() {
             Ok(()) => {
-                {
-                    let mut state = GPU_RECOVERY_STATE
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *state = GpuRecoveryState::default();
-                }
+                self.gpu_recovery = GpuRecoveryState::default();
                 tracing::warn!(%cause, "GPU device was lost and has been recreated");
                 self.report_error(format!(
                     "The GPU device was lost ({cause}) and has been recreated."
@@ -1055,12 +1084,23 @@ impl Viewer {
                 tracing::error!(%error, "could not recreate the lost GPU device");
                 if first_report {
                     self.report_error(format!(
-                        "The GPU device was lost ({cause}) and could not be recreated: {error:#}.                          Rendering is paused; RGV retries when the window is next redrawn."
+                        "The GPU device was lost ({cause}) and could not be recreated: {error:#}. \
+                         Rendering is paused; RGV retries every second."
                     ));
                 }
             }
         }
         false
+    }
+
+    /// When the event loop should next redraw to retry recreating a lost GPU device, so that
+    /// recovery does not depend on the user moving the mouse. `None` while the device is healthy.
+    pub(crate) fn gpu_recovery_deadline(&self, now: Instant) -> Option<Instant> {
+        gpu_recovery_wake(
+            self.gpu_device_health.is_lost(),
+            self.gpu_recovery.last_attempt,
+            now,
+        )
     }
 
     /// Replaces the lost device with a new one and rebuilds everything derived from it. Semantic
@@ -1072,7 +1112,11 @@ impl Viewer {
             device,
             queue,
             mut surface_config,
-        } = pollster::block_on(create_gpu_context(&self.window, self.window.inner_size()))?;
+        } = pollster::block_on(create_gpu_context(
+            &self.window,
+            self.window.inner_size(),
+            &self.gpu_device_health,
+        ))?;
         let format = surface_config.format;
         if self.surface_config.width > 0 && self.surface_config.height > 0 {
             surface_config.width = self.surface_config.width;
@@ -1080,13 +1124,20 @@ impl Viewer {
         }
 
         // Nothing captured against the lost device may be replayed.
+        //
+        // ORDER MATTERS. Ledger charges for GPU pages are reference-counted through frame pins,
+        // so every holder of GPU frames, residency leases, prefetch cursors or retirements must
+        // be dropped BEFORE `rebuild_for_device`. A holder that survives the rebuild keeps the
+        // old device's charges pinned (and releases them later against the new renderer's
+        // accounting). Add any new holder to the block of resets above the rebuild calls.
         self.alignment_presented_epoch = None;
         self.alignment_gpu_residency_bundle = None;
         self.alignment_gpu_prefetch.clear();
         self.alignment_gpu_publication_retry = None;
         self.alignment_capacity_reclaim = None;
         self.alignment_gpu_speculation_gate.reset();
-        self.alignment_gpu_renderer.rebuild_for_device(&device, format);
+        self.alignment_gpu_renderer
+            .rebuild_for_device(&device, format);
         self.alignment_summary_gpu_renderer
             .rebuild_for_device(&device, format);
         self.context_scene_gpu_renderer = ContextSceneGpuRenderer::new(&device, format);
@@ -1095,7 +1146,8 @@ impl Viewer {
         self.egui_renderer = egui_wgpu::Renderer::new(&device, format, RendererOptions::default());
         // The new egui renderer has none of the textures egui believes it already delivered.
         // Rebuilding the font atlas makes the next frame resend it in full.
-        self.egui_context.set_fonts(egui::FontDefinitions::default());
+        self.egui_context
+            .set_fonts(egui::FontDefinitions::default());
 
         // Drop the old surface (and its swapchain) before configuring the replacement: a window
         // can back only one live swapchain on some backends.
@@ -1167,9 +1219,11 @@ impl Viewer {
                 )
             {
                 if let Some(frame) = &bundle.summaries
-                    && let Err(error) = self
-                        .alignment_summary_gpu_renderer
-                        .render_within(&mut pass, frame, target_size)
+                    && let Err(error) = self.alignment_summary_gpu_renderer.render_within(
+                        &mut pass,
+                        frame,
+                        target_size,
+                    )
                 {
                     tracing::error!(
                         %error,
@@ -1181,9 +1235,9 @@ impl Viewer {
                     });
                 }
                 if let Some(frame) = &bundle.reads
-                    && let Err(error) = self
-                        .alignment_gpu_renderer
-                        .render_within(&mut pass, frame, target_size)
+                    && let Err(error) =
+                        self.alignment_gpu_renderer
+                            .render_within(&mut pass, frame, target_size)
                 {
                     tracing::error!(%error, "could not render unified alignment scene frame");
                     failures.push(AlignmentRendererFailure {
@@ -1565,6 +1619,9 @@ impl Viewer {
         buffer: &wgpu::Buffer,
         padded_bytes_per_row: u32,
     ) -> std::result::Result<Vec<u8>, String> {
+        // On a lost device the map callback may never fire, so an indefinite poll hangs, and
+        // `get_mapped_range` aborts on a buffer that was never mapped. Refuse instead.
+        native_capture_device_check(self.gpu_device_health.is_lost())?;
         let slice = buffer.slice(..);
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -1577,6 +1634,8 @@ impl Viewer {
             .recv()
             .map_err(|_| "GPU capture mapping callback was lost".to_owned())?
             .map_err(|error| format!("GPU capture mapping failed: {error}"))?;
+        // The device can be lost between the submit and here; the mapping is then not usable.
+        native_capture_device_check(self.gpu_device_health.is_lost())?;
         let mapped = slice.get_mapped_range();
         let pixels = decoded_capture_pixels(
             &mapped,
@@ -1634,6 +1693,19 @@ impl Viewer {
                 Err((AutomationErrorCode::Io, error.to_string())),
             );
         }
+    }
+}
+
+/// Refuses a native-window readback on a lost GPU device.
+fn native_capture_device_check(device_lost: bool) -> std::result::Result<(), String> {
+    if device_lost {
+        Err(
+            "The GPU device was lost; the window capture was abandoned. Retry once rendering \
+             has recovered."
+                .to_owned(),
+        )
+    } else {
+        Ok(())
     }
 }
 
@@ -1728,8 +1800,8 @@ mod capture_tests {
 
     use super::{
         GPU_RECOVERY_RETRY_INTERVAL, adapter_request_plan, choose_surface_format,
-        decoded_capture_pixels, frame_target_plan, gpu_recovery_attempt_is_due,
-        required_gpu_limits,
+        decoded_capture_pixels, frame_target_plan, gpu_recovery_attempt_is_due, gpu_recovery_wake,
+        native_capture_device_check, required_gpu_limits,
     };
 
     #[test]
@@ -1822,6 +1894,26 @@ mod capture_tests {
                 egui_wgpu::preferred_framebuffer_format(&formats).ok()
             );
         }
+    }
+
+    #[test]
+    fn a_lost_device_schedules_its_own_retry_without_user_input() {
+        let now = Instant::now();
+        assert_eq!(gpu_recovery_wake(false, None, now), None);
+        assert_eq!(gpu_recovery_wake(false, Some(now), now), None);
+        // Lost and never attempted: redraw at once.
+        assert_eq!(gpu_recovery_wake(true, None, now), Some(now));
+        // A failed attempt is retried exactly when the rate limit next allows one.
+        let retry = gpu_recovery_wake(true, Some(now), now).unwrap();
+        assert_eq!(retry, now + GPU_RECOVERY_RETRY_INTERVAL);
+        assert!(gpu_recovery_attempt_is_due(Some(now), retry));
+    }
+
+    #[test]
+    fn native_capture_is_refused_on_a_lost_device() {
+        assert!(native_capture_device_check(false).is_ok());
+        let error = native_capture_device_check(true).unwrap_err();
+        assert!(error.contains("GPU device was lost"), "{error}");
     }
 
     #[test]

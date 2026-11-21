@@ -227,7 +227,7 @@ impl Viewer {
         } else {
             TrackLayoutOptions::default().maximum_rows
         };
-        let object_id_base = 1_u32;
+        let object_ids = ObjectIdAllocator::new().allocate(records.len())?;
         let label_widths = measured_feature_label_widths(&self.egui_context, records);
         let display = layout_features_with_label_widths(
             records,
@@ -236,7 +236,7 @@ impl Viewer {
                 top: frame.top,
                 height: frame.bottom - frame.top,
                 maximum_rows: layout_maximum_rows,
-                object_id_base,
+                object_id_base: object_ids.base(),
                 feature_display_mode: display_mode,
                 ..TrackLayoutOptions::default()
             },
@@ -248,7 +248,7 @@ impl Viewer {
             records,
             x - panel_rect.left(),
             content_y,
-            object_id_base,
+            object_ids,
         )
         .map(|record_index| FeatureSelection {
             track_id,

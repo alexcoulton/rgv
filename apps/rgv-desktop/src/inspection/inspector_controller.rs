@@ -179,10 +179,22 @@ impl Viewer {
                 Some(bounded_aligned_sequence_copy(bases)),
             ),
         };
-        let modified_bases = decode_modified_bases(&record).map_or_else(
-            |error| format!("error: {error}"),
-            |calls| calls.len().to_string(),
-        );
+        // Both strings are functions of the record alone; see `ReadInspectorDerivedCache`.
+        let crate::inspection::read::ReadInspectorDerived {
+            modified_bases,
+            cigar,
+        } = self
+            .read_inspector_derived
+            .borrow_mut()
+            .get_or_compute(&record, |record| {
+                crate::inspection::read::ReadInspectorDerived {
+                    modified_bases: decode_modified_bases(record).map_or_else(
+                        |error| format!("error: {error}"),
+                        |calls| calls.len().to_string(),
+                    ),
+                    cigar: format_cigar(&record.cigar),
+                }
+            });
         let selected_filters = self.alignment_filters_for_track(track_id);
         let selected_event = alignment_component_event(hit.component, &record);
         let selected_operation_index = selected_event.map(|(operation_index, _)| operation_index);
@@ -210,7 +222,6 @@ impl Viewer {
             _ => "unavailable".to_owned(),
         };
         let track_name = self.alignment_track_name_for_id(track_id);
-        let cigar = format_cigar(&record.cigar);
         let segment_role = if record.flags.is_supplementary() {
             "Supplementary"
         } else if record.flags.is_secondary() {
@@ -1110,6 +1121,36 @@ mod scene_inspection_tests {
         );
     }
 
+    #[test]
+    fn read_inspector_strings_are_derived_once_per_selected_record() {
+        use crate::inspection::read::{ReadInspectorDerived, ReadInspectorDerivedCache};
+        use std::cell::Cell;
+
+        let derivations = Cell::new(0);
+        let derive = |record: &AlignmentRecord| {
+            derivations.set(derivations.get() + 1);
+            ReadInspectorDerived {
+                modified_bases: "0".to_owned(),
+                cigar: format_cigar(&record.cigar),
+            }
+        };
+        let mut cache = ReadInspectorDerivedCache::default();
+        let selected = record();
+        // The inspector is rebuilt every frame; the same selection derives once.
+        for _ in 0..60 {
+            assert_eq!(cache.get_or_compute(&selected, derive).cigar, "5M3I5X");
+        }
+        assert_eq!(derivations.get(), 1);
+
+        // Another read, even one differing only in its CIGAR, is never served stale strings.
+        let mut other = record();
+        other.cigar.truncate(1);
+        assert_eq!(cache.get_or_compute(&other, derive).cigar, "5M");
+        assert_eq!(derivations.get(), 2);
+        // Returning to the first read recomputes: one entry, keyed by the record itself.
+        assert_eq!(cache.get_or_compute(&selected, derive).cigar, "5M3I5X");
+        assert_eq!(derivations.get(), 3);
+    }
 
     fn record() -> AlignmentRecord {
         AlignmentRecord {

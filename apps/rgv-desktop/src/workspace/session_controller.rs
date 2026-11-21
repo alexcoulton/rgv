@@ -25,15 +25,95 @@ fn prepare_session_geometry(
 }
 
 impl Viewer {
+    /// Replaces an imported IGV session's placeholder locus (see
+    /// [`ImportedLocusRequest`]); `None` for every other project.
+    pub(crate) fn adopt_imported_locus(
+        &mut self,
+        request: Option<ImportedLocusRequest>,
+    ) -> Result<()> {
+        if let Some(request) = &request {
+            self.panels.adopt_imported_locus(request)?;
+            self.locus_editor = request.requested_locus().unwrap_or_default();
+        }
+        self.imported_locus = request;
+        self.imported_feature_search = None;
+        Ok(())
+    }
+
+    /// Finishes resolving a panel's requested locus against `dictionary`,
+    /// queuing a feature search when it was an imported gene name.
+    pub(crate) fn resolve_panel_requested_locus(
+        &self,
+        dictionary: &ReferenceDictionary,
+        requested: Option<&str>,
+    ) -> Result<RequestedLocus> {
+        resolve_requested_locus(
+            dictionary,
+            &self.contig_aliases,
+            requested,
+            self.imported_locus
+                .as_ref()
+                .and_then(ImportedLocusRequest::feature_name),
+        )
+    }
+
+    /// Called once panels have been placed on a newly opened dictionary:
+    /// searches the annotations for an imported feature name, or says why
+    /// the default locus is showing.
+    pub(crate) fn finish_imported_locus(&mut self, feature_search: Option<String>) {
+        if self.imported_locus.take().is_none() {
+            return;
+        }
+        let Some(name) = feature_search else {
+            return;
+        };
+        for panel in self.panels.iter_mut() {
+            if panel.requested_locus.as_deref() == Some(name.as_str()) {
+                panel.requested_locus = None;
+            }
+        }
+        self.locus_editor.clone_from(&name);
+        if self.track_engine.is_none() {
+            self.report_warning(format!(
+                "IGV session locus {name} is not a contig; showing the default locus until an \
+                 annotation track is open to search for it"
+            ));
+        }
+        self.imported_feature_search = Some(name);
+        self.retry_imported_feature_search();
+    }
+
+    /// Runs the deferred search for an imported feature name as soon as an
+    /// annotation engine exists (the built-in Genes track may be installed
+    /// after the dictionary that placed the panels).
+    pub(crate) fn retry_imported_feature_search(&mut self) {
+        if self.track_engine.is_some()
+            && let Some(name) = self.imported_feature_search.take()
+        {
+            self.request_annotation_search(&name, true, true);
+        }
+    }
+
     pub(crate) fn persist_settings(&mut self) {
         self.remember_current_locus();
-        if let Err(error) = self.settings.write(&self.settings_path) {
-            tracing::warn!(
-                path = %self.settings_path.display(),
-                %error,
-                "could not persist desktop settings"
-            );
+        // Serialising, fsyncing and renaming happen on the settings worker;
+        // rapid saves collapse into one write of the newest snapshot.
+        self.settings_writer.submit(&self.settings);
+    }
+
+    /// Surfaces a settings save that failed on the worker.
+    pub(crate) fn poll_settings_writer(&mut self) {
+        if let Some(error) = self.settings_writer.take_failure() {
+            self.report_warning(format!(
+                "Could not save settings to {}: {error}",
+                self.settings_path.display()
+            ));
         }
+    }
+
+    /// Blocks until every queued save is on disk; call last at exit.
+    pub(crate) fn finish_settings_writer(&mut self) {
+        self.settings_writer.finish();
     }
 
     pub(crate) fn handle_dropped_file(&mut self, path: &Path) {
@@ -137,13 +217,12 @@ impl Viewer {
             } else {
                 engine.try_add_with_query_contig_aliases(specification, query_contig_aliases)?;
             }
-        } else if query_contig_aliases.is_empty() {
-            self.track_engine = Some(TrackEngine::spawn(vec![specification], 8));
         } else {
-            self.track_engine = Some(TrackEngine::spawn_with_query_contig_aliases(
-                vec![(specification, query_contig_aliases)],
-                8,
-            ));
+            // An empty alias map is the no-alias case.
+            self.track_engine = Some(spawn_track_engine(vec![(
+                specification,
+                query_contig_aliases,
+            )]));
         }
         let source_label = config.source.redacted_label();
         self.tracks.push(config);
@@ -298,8 +377,8 @@ impl Viewer {
             None
         };
         let (specifications, tracks) = session_track_specs(session);
-        let track_engine =
-            (!specifications.is_empty()).then(|| TrackEngine::spawn(specifications, 8));
+        let track_engine = (!specifications.is_empty())
+            .then(|| spawn_track_engine_without_aliases(specifications));
 
         // Commit starts here. No fallible preparation or blocking destructor follows.
         if let Some(error) = landmark_error {

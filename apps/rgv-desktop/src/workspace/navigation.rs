@@ -1,102 +1,160 @@
 use super::super::*;
 
+/// Bases shown on each side of a single-position locus such as `chr1:12345`.
+pub(crate) const SINGLE_POSITION_FLANK: u64 = 20;
+
+/// Resolves a typed locus with the shared [`Locus`] grammar, or the opening
+/// view (the first 100 kb of the first contig) when none was requested.
 pub(crate) fn resolve_initial_locus(
     dictionary: &ReferenceDictionary,
     aliases: &ContigAliases,
     requested: Option<&str>,
 ) -> Result<(GenomicInterval, String, u64)> {
-    let (name, range) = if let Some(requested) = requested {
-        requested
-            .split_once(':')
-            .map_or((requested, None), |(name, range)| (name, Some(range)))
-    } else {
+    let Some(requested) = requested else {
         let first = dictionary
             .iter()
             .next()
             .context("alignment header has no reference sequences")?;
-        (first.name(), None)
+        anyhow::ensure!(
+            first.length() > 0,
+            "contig {} has zero length",
+            first.name()
+        );
+        let interval = GenomicInterval::new(first.id(), 0, first.length().min(100_000))?;
+        return Ok((interval, first.name().to_owned(), first.length()));
     };
-    let contig_id = resolve_typed_contig(dictionary, aliases, name)?
-        .with_context(|| format!("alignment header has no contig named {name}"))?;
-    let contig = dictionary
-        .get(contig_id)
-        .context("alignment reference dictionary is inconsistent")?;
-    if contig.length() == 0 {
-        anyhow::bail!("contig {name} has zero length");
-    }
-
-    let (start, end) = if let Some(range) = range {
-        parse_locus_range(range)?
-    } else if requested.is_some() {
-        // A bare contig name shows the whole contig, as IGV does.
-        (0, contig.length())
-    } else {
-        (0, contig.length().min(100_000))
-    };
-    let interval = GenomicInterval::bounded(contig_id, start, end, contig.length())?;
-    Ok((interval, contig.name().to_owned(), contig.length()))
+    let resolved = Locus::resolve(requested, dictionary, aliases)?;
+    let interval = resolved.interval(SINGLE_POSITION_FLANK)?;
+    Ok((interval, resolved.contig_name, resolved.contig_length))
 }
 
-/// Bases shown on each side of a single-position locus such as `chr1:12345`.
-const SINGLE_POSITION_FLANK: u64 = 20;
+/// What to open for an imported IGV session whose `Session.locus` was not a
+/// coordinate interval (CORE-1). The imported document then only holds a
+/// one-base placeholder, which must never be navigated to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ImportedLocusRequest {
+    /// IGV's whole-genome view (`All`), or a missing or unparseable locus.
+    Default,
+    /// A bare contig, or a feature such as a gene symbol.
+    Named(String),
+}
 
-/// Parses the coordinate part of a locus into a zero-based half-open range. Accepts
-/// `start-end` and a single one-based position, which is centred in a small window.
-fn parse_locus_range(range: &str) -> Result<(u64, u64)> {
-    let range = range.replace(',', "");
-    let range = range.trim();
-    if let Some((start, end)) = range.split_once('-') {
-        let one_based_start: u64 = start
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid locus start {start}"))?;
-        let one_based_end: u64 = end
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid locus end {end}"))?;
-        if one_based_start == 0 || one_based_end < one_based_start {
-            anyhow::bail!("locus coordinates must be one-based and forward");
+pub(crate) fn imported_locus_request(
+    resolution: &IgvLocusResolution,
+) -> Option<ImportedLocusRequest> {
+    match resolution {
+        IgvLocusResolution::Interval => None,
+        IgvLocusResolution::Named { name } => Some(ImportedLocusRequest::Named(name.clone())),
+        IgvLocusResolution::Unresolved { .. } => Some(ImportedLocusRequest::Default),
+    }
+}
+
+impl ImportedLocusRequest {
+    /// The locus each panel asks for once a dictionary is known.
+    pub(crate) fn requested_locus(&self) -> Option<String> {
+        match self {
+            Self::Default => None,
+            Self::Named(name) => Some(name.clone()),
         }
-        return Ok((one_based_start - 1, one_based_end));
     }
-    let position: u64 = range
-        .parse()
-        .with_context(|| format!("locus must use name:start-end or name:position, got {range}"))?;
-    if position == 0 {
-        anyhow::bail!("locus coordinates must be one-based and forward");
+
+    pub(crate) fn feature_name(&self) -> Option<&str> {
+        match self {
+            Self::Default => None,
+            Self::Named(name) => Some(name),
+        }
     }
-    Ok((
-        (position - 1).saturating_sub(SINGLE_POSITION_FLANK),
-        position.saturating_add(SINGLE_POSITION_FLANK),
-    ))
 }
 
-/// Resolves a contig name typed by the user. Explicit aliases win; otherwise the common `chr`
-/// prefix and mitochondrial spellings are tried, so `1`, `chr1`, `MT` and `chrM` all work
-/// against either naming convention.
-pub(crate) fn resolve_typed_contig(
+/// Shown until a dictionary places the imported session's real locus.
+pub(crate) const IMPORTED_PLACEHOLDER_LOCUS: &str = "chr1:1-100000";
+
+/// A panel's requested locus resolved against a newly opened dictionary.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RequestedLocus {
+    pub(crate) interval: GenomicInterval,
+    pub(crate) contig_name: String,
+    pub(crate) contig_length: u64,
+    /// Set when the request was an imported feature name rather than a
+    /// contig: the default locus was opened and this name should be found by
+    /// annotation search.
+    pub(crate) feature_search: Option<String>,
+}
+
+/// [`resolve_initial_locus`], except that an imported IGV name which is not a
+/// contig opens the default locus and asks for a feature search instead of
+/// failing.
+pub(crate) fn resolve_requested_locus(
     dictionary: &ReferenceDictionary,
     aliases: &ContigAliases,
-    name: &str,
-) -> Result<Option<ContigId>> {
-    if let Some(contig) = resolve_contig_alias(dictionary, aliases, name)? {
-        return Ok(Some(contig));
+    requested: Option<&str>,
+    imported_feature_name: Option<&str>,
+) -> Result<RequestedLocus> {
+    let direct = |requested| {
+        resolve_initial_locus(dictionary, aliases, requested).map(
+            |(interval, contig_name, contig_length)| RequestedLocus {
+                interval,
+                contig_name,
+                contig_length,
+                feature_search: None,
+            },
+        )
+    };
+    let is_imported_name = requested.is_some() && requested == imported_feature_name;
+    if is_imported_name
+        && let Some(name) = requested
+        && matches!(
+            Locus::resolve(name, dictionary, aliases),
+            Err(LocusError::UnknownContig(_))
+        )
+    {
+        return direct(None).map(|locus| RequestedLocus {
+            feature_search: Some(name.to_owned()),
+            ..locus
+        });
     }
-    let mut candidates = Vec::with_capacity(3);
-    if let Some(stripped) = name.strip_prefix("chr") {
-        candidates.push(stripped.to_owned());
-        if stripped == "M" {
-            candidates.push("MT".to_owned());
-        }
-    } else {
-        candidates.push(format!("chr{name}"));
-        if name == "MT" {
-            candidates.push("chrM".to_owned());
+    direct(requested)
+}
+
+/// Whether one item of a locus expression should navigate instead of being
+/// sent to ID/annotation search.
+///
+/// It navigates when it resolves, and also when it is recognisably a locus
+/// that is merely wrong (`chr1:0`, `chr99:1-100`), so the user is told why.
+/// A name that matches no contig and carries no coordinate range, such as a
+/// gene symbol, the variant ID `chr1:12345:A:G` or an HGVS expression, does
+/// not.
+pub(crate) fn locus_item_is_navigable(
+    item: &str,
+    dictionary: Option<&ReferenceDictionary>,
+    aliases: &ContigAliases,
+) -> bool {
+    if let Some(dictionary) = dictionary {
+        match Locus::resolve(item, dictionary, aliases) {
+            Err(LocusError::UnknownContig(_)) => {}
+            Err(LocusError::Empty) => return false,
+            Ok(_) | Err(_) => return true,
         }
     }
-    Ok(candidates
-        .iter()
-        .find_map(|candidate| dictionary.id_by_name(candidate)))
+    match Locus::parse(item) {
+        Ok(locus) => locus.range != LocusRange::WholeContig,
+        Err(LocusError::Empty) => false,
+        Err(_) => true,
+    }
+}
+
+/// Whether every locus of `expression` is navigable (see
+/// [`locus_item_is_navigable`]).
+pub(crate) fn locus_expression_is_navigable(
+    expression: &str,
+    dictionary: Option<&ReferenceDictionary>,
+    aliases: &ContigAliases,
+) -> bool {
+    let loci = rgv_core::split_loci(expression);
+    !loci.is_empty()
+        && loci
+            .iter()
+            .all(|locus| locus_item_is_navigable(locus, dictionary, aliases))
 }
 
 pub(crate) fn parse_contig_aliases(values: &[String]) -> Result<ContigAliases> {
@@ -108,8 +166,8 @@ pub(crate) fn parse_contig_aliases(values: &[String]) -> Result<ContigAliases> {
         anyhow::ensure!(
             !alias.is_empty()
                 && !target.is_empty()
-                && !alias.contains([':', ' ', '\t', '\n'])
-                && !target.contains([':', ' ', '\t', '\n']),
+                && !alias.contains([' ', '\t', '\n'])
+                && !target.contains([' ', '\t', '\n']),
             "contig alias must contain two non-empty contig names, got {value}"
         );
         if let Some(previous) = aliases.insert(alias.to_owned(), target.to_owned()) {
@@ -148,24 +206,33 @@ pub(crate) fn launch_contig_aliases(options: &LaunchOptions) -> Result<ContigAli
     Ok(aliases)
 }
 
+/// A locus for a workspace with no reference dictionary: the contig name is
+/// taken as typed and its length is unknown, so a coordinate range is needed.
 pub(crate) fn standalone_locus(locus: &str) -> Result<(GenomicInterval, String, u64)> {
-    let (name, range) = locus
-        .split_once(':')
-        .with_context(|| format!("standalone track locus must use name:start-end, got {locus}"))?;
-    let (start, end) = parse_locus_range(range)?;
+    let parsed = Locus::parse(locus)?;
+    let (start, end) = match parsed.range {
+        LocusRange::WholeContig => anyhow::bail!(
+            "standalone track locus must use name:start-end or name:position, got {locus}"
+        ),
+        LocusRange::Position(position) => (
+            position.saturating_sub(SINGLE_POSITION_FLANK),
+            position
+                .saturating_add(1)
+                .saturating_add(SINGLE_POSITION_FLANK),
+        ),
+        LocusRange::Interval { start, end } => (start, end),
+    };
     let contig_length = end.saturating_mul(2).max(end.saturating_add(1_000_000));
     Ok((
         GenomicInterval::new(ContigId::new(0), start, end)?,
-        name.to_owned(),
+        parsed.contig,
         contig_length,
     ))
 }
 
+/// Splits a locus-box expression into its loci (see [`rgv_core::split_loci`]).
 pub(crate) fn split_locus_expression(expression: &str) -> Result<Vec<&str>> {
-    let loci = expression
-        .split_ascii_whitespace()
-        .filter(|locus| !locus.is_empty())
-        .collect::<Vec<_>>();
+    let loci = rgv_core::split_loci(expression);
     anyhow::ensure!(!loci.is_empty(), "enter at least one genomic locus");
     anyhow::ensure!(
         loci.len() <= MAXIMUM_VIEW_PANELS,

@@ -295,6 +295,8 @@ impl Viewer {
             || !self.session_save_tasks.is_empty()
             || !self.session_load_tasks.is_empty()
             || !self.workspace_list_import_tasks.is_empty()
+            // A built-in Genes track is still being verified and decoded.
+            || self.genome_tasks.iter().any(|task| task.landmark.is_some())
         {
             return false;
         }
@@ -467,10 +469,18 @@ impl Viewer {
                     }
                 }
                 Ok(Err(error)) => {
-                    self.data_status = format!("Could not write automation report: {error}");
+                    crate::app::shell_state::report_error_to(
+                        &mut self.shell.notifications,
+                        &mut self.data_status,
+                        format!("Could not write automation report: {error}"),
+                    );
                 }
                 Err(_) => {
-                    "Automation-report worker failed".clone_into(&mut self.data_status);
+                    crate::app::shell_state::report_error_to(
+                        &mut self.shell.notifications,
+                        &mut self.data_status,
+                        "Automation-report worker failed",
+                    );
                 }
             }
             runner.finished = true;
@@ -843,7 +853,11 @@ impl Viewer {
         let json = match report.to_json() {
             Ok(json) => json,
             Err(error) => {
-                self.data_status = format!("Could not serialize automation report: {error}");
+                crate::app::shell_state::report_error_to(
+                    &mut self.shell.notifications,
+                    &mut self.data_status,
+                    format!("Could not serialize automation report: {error}"),
+                );
                 runner.finished = true;
                 self.automation_exit_requested = runner.exit_after_report;
                 return;
@@ -861,7 +875,11 @@ impl Viewer {
         {
             Ok(worker) => Some(worker),
             Err(error) => {
-                self.data_status = format!("Could not start automation-report writer: {error}");
+                crate::app::shell_state::report_error_to(
+                    &mut self.shell.notifications,
+                    &mut self.data_status,
+                    format!("Could not start automation-report writer: {error}"),
+                );
                 None
             }
         };
@@ -1779,9 +1797,9 @@ impl Viewer {
                 }
                 match self.start_automation_export(command_index, PathBuf::from(path), kind) {
                     Ok(()) => AutomationExecution::Wait(AutomationWait::File {
-                    command_index,
-                    deadline: now + AUTOMATION_FILE_WAIT_TIMEOUT,
-                }),
+                        command_index,
+                        deadline: now + AUTOMATION_FILE_WAIT_TIMEOUT,
+                    }),
                     Err(error) if error.to_string().starts_with("complete reads unavailable") => {
                         automation_failure(AutomationErrorCode::TooDense, error)
                     }
@@ -1793,9 +1811,9 @@ impl Viewer {
             AutomationCommand::Save { path } => {
                 match self.start_automation_session_save(command_index, PathBuf::from(path)) {
                     Ok(()) => AutomationExecution::Wait(AutomationWait::File {
-                    command_index,
-                    deadline: now + AUTOMATION_FILE_WAIT_TIMEOUT,
-                }),
+                        command_index,
+                        deadline: now + AUTOMATION_FILE_WAIT_TIMEOUT,
+                    }),
                     Err(error) => automation_failure(AutomationErrorCode::Io, error),
                 }
             }
@@ -3239,10 +3257,7 @@ impl Viewer {
         let contig_length = panel.contig_length;
         let next = automation_viewport_after_operation(current, contig_length, operation)?;
         self.panels.active_mut().viewport = next;
-        self.panels
-            .active_mut()
-            .navigation_history
-            .visit(next.interval());
+        self.panels.active_mut().visit_history(next.interval());
         self.viewport_changed();
         if let Some(runner) = self.automation.as_mut() {
             runner.begin_navigation(
@@ -4097,18 +4112,18 @@ impl Viewer {
             .entries()
             .enumerate()
             .take(MAXIMUM_AUTOMATION_HISTORY_ENTRIES)
-            .map(|(index, interval)| {
-                let contig = self
-                    .assembly
-                    .dictionary
-                    .get(interval.contig())
-                    .map_or(panel.contig_name.as_str(), |contig| contig.name());
+            .map(|(index, entry)| {
                 serde_json::json!({
                     "index": index,
-                    "locus": automation_locus(contig, *interval),
-                    "contig": contig,
-                    "start": interval.start(),
-                    "end": interval.end(),
+                    "locus": format!(
+                        "{}:{}-{}",
+                        entry.contig_name,
+                        entry.start.saturating_add(1),
+                        entry.end
+                    ),
+                    "contig": entry.contig_name,
+                    "start": entry.start,
+                    "end": entry.end,
                     "current": index == panel.navigation_history.cursor(),
                 })
             })
@@ -4170,7 +4185,7 @@ impl Viewer {
             panel_id.get()
         );
         self.commit_navigation_gesture();
-        let interval = match action {
+        let entry = match action {
             AutomationHistoryNavigation::Back => self.panels.active_mut().navigation_history.back(),
             AutomationHistoryNavigation::Forward => {
                 self.panels.active_mut().navigation_history.forward()
@@ -4179,11 +4194,13 @@ impl Viewer {
                 self.panels.active_mut().navigation_history.select(index)
             }
         }
+        .cloned()
         .context("navigation history boundary was reached")?;
-        self.navigate_to_history_interval(interval);
+        let interval = self.navigate_to_history_entry(&entry)?;
         self.bump_workspace_revision();
         Ok(serde_json::json!({
             "panel_id": panel_id.get(),
+            "contig": self.panels.active().contig_name,
             "start": interval.start(),
             "end": interval.end(),
             "settled": self.automation_is_settled(),
@@ -5158,6 +5175,9 @@ impl Viewer {
             );
         }
         let truncated = scope_label.contains("truncated");
+        // Automation keeps the historical one pixel per point (REND-9): the snapshot command
+        // has no scale field, because adding one would break every out-of-tree constructor.
+        let scale = export::AUTOMATION_SNAPSHOT_SCALE;
         let completion_data = serde_json::json!({
             "width": width,
             "height": height,
@@ -5173,7 +5193,7 @@ impl Viewer {
             command_index,
             path,
             completion_data,
-            move |path| capture.write(path, format, &metadata),
+            move |path| capture.write(path, format, &metadata, scale),
         )
     }
 

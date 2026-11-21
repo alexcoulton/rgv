@@ -48,7 +48,8 @@ pub use automation::{
     MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS, MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS,
     MAXIMUM_AUTOMATION_STRING_BYTES, MAXIMUM_AUTOMATION_TRACK_SELECTION,
     MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT, MINIMUM_AUTOMATION_SCHEMA_VERSION,
-    MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS,
+    MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS, check_automation_remote_url,
+    check_session_sources_within,
 };
 pub use coordinates::{
     Contig, ContigAliasError, ContigAliases, ContigId, DuplicateContigError, GenomicInterval,
@@ -92,7 +93,7 @@ pub use landmarks::{
     LandmarkSearchIndexError, MAXIMUM_LANDMARK_ASSETS, MAXIMUM_LANDMARK_BUNDLES, dictionary_sha256,
     parse_landmark_aliases, parse_landmark_search_index,
 };
-pub use locus::{Locus, LocusError, LocusRange, ResolvedLocus, resolve_contig_name};
+pub use locus::{Locus, LocusError, LocusRange, ResolvedLocus, resolve_contig_name, split_loci};
 pub use lod::{DetailLevel, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, RenderBudget};
 pub use navigation::{NamedNavigationHistory, NavigationEntry, NavigationHistory};
 pub use panel::{PanelGeneration, PanelId, PanelTrackId};
@@ -101,6 +102,7 @@ pub use sample_metadata::{
     MAXIMUM_SAMPLE_METADATA_COLUMNS, MAXIMUM_SAMPLE_METADATA_FIELD_BYTES,
     MAXIMUM_SAMPLE_METADATA_ROWS, SampleMetadataError, SampleMetadataRow, SampleMetadataTable,
 };
+pub use session::newer_writer_notice;
 pub use session::{
     AlignmentAuxComparison, AlignmentAuxFilterValue, AlignmentCigarEventPredicate,
     AlignmentColorMode, AlignmentFlagPredicate, AlignmentGroupMode, AlignmentOrderDirection,

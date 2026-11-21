@@ -5,9 +5,11 @@ use crate::display::alignment::{
     read_pane_layout, read_panel_bounds, read_state_display,
 };
 use crate::display::auxiliary::{
-    feature_layout_row_count, feature_record_index_at_display_point,
-    pinned_gene_layout_maximum_rows,
+    FIRST_CONTEXT_TRACK_OBJECT_ID, feature_layout_row_count, feature_record_index_at_display_point,
+    pinned_gene_layout_maximum_rows, quantitative_object_id_span, strip_object_ids,
+    track_options_with_object_ids,
 };
+use crate::display::reference_lanes::append_reference_translation_lanes;
 use crate::display::{
     ANNOTATION_PANE_BACKGROUND, PINNED_ALIGNMENT_COVERAGE_HEIGHT,
     PINNED_ALIGNMENT_JUNCTION_COLLAPSED_HEIGHT, PINNED_ALIGNMENT_JUNCTION_EXPANDED_HEIGHT,
@@ -2034,7 +2036,10 @@ fn gene_picking_uses_the_exact_rendered_primitive_geometry() {
         1_000.0,
     )
     .unwrap();
-    let object_id_base = 50;
+    let object_ids = ObjectIdAllocator::starting_at(50)
+        .allocate(records.len())
+        .unwrap();
+    let object_id_base = object_ids.base();
     let display = layout_features(
         &records,
         viewport,
@@ -2058,7 +2063,7 @@ fn gene_picking_uses_the_exact_rendered_primitive_geometry() {
         &records,
         third_row_rectangle.x + third_row_rectangle.width * 0.5,
         third_row_rectangle.y + third_row_rectangle.height * 0.5,
-        object_id_base,
+        object_ids,
     );
     assert_eq!(picked, Some(2));
 
@@ -2068,9 +2073,172 @@ fn gene_picking_uses_the_exact_rendered_primitive_geometry() {
             &records,
             third_row_rectangle.x + third_row_rectangle.width * 0.5,
             47.5,
-            object_id_base,
+            object_ids,
         ),
         None,
+    );
+}
+
+fn object_id_test_feature(start: u64) -> rgv_hts::FeatureRecord {
+    rgv_hts::FeatureRecord {
+        contig: "chr1".to_owned(),
+        start,
+        end: start + 8,
+        name: None,
+        feature_type: None,
+        score: None,
+        strand: rgv_hts::Strand::Forward,
+        blocks: Vec::new(),
+        coding_interval: None,
+        peak: None,
+        attributes: Vec::new(),
+    }
+}
+
+#[test]
+fn a_quarter_million_record_track_cannot_alias_the_next_tracks_object_ids() {
+    // CORE-11: the stride scheme gave track N ids from 1_000_000 + N * 100_000,
+    // so record 100,000 of one track was record 0 of the next.
+    let large = (0..250_000_u64)
+        .map(|index| object_id_test_feature(index * 10))
+        .collect::<Vec<_>>();
+    let small = (0..3_u64)
+        .map(|index| object_id_test_feature(2_499_900 + index * 10))
+        .collect::<Vec<_>>();
+    // The tail of the large track, where the old ids ran into the next track.
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 2_499_000, 2_500_000).unwrap(),
+        1_000.0,
+    )
+    .unwrap();
+    let mut allocator = ObjectIdAllocator::starting_at(FIRST_CONTEXT_TRACK_OBJECT_ID);
+    let lane = |top| TrackLayoutOptions {
+        top,
+        height: 40.0,
+        feature_display_mode: FeatureDisplayMode::Collapsed,
+        ..TrackLayoutOptions::default()
+    };
+    let (large_options, large_ids) =
+        track_options_with_object_ids(&mut allocator, large.len(), lane(0.0));
+    let (small_options, small_ids) =
+        track_options_with_object_ids(&mut allocator, small.len(), lane(40.0));
+    let (large_ids, small_ids) = (large_ids.unwrap(), small_ids.unwrap());
+    assert_eq!(large_ids.base(), FIRST_CONTEXT_TRACK_OBJECT_ID);
+    assert_eq!(small_ids.base(), FIRST_CONTEXT_TRACK_OBJECT_ID + 250_000);
+
+    let large_display = layout_features(&large, viewport, large_options).0;
+    let small_display = layout_features(&small, viewport, small_options).0;
+    let pickable = |display: &DisplayList| {
+        display
+            .rectangles
+            .iter()
+            .map(|rectangle| rectangle.object_id)
+            .filter(|id| *id != 0)
+            .collect::<BTreeSet<_>>()
+    };
+    let (large_drawn, small_drawn) = (pickable(&large_display), pickable(&small_display));
+    assert!(large_drawn.contains(&large_ids.object_id(249_999).unwrap()));
+    assert!(large_drawn.iter().all(|id| large_ids.contains(*id)));
+    assert!(!small_drawn.is_empty());
+    assert!(small_drawn.iter().all(|id| small_ids.contains(*id)));
+    assert!(large_drawn.is_disjoint(&small_drawn));
+
+    // A hit on the large track's last record decodes to that record, and is
+    // never attributed to the neighbouring track.
+    let last = large_display
+        .rectangles
+        .iter()
+        .find(|rectangle| large_ids.record_index(rectangle.object_id) == Some(249_999))
+        .unwrap();
+    let (x, y) = (last.x + last.width * 0.5, last.y + last.height * 0.5);
+    assert_eq!(
+        feature_record_index_at_display_point(&large_display, &large, x, y, large_ids),
+        Some(249_999)
+    );
+    assert_eq!(
+        feature_record_index_at_display_point(&large_display, &small, x, y, small_ids),
+        None
+    );
+}
+
+#[test]
+fn an_exhausted_object_id_space_leaves_a_track_unpickable() {
+    let mut allocator = ObjectIdAllocator::starting_at(u32::MAX - 1);
+    let records = (0..3_u64)
+        .map(|index| object_id_test_feature(index * 10))
+        .collect::<Vec<_>>();
+    let (options, range) = track_options_with_object_ids(
+        &mut allocator,
+        records.len(),
+        TrackLayoutOptions {
+            height: 40.0,
+            ..TrackLayoutOptions::default()
+        },
+    );
+    assert_eq!(range, None);
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 0, 100).unwrap(),
+        500.0,
+    )
+    .unwrap();
+    let mut display = layout_features(&records, viewport, options).0;
+    assert!(!display.rectangles.is_empty());
+    strip_object_ids(&mut display);
+    assert!(
+        display
+            .rectangles
+            .iter()
+            .all(|rectangle| rectangle.object_id == 0)
+    );
+}
+
+#[test]
+fn reduced_quantitative_lanes_reserve_an_id_per_pixel_window() {
+    let viewport = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 0, 1_000_000).unwrap(),
+        800.5,
+    )
+    .unwrap();
+    assert_eq!(quantitative_object_id_span(3, viewport), 801);
+    assert_eq!(quantitative_object_id_span(250_000, viewport), 250_000);
+}
+
+#[test]
+fn desktop_reference_translation_phases_reverse_frames_from_the_contig_end() {
+    // CORE-13: a 10 bp contig is not a multiple of three, so reverse frame 1
+    // codons end at the contig end: [7,10), [4,7), [1,4).
+    let reference = ReferenceSlice {
+        interval: GenomicInterval::new(ContigId::new(0), 0, 10).unwrap(),
+        bases: b"ACGTACGTAC".to_vec(),
+    };
+    let viewport = Viewport::new(reference.interval, 1_000.0).unwrap();
+    let mut display = DisplayList::default();
+    append_reference_translation_lanes(
+        &mut display,
+        &reference,
+        viewport,
+        50.0,
+        &[
+            ReferenceTranslationFrame::Forward1,
+            ReferenceTranslationFrame::Reverse1,
+        ],
+        GeneticCode::default(),
+        10,
+    );
+    let lane_lefts = |top: f32| {
+        display
+            .rectangles
+            .iter()
+            .filter(|rectangle| rectangle.y >= top && rectangle.y < top + 20.0)
+            .map(|rectangle| rectangle.x.round() as i32)
+            .collect::<BTreeSet<_>>()
+    };
+    let (forward, reverse) = (lane_lefts(50.0), lane_lefts(70.0));
+    assert!(forward.contains(&0) && forward.contains(&300));
+    assert!(reverse.contains(&100) && reverse.contains(&400) && reverse.contains(&700));
+    assert!(
+        !reverse.contains(&300),
+        "reverse frame reused the forward phase"
     );
 }
 

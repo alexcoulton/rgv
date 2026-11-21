@@ -911,7 +911,7 @@ impl Viewer {
             }
             Err(EngineQueueError::Disconnected) => {
                 self.panels.active_mut().pending_queries.reference = false;
-                self.data_status = EngineQueueError::Disconnected.to_string();
+                self.report_error(EngineQueueError::Disconnected.to_string());
             }
         }
     }
@@ -1021,7 +1021,7 @@ impl Viewer {
             Err(EngineQueueError::Disconnected) => {
                 self.panels.active_mut().pending_queries.tracks = false;
                 self.panels.active_mut().track_request_interval = None;
-                self.data_status = EngineQueueError::Disconnected.to_string();
+                self.report_error(EngineQueueError::Disconnected.to_string());
             }
         }
     }
@@ -1269,6 +1269,7 @@ impl Viewer {
         self.poll_engine_retirement_tasks();
         self.poll_session_load_tasks();
         self.poll_session_save_tasks();
+        self.poll_settings_writer();
         self.poll_export_tasks();
         self.poll_workspace_list_import_tasks();
         self.poll_genome_tasks();
@@ -1394,7 +1395,7 @@ impl Viewer {
                     Ok(Some(event)) => events.push(event),
                     Ok(None) => break,
                     Err(error) => {
-                        self.data_status = error.to_string();
+                        self.report_error(error.to_string());
                         break;
                     }
                 }
@@ -1449,6 +1450,7 @@ impl Viewer {
                         .extend(self.panels.iter().map(|panel| panel.id));
                     if self.primary_alignment_dictionary().is_none() {
                         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+                        let mut imported_feature_search = None;
                         for id in ids {
                             let (requested, pixel_width) = self
                                 .panels
@@ -1457,20 +1459,20 @@ impl Viewer {
                                     (panel.requested_locus.clone(), panel.viewport.pixel_width())
                                 })
                                 .expect("panel id came from the panel collection");
-                            match resolve_initial_locus(
-                                &dictionary,
-                                &self.contig_aliases,
-                                requested.as_deref(),
-                            )
-                            .and_then(|(interval, name, length)| {
-                                Ok((
-                                    Viewport::new(interval, pixel_width)?,
-                                    interval,
-                                    name,
-                                    length,
-                                ))
-                            }) {
-                                Ok((viewport, interval, name, length)) => {
+                            match self
+                                .resolve_panel_requested_locus(&dictionary, requested.as_deref())
+                                .and_then(|locus| {
+                                    Ok((Viewport::new(locus.interval, pixel_width)?, locus))
+                                }) {
+                                Ok((viewport, locus)) => {
+                                    let RequestedLocus {
+                                        interval,
+                                        contig_name: name,
+                                        contig_length: length,
+                                        feature_search,
+                                    } = locus;
+                                    imported_feature_search =
+                                        imported_feature_search.or(feature_search);
                                     let panel = self
                                         .panels
                                         .get_mut(id)
@@ -1479,18 +1481,18 @@ impl Viewer {
                                     panel.viewport = viewport;
                                     panel.contig_name = name;
                                     panel.contig_length = length;
-                                    panel.home_interval = interval;
-                                    panel.navigation_history = NavigationHistory::new(interval);
+                                    panel.reset_history(interval);
                                     panel.vertical_scroll_points = 0.0;
                                     panel.vertical_content_origin_points = 0.0;
                                     panel.latent_vertical_scroll_fraction = None;
                                 }
                                 Err(error) if id == active_panel_id => {
-                                    self.data_status = error.to_string();
+                                    self.report_error(error.to_string());
                                 }
                                 Err(_) => {}
                             }
                         }
+                        self.finish_imported_locus(imported_feature_search);
                         let default_annotation_count = self.assembly.default_annotation_count;
                         let (assembly, cytoband_failure) = load_assembly_reporting(
                             &self.assembly_name,
@@ -1764,7 +1766,11 @@ impl Viewer {
                     Err(error) => {
                         track.lifecycle = AlignmentTrackLifecycle::Failed(error.to_string());
                         if Some(track_id) == primary_id {
-                            self.data_status = error.to_string();
+                            crate::app::shell_state::report_error_to(
+                                &mut self.shell.notifications,
+                                &mut self.data_status,
+                                error.to_string(),
+                            );
                         }
                         break;
                     }
@@ -2261,7 +2267,7 @@ impl Viewer {
                         projection.scene_pressure_retry = None;
                         projection.settle_unavailable(message.clone());
                         if Some(track_id) == primary_id && panel_id == active_panel_id {
-                            self.data_status = message;
+                            self.report_warning(message);
                         }
                         rebuild_display = true;
                         continue;
@@ -2611,7 +2617,7 @@ impl Viewer {
                     if Some(track_id) == primary_id
                         && panel_id.is_none_or(|panel_id| panel_id == active_panel_id)
                     {
-                        self.data_status = message.to_string();
+                        self.report_error(message.to_string());
                     }
                     rebuild_display = true;
                 }
@@ -2652,8 +2658,7 @@ impl Viewer {
                         .to_owned(),
                 );
                 if Some(track_id) == primary_id && panel_id == active_panel_id {
-                    "Internal liveness failure: the alignment worker became idle before completing this target"
-                        .clone_into(&mut self.data_status);
+                    self.report_error("Internal liveness failure: the alignment worker became idle before completing this target");
                 }
                 rebuild_display = true;
             }
@@ -2691,22 +2696,25 @@ impl Viewer {
                 self.persist_settings();
             }
             let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
+            let mut imported_feature_search = None;
             for id in ids {
                 let (requested, pixel_width) = self
                     .panels
                     .get(id)
                     .map(|panel| (panel.requested_locus.clone(), panel.viewport.pixel_width()))
                     .expect("panel id came from the panel collection");
-                match resolve_initial_locus(&dictionary, &self.contig_aliases, requested.as_deref())
-                    .and_then(|(interval, name, length)| {
-                        Ok((
-                            Viewport::new(interval, pixel_width)?,
+                match self
+                    .resolve_panel_requested_locus(&dictionary, requested.as_deref())
+                    .and_then(|locus| Ok((Viewport::new(locus.interval, pixel_width)?, locus)))
+                {
+                    Ok((viewport, locus)) => {
+                        let RequestedLocus {
                             interval,
-                            name,
-                            length,
-                        ))
-                    }) {
-                    Ok((viewport, interval, name, length)) => {
+                            contig_name: name,
+                            contig_length: length,
+                            feature_search,
+                        } = locus;
+                        imported_feature_search = imported_feature_search.or(feature_search);
                         let panel = self
                             .panels
                             .get_mut(id)
@@ -2714,16 +2722,16 @@ impl Viewer {
                         panel.viewport = viewport;
                         panel.contig_name = name;
                         panel.contig_length = length;
-                        panel.home_interval = interval;
-                        panel.navigation_history = NavigationHistory::new(interval);
+                        panel.reset_history(interval);
                         panel.vertical_scroll_points = 0.0;
                         panel.vertical_content_origin_points = 0.0;
                         panel.latent_vertical_scroll_fraction = None;
                     }
-                    Err(error) if id == active_panel_id => self.data_status = error.to_string(),
+                    Err(error) if id == active_panel_id => self.report_error(error.to_string()),
                     Err(_) => {}
                 }
             }
+            self.finish_imported_locus(imported_feature_search);
             let default_annotation_count = self.assembly.default_annotation_count;
             let (assembly, cytoband_failure) = load_assembly_reporting(
                 &self.assembly_name,
@@ -2775,6 +2783,38 @@ impl Viewer {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Logs a per-track warning the first time a text track reports skipped malformed lines.
+    fn report_track_source_diagnostics(&mut self) {
+        let Some(engine) = &self.track_engine else {
+            return;
+        };
+        for (track_id, diagnostics) in engine.source_diagnostics() {
+            let name = self
+                .tracks
+                .tracks()
+                .iter()
+                .find(|track| track.id == track_id)
+                .map_or_else(
+                    || format!("track {}", track_id.get()),
+                    |track| track.name.clone(),
+                );
+            if let Some(message) = self.shell.skipped_lines.observe(
+                track_id,
+                &name,
+                diagnostics.malformed_lines,
+                diagnostics.first_malformed_line.as_ref(),
+            ) {
+                tracing::warn!(track_id = track_id.get(), %message, "track source skipped lines");
+                self.shell.notifications.push(
+                    app::shell_state::NotificationSeverity::Warning,
+                    Some(track_id),
+                    message,
+                );
+                self.window.request_redraw();
+            }
+        }
+    }
+
     pub(crate) fn poll_track_events(&mut self) {
         let mut events = Vec::new();
         if let Some(engine) = &self.track_engine {
@@ -2783,13 +2823,18 @@ impl Viewer {
                     Ok(Some(event)) => events.push(event),
                     Ok(None) => break,
                     Err(error) => {
-                        self.data_status = error.to_string();
+                        self.report_error(error.to_string());
                         break;
                     }
                 }
             }
         }
         let had_events = !events.is_empty();
+        if had_events {
+            // Ready / TrackAdded / TracksAdded / LaneCompleted may each have met malformed
+            // lines; the reporter logs each track once however many events arrive.
+            self.report_track_source_diagnostics();
+        }
         for event in events {
             let stale_query_result = match &event {
                 TrackEngineEvent::QueryCompleted { request, .. }
@@ -2881,7 +2926,7 @@ impl Viewer {
                     selected_index,
                 } => {
                     if let Err(error) = self.expand_tdf_channels(id, &track_names, selected_index) {
-                        self.data_status = error.to_string();
+                        self.report_error(error.to_string());
                     }
                 }
                 TrackEngineEvent::LaneCompleted {

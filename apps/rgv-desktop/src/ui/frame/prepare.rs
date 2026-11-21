@@ -613,7 +613,7 @@ impl Viewer {
     }
 
     fn prepare_shell_ui_draft(&mut self) -> super::shell_dialogs::ShellUiDraft {
-        let shell = &mut self.document_state.shell;
+        let shell = &mut self.shell;
         if shell.notifications_open {
             // Everything listed in the open window has been seen.
             shell.notifications.mark_seen();
@@ -1069,13 +1069,12 @@ impl Viewer {
         let region_to_relocate = None;
         let review_to_relocate = None;
         // Read by the metadata window and by the sample pickers in track settings.
-        let sample_metadata = if metadata_open
-            || matches!(self.open_panel, Some(UiPanel::TrackSettings(_)))
-        {
-            self.sample_metadata.clone()
-        } else {
-            None
-        };
+        let sample_metadata =
+            if metadata_open || matches!(self.open_panel, Some(UiPanel::TrackSettings(_))) {
+                self.sample_metadata.clone()
+            } else {
+                None
+            };
         let metadata_filter_column = self.metadata_filter_column;
         let metadata_filter_value = self.metadata_filter_value.clone();
         let metadata_selected_tracks = self.metadata_selected_tracks.clone();

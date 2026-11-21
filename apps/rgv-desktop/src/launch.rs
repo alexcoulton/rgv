@@ -134,6 +134,11 @@ pub(super) struct LaunchOptions {
     /// Restrict local-control input and output paths to this directory.
     #[arg(long, requires = "control_port")]
     pub(super) control_root: Option<PathBuf>,
+    /// Let local-control clients open URLs on loopback, link-local and private-network
+    /// addresses. Off by default so a control client cannot use the viewer to reach services
+    /// only this machine or network can see.
+    #[arg(long, requires = "control_port")]
+    pub(super) control_allow_private_urls: bool,
     #[arg(skip)]
     pub(super) loaded_session: Option<SessionDocument>,
     #[arg(skip)]
@@ -145,7 +150,12 @@ pub(super) struct LaunchOptions {
     #[arg(skip)]
     pub(super) loaded_settings: DesktopSettings,
     #[arg(skip)]
+    pub(super) loaded_settings_recovery: Option<rgv_core::SettingsRecovery>,
+    #[arg(skip)]
     pub(super) loaded_igv_report: Option<IgvImportReport>,
+    /// Set when the imported IGV session's locus was not an interval.
+    #[arg(skip)]
+    pub(super) loaded_igv_locus: Option<ImportedLocusRequest>,
     #[arg(skip)]
     pub(super) recovered_unclean_exit: bool,
     #[arg(skip)]
@@ -207,17 +217,18 @@ impl LaunchOptions {
             .transpose()
             .context("failed to read automation batch")?;
         self.load_control_configuration()?;
-        self.loaded_settings = if settings_path.exists() {
-            match DesktopSettings::read(&settings_path) {
-                Ok(settings) => settings,
-                Err(error) => {
-                    tracing::warn!(path = %settings_path.display(), %error, "ignoring invalid settings file");
-                    DesktopSettings::default()
-                }
-            }
-        } else {
-            DesktopSettings::default()
-        };
+        // A missing file is a first run; an unreadable one is preserved
+        // beside itself and reported once the window exists (APP-11).
+        let (settings, recovery) = DesktopSettings::read_or_recover(&settings_path);
+        if let Some(recovery) = &recovery {
+            tracing::warn!(
+                path = %settings_path.display(),
+                error = %recovery.error,
+                "settings file is unreadable; using defaults"
+            );
+        }
+        self.loaded_settings = settings;
+        self.loaded_settings_recovery = recovery;
         self.load_launch_genome()?;
         let mut document = if let Some(path) = &self.session {
             Some(
@@ -229,6 +240,7 @@ impl LaunchOptions {
                 .with_context(|| format!("failed to read IGV session {}", path.display()))?;
             let imported = SessionDocument::import_igv_with_report(&xml)
                 .with_context(|| format!("failed to import IGV session {}", path.display()))?;
+            self.loaded_igv_locus = imported_locus_request(&imported.locus_resolution);
             let mut document = imported.document;
             let parent = path
                 .parent()
@@ -268,12 +280,16 @@ impl LaunchOptions {
                 }
                 None => None,
             };
-            self.locus = Some(format!(
-                "{}:{}-{}",
-                document.locus.contig,
-                document.locus.start + 1,
-                document.locus.end
-            ));
+            // An imported placeholder is not a locus: leave it unset so the
+            // default opens until the request can be resolved.
+            self.locus = self.loaded_igv_locus.is_none().then(|| {
+                format!(
+                    "{}:{}-{}",
+                    document.locus.contig,
+                    document.locus.start + 1,
+                    document.locus.end
+                )
+            });
             self.max_alignments = primary_alignment_track(document)
                 .map_or(document.maximum_alignments, |track| {
                     track.maximum_alignments
@@ -792,17 +808,18 @@ impl RunMarker {
                 .filter_map(std::result::Result::ok)
                 .map(|entry| entry.path())
             {
-                let is_marker = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with("rgv-running") && name.ends_with(".marker")
-                    });
+                let is_marker =
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("rgv-running") && name.ends_with(".marker")
+                        });
                 if !is_marker {
                     continue;
                 }
                 // Our own pid cannot belong to an earlier live instance: the marker is stale.
-                let stale = run_marker_pid(&path).is_none_or(|pid| pid == own_pid || !is_alive(pid));
+                let stale =
+                    run_marker_pid(&path).is_none_or(|pid| pid == own_pid || !is_alive(pid));
                 if stale {
                     previous_unclean_exit = true;
                     if let Err(error) = std::fs::remove_file(&path) {
@@ -946,7 +963,10 @@ mod tests {
             std::fs::read_dir(&autosaves).unwrap().count(),
             MAX_RECOVERY_CANDIDATES + 2
         );
-        assert!(!other_instance.exists(), "the oldest foreign snapshot goes first");
+        assert!(
+            !other_instance.exists(),
+            "the oldest foreign snapshot goes first"
+        );
     }
 
     #[test]

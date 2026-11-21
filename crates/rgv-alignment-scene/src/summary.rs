@@ -1,8 +1,8 @@
 use std::{mem::size_of, sync::Arc};
 
 use rgv_hts::{
-    AlignmentMateOverlapCollapser, CigarOpKind, ExactDepthRun, ExactDepthTile,
-    ExactDepthTileBuilder, add_unmasked_range,
+    AlignmentMateAlignment, AlignmentMateOverlapCollapser, CigarOpKind, ExactDepthRun,
+    ExactDepthTile, ExactDepthTileBuilder,
 };
 use thiserror::Error;
 
@@ -104,14 +104,20 @@ impl ExactDepthSummaryTile {
                 .ok_or(EvidenceSelectionError::InvalidChunkIndex)?;
             let flags = record.flags();
             let reverse = flags.is_reverse();
-            let overlap_mask = collapser.mask_for(
-                record.read_name(),
-                record.contig(),
-                record.start(),
-                record.end(),
-                flags,
-                record.mate_contig(),
-                record.mate_start(),
+            // Depth collapses only where the earlier mate has an aligned base; its deletions and
+            // `N` skips leave the later mate's bases counted, as in the direct rgv-hts query.
+            let overlap_mask = collapser.mask_for_alignment(
+                AlignmentMateAlignment {
+                    read_name: record.read_name(),
+                    contig: record.contig(),
+                    start: record.start(),
+                    end: record.end(),
+                    flags,
+                    mate_contig: record.mate_contig(),
+                    mate_start: record.mate_start(),
+                },
+                record.cigar().iter().copied(),
+                |_| true,
             );
             let mut reference_position = record.start();
             let mut aligned_segments = Vec::<(u64, u64)>::new();
@@ -153,19 +159,20 @@ impl ExactDepthSummaryTile {
                 if start >= end {
                     continue;
                 }
-                collapsed = collapsed.saturating_add(add_unmasked_range(
-                    start,
-                    end,
-                    overlap_mask,
-                    |start, end| {
-                        depth_builder.add_aligned_segment(
-                            start,
-                            end,
-                            reverse,
-                            record.mapping_quality(),
-                        );
-                    },
-                ));
+                let mut add = |start, end| {
+                    depth_builder.add_aligned_segment(
+                        start,
+                        end,
+                        reverse,
+                        record.mapping_quality(),
+                    );
+                };
+                if let Some(mask) = &overlap_mask {
+                    collapsed =
+                        collapsed.saturating_add(mask.add_unmasked_depth_range(start, end, add));
+                } else {
+                    add(start, end);
+                }
             }
             collapser.note_collapsed(collapsed);
         }

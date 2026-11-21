@@ -288,7 +288,6 @@ use rgv_layout::{
     Direction, DisplayList, RectPrimitive, RectShape, TextPrimitive, breakend_bracket_dimensions,
     junction_arc_distance_to_point, junction_arc_stroke_width, read_arrow_head_width,
 };
-use wgpu::util::DeviceExt;
 
 const RECTANGLE_SHADER: &str = include_str!("rectangle.wgsl");
 const MAX_UPLOAD_BYTES_PER_FRAME: usize = 16 * 1024 * 1024;
@@ -415,14 +414,15 @@ impl RectangleRenderer {
             label: Some("RGV rectangle shader"),
             source: wgpu::ShaderSource::Wgsl(RECTANGLE_SHADER.into()),
         });
-        let screen_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        // Created unmapped: both screen uniforms are written by every `prepare` before anything
+        // is drawn, and a buffer mapped at creation aborts the process when the device is
+        // already lost (wgpu treats a failed `get_mapped_range` as fatal), which would turn a
+        // device loss during recovery into a crash.
+        let screen_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("RGV screen uniform"),
-            contents: bytemuck::bytes_of(&ScreenUniform {
-                size: [1.0, 1.0],
-                selected_object_id: 0,
-                hovered_object_id: 0,
-            }),
+            size: std::mem::size_of::<ScreenUniform>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let screen_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("RGV screen layout"),
@@ -445,14 +445,11 @@ impl RectangleRenderer {
                 resource: screen_buffer.as_entire_binding(),
             }],
         });
-        let neutral_screen_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let neutral_screen_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("RGV neutral rectangle screen uniform"),
-            contents: bytemuck::bytes_of(&ScreenUniform {
-                size: [1.0, 1.0],
-                selected_object_id: 0,
-                hovered_object_id: 0,
-            }),
+            size: std::mem::size_of::<ScreenUniform>() as wgpu::BufferAddress,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let neutral_screen_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("RGV neutral rectangle screen bind group"),

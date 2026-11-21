@@ -448,7 +448,7 @@ impl Viewer {
                             "Removed auxiliary track".clone_into(&mut self.data_status);
                         }
                         Ok(_) => {}
-                        Err(error) => self.data_status = error.to_string(),
+                        Err(error) => self.report_error(error.to_string()),
                     }
                 }
                 TrackUiAction::Remove(TrackFrameKey::Alignment(id)) => {
@@ -654,7 +654,7 @@ impl Viewer {
                             .iter()
                             .any(|intent| intent_channel(intent) == ui::TrackPane::Reads);
                 }
-                Err(error) => self.data_status = error.to_string(),
+                Err(error) => self.report_error(error.to_string()),
             }
         }
         outcome
@@ -677,7 +677,7 @@ impl Viewer {
                 },
                 visible,
             }]) {
-                self.data_status = error.to_string();
+                self.report_error(error.to_string());
                 return;
             }
             self.invalidate_navigation_contract("read track visibility changed");

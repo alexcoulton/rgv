@@ -1,8 +1,8 @@
 use std::{mem::size_of, sync::Arc};
 
 use rgv_hts::{
-    AlignmentMateOverlapCollapser, CigarOpKind, PileupBin, PileupBuilder, SequenceView,
-    add_unmasked_range, aligned_observation, bisulfite_strand_is_reverse,
+    AlignmentMateAlignment, AlignmentMateOverlapCollapser, CigarOpKind, PileupBin, PileupBuilder,
+    SequenceView, aligned_observation, base_observation_is_counted, bisulfite_strand_is_reverse,
 };
 use thiserror::Error;
 
@@ -117,15 +117,31 @@ impl ExactAlleleSummaryTile {
             let flags = record.flags();
             let reverse = flags.is_reverse();
             let bisulfite_reverse = bisulfite_strand_is_reverse(flags);
-            let overlap_mask = collapser.mask_for(
-                record.read_name(),
-                record.contig(),
-                record.start(),
-                record.end(),
-                flags,
-                record.mate_contig(),
-                record.mate_start(),
+            // The mask follows the earlier mate's own CIGAR and base-quality eligibility, exactly
+            // as the direct rgv-hts pileup query does: a deletion, `N` skip or rejected base in
+            // the earlier mate must not hide the later mate's evidence.
+            let minimum_base_quality = contract.minimum_base_quality();
+            let overlap_mask = collapser.mask_for_alignment(
+                AlignmentMateAlignment {
+                    read_name: record.read_name(),
+                    contig: record.contig(),
+                    start: record.start(),
+                    end: record.end(),
+                    flags,
+                    mate_contig: record.mate_contig(),
+                    mate_start: record.mate_start(),
+                },
+                record.cigar().iter().copied(),
+                |read_position| {
+                    base_observation_is_counted(
+                        bases.len(),
+                        qualities,
+                        read_position,
+                        minimum_base_quality,
+                    )
+                },
             );
+            let overlap_mask = overlap_mask.as_ref();
             let mut reference_position = record.start();
             let mut read_position = 0_usize;
             let mut collapsed = 0_u64;
@@ -138,7 +154,7 @@ impl ExactAlleleSummaryTile {
                         for offset in 0..operation.len as usize {
                             let position = reference_position.saturating_add(offset as u64);
                             if !interval.contains(position)
-                                || overlap_mask.is_some_and(|mask| mask.contains(position))
+                                || overlap_mask.is_some_and(|mask| mask.masks_base(position))
                             {
                                 continue;
                             }
@@ -159,12 +175,9 @@ impl ExactAlleleSummaryTile {
                         let clipped_start = reference_position.max(interval.start());
                         let clipped_end = end.min(interval.end());
                         if clipped_start < clipped_end {
-                            collapsed = collapsed.saturating_add(add_unmasked_range(
-                                clipped_start,
-                                clipped_end,
-                                overlap_mask,
-                                |_, _| {},
-                            ));
+                            collapsed = collapsed.saturating_add(overlap_mask.map_or(0, |mask| {
+                                mask.add_unmasked_depth_range(clipped_start, clipped_end, |_, _| {})
+                            }));
                         }
                         read_position = read_position.saturating_add(operation.len as usize);
                         reference_position = end;
@@ -174,12 +187,16 @@ impl ExactAlleleSummaryTile {
                         let clipped_start = reference_position.max(interval.start());
                         let clipped_end = end.min(interval.end());
                         if clipped_start < clipped_end {
-                            collapsed = collapsed.saturating_add(add_unmasked_range(
-                                clipped_start,
-                                clipped_end,
-                                overlap_mask,
-                                |start, end| alleles.add_deletion(start, end, reverse),
-                            ));
+                            if let Some(mask) = overlap_mask {
+                                collapsed =
+                                    collapsed.saturating_add(mask.add_unmasked_deletion_range(
+                                        clipped_start,
+                                        clipped_end,
+                                        |start, end| alleles.add_deletion(start, end, reverse),
+                                    ));
+                            } else {
+                                alleles.add_deletion(clipped_start, clipped_end, reverse);
+                            }
                         }
                         reference_position = end;
                     }
@@ -196,7 +213,8 @@ impl ExactAlleleSummaryTile {
                         // boundary fallback.
                         let insertion_anchor = reference_position.saturating_sub(1);
                         if interval.contains(insertion_anchor)
-                            && !overlap_mask.is_some_and(|mask| mask.contains(reference_position))
+                            && !overlap_mask
+                                .is_some_and(|mask| mask.masks_indel(reference_position))
                         {
                             alleles.add_insertion(reference_position, reverse);
                         }
@@ -535,6 +553,173 @@ mod tests {
         assert_eq!(once.site_at(12).unwrap().alleles.a, 1);
         assert_eq!(both.site_at(12).unwrap().alleles.a, 2);
         assert_eq!(once.collapsed_mate_bases(), 2);
+    }
+
+    /// Earlier mate `10: 4M2D4M` (bases at 10..14 and 16..20, deletion over 14..16) whose
+    /// read index 4 (reference 16) fails base quality; later mate `12: 10M` (12..22).
+    fn overlapping_mates_with_a_deletion_and_a_low_quality_base() -> [AlignmentRecord; 2] {
+        let op = |kind, len| CigarOp { kind, len };
+        let mut earlier = record(
+            b"pair",
+            10,
+            b"AAAAAAAA",
+            &[30, 30, 30, 30, 5, 30, 30, 30],
+            0x1 | 0x20 | 0x40,
+            Some(12),
+        );
+        earlier.cigar = vec![
+            op(CigarOpKind::Match, 4),
+            op(CigarOpKind::Deletion, 2),
+            op(CigarOpKind::Match, 4),
+        ];
+        earlier.end = 20;
+        let later = record(
+            b"pair",
+            12,
+            b"CCCCCCCCCC",
+            &[30; 10],
+            0x1 | 0x10 | 0x80,
+            Some(10),
+        );
+        [earlier, later]
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn count_once_follows_the_earlier_mates_deletion_and_base_quality() {
+        let ledger = AllocationLedger::new(2 << 20, 0);
+        let records = overlapping_mates_with_a_deletion_and_a_low_quality_base();
+        let root = evidence(&records, &ledger);
+        let alleles = ExactAlleleSummaryTile::build(
+            &root,
+            tile(),
+            100,
+            AlleleSummaryContract::new(
+                OverlappingMatePolicy::CountOnce,
+                10,
+                AlleleSummaryDetail::Counts,
+            ),
+            &ledger,
+            ReservationKind::Normal,
+            3,
+        )
+        .unwrap();
+        let depth = crate::ExactDepthSummaryTile::build(
+            &root,
+            tile(),
+            100,
+            crate::DepthSummaryContract::new(OverlappingMatePolicy::CountOnce),
+            &ledger,
+            ReservationKind::Normal,
+            4,
+        )
+        .unwrap();
+
+        // (position, A, C, deletion, depth), computed by hand:
+        //  10,11  only the earlier mate.
+        //  12,13  both aligned: the later mate's C and depth collapse.
+        //  14,15  the earlier mate's deletion is the template's observation, so the later
+        //         mate's C is not an allele; but only the later mate has an aligned base, so
+        //         it supplies the depth (the legacy single-range mask reported depth 0 here).
+        //  16     the earlier A fails base quality, so the later C is counted; depth collapses.
+        //  17..20 both aligned: collapsed onto the earlier mate.
+        //  20,21  only the later mate.
+        let expected = [
+            (10, 1, 0, 0, 1),
+            (11, 1, 0, 0, 1),
+            (12, 1, 0, 0, 1),
+            (13, 1, 0, 0, 1),
+            (14, 0, 0, 1, 1),
+            (15, 0, 0, 1, 1),
+            (16, 0, 1, 0, 1),
+            (17, 1, 0, 0, 1),
+            (18, 1, 0, 0, 1),
+            (19, 1, 0, 0, 1),
+            (20, 0, 1, 0, 1),
+            (21, 0, 1, 0, 1),
+        ];
+        let mut scene_depth = vec![0_u32; 100];
+        for run in depth.depth().runs() {
+            for position in run.start..run.end {
+                scene_depth[usize::try_from(position).unwrap()] += run.depth;
+            }
+        }
+        for (position, a, c, deletion, expected_depth) in expected {
+            let site = alleles.site_at(position).unwrap().alleles;
+            assert_eq!(
+                (site.a, site.c, site.deletion),
+                (a, c, deletion),
+                "alleles at {position}"
+            );
+            assert_eq!(site.base_observations() + site.deletion, 1, "{position}");
+            assert_eq!(
+                scene_depth[usize::try_from(position).unwrap()],
+                expected_depth,
+                "depth at {position}"
+            );
+        }
+        assert_eq!(scene_depth.iter().sum::<u32>(), 12);
+        // Aligned in both mates: 12, 13 and 16..20.
+        assert_eq!(depth.collapsed_mate_bases(), 6);
+        assert_eq!(alleles.collapsed_mate_bases(), 6);
+
+        // The direct rgv-hts query over the same reads must report exactly the same thing.
+        let mut batch = AlignmentBatch::default();
+        for record in &records {
+            batch.push(record).unwrap();
+        }
+        let whole = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let resident = rgv_hts::AlignmentQuery {
+            interval: whole,
+            header: Arc::new(rgv_hts::AlignmentHeaderMetadata::default()),
+            batch,
+            pileup: rgv_hts::PileupSummary::default(),
+            junctions: rgv_hts::JunctionSummary::default(),
+            pairs: rgv_hts::PairSummary::default(),
+            reference: None,
+            stats: rgv_hts::QueryStats {
+                records_seen: 2,
+                records_eligible: 2,
+                records_emitted: 2,
+                complete_read_limit: 100,
+                ..rgv_hts::QueryStats::default()
+            },
+        };
+        let options = rgv_hts::QueryOptions {
+            detail: rgv_hts::QueryDetail::Full,
+            max_records: std::num::NonZeroUsize::new(100).unwrap(),
+            coverage_bins: std::num::NonZeroUsize::new(100).unwrap(),
+            collect_alleles: true,
+            overlapping_mate_policy: OverlappingMatePolicy::CountOnce,
+            minimum_base_quality: 10,
+            ..rgv_hts::QueryOptions::default()
+        };
+        let direct = rgv_hts::derive_alignment_query(
+            &resident,
+            &rgv_hts::AlignmentOverlapIndex::new(&resident.batch),
+            whole,
+            &options,
+            None,
+            &|| true,
+        )
+        .unwrap();
+        assert_eq!(direct.pileup.len(), 100);
+        for position in 0..100_u64 {
+            let (_, bin) = direct.pileup.bin_at(whole, position).unwrap();
+            let site = alleles.site_at(position).unwrap();
+            assert_eq!(site.alleles, bin.alleles, "direct alleles at {position}");
+            assert_eq!(site.forward_alleles, bin.forward_alleles, "{position}");
+            assert_eq!(site.reverse_alleles, bin.reverse_alleles, "{position}");
+            assert_eq!(
+                scene_depth[usize::try_from(position).unwrap()],
+                bin.depth,
+                "direct depth at {position}"
+            );
+        }
+        assert_eq!(
+            direct.pileup.provenance.collapsed_mate_bases,
+            alleles.collapsed_mate_bases()
+        );
     }
 
     #[test]

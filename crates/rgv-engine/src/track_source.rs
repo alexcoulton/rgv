@@ -8,12 +8,12 @@ use std::sync::{Arc, Mutex};
 
 use rgv_core::{CopyNumberTrackSettings, InteractionTrackSettings, VariantTrackSettings};
 use rgv_hts::{
-    BigBedSource, BigWigSource, FeatureRecord, LocalVariantSource, Strand, TdfSource,
-    TextCopyNumberSource, TextFeatureSource, TextGwasSource, TextInteractionSource,
-    TextMutationSource, TextQuantitativeSource,
+    BigBedSource, BigWigSource, FeatureRecord, LocalVariantSource, RemoteCancellation,
+    RemoteTransferBudget, Strand, TdfSource, TextCopyNumberSource, TextFeatureSource,
+    TextGwasSource, TextInteractionSource, TextMutationSource, TextQuantitativeSource,
 };
 
-use crate::TrackSnapshotData;
+use crate::{TrackSnapshotData, TrackSourceDiagnostics};
 
 /// Upper bound on variant records returned for one viewport query.
 const MAX_VARIANT_QUERY_RECORDS: usize = 100_000;
@@ -77,6 +77,21 @@ pub(crate) trait TrackSource: Send {
     fn channels(&self) -> Option<(Vec<String>, usize)> {
         None
     }
+
+    /// Governs the remote reads of the operations that follow: `keep_going` abandons them once
+    /// it returns false, and `budget` is a fresh allowance of requests and bytes. `None` lifts
+    /// either. Sources that read no remote data through RGV's range reader ignore both.
+    fn set_remote_control(
+        &mut self,
+        _keep_going: Option<RemoteCancellation>,
+        _budget: Option<RemoteTransferBudget>,
+    ) {
+    }
+
+    /// Input the source had to skip; `None` for kinds that do not track it.
+    fn diagnostics(&self) -> Option<TrackSourceDiagnostics> {
+        None
+    }
 }
 
 impl TrackSource for TextFeatureSource {
@@ -115,6 +130,15 @@ impl TrackSource for TextFeatureSource {
             scan_truncated: results.scan_truncated,
         }))
     }
+
+    fn diagnostics(&self) -> Option<TrackSourceDiagnostics> {
+        Some(TrackSourceDiagnostics {
+            malformed_lines: self.malformed_line_count(),
+            first_malformed_line: self
+                .first_malformed_line()
+                .map(|(line, message)| (line, message.to_owned())),
+        })
+    }
 }
 
 impl TrackSource for BigBedSource {
@@ -152,6 +176,15 @@ impl TrackSource for BigBedSource {
             index_truncated: results.index_truncated,
             scan_truncated: results.scan_truncated,
         }))
+    }
+
+    fn set_remote_control(
+        &mut self,
+        keep_going: Option<RemoteCancellation>,
+        budget: Option<RemoteTransferBudget>,
+    ) {
+        self.set_remote_cancellation(keep_going);
+        self.set_remote_transfer_budget(budget);
     }
 }
 
@@ -261,6 +294,15 @@ impl TrackSource for BigWigSource {
             .map(|query| TrackSnapshotData::Quantitative(Arc::new(query)))
             .map_err(|error| error.to_string())
     }
+
+    fn set_remote_control(
+        &mut self,
+        keep_going: Option<RemoteCancellation>,
+        budget: Option<RemoteTransferBudget>,
+    ) {
+        self.set_remote_cancellation(keep_going);
+        self.set_remote_transfer_budget(budget);
+    }
 }
 
 impl TrackSource for TextQuantitativeSource {
@@ -337,6 +379,10 @@ impl TrackSource for TextMutationSource {
 pub(crate) struct TdfChannel {
     pub(crate) source: Arc<Mutex<TdfSource>>,
     pub(crate) track_index: usize,
+    /// Remote control of this channel's next query. Channels of one archive share a reader, so
+    /// it is installed while the reader is locked for the query, never ahead of it.
+    pub(crate) keep_going: Option<RemoteCancellation>,
+    pub(crate) budget: Option<RemoteTransferBudget>,
 }
 
 impl TrackSource for TdfChannel {
@@ -347,12 +393,28 @@ impl TrackSource for TdfChannel {
         end: u64,
         _settings: TrackQuerySettings<'_>,
     ) -> Result<TrackSnapshotData, String> {
-        self.source
+        let mut source = self
+            .source
             .lock()
-            .map_err(|_| "the TDF reader failed in another query".to_owned())?
+            .map_err(|_| "the TDF reader failed in another query".to_owned())?;
+        source.set_remote_cancellation(self.keep_going.clone());
+        source.set_remote_transfer_budget(self.budget);
+        let result = source
             .query_channel(self.track_index, contig, start, end)
             .map(|query| TrackSnapshotData::Quantitative(Arc::new(query)))
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string());
+        // Another channel's query must not inherit this one's (possibly stale) check.
+        source.set_remote_cancellation(None);
+        result
+    }
+
+    fn set_remote_control(
+        &mut self,
+        keep_going: Option<RemoteCancellation>,
+        budget: Option<RemoteTransferBudget>,
+    ) {
+        self.keep_going = keep_going;
+        self.budget = budget;
     }
 
     fn channels(&self) -> Option<(Vec<String>, usize)> {

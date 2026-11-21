@@ -34,6 +34,9 @@ pub(super) struct GenomicDisplayPass {
     pub(super) pending_context_lanes: BTreeSet<ContextLaneKey>,
     pub(super) unavailable_context_lanes: BTreeSet<ContextLaneKey>,
     pub(super) read_panel_displays: Vec<ReadPanelDisplayCache>,
+    /// Hands every contextual track a disjoint block of pickable object ids
+    /// for this pass, sized to its record count.
+    pub(super) object_ids: ObjectIdAllocator,
 }
 
 impl Viewer {
@@ -259,6 +262,7 @@ impl Viewer {
             pending_context_lanes: BTreeSet::new(),
             unavailable_context_lanes: BTreeSet::new(),
             read_panel_displays: Vec::new(),
+            object_ids: ObjectIdAllocator::starting_at(FIRST_CONTEXT_TRACK_OBJECT_ID),
         }
     }
 

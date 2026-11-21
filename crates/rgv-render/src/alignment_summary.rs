@@ -318,6 +318,8 @@ pub enum AlignmentSummaryJunctionComponentToken {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct AlignmentSummaryGpuJunctionInstance {
+    /// Signed double-single offsets from the carrier page start. `start_offset` is negative for
+    /// a junction which enters the page from the left; `end_offset` may exceed the page length.
     pub start_offset: [f32; 2],
     pub end_offset: [f32; 2],
     /// `[component depth, total depth, minimum left flank, minimum right flank]`.
@@ -727,6 +729,34 @@ fn junction_arc_curve_offset(fraction: f64, height: f64, stroke_width: f64) -> f
     let inner_height = (height - stroke_width).max(0.0);
     let centred = fraction.clamp(0.0, 1.0) - 0.5;
     stroke_width * 0.5 + inner_height * 4.0 * centred * centred
+}
+
+/// CPU mirror of the fragment stage's stroke distance for a junction arc: the distance from a
+/// point to the arc centre line measured perpendicular to the curve (first-order), so the stroke
+/// keeps its thickness on steep flanks instead of thinning with the vertical distance. `fraction`
+/// is the arc parameter and `local_y` the offset from the top of the arc bounds, in points.
+#[cfg(test)]
+fn junction_arc_stroke_distance(
+    fraction: f64,
+    local_y: f64,
+    width: f64,
+    height: f64,
+    stroke_width: f64,
+    downward: bool,
+) -> f64 {
+    let inner_height = (height - stroke_width).max(0.0);
+    let offset = junction_arc_curve_offset(fraction, height, stroke_width);
+    let curve_y = if downward { height - offset } else { offset };
+    let slope = 8.0 * inner_height * (fraction - 0.5) / width.max(1.0);
+    (local_y - curve_y).abs() / (1.0 + slope * slope).sqrt()
+}
+
+/// CPU mirror of the fragment stage's stroke coverage (without the strand chevron).
+#[cfg(test)]
+fn junction_arc_stroke_coverage(distance: f64, stroke_width: f64) -> f64 {
+    let edge0 = stroke_width * 0.5;
+    let t = ((distance - edge0) / 1.0).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
 }
 
 fn projected_horizontal(
@@ -1491,6 +1521,7 @@ fn pack_junction_page(
     page: &SummarySemanticPage,
 ) -> Result<PackedAlignmentSummaryPage, AlignmentSummaryGpuPageError> {
     AlignmentSummaryGpuPageKey::junctions(page)?;
+    let page_start = page.interval().start();
     let mut instances = Vec::with_capacity(page.primitives().len().saturating_mul(4));
     let mut entries = Vec::with_capacity(page.primitives().len());
     let mut maximum_expanded_row = 0_u32;
@@ -1508,6 +1539,11 @@ fn pack_junction_page(
             ));
         };
         maximum_expanded_row = maximum_expanded_row.max(junction.expanded_row);
+        // Geometry comes from the biological extent, not the tile-clipped primitive span: a
+        // junction entering the first prepared tile starts left of the page, so its start offset
+        // is negative. The primitive span stays the page-local overlap extent for range queries.
+        let start_offset = junction_page_offset(junction.evidence.start, page_start);
+        let end_offset = junction_page_offset(junction.evidence.end, page_start);
         entries.push(AlignmentSummaryJunctionEntry {
             start_offset: primitive.start_offset,
             end_offset: primitive.end_offset,
@@ -1538,8 +1574,8 @@ fn pack_junction_page(
                 continue;
             }
             instances.push(AlignmentSummaryGpuJunctionInstance {
-                start_offset: split_f64(primitive.start_offset as f64),
-                end_offset: split_f64(primitive.end_offset as f64),
+                start_offset,
+                end_offset,
                 evidence: [
                     component_depth,
                     junction.evidence.depth,
@@ -1551,8 +1587,8 @@ fn pack_junction_page(
         }
         if junction.annotation.is_some() {
             instances.push(AlignmentSummaryGpuJunctionInstance {
-                start_offset: split_f64(primitive.start_offset as f64),
-                end_offset: split_f64(primitive.end_offset as f64),
+                start_offset,
+                end_offset,
                 evidence: [
                     0,
                     junction.evidence.depth,
@@ -5284,10 +5320,8 @@ impl AlignmentSummaryGpuRenderer {
                         continue;
                     }
                     let instance = AlignmentSummaryGpuJunctionInstance {
-                        start_offset: split_f64(
-                            evidence.start.saturating_sub(draw.page_start) as f64
-                        ),
-                        end_offset: split_f64(evidence.end.saturating_sub(draw.page_start) as f64),
+                        start_offset: junction_page_offset(evidence.start, draw.page_start),
+                        end_offset: junction_page_offset(evidence.end, draw.page_start),
                         evidence: [
                             depth,
                             evidence.depth,
@@ -5403,15 +5437,9 @@ impl AlignmentSummaryGpuRenderer {
                 .max_by_key(|(depth, component)| (*depth, std::cmp::Reverse(*component as u32))) else {
                     continue;
                 };
-                let (Some(start), Some(end)) = (
-                    evidence.start.checked_sub(draw.page_start),
-                    evidence.end.checked_sub(draw.page_start),
-                ) else {
-                    continue;
-                };
                 let instance = AlignmentSummaryGpuJunctionInstance {
-                    start_offset: split_f64(start as f64),
-                    end_offset: split_f64(end as f64),
+                    start_offset: junction_page_offset(evidence.start, draw.page_start),
+                    end_offset: junction_page_offset(evidence.end, draw.page_start),
                     evidence: [
                         component_depth,
                         evidence.depth,
@@ -6646,14 +6674,10 @@ fn junction_interaction_uniform(
     let Some(interaction) = interaction else {
         return ([0.0; 4], 0, false);
     };
-    let (Some(start), Some(end)) = (
-        interaction.start.checked_sub(page_start),
-        interaction.end.checked_sub(page_start),
-    ) else {
-        return ([0.0; 4], interaction.component as u32, false);
-    };
-    let start = split_f64(start as f64);
-    let end = split_f64(end as f64);
+    // Must be bit-identical to the packed instance offsets (the shader compares them exactly),
+    // including the negative start of a junction entering the page from the left.
+    let start = junction_page_offset(interaction.start, page_start);
+    let end = junction_page_offset(interaction.end, page_start);
     (
         [start[0], start[1], end[0], end[1]],
         interaction.component as u32,
@@ -6689,6 +6713,19 @@ const fn bisulfite_context_mask(context: BisulfiteContext) -> u8 {
         BisulfiteContext::Gch => 4,
         BisulfiteContext::Wcg => 5,
     }
+}
+
+/// Signed page-relative junction coordinate as a double-single pair. A junction may start left
+/// of its carrier page (an entering junction on the first prepared tile) and may end beyond it,
+/// so the offset is formed as an exact integer difference before conversion; it stays exact for
+/// any contig length because only the distance from the page start reaches floating point.
+fn junction_page_offset(coordinate: u64, page_start: u64) -> [f32; 2] {
+    let offset = if coordinate >= page_start {
+        (coordinate - page_start) as f64
+    } else {
+        -((page_start - coordinate) as f64)
+    };
+    split_f64(offset)
 }
 
 fn split_f64(value: f64) -> [f32; 2] {
@@ -7589,11 +7626,15 @@ mod tests {
         )
     }
 
-    fn exact_authority_with_tile_bases(
+    /// Evidence always covers `0..100`; the summary root is prepared over `summary_start..100`,
+    /// so a junction starting left of `summary_start` enters its first tile.
+    fn exact_authority_over(
         ledger: &AllocationLedger,
         tile_bases: NonZeroU64,
+        summary_start: u64,
     ) -> (Arc<EvidenceRoot>, Arc<ExactSummaryRoot>) {
         let interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+        let summary_interval = GenomicInterval::new(ContigId::new(0), summary_start, 100).unwrap();
         let record = AlignmentRecord {
             contig: ContigId::new(0),
             start: 10,
@@ -7735,7 +7776,7 @@ mod tests {
         let mut pairs = Vec::new();
         let mut filters = Vec::new();
         let mut modifications = Vec::new();
-        for (index, tile) in CanonicalGenomicTile::covering(interval, tile_bases, 100)
+        for (index, tile) in CanonicalGenomicTile::covering(summary_interval, tile_bases, 100)
             .unwrap()
             .into_iter()
             .enumerate()
@@ -7795,7 +7836,7 @@ mod tests {
                     &evidence,
                     tile,
                     100,
-                    interval,
+                    summary_interval,
                     contract.filters(),
                     ledger,
                     ReservationKind::Normal,
@@ -7822,7 +7863,7 @@ mod tests {
             evidence.source_revision(),
             evidence.record_contract(),
             contract,
-            interval,
+            summary_interval,
             depth,
             alleles,
             junctions,
@@ -7878,15 +7919,29 @@ mod tests {
         tile_bases: NonZeroU64,
         reference_bases: Option<Vec<u8>>,
     ) -> Arc<AlignmentSceneSnapshot> {
-        let (evidence, summaries) = exact_authority_with_tile_bases(ledger, tile_bases);
+        test_snapshot_over(ledger, prepared_interval, tile_bases, 0, reference_bases)
+    }
+
+    fn test_snapshot_over(
+        ledger: &AllocationLedger,
+        prepared_interval: Option<GenomicInterval>,
+        tile_bases: NonZeroU64,
+        summary_start: u64,
+        reference_bases: Option<Vec<u8>>,
+    ) -> Arc<AlignmentSceneSnapshot> {
+        let (evidence, summaries) = exact_authority_over(ledger, tile_bases, summary_start);
         let interval = summaries.prepared_interval();
         let prepared_interval = prepared_interval.unwrap_or(interval);
         let reference_revision = ReferenceRevision::new(RevisionFingerprint::new(30, 31));
+        // The reference always spans the evidence, which starts left of a late summary root.
+        let reference_interval =
+            GenomicInterval::new(interval.contig(), 0, interval.end()).unwrap();
         let reference = ReferenceSlice {
-            interval,
-            bases: reference_bases.unwrap_or_else(|| vec![b'A'; interval.len() as usize]),
+            interval: reference_interval,
+            bases: reference_bases
+                .unwrap_or_else(|| vec![b'A'; reference_interval.len() as usize]),
         };
-        assert_eq!(reference.bases.len(), interval.len() as usize);
+        assert_eq!(reference.bases.len(), reference_interval.len() as usize);
         let layout = LayoutContract {
             stacking: ReadStackingMode::Compact,
             grouping: AlignmentGroupMode::None,
@@ -8444,7 +8499,7 @@ mod tests {
                 .rectangles
                 .iter()
                 .any(|rectangle| rectangle.y < 96.0
-                    && rectangle.color == Rgba::new(0.48, 0.48, 0.48, 0.90))
+                    && rectangle.color == Rgba::new(0.48, 0.48, 0.48, 1.0))
         );
         assert!(
             expected.primitives.iter().any(|primitive| matches!(
@@ -8851,6 +8906,176 @@ mod tests {
                     && (projected.bounds.height - primitive.height).abs() < 1.0e-4
             }));
         }
+    }
+
+    #[test]
+    fn entering_junction_projects_its_true_extent_like_the_cpu_projector() {
+        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+        // The fixture junction spans 15..18. Preparing summaries from 16 leaves its owner tile
+        // out of the root, so tile 1 (16..32) carries it as an entering junction.
+        let scene = test_snapshot_over(&ledger, None, NonZeroU64::new(16).unwrap(), 16, None);
+        let camera = camera(scene.prepared_interval());
+        assert_eq!(scene.prepared_interval().start(), 16);
+        let mut options = sashimi_options(
+            JunctionDisplayMode::Collapsed,
+            AlignmentSashimiScalePolicy::Fixed(1.0),
+        );
+        options.projection.scale_maximum = Some(1.0);
+        options.projection.show_labels = false;
+
+        let mut gpu = Vec::new();
+        let mut entries = Vec::new();
+        for page in scene
+            .summary_pages()
+            .iter()
+            .filter(|page| page.key().family() == SummaryPageFamily::Junctions)
+        {
+            let PackedAlignmentSummaryPage::Junctions {
+                instances,
+                metadata,
+            } = PackedAlignmentSummaryPage::from_request(
+                AlignmentSummaryGpuPageRequest::junctions(page),
+            )
+            .unwrap()
+            else {
+                unreachable!();
+            };
+            for entry in metadata.entries() {
+                entries.push((*entry, page.interval().start()));
+            }
+            // The instance carries the true start as a negative page-relative offset, and
+            // hover/selection uniforms reproduce the same bits.
+            let (span, _, present) = junction_interaction_uniform(
+                Some(AlignmentSummaryJunctionInteraction {
+                    start: 15,
+                    end: 18,
+                    component: AlignmentSummaryJunctionComponentToken::Positive,
+                }),
+                page.interval().start(),
+            );
+            assert!(present);
+            for instance in &instances {
+                assert_eq!(span.map(f32::to_bits), [-1.0, 0.0, 2.0, 0.0].map(f32::to_bits));
+                let offsets = [instance.start_offset, instance.end_offset].concat();
+                assert_eq!(bytemuck::cast_slice::<f32, u32>(&offsets), span.map(f32::to_bits));
+            }
+            gpu.extend(instances.iter().filter_map(|instance| {
+                project_alignment_summary_junction_instance(
+                    *instance,
+                    page.interval().start(),
+                    camera,
+                    1.0,
+                    1.0,
+                    1,
+                    options.projection.minimum_depth,
+                    options.projection.minimum_flank,
+                    options.projection.display_mode,
+                )
+                .filter(|projected| {
+                    projected.component != AlignmentSummaryJunctionComponentToken::Annotation
+                })
+            }));
+        }
+        assert_eq!(entries.len(), 1);
+        let (entry, page_start) = entries[0];
+        assert_eq!((entry.evidence().start, entry.evidence().end, page_start), (15, 18, 16));
+        // The page-local overlap span stays clipped to the tile for range queries.
+        assert_eq!((entry.start_offset(), entry.end_offset()), (0, 2));
+
+        let cpu = CpuSummaryProjector::project(
+            &scene,
+            1,
+            camera,
+            &CpuSummaryProjectionOptions::Junctions(options.projection),
+        )
+        .unwrap();
+        let cpu = cpu
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(
+                    primitive.component,
+                    CpuSummaryProjectedComponent::Junction { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!gpu.is_empty());
+        assert_eq!(gpu.len(), cpu.len());
+        let clip = camera.clip();
+        let points_per_base = 1.0 / camera.bases_per_pixel();
+        let expected_x = clip.x + (15.0 - camera.exact_start()) * points_per_base;
+        for projected in &gpu {
+            // Arc endpoints are the true genomic start and end; the start is left of the pane.
+            assert_near(projected.bounds.x, expected_x);
+            assert!(projected.bounds.x < clip.x);
+            assert_near(projected.bounds.width, 3.0 * points_per_base);
+            let right = projected.bounds.x + projected.bounds.width;
+            assert!(cpu.iter().any(|primitive| {
+                (primitive.x - projected.bounds.x).abs() < 1.0e-4
+                    && (primitive.x + primitive.width - right).abs() < 1.0e-4
+                    && (primitive.y - projected.bounds.y).abs() < 1.0e-4
+                    && (primitive.height - projected.bounds.height).abs() < 1.0e-4
+            }));
+        }
+    }
+
+    #[test]
+    fn junction_arc_stroke_uses_perpendicular_distance_on_steep_flanks() {
+        // A narrow, tall arc: 20 points wide, 40 high, stroke 4 (the picking stroke for this
+        // height), sampled a tenth of the way along where the centre line is steep.
+        let (width, height) = (20.0_f64, 40.0_f64);
+        let stroke = f64::from(crate::junction_arc_stroke_width(height as f32));
+        assert_near(stroke, 4.0);
+        let fraction = 0.1;
+        let curve = junction_arc_curve_offset(fraction, height, stroke);
+        let slope = 8.0 * (height - stroke) * (fraction - 0.5) / width;
+        assert!(slope.abs() > 5.0);
+
+        // Four points below the centre line is outside a vertical-distance stroke, but well
+        // inside the perpendicular one.
+        let vertical = 4.0;
+        assert!(vertical > stroke * 0.5 + 1.0);
+        for downward in [false, true] {
+            let local_y = if downward {
+                height - curve - vertical
+            } else {
+                curve + vertical
+            };
+            let distance =
+                junction_arc_stroke_distance(fraction, local_y, width, height, stroke, downward);
+            assert_near(distance, vertical / (1.0 + slope * slope).sqrt());
+            assert_near(junction_arc_stroke_coverage(distance, stroke), 1.0);
+
+            // The rendered stroke and the picking distance are the same function.
+            let rectangle = RectPrimitive {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+                color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                object_id: 0,
+                shape: if downward {
+                    RectShape::JunctionArcDown
+                } else {
+                    RectShape::JunctionArcUp
+                },
+            };
+            let picked = junction_arc_distance_to_point(
+                rectangle,
+                (fraction * width) as f32,
+                local_y as f32,
+            )
+            .unwrap();
+            assert!((f64::from(picked) - distance).abs() < 1.0e-4);
+        }
+
+        // At the apex the curve is flat and both measures agree.
+        let apex = junction_arc_curve_offset(0.5, height, stroke);
+        assert_near(
+            junction_arc_stroke_distance(0.5, apex + 1.5, width, height, stroke, false),
+            1.5,
+        );
+        assert_near(junction_arc_stroke_coverage(stroke * 0.5 + 1.0, stroke), 0.0);
     }
 
     #[test]

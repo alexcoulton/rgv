@@ -21,7 +21,7 @@ pub use genome_context::{
     ContigAxis, CoordinateRulerLayout, CoordinateRulerOptions, IdeogramCentromere, IdeogramLayout,
     IdeogramSegment, RulerTick, format_genomic_position, layout_coordinate_ruler, layout_ideogram,
 };
-pub use object_id::{NO_OBJECT_ID, ObjectIdAllocator, ObjectIdRange, record_object_id};
+pub use object_id::{NO_OBJECT_ID, ObjectIdAllocator, ObjectIdRange, offset_object_id};
 pub use reference_layout::{
     MINIMUM_BASE_GLYPH_PIXEL_WIDTH, layout_reference_slice, layout_reference_slice_oriented,
     layout_reference_translation, layout_reference_translation_in_contig,

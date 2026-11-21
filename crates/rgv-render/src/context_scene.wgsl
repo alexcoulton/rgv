@@ -5,7 +5,8 @@ struct Camera {
     y_offset: f32,
     selected_object_id: u32,
     hovered_object_id: u32,
-    padding: u32,
+    // Source-space x subtracted before scaling; see `context_camera_uniform`.
+    x_origin: f32,
 };
 
 @group(0) @binding(0)
@@ -39,9 +40,17 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
         vec2<f32>(1.0, 0.0),
         vec2<f32>(1.0, 1.0),
     );
-    let projected_size = vec2<f32>(input.size.x * camera.x_scale, input.size.y);
+    // A feature with any extent keeps at least one point of width when the camera zooms out
+    // over stale layout; mirrored by `project_context_scene_rectangle`.
+    var projected_width = input.size.x * camera.x_scale;
+    if input.size.x > 0.0 {
+        projected_width = max(projected_width, 1.0);
+    }
+    let projected_size = vec2<f32>(projected_width, input.size.y);
+    // Origin-relative: the difference of two nearby source coordinates is exact in f32, so the
+    // large `origin * scale` and `offset` terms cancel on the CPU in f64 instead of here.
     let projected_origin = vec2<f32>(
-        input.origin.x * camera.x_scale + camera.x_offset,
+        (input.origin.x - camera.x_origin) * camera.x_scale + camera.x_offset,
         input.origin.y + camera.y_offset,
     );
     let point = projected_origin + corners[input.vertex_index] * projected_size;

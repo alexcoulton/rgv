@@ -32,6 +32,7 @@ impl Viewer {
         let pending_context_lanes = &mut pass.pending_context_lanes;
         let unavailable_context_lanes = &mut pass.unavailable_context_lanes;
         let context_lane_drafts = &mut pass.context_lane_drafts;
+        let object_ids = &mut pass.object_ids;
         let mut top = pass.top;
         let display_configs = effective_auxiliary_configs
             .iter()
@@ -134,11 +135,6 @@ impl Viewer {
                         top,
                         height,
                         selected_record: self.selected_auxiliary_record(member.id),
-                        object_id_base: 1_000_000_u32.saturating_add(
-                            u32::try_from(member.id.get())
-                                .unwrap_or(u32::MAX)
-                                .saturating_mul(100_000),
-                        ),
                         feature_display_mode: member.feature.display_mode,
                         ..TrackLayoutOptions::default()
                     };
@@ -156,6 +152,7 @@ impl Viewer {
                             effective_mutation_settings: &effective_mutation_settings,
                         },
                         &mut subtracks,
+                        object_ids,
                     );
                     context_lane_drafts.push(ContextLaneDraft {
                         key: ContextLaneKey::Auxiliary(member.id),
@@ -262,6 +259,7 @@ impl Viewer {
         &self,
         lane: AuxiliaryMemberLane<'_>,
         subtracks: &mut Vec<TrackSubtrack>,
+        object_ids: &mut ObjectIdAllocator,
     ) -> DisplayList {
         let AuxiliaryMemberLane {
             member,
@@ -275,7 +273,25 @@ impl Viewer {
             effective_copy_number_settings,
             effective_mutation_settings,
         } = lane;
-        match data {
+        let quantitative_records = matches!(data, TrackSnapshotData::Quantitative(_))
+            .then(|| {
+                quantitative_display_records(
+                    member,
+                    &self.panels.active().track_snapshots,
+                    source_viewport,
+                )
+            })
+            .flatten();
+        let object_id_span = match data {
+            TrackSnapshotData::Quantitative(_) => quantitative_object_id_span(
+                quantitative_records.as_deref().map_or(0, <[_]>::len),
+                source_viewport,
+            ),
+            other => snapshot_data_record_count(other),
+        };
+        let (options, object_id_range) =
+            track_options_with_object_ids(object_ids, object_id_span, options);
+        let mut display = match data {
             TrackSnapshotData::Features(records) => {
                 let label_widths = measured_feature_label_widths(&self.egui_context, records);
                 layout_features_with_label_widths(
@@ -328,12 +344,7 @@ impl Viewer {
                         )
                     })
                     .flatten();
-                quantitative_display_records(
-                    member,
-                    &self.panels.active().track_snapshots,
-                    source_viewport,
-                )
-                .map_or_else(DisplayList::default, |records| {
+                quantitative_records.map_or_else(DisplayList::default, |records| {
                     layout_quantitative(
                         &records,
                         source_viewport,
@@ -425,6 +436,10 @@ impl Viewer {
                 )
                 .0
             }
+        };
+        if object_id_range.is_none() {
+            strip_object_ids(&mut display);
         }
+        display
     }
 }

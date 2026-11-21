@@ -560,7 +560,7 @@ impl Viewer {
             AlignmentContextAction::GoToMate => {
                 if self.select_alignment_context_read(target) {
                     if let Err(error) = self.go_to_selected_mate_in_current_panel() {
-                        self.data_status = error.to_string();
+                        self.report_error(error.to_string());
                         action_outcome = "failed";
                         action_reason = Some("mate_navigation_failed");
                     }
@@ -572,7 +572,7 @@ impl Viewer {
             AlignmentContextAction::OpenMateInNewPanel => {
                 if self.select_alignment_context_read(target) {
                     if let Err(error) = self.open_selected_mate_in_new_panel() {
-                        self.data_status = error.to_string();
+                        self.report_error(error.to_string());
                         action_outcome = "failed";
                         action_reason = Some("mate_panel_open_failed");
                     }
@@ -590,7 +590,7 @@ impl Viewer {
                             );
                         }
                         Err(error) => {
-                            self.data_status = error.to_string();
+                            self.report_error(error.to_string());
                             action_outcome = "failed";
                             action_reason = Some("supplementary_panel_open_failed");
                         }

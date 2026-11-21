@@ -368,7 +368,7 @@ fn summary_color(
 ) -> Rgba {
     use CpuSummaryProjectedComponent as C;
     match component {
-        C::Depth { .. } => Rgba::new(0.48, 0.48, 0.48, 0.90),
+        C::Depth { .. } => Rgba::new(0.48, 0.48, 0.48, 1.0),
         C::CoverageCenterLine => Rgba::new(0.72, 0.75, 0.82, 0.72),
         C::CoverageSelectedPosition { .. } => Rgba::new(1.0, 0.78, 0.18, 0.92),
         C::Allele { allele, .. } => {

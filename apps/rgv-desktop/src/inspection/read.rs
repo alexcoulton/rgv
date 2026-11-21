@@ -806,6 +806,40 @@ pub(crate) const fn complement_base(base: u8) -> u8 {
     }
 }
 
+/// The read inspector's expensive derived strings for one record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReadInspectorDerived {
+    pub(crate) modified_bases: String,
+    pub(crate) cigar: String,
+}
+
+/// Remembers [`ReadInspectorDerived`] for the selected record (UI-4). The inspector is rebuilt
+/// every frame; for a long read, decoding its modified bases and formatting its CIGAR each time
+/// dominated the frame. The key is the record itself, so the cache can never serve another
+/// read's strings: comparing two records is a linear scan with no allocation, far cheaper than
+/// either derivation, and a changed selection or refreshed record simply misses.
+#[derive(Debug, Default)]
+pub(crate) struct ReadInspectorDerivedCache {
+    entry: Option<(rgv_hts::AlignmentRecord, ReadInspectorDerived)>,
+}
+
+impl ReadInspectorDerivedCache {
+    pub(crate) fn get_or_compute(
+        &mut self,
+        record: &rgv_hts::AlignmentRecord,
+        compute: impl FnOnce(&rgv_hts::AlignmentRecord) -> ReadInspectorDerived,
+    ) -> ReadInspectorDerived {
+        if let Some((cached, derived)) = &self.entry
+            && cached == record
+        {
+            return derived.clone();
+        }
+        let derived = compute(record);
+        self.entry = Some((record.clone(), derived.clone()));
+        derived
+    }
+}
+
 pub(crate) fn format_cigar(cigar: &[rgv_hts::CigarOp]) -> String {
     if cigar.is_empty() {
         return "*".to_owned();

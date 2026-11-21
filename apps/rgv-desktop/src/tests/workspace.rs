@@ -6,6 +6,7 @@ use crate::workspace::alignment_management::{
     alignment_scene_viewport_for_layout_width, alignment_summary_camera_capture_error_is_deferred,
     retained_alignment_scene_can_present, uncovered_vertical_candidate_retains_committed_pixels,
 };
+use crate::workspace::navigation_controller::{LociNavigationPlan, loci_navigation_plan};
 use crate::workspace::queries::{
     AlignmentReferenceLanePlan, AlignmentReferenceLaneRequirement, AlignmentSceneFrameSettlement,
     alignment_scene_budget_event_is_current, alignment_scene_event_token_is_current,
@@ -3156,6 +3157,265 @@ fn locus_parser_accepts_single_positions_bare_contigs_and_chr_prefix_variants() 
     let (interval, name, _) = standalone_locus("chr9:1,000").unwrap();
     assert_eq!(name, "chr9");
     assert_eq!((interval.start(), interval.end()), (979, 1_020));
+}
+
+fn hla_dictionary() -> ReferenceDictionary {
+    ReferenceDictionary::from_contigs([
+        ("chr1".to_owned(), 1_000_000),
+        ("chrX".to_owned(), 500_000),
+        ("chrM".to_owned(), 16_569),
+        ("HLA-A*01:01:01:01".to_owned(), 3_503),
+    ])
+}
+
+#[test]
+fn colon_bearing_contig_names_navigate_and_round_trip() {
+    let dictionary = hla_dictionary();
+    let aliases = ContigAliases::default();
+    let (interval, name, length) =
+        resolve_initial_locus(&dictionary, &aliases, Some("HLA-A*01:01:01:01:1-100")).unwrap();
+    assert_eq!(name, "HLA-A*01:01:01:01");
+    assert_eq!(length, 3_503);
+    assert_eq!((interval.start(), interval.end()), (0, 100));
+    // The bare name is the whole contig, not position 1 of `HLA-A*01:01:01`.
+    let (whole, name, _) =
+        resolve_initial_locus(&dictionary, &aliases, Some("HLA-A*01:01:01:01")).unwrap();
+    assert_eq!(name, "HLA-A*01:01:01:01");
+    assert_eq!((whole.start(), whole.end()), (0, 3_503));
+
+    // The `name:start-end` strings RGV itself writes (locus box, history,
+    // search hits, mate loci) resolve back to the same interval.
+    let written = format!("{name}:{}-{}", interval.start() + 1, interval.end());
+    let (again, again_name, _) =
+        resolve_initial_locus(&dictionary, &aliases, Some(&written)).unwrap();
+    assert_eq!(
+        (again, again_name.as_str()),
+        (interval, "HLA-A*01:01:01:01")
+    );
+    assert!(locus_expression_is_navigable(
+        &written,
+        Some(&dictionary),
+        &aliases
+    ));
+
+    // Without a dictionary the same string still splits at the last colon.
+    let (standalone, standalone_name, _) = standalone_locus(&written).unwrap();
+    assert_eq!(standalone_name, "HLA-A*01:01:01:01");
+    assert_eq!((standalone.start(), standalone.end()), (0, 100));
+}
+
+#[test]
+fn variant_ids_and_hgvs_fall_through_to_search_but_malformed_loci_report_errors() {
+    let dictionary = hla_dictionary();
+    let aliases = ContigAliases::default();
+    for searchable in [
+        "chr1:12345:A:G",
+        "1:12345:A:G",
+        "NM_000546.6:c.215C>G",
+        "chr1:g.12345A>G",
+        "rs12345",
+        "TP53",
+        "",
+        "   ",
+    ] {
+        assert!(
+            !locus_expression_is_navigable(searchable, Some(&dictionary), &aliases),
+            "{searchable:?} must reach ID/annotation search"
+        );
+        assert!(
+            !locus_expression_is_navigable(searchable, None, &aliases),
+            "{searchable:?} must reach search without a dictionary"
+        );
+    }
+    // Recognisably a locus, merely wrong: navigation runs so its error shows.
+    for wrong in ["chr1:0", "chr1:200-100", "chr99:1-100"] {
+        assert!(locus_expression_is_navigable(
+            wrong,
+            Some(&dictionary),
+            &aliases
+        ));
+        assert!(resolve_initial_locus(&dictionary, &aliases, Some(wrong)).is_err());
+    }
+    // One search term in a multi-locus expression sends the whole of it to search.
+    assert!(locus_expression_is_navigable(
+        "chr1:1-10 chrX",
+        Some(&dictionary),
+        &aliases
+    ));
+    assert!(!locus_expression_is_navigable(
+        "chr1:1-10 TP53",
+        Some(&dictionary),
+        &aliases
+    ));
+}
+
+#[test]
+fn tabular_loci_navigate_as_one_locus() {
+    let dictionary = hla_dictionary();
+    let aliases = ContigAliases::default();
+    for (typed, expected) in [
+        ("chr1\t12345", (12_324, 12_365)),
+        ("chr1 100 200", (99, 200)),
+        ("chr1\t1,000\t2,000", (999, 2_000)),
+    ] {
+        assert!(locus_expression_is_navigable(
+            typed,
+            Some(&dictionary),
+            &aliases
+        ));
+        assert!(locus_expression_is_navigable(typed, None, &aliases));
+        let loci = split_locus_expression(typed).unwrap();
+        assert_eq!(loci.len(), 1, "{typed:?} is one locus, not one per token");
+        assert_eq!(
+            loci_navigation_plan(loci.len()),
+            LociNavigationPlan::RetargetActivePanel
+        );
+        let (interval, name, _) =
+            resolve_initial_locus(&dictionary, &aliases, Some(loci[0])).unwrap();
+        assert_eq!(name, "chr1");
+        assert_eq!((interval.start(), interval.end()), expected);
+        let (standalone, name, _) = standalone_locus(loci[0]).unwrap();
+        assert_eq!(name, "chr1");
+        assert_eq!((standalone.start(), standalone.end()), expected);
+    }
+}
+
+#[test]
+fn contigs_resolve_case_insensitively_and_across_naming_conventions() {
+    let dictionary = hla_dictionary();
+    let aliases = ContigAliases::default();
+    for (typed, canonical) in [
+        ("CHR1:1-10", "chr1"),
+        ("chrx:1-10", "chrX"),
+        ("CHRX", "chrX"),
+        ("x:1-10", "chrX"),
+        ("1:1-10", "chr1"),
+        ("MT:1-10", "chrM"),
+        ("chrMT:1-10", "chrM"),
+        ("m", "chrM"),
+    ] {
+        let (_, name, _) = resolve_initial_locus(&dictionary, &aliases, Some(typed)).unwrap();
+        assert_eq!(name, canonical, "{typed}");
+        assert!(locus_expression_is_navigable(
+            typed,
+            Some(&dictionary),
+            &aliases
+        ));
+    }
+    let plain =
+        ReferenceDictionary::from_contigs([("1".to_owned(), 1_000), ("MT".to_owned(), 100)]);
+    for (typed, canonical) in [("chr1:1-10", "1"), ("CHR1", "1"), ("chrM:1-10", "MT")] {
+        let (_, name, _) = resolve_initial_locus(&plain, &aliases, Some(typed)).unwrap();
+        assert_eq!(name, canonical, "{typed}");
+    }
+}
+
+#[test]
+fn contig_aliases_may_name_colon_bearing_contigs() {
+    let dictionary = hla_dictionary();
+    let aliases = parse_contig_aliases(&["hla-a=HLA-A*01:01:01:01".to_owned()]).unwrap();
+    let (interval, name, _) =
+        resolve_initial_locus(&dictionary, &aliases, Some("hla-a:5-10")).unwrap();
+    assert_eq!(name, "HLA-A*01:01:01:01");
+    assert_eq!((interval.start(), interval.end()), (4, 10));
+    assert!(parse_contig_aliases(&["a b=chr1".to_owned()]).is_err());
+}
+
+/// Imports an IGV session with `locus` and builds its panels as both the
+/// launch path and File > Import do.
+fn imported_igv_panels(locus: &str) -> (PanelWorkspace, Option<ImportedLocusRequest>) {
+    let imported = SessionDocument::import_igv_with_report(&format!(
+        r#"<Session genome="hg38" locus="{locus}"><Resources><Resource path="reads.bam"/></Resources></Session>"#
+    ))
+    .unwrap();
+    let request = imported_locus_request(&imported.locus_resolution);
+    let mut panels = PanelWorkspace::from_session(&imported.document, 1_000.0, 0.0).unwrap();
+    if let Some(request) = &request {
+        panels.adopt_imported_locus(request).unwrap();
+    }
+    (panels, request)
+}
+
+fn resolve_imported(
+    panels: &PanelWorkspace,
+    request: Option<&ImportedLocusRequest>,
+    dictionary: &ReferenceDictionary,
+) -> Result<RequestedLocus> {
+    resolve_requested_locus(
+        dictionary,
+        &ContigAliases::default(),
+        panels.active().requested_locus.as_deref(),
+        request.and_then(ImportedLocusRequest::feature_name),
+    )
+}
+
+#[test]
+fn imported_igv_sessions_open_for_whole_genome_gene_and_contig_loci() {
+    let dictionary = ReferenceDictionary::from_contigs([
+        ("chr1".to_owned(), 248_956_422),
+        ("chr17".to_owned(), 83_257_441),
+    ]);
+
+    // CORE-1: `All` has no interval. The panel must not ask for the importer's
+    // placeholder; it opens the default locus.
+    let (panels, request) = imported_igv_panels("All");
+    assert_eq!(request, Some(ImportedLocusRequest::Default));
+    assert_eq!(panels.active().requested_locus, None);
+    assert_eq!(panels.active().contig_name, "chr1");
+    let opened = resolve_imported(&panels, request.as_ref(), &dictionary).unwrap();
+    assert_eq!(opened.contig_name, "chr1");
+    assert_eq!(
+        (opened.interval.start(), opened.interval.end()),
+        (0, 100_000)
+    );
+    assert_eq!(opened.feature_search, None);
+
+    // A gene symbol opens the default locus and is handed to feature search
+    // instead of failing as an unknown contig.
+    let (panels, request) = imported_igv_panels("BRCA1");
+    assert_eq!(
+        request,
+        Some(ImportedLocusRequest::Named("BRCA1".to_owned()))
+    );
+    assert_eq!(panels.active().requested_locus.as_deref(), Some("BRCA1"));
+    assert_ne!(panels.active().contig_name, "BRCA1");
+    let opened = resolve_imported(&panels, request.as_ref(), &dictionary).unwrap();
+    assert_eq!(opened.contig_name, "chr1");
+    assert_eq!(opened.feature_search.as_deref(), Some("BRCA1"));
+
+    // A bare contig is the whole contig, under any accepted spelling.
+    for name in ["chr17", "17"] {
+        let (panels, request) = imported_igv_panels(name);
+        let opened = resolve_imported(&panels, request.as_ref(), &dictionary).unwrap();
+        assert_eq!(opened.contig_name, "chr17");
+        assert_eq!(
+            (opened.interval.start(), opened.interval.end()),
+            (0, 83_257_441)
+        );
+        assert_eq!(opened.feature_search, None);
+    }
+
+    // An ordinary interval is untouched.
+    let (panels, request) = imported_igv_panels("chr17:101-200");
+    assert_eq!(request, None);
+    let opened = resolve_imported(&panels, None, &dictionary).unwrap();
+    assert_eq!(opened.contig_name, "chr17");
+    assert_eq!((opened.interval.start(), opened.interval.end()), (100, 200));
+}
+
+#[test]
+fn only_the_imported_name_is_excused_from_being_a_contig() {
+    let dictionary = ReferenceDictionary::from_contigs([("chr1".to_owned(), 1_000)]);
+    let aliases = ContigAliases::default();
+    // A typed or saved locus on an unknown contig still fails.
+    assert!(resolve_requested_locus(&dictionary, &aliases, Some("BRCA1"), None).is_err());
+    assert!(
+        resolve_requested_locus(&dictionary, &aliases, Some("chr9:1-10"), Some("BRCA1")).is_err()
+    );
+    // So does an imported name that is a contig with a bad range elsewhere.
+    assert!(
+        resolve_requested_locus(&dictionary, &aliases, Some("chr1:0"), Some("chr1:0")).is_err()
+    );
 }
 
 #[test]

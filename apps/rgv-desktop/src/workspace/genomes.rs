@@ -158,11 +158,15 @@ pub(crate) enum GenomeTaskOutcome {
         from_cache: bool,
     },
     Genome(Box<IgvGenomeImport>),
+    /// A built-in landmark bundle verified and decoded off the event loop.
+    Landmark(Box<crate::workspace::landmarks::PreparedLandmarkContext>),
 }
 
 pub(crate) struct GenomeTask {
     pub(crate) label: String,
     pub(crate) is_list: bool,
+    /// Set for a landmark install: what the preparation was computed for.
+    pub(crate) landmark: Option<crate::workspace::landmarks::LandmarkInstallRequest>,
     pub(crate) worker: JoinHandle<std::result::Result<GenomeTaskOutcome, String>>,
 }
 
@@ -191,6 +195,7 @@ impl Viewer {
                 self.genome_tasks.push(GenomeTask {
                     label: "hosted genome list".to_owned(),
                     is_list: true,
+                    landmark: None,
                     worker,
                 });
             }
@@ -216,10 +221,11 @@ impl Viewer {
                 self.genome_tasks.push(GenomeTask {
                     label,
                     is_list: false,
+                    landmark: None,
                     worker,
                 });
             }
-            Err(error) => self.data_status = format!("Could not start genome load: {error}"),
+            Err(error) => self.report_error(format!("Could not start genome load: {error}")),
         }
         self.mark_display_dirty("explicit display invalidation");
     }
@@ -236,7 +242,17 @@ impl Viewer {
                 .worker
                 .join()
                 .unwrap_or_else(|_| Err("the genome worker stopped unexpectedly".to_owned()));
+            if let Some(request) = &task.landmark {
+                let outcome = outcome.and_then(|outcome| match outcome {
+                    GenomeTaskOutcome::Landmark(prepared) => Ok(prepared),
+                    _ => Err("the landmark worker returned an unrelated result".to_owned()),
+                });
+                self.finish_landmark_install(request, outcome);
+                self.mark_display_dirty("explicit display invalidation");
+                continue;
+            }
             match outcome {
+                Ok(GenomeTaskOutcome::Landmark(_)) => {}
                 Ok(GenomeTaskOutcome::List {
                     entries,
                     from_cache,
@@ -259,7 +275,7 @@ impl Viewer {
                             };
                         }
                         Err(error) => {
-                            self.data_status = format!("Could not open genome {name}: {error:#}");
+                            self.report_error(format!("Could not open genome {name}: {error:#}"));
                         }
                     }
                     for notice in notices {
@@ -270,7 +286,7 @@ impl Viewer {
                     self.hosted_genomes.status = HostedGenomeListStatus::Failed(error);
                 }
                 Err(error) => {
-                    self.data_status = format!("Could not load genome {}: {error}", task.label);
+                    self.report_error(format!("Could not load genome {}: {error}", task.label));
                 }
             }
             self.mark_display_dirty("explicit display invalidation");

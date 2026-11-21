@@ -1,7 +1,41 @@
 use super::*;
 
+/// Contextual tracks take object ids from here upwards; lower ids stay with
+/// the other users of the display-list id space.
+pub(crate) const FIRST_CONTEXT_TRACK_OBJECT_ID: u32 = 1_000_000;
+
 pub(crate) fn snapshot_record_count(snapshot: &TrackSnapshot) -> usize {
-    match &snapshot.data {
+    snapshot_data_record_count(&snapshot.data)
+}
+
+/// Object ids a quantitative lane can emit: one per record when drawn raw, or
+/// one per pixel-wide window when reduced.
+pub(crate) fn quantitative_object_id_span(record_count: usize, viewport: Viewport) -> usize {
+    record_count.max(viewport.pixel_width().ceil().max(1.0) as usize)
+}
+
+/// Reserves a block of object ids sized to the track and points `options` at
+/// it. When the id space is exhausted the range is `None` and the caller must
+/// [`strip_object_ids`] from the resulting display, leaving the track drawn
+/// but unpickable rather than aliasing another track.
+pub(crate) fn track_options_with_object_ids(
+    allocator: &mut ObjectIdAllocator,
+    record_count: usize,
+    mut options: TrackLayoutOptions,
+) -> (TrackLayoutOptions, Option<ObjectIdRange>) {
+    let range = allocator.allocate(record_count);
+    options.object_id_base = range.map_or(rgv_layout::NO_OBJECT_ID, ObjectIdRange::base);
+    (options, range)
+}
+
+pub(crate) fn strip_object_ids(display: &mut DisplayList) {
+    for rectangle in &mut display.rectangles {
+        rectangle.object_id = rgv_layout::NO_OBJECT_ID;
+    }
+}
+
+pub(crate) fn snapshot_data_record_count(data: &TrackSnapshotData) -> usize {
+    match data {
         TrackSnapshotData::Features(records) => records.len(),
         TrackSnapshotData::Variants(query) => query.records.len(),
         TrackSnapshotData::Quantitative(query) => query.records.len(),
@@ -378,21 +412,20 @@ pub(crate) fn feature_record_index_at_display_point(
     records: &[rgv_hts::FeatureRecord],
     x: f32,
     y: f32,
-    object_id_base: u32,
+    object_ids: ObjectIdRange,
 ) -> Option<usize> {
     display
         .rectangles
         .iter()
         .filter_map(|rectangle| {
-            if rectangle.object_id < object_id_base
-                || x < rectangle.x
+            if x < rectangle.x
                 || x >= rectangle.x + rectangle.width
                 || y < rectangle.y
                 || y >= rectangle.y + rectangle.height
             {
                 return None;
             }
-            let record_index = usize::try_from(rectangle.object_id - object_id_base).ok()?;
+            let record_index = object_ids.record_index(rectangle.object_id)?;
             let record = records.get(record_index)?;
             Some((record.end.saturating_sub(record.start), record_index))
         })

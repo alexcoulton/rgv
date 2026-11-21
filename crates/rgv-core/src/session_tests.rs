@@ -2190,6 +2190,15 @@ fn sessions_record_their_writer_and_explain_newer_revisions() {
     let opened = SessionDocument::from_json(&newer.to_string()).unwrap();
     assert_eq!(opened.migration_notices.len(), 1);
     assert!(opened.migration_notices[0].contains("newer RGV (rgv 9.9.9"));
+    assert_eq!(
+        opened.newer_writer_notice(),
+        Some(opened.migration_notices[0].as_str())
+    );
+    assert_eq!(minimal_session().newer_writer_notice(), None);
+    assert_eq!(
+        crate::newer_writer_notice(&["Presentation was migrated".to_owned()]),
+        None
+    );
     assert!(opened.migration_notices[0].contains("lost if the project is saved"));
 
     // Same schema, newer revision, unknown enum variant: a named error, not raw serde.

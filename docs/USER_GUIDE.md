@@ -106,6 +106,21 @@ before replacing the current panel arrangement. A workspace supports at most 16 
 an additional arrangement when the window is too narrow to keep every panel readable. Internally,
 all calculations use zero-based half-open intervals.
 
+Every place that accepts a locus (the locus field, `--locus`, automation `goto`, IGV import) uses
+one grammar. Accepted forms are a bare contig (`chr1`, the whole contig), a position
+(`chr1:12,345`, shown with a 20 bp flank), a range (`chr1:100-200`), and the tab- or
+space-separated forms pasted from a table (`chr1<TAB>12345`, `chr1 100 200`), which are read as a
+single locus with one-based coordinates. Contig names resolve case-insensitively (`CHR1`, `chrx`)
+and across naming conventions (`1`/`chr1`, `MT`/`chrM`) when exactly one contig matches. A contig
+whose own name contains colons, such as `HLA-A*01:01:01:01`, is recognised from the reference
+dictionary, so `HLA-A*01:01:01:01:1-100` navigates and the locus strings RGV itself writes for
+such contigs can be pasted back. Text that is not a locus, such as a gene symbol, a variant ID
+like `chr1:12345:A:G`, or an HGVS expression, is sent to ID and annotation search instead; text
+that is recognisably a locus but wrong (`chr1:0`, an unknown contig with a range) reports why.
+Back/Forward history records contigs by name, so it returns to the right contig even when an
+alignment header orders contigs differently from the reference, and in track-only workspaces
+that have no dictionary.
+
 **Genomes → Open genome configuration** loads a portable schema-versioned JSON bundle containing
 the FASTA, assembly name, exact contig aliases, optional cytobands, and default annotations. Local
 paths are relative to that file. See [Portable genome configuration](GENOME_CONFIGURATION.md).
@@ -114,8 +129,8 @@ exact and persisted in sessions; conflicts and aliases targeting absent FASTA co
 
 ## Navigation and inspection
 
-The locus field also searches open text annotation tracks. Type at least two characters without a
-colon to autocomplete feature names, gene names, aliases, IDs, and transcript IDs. Exact matches
+The locus field also searches open text annotation tracks. Type at least two characters that are
+not a coordinate locus to autocomplete feature names, gene names, aliases, IDs, and transcript IDs. Exact matches
 are preferred; a unique exact match opens on Enter, while ambiguous matches remain as explicit
 choices with their track and coordinates. Gene results lead with the human-readable gene symbol;
 stable gene and transcript accessions remain visible as secondary identifiers and remain directly
@@ -902,8 +917,27 @@ IGV XML import resolves relative resources from the XML file's directory and imp
 resource names/paths, supported track names, visibility and heights, and alignment coverage or
 junction visibility. It opens an **IGV session import report** that separately lists every imported,
 approximated, and ignored XML semantic category; the report never silently claims that an IGV-only
-renderer or scale was reproduced. PNG export is deterministic and independent of the platform text
-renderer.
+renderer or scale was reproduced. An IGV `locus="All"` (whole-genome view), a missing locus, or
+an unparseable one opens the default locus; a bare contig opens that contig; a gene name opens the
+default locus and is then searched for in the open annotations (including the built-in Genes
+track), navigating when there is a unique match. PNG export is deterministic and independent of
+the platform text renderer. **File → Export PNG…** and the Sashimi PNG export write at the
+display's pixel density (2× on a Retina display), so the file is as sharp as the window;
+automation snapshots stay at one pixel per point.
+
+A project written by a newer RGV opens with a warning that settings this version does not
+understand were dropped. The warning is kept in the notification log, and the first **Save** back
+over that file is held and shows it again; save a second time to overwrite, or use
+**Save project as…** to keep the original.
+
+If the settings file cannot be read at startup, RGV starts with default preferences, keeps the
+unreadable file beside it as `<name>.corrupt`, and says so in the notification log. Settings are
+saved in the background; rapid changes are written once.
+
+The notification log also reports, once per occurrence: a view too dense to draw completely
+(marks beyond the per-frame renderer budget are left out until you zoom in or collapse tracks),
+and text tracks whose malformed lines were skipped ("N malformed lines skipped, first at line
+L"). If the GPU device is lost, RGV retries recreating it every second without needing input.
 
 `Ctrl/Cmd+K` opens searchable commands, `Ctrl/Cmd+O` opens alignments, `Ctrl/Cmd+S` saves a session,
 `Ctrl/Cmd+E` exports PNG, `Ctrl/Cmd+D` toggles the diagnostics window, and `Ctrl/Cmd+,` opens
@@ -1040,8 +1074,13 @@ An authenticated client sends the same JSON object accepted by `--batch` to
 actually completed or failed the commands. `GET /v1/status` reports only the protocol version and
 authentication scheme; it exposes no workspace state. Requests are serialized, limited to 8 MiB,
 and have a ten-minute transport deadline. Local source and output paths are resolved against
-`--control-root` (or the launch working directory when omitted), and lexical paths outside that root
-are rejected. Use `--batch` for longer unattended runs.
+`--control-root` (or the launch working directory when omitted); paths whose real location (after
+resolving symbolic links) is outside that root are rejected. The same rule applies to every source
+named inside a project opened with `open_workspace`: a project inside the root cannot point RGV at
+files outside it. Remote sources in control batches and in such projects must be `http` or `https`
+URLs and may not name `localhost` or a loopback, link-local or private-network address literal
+unless RGV was started with `--control-allow-private-urls`. Projects and tracks opened from the
+GUI are not restricted. Use `--batch` for longer unattended runs.
 
 The secret is read into memory at startup. It is not accepted as a command-line value and is never
 written to logs, settings, sessions, diagnostics, reports, or responses. Batch mode and local-control

@@ -412,8 +412,9 @@ pub(crate) struct ViewPanelController {
     pub(crate) id: PanelId,
     pub(crate) viewport: Viewport,
     pub(crate) generation_clock: GenerationClock,
-    pub(crate) navigation_history: NavigationHistory,
-    pub(crate) home_interval: GenomicInterval,
+    /// Keyed by contig name: a contig id is only meaningful in one dictionary.
+    pub(crate) navigation_history: NamedNavigationHistory,
+    pub(crate) home: NavigationEntry,
     pub(crate) requested_locus: Option<String>,
     pub(crate) contig_name: String,
     pub(crate) contig_length: u64,
@@ -625,6 +626,21 @@ impl PanelWorkspace {
         Ok(workspace)
     }
 
+    /// Replaces the placeholder locus of an imported IGV session in every
+    /// panel: each shows a neutral standalone window and asks for `request`
+    /// once a dictionary can place it.
+    pub(crate) fn adopt_imported_locus(&mut self, request: &ImportedLocusRequest) -> Result<()> {
+        let (interval, contig_name, contig_length) = standalone_locus(IMPORTED_PLACEHOLDER_LOCUS)?;
+        for panel in &mut self.panels {
+            panel.viewport = Viewport::new(interval, panel.viewport.pixel_width())?;
+            panel.contig_name.clone_from(&contig_name);
+            panel.contig_length = contig_length;
+            panel.requested_locus = request.requested_locus();
+            panel.reset_history(interval);
+        }
+        Ok(())
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.panels.len()
     }
@@ -830,6 +846,19 @@ fn read_panel_allocation(item: &ui::PaneItemLayout) -> Option<(TrackId, egui::Re
 }
 
 impl ViewPanelController {
+    /// Records `interval` on the panel's current contig as a history visit.
+    /// Set `contig_name` first when the navigation changes contig.
+    pub(crate) fn visit_history(&mut self, interval: GenomicInterval) {
+        self.navigation_history
+            .visit(NavigationEntry::new(self.contig_name.clone(), interval));
+    }
+
+    /// Restarts history and Home at `interval` on the current contig.
+    pub(crate) fn reset_history(&mut self, interval: GenomicInterval) {
+        self.home = NavigationEntry::new(self.contig_name.clone(), interval);
+        self.navigation_history = NamedNavigationHistory::new(self.home.clone());
+    }
+
     pub(crate) fn new(
         id: PanelId,
         viewport: Viewport,
@@ -838,12 +867,13 @@ impl ViewPanelController {
         contig_length: u64,
     ) -> Self {
         let initial_interval = viewport.interval();
+        let home = NavigationEntry::new(contig_name.clone(), initial_interval);
         Self {
             id,
             viewport,
             generation_clock: GenerationClock::default(),
-            navigation_history: NavigationHistory::new(initial_interval),
-            home_interval: initial_interval,
+            navigation_history: NamedNavigationHistory::new(home.clone()),
+            home,
             requested_locus,
             contig_name,
             contig_length,

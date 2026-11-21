@@ -16,12 +16,35 @@ pub(crate) struct SemanticExportCapture {
     _resources: rgv_alignment_scene::TransientResourceReservation,
 }
 
+/// Automation snapshots are one PNG pixel per logical point, as they always were.
+pub(crate) const AUTOMATION_SNAPSHOT_SCALE: f32 = 1.0;
+/// Largest pixel density an interactive export uses.
+const MAXIMUM_INTERACTIVE_EXPORT_SCALE: f32 = 8.0;
+
+/// The PNG size, in physical pixels, of a `width` x `height` point snapshot at `scale`.
+#[cfg(test)]
+fn scaled_snapshot_pixels(width: u32, height: u32, scale: f32) -> (u32, u32) {
+    let edge = |points: u32| (f64::from(points) * f64::from(scale)).round().max(1.0) as u32;
+    (edge(width), edge(height))
+}
+
+/// Pixels per point for an export the user started from the window: the display's own density,
+/// so the file is as sharp as what they were looking at.
+pub(crate) fn interactive_export_scale(window_scale_factor: f64) -> f32 {
+    if window_scale_factor.is_finite() && window_scale_factor >= 1.0 {
+        (window_scale_factor as f32).min(MAXIMUM_INTERACTIVE_EXPORT_SCALE)
+    } else {
+        1.0
+    }
+}
+
 impl SemanticExportCapture {
     pub(crate) fn write(
         self,
         path: PathBuf,
         format: AutomationSnapshotFormat,
         metadata: &str,
+        scale: f32,
     ) -> std::io::Result<()> {
         let geometry = rgv_render::project_semantic_alignment_export(
             &self.panels,
@@ -34,8 +57,10 @@ impl SemanticExportCapture {
             .extend_from_slice(&geometry.display.rectangles);
         let display = cropped_display_list(&display, self.bounds);
         match format {
-            AutomationSnapshotFormat::Png => export_png(&display, self.width, self.height, path)
-                .map_err(|error| std::io::Error::other(error.to_string())),
+            AutomationSnapshotFormat::Png => {
+                export_png_scaled(&display, self.width, self.height, scale, path)
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            }
             AutomationSnapshotFormat::Svg => std::fs::write(
                 path,
                 display_list_svg_export(&display, self.width, self.height, metadata),
@@ -1235,4 +1260,50 @@ pub(crate) fn atomic_write_text(path: &Path, contents: &str) -> std::result::Res
         .and_then(|directory| directory.sync_all())
         .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+
+    #[test]
+    fn interactive_exports_use_the_display_density_and_automation_reports_pixels() {
+        let scale = |factor: f64| interactive_export_scale(factor).to_bits();
+        assert_eq!(scale(2.0), 2.0_f32.to_bits());
+        assert_eq!(scale(1.5), 1.5_f32.to_bits());
+        // A nonsensical factor never shrinks or breaks the export.
+        assert_eq!(scale(0.5), 1.0_f32.to_bits());
+        assert_eq!(scale(f64::NAN), 1.0_f32.to_bits());
+        assert_eq!(scale(64.0), 8.0_f32.to_bits());
+        assert_eq!(AUTOMATION_SNAPSHOT_SCALE.to_bits(), 1.0_f32.to_bits());
+
+        assert_eq!(scaled_snapshot_pixels(1_280, 720, 1.0), (1_280, 720));
+        assert_eq!(scaled_snapshot_pixels(1_280, 720, 2.0), (2_560, 1_440));
+        assert_eq!(scaled_snapshot_pixels(3, 3, 1.5), (5, 5));
+    }
+
+    #[test]
+    fn a_scaled_png_has_the_reported_pixel_size() {
+        let display = DisplayList {
+            rectangles: vec![RectPrimitive {
+                x: 10.0,
+                y: 10.0,
+                width: 20.0,
+                height: 10.0,
+                color: Rgba::new(0.1, 0.2, 0.3, 1.0),
+                object_id: 0,
+                shape: rgv_layout::RectShape::default(),
+            }],
+            texts: Vec::new(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        for scale in [1.0_f32, 2.0] {
+            let path = directory.path().join(format!("view-{scale}.png"));
+            export_png_scaled(&display, 120, 60, scale, &path).unwrap();
+            assert_eq!(
+                image::image_dimensions(&path).unwrap(),
+                scaled_snapshot_pixels(120, 60, scale)
+            );
+        }
+    }
 }

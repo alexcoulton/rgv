@@ -380,6 +380,11 @@ impl ApplicationHandler for Application {
                 viewer.next_egui_repaint = None;
                 viewer.window.request_redraw();
             }
+            // A lost GPU device is retried on a timer, not only when input causes a redraw.
+            let gpu_recovery_deadline = viewer.gpu_recovery_deadline(now);
+            if gpu_recovery_deadline.is_some_and(|deadline| deadline <= now) {
+                viewer.window.request_redraw();
+            }
             viewer.commit_due_navigation_gesture(now);
             viewer.capture_status_notification();
             let engines_open = viewer.has_alignment_engine()
@@ -407,6 +412,8 @@ impl ApplicationHandler for Application {
                         .autosave_enabled
                         .then_some(viewer.next_autosave),
                     viewer.navigation_gesture_deadline(),
+                    // After a due attempt the redraw above moves this into the future.
+                    gpu_recovery_deadline.filter(|deadline| *deadline > now),
                 ],
                 crate::app::shell_state::WakeState {
                     polled_work_in_flight,
@@ -437,6 +444,7 @@ impl ApplicationHandler for Application {
                 service.shutdown();
             }
             viewer.persist_settings();
+            viewer.finish_settings_writer();
         }
     }
 }

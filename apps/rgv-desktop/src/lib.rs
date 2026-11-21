@@ -103,9 +103,10 @@ use rgv_core::{
     CopyNumberSortMode, CopyNumberTrackSettings, CopyNumberValueMode, CoverageScaleTransform,
     DesktopSettings, DetailLevel, FeatureDisplayMode, GenerationClock, GeneticCode, GenomeAssembly,
     GenomeAssemblyIdentity, GenomeConfiguration, GenomeLandmarkCatalogue, GenomicInterval,
-    GenomicSourceFormat, GwasColorMode, GwasTrackSettings, IgvImportReport, InspectorActivation,
-    InteractionDisplayMode, InteractionTrackSettings, JunctionDisplayMode, LandmarkAssetRole,
-    LandmarkSearchIndex, MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_AUTOMATION_EVIDENCE_FIELDS,
+    GenomicSourceFormat, GwasColorMode, GwasTrackSettings, IgvImportReport, IgvLocusResolution,
+    InspectorActivation, InteractionDisplayMode, InteractionTrackSettings, JunctionDisplayMode,
+    LandmarkAssetRole, LandmarkSearchIndex, Locus, LocusError, LocusRange,
+    MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_AUTOMATION_EVIDENCE_FIELDS,
     MAXIMUM_AUTOMATION_HISTORY_ENTRIES, MAXIMUM_AUTOMATION_LOCI,
     MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS, MAXIMUM_AUTOSAVE_INTERVAL_SECONDS,
     MAXIMUM_AUTOSAVE_RETENTION, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, MAXIMUM_CACHE_BUDGET_MIB,
@@ -114,19 +115,19 @@ use rgv_core::{
     MAXIMUM_VIEW_PANELS, MINIMUM_AUTOSAVE_INTERVAL_SECONDS, MINIMUM_AUTOSAVE_RETENTION,
     MINIMUM_CACHE_BUDGET_MIB, MINIMUM_INTERFACE_SCALE_PERCENT,
     MINIMUM_READ_BROWSING_BUFFER_PERCENT, ModifiedBaseColorMode, MutationColorMode,
-    MutationTrackSettings, NavigationHistory, OverlappingMatePolicy, PanelGeneration, PanelId,
-    PresentationNodeId, QuantitativeArithmetic, QuantitativeDisplayMode, QuantitativeMissingMode,
-    QuantitativeScaleMode, QuantitativeScaleTransform, QuantitativeTrackSettings,
-    QuantitativeWindowFunction, ReadBaseDisplayMode, ReadStackingMode, ReferenceDictionary,
-    ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus, SampleMetadataTable,
-    SashimiCountMode, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
+    MutationTrackSettings, NamedNavigationHistory, NavigationEntry, OverlappingMatePolicy,
+    PanelGeneration, PanelId, PresentationNodeId, QuantitativeArithmetic, QuantitativeDisplayMode,
+    QuantitativeMissingMode, QuantitativeScaleMode, QuantitativeScaleTransform,
+    QuantitativeTrackSettings, QuantitativeWindowFunction, ReadBaseDisplayMode, ReadStackingMode,
+    ReferenceDictionary, ReferenceTranslationFrame, RegionOfInterest, ReviewItem, ReviewStatus,
+    SampleMetadataTable, SashimiCountMode, SashimiScaleMode, SbxDisplayOptions, SbxSimplexTailMode,
     SessionAlignmentTrack, SessionDocument, SessionFilters, SessionLocus, SessionPaneTrackState,
     SessionReadPanelState, SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackCollection,
     TrackConfig, TrackFormat, TrackId, TrackIntent, TrackKind, TrackSource, UltimaDisplayOptions,
     UltimaQualityMode, UnresolvedSessionSource, VariantColorMode, VariantFieldComparison,
     VariantFieldPredicate, VariantFieldScope, VariantGenotypeFilter, VariantGenotypeGrouping,
     VariantMissingValueRule, VariantTrackSettings, VariantTypeGroup, Viewport, ViewportGeneration,
-    WorkspacePresentation, classify_genomic_source, parse_ucsc_cytobands, resolve_contig_alias,
+    WorkspacePresentation, classify_genomic_source, parse_ucsc_cytobands,
 };
 use rgv_engine::{
     AlignmentCoordinatorFrame, AlignmentIndividualReadCapability, AlignmentReferenceAuthority,
@@ -151,20 +152,21 @@ use rgv_hts::{
     smrt_kinetics_series, summarize_bisulfite_record, summarize_sbx_record,
 };
 #[cfg(test)]
-#[cfg(test)]
 use rgv_layout::layout_features;
 use rgv_layout::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode,
     COPY_NUMBER_HEADER_HEIGHT, DisplayList, JunctionAnnotationLookup, JunctionAnnotationStatus,
     JunctionArcComponent, MAX_HIDDEN_MODIFICATION_CODES, MINIMUM_BASE_GLYPH_PIXEL_WIDTH,
-    MUTATION_HEADER_HEIGHT, QuantitativeRange, RectPrimitive, Rgba, SashimiLayoutOptions,
-    TrackLayoutOptions, alignment_read_name_hash, compose_quantitative_records,
-    copy_number_sample_order, gwas_point_y, junction_count_value, layout_copy_number,
-    layout_features_with_label_widths, layout_gwas, layout_interactions, layout_mutations,
-    layout_quantitative, layout_reference_slice_oriented, layout_reference_translation,
-    layout_sashimi, layout_variants, modification_code_color, quantitative_data_range,
-    ultima_quality_color,
+    MUTATION_HEADER_HEIGHT, ObjectIdAllocator, ObjectIdRange, QuantitativeRange, RectPrimitive,
+    Rgba, SashimiLayoutOptions, TrackLayoutOptions, alignment_read_name_hash,
+    compose_quantitative_records, copy_number_sample_order, gwas_point_y, junction_count_value,
+    layout_copy_number, layout_features_with_label_widths, layout_gwas, layout_interactions,
+    layout_mutations, layout_quantitative, layout_reference_slice_oriented,
+    layout_reference_translation_in_contig, layout_sashimi, layout_variants,
+    modification_code_color, quantitative_data_range, ultima_quality_color,
 };
+#[cfg(test)]
+use rgv_render::export_png;
 use rgv_render::{
     AlignmentGpuCameraCaptureError, AlignmentGpuFrame, AlignmentGpuPageAdmissionError,
     AlignmentGpuPrefetchCursor, AlignmentGpuPrepareError, AlignmentGpuPrepareStats,
@@ -181,7 +183,7 @@ use rgv_render::{
     ContextSceneGpuFrame, ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest,
     ContextSceneGpuRejection, ContextSceneGpuRejectionReason, ContextSceneGpuRenderer,
     ContextSceneGpuRetainedLaneRequest, ContextSceneGpuScissor, GpuBudgetPressure, GpuReclaimGoal,
-    GpuReclaimReport, PrepareStats, RectangleRenderer, export_png,
+    GpuReclaimReport, PrepareStats, RectangleRenderer, export_png_scaled,
 };
 use runtime::*;
 use sha2::{Digest as _, Sha256};
@@ -1503,6 +1505,8 @@ struct Viewer {
     session_load_tasks: Vec<SessionLoadTask>,
     workspace_list_import_tasks: Vec<WorkspaceListImportTask>,
     genome_tasks: Vec<crate::workspace::genomes::GenomeTask>,
+    /// The most recent landmark install request; older completions are stale.
+    landmark_install_ticket: u64,
     hosted_genomes: crate::workspace::genomes::HostedGenomes,
     /// Ephemeral selection ordering; never written to sessions or diagnostics.
     promoted_read: Option<(TrackId, u64)>,
@@ -1542,16 +1546,30 @@ struct Viewer {
     annotation_search_results: TrackSearchResults,
     pending_annotation_navigation: Option<String>,
     settings: DesktopSettings,
+    /// Derived strings of the read shown in the inspector, reused across frames.
+    read_inspector_derived: std::cell::RefCell<crate::inspection::read::ReadInspectorDerivedCache>,
+    /// Window-shell policy state: unsaved-changes gate, gesture commits, notifications, ….
+    shell: app::shell_state::ShellState,
+    /// Health of the GPU device this viewer currently owns; shared with the wgpu callbacks.
+    gpu_device_health: Arc<rgv_render::GpuDeviceHealth>,
+    gpu_recovery: app::viewer_runtime::GpuRecoveryState,
     settings_path: PathBuf,
+    settings_writer: app::settings_writer::SettingsWriter,
     current_session_path: Option<PathBuf>,
     unresolved_session_sources: Vec<UnresolvedSessionSource>,
     session_migration_notices: Vec<String>,
     igv_import_report: Option<IgvImportReport>,
+    /// An imported IGV locus still waiting for a dictionary to place it.
+    imported_locus: Option<ImportedLocusRequest>,
+    /// An imported feature name to search for once an annotation engine exists.
+    imported_feature_search: Option<String>,
     next_autosave: Instant,
     recovery_candidates: Vec<PathBuf>,
     recovery_open: bool,
     automation: Option<AutomationRunner>,
     control_service: Option<ControlService>,
+    /// Present while local control is enabled.
+    control_source_policy: Option<app::tasks::ControlSourcePolicy>,
     automation_exit_requested: bool,
     exit_confirmation_open: bool,
     user_exit_requested: bool,

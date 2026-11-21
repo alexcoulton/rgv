@@ -210,7 +210,9 @@ that is downscaled before it is inlined, preserving the aspect ratio; a narrower
 enlarged. The result's `width`/`height` describe the inlined PNG, `source_width`/`source_height`
 the viewer's original capture, and `downscaled` whether they differ, so image pixels can be mapped
 back to the reported panel geometry by the ratio `source_width / width`. Pass a larger `max_width`
-when full resolution is needed. The workspace state associated with a capture is reported once, as
+when full resolution is needed. Automation `snapshot` PNGs remain one pixel per logical point; only
+exports started from the desktop menus use the display's pixel density. The workspace state
+associated with a capture is reported once, as
 the top-level `panels`, `loci`, `genome`, and revision fields; the embedded command report does not
 repeat the workspace snapshot.
 
@@ -260,7 +262,14 @@ coordinates.
   to `[path]/<file name>`, URLs reduced to scheme and host, and bearer tokens and secret-named
   `key=value` pairs removed. The control secret is never logged or returned.
 - Local reads and writes stay under `--control-root`. Absolute/traversing artifact arguments and
-  symbolic-link escapes are rejected.
+  symbolic-link escapes are rejected. Sources named inside a project opened through the control
+  service are held to the same root; a project that names a file outside it is not opened and the
+  command fails with `invalid_command`.
+- Remote sources (`load_track`, `set_genome`, and URLs inside an opened project) must be `http` or
+  `https` and may not target `localhost` or a loopback, link-local or private-network address
+  literal. A batch that does is refused with HTTP 403 `source_refused` before it reaches the
+  window. Start `rgv-desktop` with `--control-allow-private-urls` to permit private addresses
+  (other schemes stay refused).
 - stdout is reserved for MCP protocol frames. Diagnostics go to stderr.
 
 No telemetry or genomic content is sent outside the local `rgv-mcp` and `rgv-desktop` processes.

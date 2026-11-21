@@ -832,7 +832,7 @@ impl Viewer {
         if !presentation_intents.is_empty()
             && let Err(error) = self.apply_track_intents(&presentation_intents)
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         let mut changed = false;
         for track in self

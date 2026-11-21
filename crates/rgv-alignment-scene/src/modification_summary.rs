@@ -13,7 +13,9 @@ use crate::{
     ModificationSummaryContract, PinnedAllocationLease, ReservationKind, TransientResourceClass,
 };
 
-const REQUIRED_MODIFICATION_TAGS: [[u8; 2]; 5] = [*b"HP", *b"ML", *b"MM", *b"Ml", *b"Mm"];
+/// `MN` is required alongside `MM`/`ML`: it decides whether `MM` still describes the stored
+/// sequence, most importantly for hard-clipped supplementary alignments.
+const REQUIRED_MODIFICATION_TAGS: [[u8; 2]; 6] = [*b"HP", *b"ML", *b"MM", *b"MN", *b"Ml", *b"Mm"];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ExactModificationSummaryKey {
@@ -114,14 +116,16 @@ impl ExactModificationSummaryTile {
             let mm_lower = selection.auxiliary_field(index, *b"Mm")?;
             let ml_upper = selection.auxiliary_field(index, *b"ML")?;
             let ml_lower = selection.auxiliary_field(index, *b"Ml")?;
+            let mn = selection.auxiliary_field(index, *b"MN")?;
             let haplotype = selection.auxiliary_field(index, *b"HP")?;
-            builder.add_record_parts(
+            builder.add_record_parts_checked(
                 record.start(),
                 record.cigar(),
                 record.flags(),
                 sequence,
                 auxiliary_value(mm_upper.as_ref().or(mm_lower.as_ref())),
                 auxiliary_value(ml_upper.as_ref().or(ml_lower.as_ref())),
+                auxiliary_value(mn.as_ref()),
                 auxiliary_value(haplotype.as_ref()),
             );
         }

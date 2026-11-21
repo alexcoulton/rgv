@@ -16,7 +16,7 @@ pub const NO_OBJECT_ID: u32 = 0;
 /// Overflow never wraps or saturates onto another record's id: a record that
 /// cannot be identified is drawn but is not pickable.
 #[must_use]
-pub fn record_object_id(base: u32, record_index: usize) -> u32 {
+pub fn offset_object_id(base: u32, record_index: usize) -> u32 {
     u32::try_from(record_index)
         .ok()
         .and_then(|index| base.checked_add(index))
@@ -136,7 +136,7 @@ mod tests {
                 assert_ne!(id, NO_OBJECT_ID);
                 assert!(seen.insert(id));
                 assert_eq!(range.record_index(id), Some(record));
-                assert_eq!(record_object_id(range.base(), record), id);
+                assert_eq!(offset_object_id(range.base(), record), id);
             }
         }
         assert_eq!(first.record_index(second.base()), None);
@@ -159,10 +159,10 @@ mod tests {
         assert_eq!(ObjectIdAllocator::starting_at(0), ObjectIdAllocator::new());
 
         // The previous saturating arithmetic mapped both of these to u32::MAX.
-        assert_eq!(record_object_id(u32::MAX - 1, 1), u32::MAX);
-        assert_eq!(record_object_id(u32::MAX - 1, 2), NO_OBJECT_ID);
-        assert_eq!(record_object_id(u32::MAX - 1, 3), NO_OBJECT_ID);
-        assert_eq!(record_object_id(7, usize::MAX), NO_OBJECT_ID);
-        assert_eq!(record_object_id(7, 5), 12);
+        assert_eq!(offset_object_id(u32::MAX - 1, 1), u32::MAX);
+        assert_eq!(offset_object_id(u32::MAX - 1, 2), NO_OBJECT_ID);
+        assert_eq!(offset_object_id(u32::MAX - 1, 3), NO_OBJECT_ID);
+        assert_eq!(offset_object_id(7, usize::MAX), NO_OBJECT_ID);
+        assert_eq!(offset_object_id(7, 5), 12);
     }
 }

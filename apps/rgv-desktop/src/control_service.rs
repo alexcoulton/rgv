@@ -129,6 +129,9 @@ pub(crate) struct ControlStatusMetadata {
     pub(crate) surface_height_pixels: u32,
     pub(crate) scale_factor: f64,
     pub(crate) stress_health: Arc<StressHealthPublisher>,
+    /// Not reported by `/v1/status`: whether batches may name remote sources on loopback,
+    /// link-local or private-network addresses (`--control-allow-private-urls`).
+    pub(crate) allow_private_network_urls: bool,
 }
 
 impl ControlService {
@@ -559,6 +562,10 @@ fn handle_control_request(
         respond_error(request, 403, "path_outside_root", &error.to_string());
         return;
     }
+    if let Err(error) = batch.check_remote_sources(status.allow_private_network_urls) {
+        respond_error(request, 403, "source_refused", &error.to_string());
+        return;
+    }
     let (reply, reply_receiver) = sync_channel(1);
     let cancelled = Arc::new(AtomicBool::new(false));
     match request_sender.try_send(ControlRequest {
@@ -689,6 +696,7 @@ mod tests {
             surface_height_pixels: 600,
             scale_factor: 1.0,
             stress_health: Arc::new(StressHealthPublisher::new("test-instance".to_owned())),
+            allow_private_network_urls: false,
         }
     }
 
@@ -861,6 +869,76 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.contains("\"succeeded\": true"));
         service.shutdown();
+    }
+
+    #[test]
+    fn batches_naming_refused_remote_sources_never_reach_the_window() {
+        let load = |url: &str| {
+            AutomationBatch {
+                schema_version: AUTOMATION_SCHEMA_VERSION,
+                commands: vec![AutomationCommand::LoadTrack {
+                    source: rgv_core::TrackSource::Remote {
+                        url: url.to_owned(),
+                    },
+                    kind: None,
+                    name: None,
+                }],
+            }
+            .to_json()
+            .unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut service = ControlService::start(
+            0,
+            root.path().to_owned(),
+            TEST_SECRET.to_owned(),
+            test_status(),
+        )
+        .unwrap();
+        for refused in ["http://127.0.0.1:9/reads.bam", "file:///etc/passwd"] {
+            let response = batch_request(service.address(), TEST_SECRET, &load(refused));
+            assert!(
+                response.starts_with("HTTP/1.1 403"),
+                "{refused}: {response}"
+            );
+            assert!(response.contains("source_refused"), "{refused}: {response}");
+            assert!(service.try_request().is_none());
+        }
+        service.shutdown();
+
+        // The launch flag admits private addresses, but never other schemes.
+        let mut permissive = ControlService::start(
+            0,
+            root.path().to_owned(),
+            TEST_SECRET.to_owned(),
+            ControlStatusMetadata {
+                allow_private_network_urls: true,
+                ..test_status()
+            },
+        )
+        .unwrap();
+        let response = batch_request(
+            permissive.address(),
+            TEST_SECRET,
+            &load("file:///etc/passwd"),
+        );
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        let address = permissive.address();
+        let body = load("http://127.0.0.1:9/reads.bam");
+        let client = std::thread::spawn(move || batch_request(address, TEST_SECRET, &body));
+        let request = loop {
+            if let Some(request) = permissive.try_request() {
+                break request;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(
+            request.batch.commands.as_slice(),
+            [AutomationCommand::LoadTrack { .. }]
+        ));
+        drop(request);
+        let _ = client.join().unwrap();
+        permissive.shutdown();
     }
 
     #[test]

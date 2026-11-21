@@ -15,10 +15,11 @@ use rgv_core::{
 };
 use rgv_hts::{
     BigBedFeatureFormat, BigBedSource, BigWigSource, CopyNumberQuery, FeatureFormat, FeatureRecord,
-    GwasQuery, InteractionFormat, InteractionQuery, LocalVariantSource, MAX_FEATURE_SEARCH_RESULTS,
-    MutationQuery, QuantitativeFormat, QuantitativeQuery, TdfSource, TextCopyNumberSource,
-    TextFeatureSource, TextGwasSource, TextInteractionSource, TextMutationSource,
-    TextQuantitativeSource, VariantQuery,
+    GwasQuery, HttpRangeConfig, InteractionFormat, InteractionQuery, LocalVariantSource,
+    MAX_FEATURE_SEARCH_RESULTS, MutationQuery, QuantitativeFormat, QuantitativeQuery,
+    RemoteCancellation, RemoteTransferBudget, TdfSource, TextCopyNumberSource, TextFeatureSource,
+    TextGwasSource, TextInteractionSource, TextMutationSource, TextQuantitativeSource,
+    VariantQuery,
 };
 
 use crate::{
@@ -32,6 +33,41 @@ use crate::{
 
 /// Most tracks queried at the same time for one viewport request.
 const MAXIMUM_PARALLEL_TRACK_QUERIES: usize = 8;
+
+/// Most one track operation (a viewport query, a name search, a feature step) may transfer
+/// from a remote source before it fails with a clear error instead of downloading without
+/// limit. Each operation starts with a fresh allowance. Local sources ignore it.
+const REMOTE_TRACK_OPERATION_TRANSFER_BUDGET: RemoteTransferBudget = RemoteTransferBudget {
+    maximum_requests: 4_000,
+    maximum_response_bytes: 512 << 20,
+};
+
+/// Input lines a track source skipped because they could not be parsed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TrackSourceDiagnostics {
+    /// Lines skipped so far. A fully loaded source counts its whole file at open; an indexed
+    /// source counts the lines met by the queries run so far.
+    pub malformed_lines: usize,
+    /// One-based line number and parse error of the first skipped line, when known.
+    pub first_malformed_line: Option<(usize, String)>,
+}
+
+/// Latest diagnostics of every open track that reports any, shared with the engine handle.
+type SharedTrackDiagnostics = Arc<Mutex<BTreeMap<TrackId, TrackSourceDiagnostics>>>;
+
+fn record_track_diagnostics(diagnostics: &SharedTrackDiagnostics, track: &OpenTrack) {
+    let Some(report) = track.source.diagnostics() else {
+        return;
+    };
+    let mut diagnostics = diagnostics
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if report.malformed_lines == 0 {
+        diagnostics.remove(&track.id);
+    } else {
+        diagnostics.insert(track.id, report);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrackSpecKind {
@@ -213,6 +249,7 @@ pub struct TrackEngine {
     /// Newest search generation the queue accepted. The actor abandons any search older than
     /// this, before it starts and between tracks, instead of finishing an answer nobody wants.
     latest_search: Arc<AtomicU64>,
+    diagnostics: SharedTrackDiagnostics,
 }
 
 impl TrackEngine {
@@ -230,6 +267,19 @@ impl TrackEngine {
         specifications: Vec<(TrackSpec, BTreeMap<String, String>)>,
         capacity: usize,
     ) -> Self {
+        Self::spawn_with_remote_config(specifications, capacity, HttpRangeConfig::default())
+    }
+
+    /// Like [`Self::spawn_with_query_contig_aliases`], reading every remote bigWig, bigBed, TDF
+    /// and text annotation with `remote` (authentication, timeouts, retries and cache geometry)
+    /// instead of the anonymous defaults. Tracks added later use the same configuration.
+    pub fn spawn_with_remote_config(
+        specifications: Vec<(TrackSpec, BTreeMap<String, String>)>,
+        capacity: usize,
+        remote: HttpRangeConfig,
+    ) -> Self {
+        let diagnostics = SharedTrackDiagnostics::default();
+        let worker_diagnostics = Arc::clone(&diagnostics);
         let (input_tx, input_rx) = bounded(capacity.max(1));
         let (output_tx, output_rx) = bounded_coalescing_to_ui(capacity.max(1));
         let latest_search = Arc::new(AtomicU64::new(0));
@@ -240,7 +290,16 @@ impl TrackEngine {
                 // Query helpers publish lane results through the same sender.
                 let output = Arc::new(output_tx);
                 run_thread_root(
-                    || worker_loop(specifications, &input_rx, &output, &worker_latest_search),
+                    || {
+                        worker_loop(
+                            specifications,
+                            &input_rx,
+                            &output,
+                            &worker_latest_search,
+                            &remote,
+                            &worker_diagnostics,
+                        );
+                    },
                     |message| {
                         tracing::error!(message, "track actor panicked");
                         send_event(
@@ -262,7 +321,21 @@ impl TrackEngine {
             output: output_rx,
             worker: Some(worker),
             latest_search,
+            diagnostics,
         }
+    }
+
+    /// Open tracks that have skipped unparseable input, with how much and where it began.
+    /// Ordered by track; a track with nothing skipped is absent. Cheap enough to call whenever
+    /// a track event is handled.
+    #[must_use]
+    pub fn source_diagnostics(&self) -> Vec<(TrackId, TrackSourceDiagnostics)> {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(id, report)| (*id, report.clone()))
+            .collect()
     }
 
     pub fn try_query(
@@ -515,17 +588,23 @@ fn worker_loop(
     input: &Receiver<TrackEngineRequest>,
     output: &Arc<CoalescingSender<TrackEngineEvent>>,
     latest_search: &AtomicU64,
+    remote: &HttpRangeConfig,
+    diagnostics: &SharedTrackDiagnostics,
 ) {
     let mut query_pool = None;
     let mut tracks = Vec::new();
-    let mut tdf_sources = HashMap::new();
+    let mut opener = TrackOpener {
+        tdf_sources: HashMap::new(),
+        remote,
+        diagnostics,
+    };
     let mut query_contig_aliases = HashMap::new();
     let mut failed = 0;
     for (specification, aliases) in specifications {
         if output.is_closed() {
             return;
         }
-        match open_and_push_track(&specification, &mut tracks, &mut tdf_sources, output) {
+        match open_and_push_track(&specification, &mut tracks, &mut opener, output) {
             Ok(id) => {
                 if !aliases.is_empty() {
                     query_contig_aliases.insert(id, aliases);
@@ -552,7 +631,7 @@ fn worker_loop(
             TrackEngineRequest::Add {
                 specification,
                 query_contig_aliases: aliases,
-            } => match open_and_push_track(&specification, &mut tracks, &mut tdf_sources, output) {
+            } => match open_and_push_track(&specification, &mut tracks, &mut opener, output) {
                 Ok(id) => {
                     if !aliases.is_empty() {
                         query_contig_aliases.insert(id, aliases);
@@ -562,8 +641,7 @@ fn worker_loop(
                 Err(message) => send_track_open_error(output, &specification, &message),
             },
             TrackEngineRequest::AddMany(specifications) => {
-                let added =
-                    open_and_push_tracks(specifications, &mut tracks, &mut tdf_sources, output);
+                let added = open_and_push_tracks(specifications, &mut tracks, &mut opener, output);
                 if !added.is_empty() {
                     send_event(output, TrackEngineEvent::TracksAdded { ids: added });
                 }
@@ -583,11 +661,18 @@ fn worker_loop(
             TrackEngineRequest::Remove(ids) => {
                 let removed = remove_tracks(
                     &mut tracks,
-                    &mut tdf_sources,
+                    &mut opener.tdf_sources,
                     &mut query_contig_aliases,
                     ids,
                 );
                 if !removed.is_empty() {
+                    let mut diagnostics = diagnostics
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for id in &removed {
+                        diagnostics.remove(id);
+                    }
+                    drop(diagnostics);
                     send_event(output, TrackEngineEvent::TracksRemoved { ids: removed });
                 }
             }
@@ -606,6 +691,7 @@ fn worker_loop(
                 &mut query_pool,
                 &Arc::new(TrackQueryContext {
                     output: Arc::clone(output),
+                    diagnostics: Arc::clone(diagnostics),
                     clock,
                     request,
                     contig,
@@ -658,13 +744,21 @@ fn worker_loop(
     }
 }
 
+/// What opening a track needs beyond its specification.
+struct TrackOpener<'a> {
+    tdf_sources: TdfSourceCache,
+    remote: &'a HttpRangeConfig,
+    diagnostics: &'a SharedTrackDiagnostics,
+}
+
 fn open_and_push_track(
     specification: &TrackSpec,
     tracks: &mut Vec<OpenTrack>,
-    tdf_sources: &mut TdfSourceCache,
+    opener: &mut TrackOpener<'_>,
     output: &CoalescingSender<TrackEngineEvent>,
 ) -> Result<TrackId, String> {
-    let track = open_track_cached(specification, tdf_sources)?;
+    let track = open_track_with(specification, &mut opener.tdf_sources, opener.remote)?;
+    record_track_diagnostics(opener.diagnostics, &track);
     send_tdf_discovery(output, specification, &track);
     let id = specification.id;
     tracks.push(track);
@@ -674,7 +768,7 @@ fn open_and_push_track(
 fn open_and_push_tracks(
     specifications: Vec<TrackSpec>,
     tracks: &mut Vec<OpenTrack>,
-    tdf_sources: &mut TdfSourceCache,
+    opener: &mut TrackOpener<'_>,
     output: &CoalescingSender<TrackEngineEvent>,
 ) -> Vec<TrackId> {
     let mut added = Vec::new();
@@ -682,7 +776,7 @@ fn open_and_push_tracks(
         if output.is_closed() {
             break;
         }
-        match open_and_push_track(&specification, tracks, tdf_sources, output) {
+        match open_and_push_track(&specification, tracks, opener, output) {
             Ok(id) => added.push(id),
             Err(message) => send_track_open_error(output, &specification, &message),
         }
@@ -761,6 +855,9 @@ fn adjacent_feature(
         .iter_mut()
         .filter_map(|track| {
             let query_contig = track_query_contig(query_contig_aliases, track.id(), contig);
+            track
+                .source
+                .set_remote_control(None, Some(REMOTE_TRACK_OPERATION_TRANSFER_BUDGET));
             let record = match track
                 .source
                 .adjacent_feature(query_contig, position, forward)
@@ -824,6 +921,9 @@ fn search_tracks(
         if superseded() {
             return None;
         }
+        track
+            .source
+            .set_remote_control(None, Some(REMOTE_TRACK_OPERATION_TRANSFER_BUDGET));
         match track.source.search(request) {
             Ok(Some(results)) => {
                 index_truncated |= results.index_truncated;
@@ -875,6 +975,7 @@ fn search_tracks(
 /// Everything one viewport query shares across the tracks it reads.
 struct TrackQueryContext {
     output: Arc<CoalescingSender<TrackEngineEvent>>,
+    diagnostics: SharedTrackDiagnostics,
     clock: GenerationClock,
     request: PanelGeneration,
     contig: String,
@@ -887,6 +988,14 @@ struct TrackQueryContext {
 impl TrackQueryContext {
     fn is_current(&self) -> bool {
         self.clock.is_current(self.request.generation())
+    }
+
+    /// A check a remote reader can hold: true while this request is still the panel's newest.
+    /// It deliberately owns only the clock, never the event sender.
+    fn remote_keep_going(&self) -> RemoteCancellation {
+        let clock = self.clock.clone();
+        let generation = self.request.generation();
+        Arc::new(move || clock.is_current(generation))
     }
 }
 
@@ -923,7 +1032,9 @@ impl TrackQueryPool {
                 thread::Builder::new()
                     .name(format!("rgv-track-query-{ordinal}"))
                     .spawn(move || track_query_helper(&job_rx, &finished_tx))
-                    .inspect_err(|error| tracing::warn!(%error, "could not start a track query helper"))
+                    .inspect_err(
+                        |error| tracing::warn!(%error, "could not start a track query helper"),
+                    )
                     .ok()
             })
             .collect();
@@ -1018,6 +1129,12 @@ fn query_one(
     if context.output.is_closed() || !context.is_current() {
         return None;
     }
+    // A remote source stops transferring as soon as the view moves on, and may spend at most
+    // one fresh allowance on this request.
+    track.source.set_remote_control(
+        Some(context.remote_keep_going()),
+        Some(REMOTE_TRACK_OPERATION_TRANSFER_BUDGET),
+    );
     let result = query_track(
         track,
         query_contig,
@@ -1027,6 +1144,11 @@ fn query_one(
         &context.interaction_settings,
         &context.copy_number_settings,
     );
+    // A search or feature step that follows must not be abandoned by this request's check.
+    track
+        .source
+        .set_remote_control(None, Some(REMOTE_TRACK_OPERATION_TRANSFER_BUDGET));
+    record_track_diagnostics(&context.diagnostics, track);
     if !context.is_current() {
         return None;
     }
@@ -1172,9 +1294,21 @@ fn open_track(specification: &TrackSpec) -> Result<OpenTrack, String> {
     open_track_cached(specification, &mut HashMap::new())
 }
 
+#[cfg(test)]
 fn open_track_cached(
     specification: &TrackSpec,
     tdf_sources: &mut TdfSourceCache,
+) -> Result<OpenTrack, String> {
+    open_track_with(specification, tdf_sources, &HttpRangeConfig::default())
+}
+
+/// Opens one track. `remote` configures every source RGV reads through its own HTTP client
+/// (bigWig, bigBed, TDF and downloaded text annotations). VCF/BCF URLs are read by htslib and
+/// the remaining text formats are local-only, so neither uses it.
+fn open_track_with(
+    specification: &TrackSpec,
+    tdf_sources: &mut TdfSourceCache,
+    remote: &HttpRangeConfig,
 ) -> Result<OpenTrack, String> {
     let id = specification.id;
     let name = specification.name.clone();
@@ -1198,7 +1332,7 @@ fn open_track_cached(
                 TrackSpecKind::Psl => FeatureFormat::Psl,
                 _ => unreachable!(),
             };
-            TextFeatureSource::open(&specification.path, format)
+            TextFeatureSource::open_with_remote_config(&specification.path, format, remote)
                 .map(|source| OpenTrack::new(id, name, source))
                 .map_err(|error| error.to_string())
         }
@@ -1208,11 +1342,13 @@ fn open_track_cached(
         TrackSpecKind::Gwas => TextGwasSource::open(&specification.path)
             .map(|source| OpenTrack::new(id, name, source))
             .map_err(|error| error.to_string()),
-        TrackSpecKind::BigWig => BigWigSource::open(&specification.path)
-            .map(|source| OpenTrack::new(id, name, source))
-            .map_err(|error| error.to_string()),
+        TrackSpecKind::BigWig => {
+            BigWigSource::open_with_remote_config(&specification.path, remote.clone())
+                .map(|source| OpenTrack::new(id, name, source))
+                .map_err(|error| error.to_string())
+        }
         TrackSpecKind::Tdf | TrackSpecKind::TdfChannel { .. } => {
-            open_tdf_track(specification, tdf_sources)
+            open_tdf_track(specification, tdf_sources, remote)
         }
         TrackSpecKind::BedGraph | TrackSpecKind::Wig => {
             let format = if specification.kind == TrackSpecKind::BedGraph {
@@ -1247,9 +1383,13 @@ fn open_track_cached(
                 TrackSpecKind::BigNarrowPeak => BigBedFeatureFormat::BigNarrowPeak,
                 _ => unreachable!(),
             };
-            BigBedSource::open_with_format(&specification.path, format)
-                .map(|source| OpenTrack::new(id, name, source))
-                .map_err(|error| error.to_string())
+            BigBedSource::open_with_format_and_remote_config(
+                &specification.path,
+                format,
+                remote.clone(),
+            )
+            .map(|source| OpenTrack::new(id, name, source))
+            .map_err(|error| error.to_string())
         }
     }
 }
@@ -1257,12 +1397,14 @@ fn open_track_cached(
 fn open_tdf_track(
     specification: &TrackSpec,
     tdf_sources: &mut TdfSourceCache,
+    remote: &HttpRangeConfig,
 ) -> Result<OpenTrack, String> {
     let source = if let Some(source) = tdf_sources.get(&specification.path) {
         Arc::clone(source)
     } else {
         let source = Arc::new(Mutex::new(
-            TdfSource::open(&specification.path).map_err(|error| error.to_string())?,
+            TdfSource::open_with_remote_config(&specification.path, None, remote.clone())
+                .map_err(|error| error.to_string())?,
         ));
         tdf_sources.insert(specification.path.clone(), Arc::clone(&source));
         source
@@ -1291,6 +1433,8 @@ fn open_tdf_track(
         TdfChannel {
             source,
             track_index,
+            keep_going: None,
+            budget: None,
         },
     ))
 }
@@ -1541,6 +1685,7 @@ mod tests {
     ) -> Arc<TrackQueryContext> {
         Arc::new(TrackQueryContext {
             output: Arc::new(output),
+            diagnostics: SharedTrackDiagnostics::default(),
             clock: clock.clone(),
             request,
             contig: "chr1".to_owned(),
@@ -1699,8 +1844,14 @@ mod tests {
         tracks.remove(0);
         let current = latest.load(Ordering::Acquire);
         assert!(
-            search_tracks(&mut tracks, "gene".to_owned(), 10, false, &superseded(current))
-                .is_some()
+            search_tracks(
+                &mut tracks,
+                "gene".to_owned(),
+                10,
+                false,
+                &superseded(current)
+            )
+            .is_some()
         );
         assert_eq!(searches.load(Ordering::Acquire), 2);
     }
@@ -2084,8 +2235,7 @@ mod tests {
         assert_eq!(query.records[0].identifier, "rs-first");
         assert!((query.records[0].minus_log10_p - 9.0).abs() < 1e-5);
 
-        let search =
-            search_tracks(&mut tracks, "RS-FIR".to_owned(), 10, false, &|| false).unwrap();
+        let search = search_tracks(&mut tracks, "RS-FIR".to_owned(), 10, false, &|| false).unwrap();
         assert_eq!(search.hits.len(), 1);
         assert_eq!(search.hits[0].record.name.as_deref(), Some("rs-first"));
         assert_eq!(search.hits[0].record.start, 100);
@@ -2338,5 +2488,254 @@ mod tests {
         let snapshots = snapshots.expect("post-removal TDF actor query timed out");
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots[0].id, TrackId::new(31));
+    }
+
+    /// Serves byte ranges of `data` to requests carrying `Authorization: Bearer track-secret`.
+    /// While a clock is parked in `advance_on_request`, the next authorised request takes it and
+    /// advances it: the view "moves on" in the middle of a remote read.
+    struct AuthorizedRangeServer {
+        url: String,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        advance_on_request: Arc<Mutex<Option<GenerationClock>>>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    impl AuthorizedRangeServer {
+        fn start(data: Vec<u8>) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let address = server.server_addr().to_ip().unwrap();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let advance_on_request = Arc::new(Mutex::new(None::<GenerationClock>));
+            let worker_stop = Arc::clone(&stop);
+            let worker_advance = Arc::clone(&advance_on_request);
+            let header = |name: &str, value: &str| {
+                tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap()
+            };
+            let worker = thread::spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let Some(request) = server
+                        .recv_timeout(std::time::Duration::from_millis(20))
+                        .unwrap()
+                    else {
+                        continue;
+                    };
+                    let authorised = request.headers().iter().any(|header| {
+                        header.field.equiv("Authorization")
+                            && header.value.as_str() == "Bearer track-secret"
+                    });
+                    if !authorised {
+                        request
+                            .respond(tiny_http::Response::empty(tiny_http::StatusCode(401)))
+                            .unwrap();
+                        continue;
+                    }
+                    if let Some(clock) = worker_advance.lock().unwrap().take() {
+                        clock.advance();
+                    }
+                    let (start, end) = request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("Range"))
+                        .and_then(|header| {
+                            let (start, end) = header
+                                .value
+                                .as_str()
+                                .strip_prefix("bytes=")?
+                                .split_once('-')?;
+                            let last = data.len().checked_sub(1)?;
+                            let start = start.parse::<usize>().ok()?;
+                            let end = if end.is_empty() {
+                                last
+                            } else {
+                                end.parse::<usize>().ok()?.min(last)
+                            };
+                            (start <= end).then_some((start, end))
+                        })
+                        .unwrap();
+                    let response = tiny_http::Response::from_data(data[start..=end].to_vec())
+                        .with_status_code(tiny_http::StatusCode(206))
+                        .with_header(header(
+                            "Content-Range",
+                            &format!("bytes {start}-{end}/{}", data.len()),
+                        ))
+                        .with_header(header("ETag", "\"track-fixture\""));
+                    request.respond(response).unwrap();
+                }
+            });
+            Self {
+                url: format!("http://{address}/archive.tdf"),
+                stop,
+                advance_on_request,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for AuthorizedRangeServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn remote_tracks_use_the_engine_remote_config_cancellation_and_budget() {
+        let server = AuthorizedRangeServer::start(tdf_fixture());
+        let specification = TrackSpec {
+            id: TrackId::new(40),
+            name: "engine signal".to_owned(),
+            path: PathBuf::from(&server.url),
+            kind: TrackSpecKind::Tdf,
+        };
+        // The anonymous default configuration is refused by the server.
+        assert!(
+            open_track_with(
+                &specification,
+                &mut TdfSourceCache::new(),
+                &HttpRangeConfig::default()
+            )
+            .is_err()
+        );
+        let remote = HttpRangeConfig {
+            authentication: rgv_hts::RemoteAuthentication::Bearer("track-secret".to_owned()),
+            // One 64-byte block is cached at a time, so every query below must fetch.
+            chunk_size: std::num::NonZeroUsize::new(64).unwrap(),
+            maximum_cache_bytes: std::num::NonZeroUsize::new(64).unwrap(),
+            maximum_retries: 0,
+            ..HttpRangeConfig::default()
+        };
+        let mut cache = TdfSourceCache::new();
+        let mut track = open_track_with(&specification, &mut cache, &remote).unwrap();
+        let archive = Arc::clone(&cache[&specification.path]);
+        let stats = || archive.lock().unwrap().remote_io_stats().unwrap();
+
+        let clock = GenerationClock::default();
+        let interval = GenomicInterval::new(ContigId::new(0), 100, 120).unwrap();
+        let request =
+            |clock: &GenerationClock| PanelGeneration::new(PanelId::new(1), clock.current());
+        let (output, receiver) = bounded_coalescing(8);
+        let context = test_query_context(output, &clock, request(&clock), interval);
+        let lane_values =
+            |receiver: &CoalescingReceiver<TrackEngineEvent>| match receiver.try_receive().unwrap()
+            {
+                Some(TrackEngineEvent::LaneCompleted { track, .. }) => {
+                    let TrackSnapshotData::Quantitative(query) = track.data else {
+                        panic!("TDF source returned the wrong snapshot type");
+                    };
+                    query
+                        .records
+                        .iter()
+                        .map(|record| record.value)
+                        .collect::<Vec<_>>()
+                }
+                other => panic!("expected a lane, got {other:?}"),
+            };
+
+        // The budget reaches the shared reader: an exhausted allowance fails the first read...
+        track.source.set_remote_control(
+            None,
+            Some(RemoteTransferBudget {
+                maximum_requests: 0,
+                maximum_response_bytes: 0,
+            }),
+        );
+        let (_, over_budget) =
+            query_track(&mut track, "chr1", 100, 120, &[], &[], &[]).unwrap_err();
+        assert!(over_budget.contains("budget"), "{over_budget}");
+        // ...and every engine query starts with a fresh one. The fixture's first channel holds
+        // 2.0 over 100..110 and 4.0 over 110..120.
+        assert_eq!(
+            query_one(&mut track, "chr1", &context),
+            Some(TrackId::new(40))
+        );
+        assert_eq!(lane_values(&receiver), [2.0, 4.0]);
+        assert_eq!(stats().cancellations, 0);
+
+        // A second reader that has not fetched its data yet. The view moves on while the first
+        // range of its query is in flight: the reader abandons the transfer instead of
+        // finishing a lane nobody wants.
+        let mut cache = TdfSourceCache::new();
+        let mut track = open_track_with(&specification, &mut cache, &remote).unwrap();
+        let archive = Arc::clone(&cache[&specification.path]);
+        let stats = || archive.lock().unwrap().remote_io_stats().unwrap();
+        *server.advance_on_request.lock().unwrap() = Some(clock.clone());
+        assert_eq!(query_one(&mut track, "chr1", &context), None);
+        assert!(server.advance_on_request.lock().unwrap().is_none());
+        assert_eq!(receiver.try_receive().unwrap(), None);
+        assert_eq!(stats().cancellations, 1);
+
+        // The stale check does not outlive its request.
+        let (output, receiver) = bounded_coalescing(8);
+        let context = test_query_context(output, &clock, request(&clock), interval);
+        assert_eq!(
+            query_one(&mut track, "chr1", &context),
+            Some(TrackId::new(40))
+        );
+        assert_eq!(lane_values(&receiver), [2.0, 4.0]);
+        assert_eq!(stats().cancellations, 1);
+    }
+
+    #[test]
+    fn skipped_feature_lines_are_reported_through_the_engine_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("blemished.bed");
+        // Lines 2 (start is not a number) and 4 (end before start) cannot be parsed.
+        std::fs::write(
+            &path,
+            "chr1\t10\t20\tfirst\n\
+             chr1\tnot-a-number\t30\tbroken\n\
+             chr1\t40\t50\tsecond\n\
+             chr1\t70\t60\tbackwards\n",
+        )
+        .unwrap();
+        let clean = directory.path().join("clean.bed");
+        std::fs::write(&clean, "chr1\t10\t20\tonly\n").unwrap();
+        let spec = |id, path: &std::path::Path| TrackSpec {
+            id: TrackId::new(id),
+            name: format!("track-{id}"),
+            path: path.to_path_buf(),
+            kind: TrackSpecKind::Bed,
+        };
+        let engine = TrackEngine::spawn(vec![spec(50, &path), spec(51, &clean)], 4);
+        let wait_for = |wanted: &dyn Fn(&TrackEngineEvent) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match engine.try_receive().unwrap() {
+                    Some(event) if wanted(&event) => break,
+                    Some(_) => {}
+                    None => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "track actor timed out"
+                        );
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        };
+        wait_for(&|event| {
+            matches!(
+                event,
+                TrackEngineEvent::Ready {
+                    opened: 2,
+                    failed: 0
+                }
+            )
+        });
+
+        let diagnostics = engine.source_diagnostics();
+        assert_eq!(diagnostics.len(), 1, "the clean track reports nothing");
+        let (id, report) = &diagnostics[0];
+        assert_eq!(*id, TrackId::new(50));
+        assert_eq!(report.malformed_lines, 2);
+        let (line, message) = report.first_malformed_line.as_ref().unwrap();
+        assert_eq!(*line, 2);
+        assert!(message.contains("BED start"), "{message}");
+
+        engine.try_remove_many(vec![TrackId::new(50)]).unwrap();
+        wait_for(&|event| matches!(event, TrackEngineEvent::TracksRemoved { .. }));
+        assert!(engine.source_diagnostics().is_empty());
     }
 }

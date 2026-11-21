@@ -6,7 +6,8 @@
 //!
 //! * an extended evidence root and row atlas describe the same records as a clean build;
 //! * per-tile exact summaries add up to a brute-force whole-interval pileup, including at
-//!   every tile seam;
+//!   every tile seam, both counting overlapping mates twice and collapsing them onto what the
+//!   earlier mate actually contributed (its CIGAR and base-quality eligibility);
 //! * no builder ever retains more than it reserved (a build fails, or a debug assertion fires,
 //!   when one does).
 //!
@@ -32,13 +33,13 @@ use rgv_hts::{
 use crate::{
     AlignmentHandle, AlignmentPageFamily, AlignmentPageKey, AlignmentReadLabelMode,
     AlignmentRowAtlas, AlignmentSemanticPage, AlignmentSourceRevision, AlignmentStyleContract,
-    AlleleSummaryDetail, AllocationClass, AllocationLedger, CanonicalGenomicTile,
-    CanonicalRecordChunk, CanonicalRowBlock, CapabilityRequirement, CompleteCoverage,
-    ContractFingerprint, DepthSummaryContract, EvidenceAcquisition, EvidenceChunk, EvidenceRoot,
-    EvidenceStore, ExactDepthSummaryTile, ExactSummaryRoot, FilteredRecordProvenance, GeometryLod,
-    LayoutContract, PayloadContract, PayloadSidecar, PresentationContract, ReadSampling,
-    ReservationKind, RevisionFingerprint, RowAtlasRevision, SourceChunkId, SourceFingerprint,
-    SummaryContract,
+    AlleleSummaryContract, AlleleSummaryDetail, AllocationClass, AllocationLedger,
+    CanonicalGenomicTile, CanonicalRecordChunk, CanonicalRowBlock, CapabilityRequirement,
+    CompleteCoverage, ContractFingerprint, DepthSummaryContract, EvidenceAcquisition,
+    EvidenceChunk, EvidenceRoot, EvidenceStore, ExactAlleleSummaryTile, ExactDepthSummaryTile,
+    ExactSummaryRoot, FilteredRecordProvenance, GeometryLod, LayoutContract, PayloadContract,
+    PayloadSidecar, PresentationContract, ReadSampling, ReservationKind, RevisionFingerprint,
+    RowAtlasRevision, SourceChunkId, SourceFingerprint, SummaryContract,
 };
 
 const RECORD_CONTRACT: ContractFingerprint = ContractFingerprint::new(23);
@@ -952,6 +953,259 @@ fn count_once_depth_does_not_depend_on_where_tile_seams_fall() {
             );
         }
     }
+}
+
+/// What one read says about one reference position.
+#[derive(Clone, Copy)]
+enum ReadSite {
+    /// An aligned base and its quality.
+    Base(u8, u8),
+    Deleted,
+}
+
+/// A read flattened to per-position statements plus the reference positions that follow each
+/// of its insertions. Reference skips say nothing about the positions they jump.
+struct FlatRead {
+    sites: HashMap<u64, ReadSite>,
+    insertions: Vec<u64>,
+}
+
+fn flatten(record: &AlignmentRecord) -> FlatRead {
+    let SequenceData::Present {
+        bases,
+        qualities: Some(qualities),
+    } = &record.sequence
+    else {
+        unreachable!("generated reads carry a sequence and qualities");
+    };
+    let mut flat = FlatRead {
+        sites: HashMap::new(),
+        insertions: Vec::new(),
+    };
+    let mut reference = record.start;
+    let mut read = 0_usize;
+    for operation in &record.cigar {
+        let len = u64::from(operation.len);
+        match operation.kind {
+            kind if is_aligned(kind) => {
+                for offset in 0..operation.len as usize {
+                    flat.sites.insert(
+                        reference + offset as u64,
+                        ReadSite::Base(bases[read + offset], qualities[read + offset]),
+                    );
+                }
+                reference += len;
+                read += operation.len as usize;
+            }
+            CigarOpKind::Deletion => {
+                for position in reference..reference + len {
+                    flat.sites.insert(position, ReadSite::Deleted);
+                }
+                reference += len;
+            }
+            CigarOpKind::ReferenceSkip => reference += len,
+            CigarOpKind::Insertion => {
+                flat.insertions.push(reference);
+                read += operation.len as usize;
+            }
+            CigarOpKind::SoftClip => read += operation.len as usize,
+            _ => {}
+        }
+    }
+    flat
+}
+
+/// Per-base `[A, C, G, T, deletion, insertion]` and aligned depth with overlapping mates
+/// counted once.
+struct CountOncePileup {
+    depth: Vec<u32>,
+    alleles: Vec<[u32; 6]>,
+}
+
+/// Brute-force count-once pileup, position by position, with no interval arithmetic.
+///
+/// The earlier mate (lower start; on a tie, the one stored first) is counted in full. The later
+/// mate then contributes, at each position:
+/// * depth, unless the earlier mate has an aligned base there;
+/// * its base (if it passes `minimum_base_quality`), unless the earlier mate has a passing base
+///   or a deletion there;
+/// * a deletion or an insertion, unless the earlier mate has a base or a deletion there.
+fn count_once_pileup(world: &World, minimum_base_quality: u8) -> CountOncePileup {
+    let length = usize::try_from(world.contig_length).unwrap();
+    let mut pileup = CountOncePileup {
+        depth: vec![0; length],
+        alleles: vec![[0; 6]; length],
+    };
+    let flat = world.records.iter().map(flatten).collect::<Vec<_>>();
+    let mut templates = HashMap::<&[u8], Vec<usize>>::new();
+    for (index, record) in world.records.iter().enumerate() {
+        templates.entry(&record.read_name).or_default().push(index);
+    }
+    let base_slot = |base: u8| b"ACGT".iter().position(|known| *known == base).unwrap();
+    for (index, read) in flat.iter().enumerate() {
+        let record = &world.records[index];
+        let earlier = templates[record.read_name.as_slice()]
+            .iter()
+            .copied()
+            .find(|other| *other != index)
+            .filter(|other| {
+                (world.records[*other].start, *other) < (record.start, index)
+                    && record.flags.is_paired()
+            })
+            .map(|other| &flat[other]);
+        let earlier_site = |position: u64| earlier.and_then(|mate| mate.sites.get(&position));
+        for (position, site) in &read.sites {
+            let slot = usize::try_from(*position).unwrap();
+            match (site, earlier_site(*position)) {
+                (ReadSite::Base(base, quality), mate) => {
+                    if !matches!(mate, Some(ReadSite::Base(..))) {
+                        pileup.depth[slot] += 1;
+                    }
+                    let mate_observed = match mate {
+                        Some(ReadSite::Base(_, mate_quality)) => {
+                            *mate_quality >= minimum_base_quality
+                        }
+                        Some(ReadSite::Deleted) => true,
+                        None => false,
+                    };
+                    if *quality >= minimum_base_quality && !mate_observed {
+                        pileup.alleles[slot][base_slot(*base)] += 1;
+                    }
+                }
+                (ReadSite::Deleted, None) => pileup.alleles[slot][4] += 1,
+                (ReadSite::Deleted, Some(_)) => {}
+            }
+        }
+        for position in &read.insertions {
+            if earlier_site(*position).is_none() {
+                // An insertion belongs to the reference base on its left.
+                pileup.alleles[usize::try_from(*position - 1).unwrap()][5] += 1;
+            }
+        }
+    }
+    pileup
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn count_once_summaries_match_a_brute_force_mate_aware_pileup() {
+    const MINIMUM_BASE_QUALITY: u8 = 20;
+    let mut overlapping_pairs_with_indels = 0_usize;
+    let mut positions_the_legacy_mask_got_wrong = 0_usize;
+    for seed in 0..CASES {
+        let world = World::new(seed);
+        let whole = interval(0, world.contig_length);
+        let evidence = world.clean_evidence(whole);
+        let expected = count_once_pileup(&world, MINIMUM_BASE_QUALITY);
+
+        // Prove the generator exercises the cases this test exists for: an overlapping pair
+        // whose earlier mate has a deletion, skip or low-quality base inside the overlap.
+        let mut templates = HashMap::<&[u8], Vec<&AlignmentRecord>>::new();
+        for record in &world.records {
+            templates.entry(&record.read_name).or_default().push(record);
+        }
+        for mates in templates.values().filter(|mates| mates.len() == 2) {
+            let (earlier, later) = if mates[0].start <= mates[1].start {
+                (mates[0], mates[1])
+            } else {
+                (mates[1], mates[0])
+            };
+            if later.start >= earlier.end {
+                continue;
+            }
+            let earlier_flat = flatten(earlier);
+            let later_flat = flatten(later);
+            let mut differs = 0_usize;
+            for position in later.start..earlier.end.min(later.end) {
+                let later_base =
+                    matches!(later_flat.sites.get(&position), Some(ReadSite::Base(..)));
+                let earlier_counted =
+                    matches!(
+                        earlier_flat.sites.get(&position),
+                        Some(ReadSite::Base(_, quality)) if *quality >= MINIMUM_BASE_QUALITY
+                    ) || matches!(earlier_flat.sites.get(&position), Some(ReadSite::Deleted));
+                differs += usize::from(later_base && !earlier_counted);
+            }
+            positions_the_legacy_mask_got_wrong += differs;
+            overlapping_pairs_with_indels +=
+                usize::from(earlier.cigar.iter().chain(&later.cigar).any(|operation| {
+                    matches!(
+                        operation.kind,
+                        CigarOpKind::Deletion | CigarOpKind::Insertion | CigarOpKind::ReferenceSkip
+                    )
+                }));
+        }
+
+        for tile_bases in [world.contig_length, world.tile_bases.get(), 37] {
+            let context = format!("seed {seed}, {tile_bases}-base tiles");
+            let tiles = CanonicalGenomicTile::covering(
+                whole,
+                NonZeroU64::new(tile_bases).unwrap(),
+                world.contig_length,
+            )
+            .unwrap();
+            let depth_tiles = tiles
+                .iter()
+                .map(|tile| {
+                    ExactDepthSummaryTile::build(
+                        &evidence,
+                        *tile,
+                        world.contig_length,
+                        DepthSummaryContract::new(OverlappingMatePolicy::CountOnce),
+                        &world.ledger,
+                        ReservationKind::Normal,
+                        5,
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tile_depths(&depth_tiles, whole),
+                expected.depth,
+                "{context}"
+            );
+            for tile in tiles {
+                let alleles = ExactAlleleSummaryTile::build(
+                    &evidence,
+                    tile,
+                    world.contig_length,
+                    AlleleSummaryContract::new(
+                        OverlappingMatePolicy::CountOnce,
+                        MINIMUM_BASE_QUALITY,
+                        AlleleSummaryDetail::Counts,
+                    ),
+                    &world.ledger,
+                    ReservationKind::Normal,
+                    6,
+                )
+                .unwrap();
+                let tile_interval = tile.interval(world.contig_length).unwrap();
+                for position in tile_interval.start()..tile_interval.end() {
+                    let site = alleles.site_at(position).unwrap().alleles;
+                    assert_eq!(
+                        [
+                            site.a,
+                            site.c,
+                            site.g,
+                            site.t,
+                            site.deletion,
+                            site.insertion
+                        ],
+                        expected.alleles[usize::try_from(position).unwrap()],
+                        "{context}: alleles at {position}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        overlapping_pairs_with_indels >= 20,
+        "only {overlapping_pairs_with_indels} overlapping pairs carried an indel or skip"
+    );
+    assert!(
+        positions_the_legacy_mask_got_wrong >= 100,
+        "only {positions_the_legacy_mask_got_wrong} positions distinguish the mate-aware mask"
+    );
 }
 
 #[test]

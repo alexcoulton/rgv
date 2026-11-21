@@ -24,6 +24,8 @@ impl Viewer {
     }
 
     pub(crate) fn retire_track_engine(&mut self) {
+        // Every track load ends with its engine; a later load of the same id reports afresh.
+        self.shell.skipped_lines.reset();
         if let Some(engine) = self.track_engine.take()
             && let Some(worker) = engine.retire()
         {

@@ -7,8 +7,8 @@ impl Viewer {
         self.locus_editor = std::mem::take(&mut st.nav.locus_editor);
         if st.nav.locus_search_changed
             && !st.nav.navigate_requested
-            && !self.locus_editor.contains(':')
             && self.locus_editor.trim().chars().count() >= 2
+            && !self.locus_expression_is_coordinates(&self.locus_editor)
         {
             let query = self.locus_editor.clone();
             self.request_annotation_search(&query, false, false);
@@ -50,7 +50,10 @@ impl Viewer {
             {
                 self.start_export(
                     path,
-                    variant_evidence_export_tsv(inspector, &st.snapshot.inspectors.variant_alignment_evidence),
+                    variant_evidence_export_tsv(
+                        inspector,
+                        &st.snapshot.inspectors.variant_alignment_evidence,
+                    ),
                 );
             }
         }
@@ -91,9 +94,11 @@ impl Viewer {
                     .add_filter("PNG image", &["png"])
                     .save_file()
             {
+                let scale =
+                    crate::automation::export::interactive_export_scale(self.window.scale_factor());
                 self.start_export_job(path, move |path| {
                     let (display, width, height) = sashimi_export_display(&bundle);
-                    export_png(&display, width, height, path)
+                    export_png_scaled(&display, width, height, scale, path)
                         .map_err(|error| std::io::Error::other(error.to_string()))
                 });
             }
@@ -129,11 +134,11 @@ impl Viewer {
             .or(st.inspect.interaction_endpoint_requested.take())
         {
             if let Err(error) = self.open_genomic_position_in_new_panel(&contig, position) {
-                self.data_status = error.to_string();
+                self.report_error(error.to_string());
             }
         } else if st.inspect.mate_panel_requested {
             if let Err(error) = self.open_selected_mate_in_new_panel() {
-                self.data_status = error.to_string();
+                self.report_error(error.to_string());
             }
         } else if st.inspect.chain_all_panels_requested {
             match self.open_all_chain_segments_in_panels() {
@@ -145,15 +150,15 @@ impl Viewer {
                 Ok((opened, _)) => {
                     self.data_status = format!("Opened {opened} supplementary segment panels");
                 }
-                Err(error) => self.data_status = error.to_string(),
+                Err(error) => self.report_error(error.to_string()),
             }
         } else if let Some(index) = st.inspect.chain_panel_requested {
             if let Err(error) = self.open_chain_segment_in_new_panel(index) {
-                self.data_status = error.to_string();
+                self.report_error(error.to_string());
             }
         } else if let Some(index) = st.inspect.chain_navigation_requested {
             if let Err(error) = self.navigate_to_chain_segment(index) {
-                self.data_status = error.to_string();
+                self.report_error(error.to_string());
             }
         } else if let Some(contig) = st.nav.requested_contig {
             self.navigate_to_contig(contig);
@@ -191,7 +196,7 @@ impl Viewer {
             let locus = self.locus_editor.clone();
             if self.locus_expression_is_coordinates(&locus) {
                 if let Err(error) = self.navigate_to_loci(&locus) {
-                    self.data_status = error.to_string();
+                    self.report_error(error.to_string());
                 } else {
                     self.persist_settings();
                 }
@@ -263,7 +268,7 @@ impl Viewer {
         if let Some(locus) = st.commands.recent_locus_requested.take()
             && let Err(error) = self.navigate_to_locus(&locus)
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
     }
 
@@ -290,7 +295,7 @@ impl Viewer {
                 .pick_file()
             && let Err(error) = self.open_genome_configuration(&path)
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         self.hosted_genomes.filter = std::mem::take(&mut st.commands.hosted_genome_filter);
         if st.commands.refresh_hosted_genomes_requested {
@@ -302,22 +307,22 @@ impl Viewer {
         if st.commands.restore_default_genes_requested
             && let Err(error) = self.restore_default_genes()
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         if st.commands.open_landmark_folder_requested
             && let Err(error) = self.open_landmark_resource_folder()
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         if let Some(bundle_id) = st.inspect.show_all_transcripts_requested.take()
             && let Err(error) = self.show_all_transcripts(&bundle_id)
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         if let Some(bundle_id) = st.inspect.return_to_representative_genes_requested.take()
             && let Err(error) = self.return_to_representative_genes(&bundle_id)
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         if st.commands.add_track_requested
             && let Some(path) = rfd::FileDialog::new()
@@ -363,7 +368,7 @@ impl Viewer {
                 .pick_file()
             && let Err(error) = self.add_track_source(&path)
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
         if let Some(path) = st.commands.recovery_requested.take() {
             self.request_session_load(path, SessionLoadKind::Recovery);
@@ -404,11 +409,19 @@ impl Viewer {
                 .add_filter("PNG image", &["png"])
                 .save_file()
         {
+            // REND-9: match the display's pixel density instead of one pixel per point.
+            let scale =
+                crate::automation::export::interactive_export_scale(self.window.scale_factor());
             match self.capture_semantic_export(AutomationSnapshotScope::VisibleWorkspace) {
                 Ok(capture) => self.start_export_job(path, move |path| {
-                    capture.write(path, AutomationSnapshotFormat::Png, "RGV manual export")
+                    capture.write(
+                        path,
+                        AutomationSnapshotFormat::Png,
+                        "RGV manual export",
+                        scale,
+                    )
                 }),
-                Err(error) => self.data_status = error.to_string(),
+                Err(error) => self.report_error(error.to_string()),
             }
         }
     }
@@ -434,7 +447,11 @@ impl Viewer {
             for track in &mut self.alignment_tracks {
                 if let Some(engine) = &track.scene_engine {
                     if let Err(error) = engine.try_clear_cache_budget(budget) {
-                        self.data_status = error.to_string();
+                        crate::app::shell_state::report_error_to(
+                            &mut self.shell.notifications,
+                            &mut self.data_status,
+                            error.to_string(),
+                        );
                     } else {
                         track.scene_budget_retry = None;
                     }

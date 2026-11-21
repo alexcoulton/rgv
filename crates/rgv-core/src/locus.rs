@@ -229,6 +229,22 @@ pub fn resolve_contig_name(
     Ok(None)
 }
 
+/// Splits a whitespace-separated expression into its loci.
+///
+/// `chr2:20-40 chr1:1-10` is two loci, but a contig token followed by one or
+/// two bare coordinates (`chr1 100 200`, `chr1<TAB>12345`, as pasted from a
+/// table) is a single locus and is returned whole for [`Locus::parse`] or
+/// [`Locus::resolve`]. That form wins over reading the coordinates as
+/// numerically named contigs.
+#[must_use]
+pub fn split_loci(expression: &str) -> Vec<&str> {
+    let tokens = expression.split_whitespace().collect::<Vec<_>>();
+    if matches!(tokens.len(), 2 | 3) && tokens[1..].iter().all(|token| is_coordinate(token)) {
+        return vec![expression.trim()];
+    }
+    tokens
+}
+
 /// `name` followed by its `chr`-prefix and mitochondrial equivalents.
 fn contig_spellings(name: &str) -> Vec<String> {
     let has_prefix = name
@@ -315,6 +331,21 @@ fn parse_range(text: &str) -> Result<LocusRange, LocusError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expressions_split_into_loci_but_keep_tabular_coordinates_together() {
+        assert_eq!(
+            split_loci("chr2:20-40  chr1:1-10\nchrX"),
+            vec!["chr2:20-40", "chr1:1-10", "chrX"]
+        );
+        assert_eq!(split_loci(" chr1\t12345 "), vec!["chr1\t12345"]);
+        assert_eq!(split_loci("chr1 100 200"), vec!["chr1 100 200"]);
+        assert_eq!(split_loci("chr1 1,000 2,000"), vec!["chr1 1,000 2,000"]);
+        // Four tokens, or a non-coordinate second token, is a list of loci.
+        assert_eq!(split_loci("chr1 100 200 300").len(), 4);
+        assert_eq!(split_loci("chr1 chr2"), vec!["chr1", "chr2"]);
+        assert!(split_loci("  ").is_empty());
+    }
 
     fn dictionary() -> ReferenceDictionary {
         ReferenceDictionary::from_contigs([

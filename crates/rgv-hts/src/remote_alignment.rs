@@ -454,18 +454,15 @@ impl LocalCramAlignmentSource {
         let mut reader = builder.build_from_path(path)?;
         let header = reader.read_header()?;
         let metadata = Arc::new(alignment_header_metadata_from_noodles(&header));
-        let dictionary = ReferenceDictionary::from_contigs(
-            header
-                .reference_sequences()
-                .iter()
-                .map(|(name, reference)| {
+        let dictionary =
+            crate::local::header_reference_dictionary(header.reference_sequences().iter().map(
+                |(name, reference)| {
                     (
                         String::from_utf8_lossy(name.as_ref()).into_owned(),
                         reference.length().get() as u64,
                     )
-                })
-                .collect::<Vec<_>>(),
-        );
+                },
+            ))?;
         let index_path = local_alignment_index_candidates(
             path,
             options.index_path.as_deref(),
@@ -581,18 +578,15 @@ impl RemoteBamAlignmentSource {
         let mut reader = noodles::bgzf::io::Reader::new(source);
         let header = bam::io::Reader::from(&mut reader).read_header()?;
         let metadata = Arc::new(alignment_header_metadata_from_noodles(&header));
-        let dictionary = ReferenceDictionary::from_contigs(
-            header
-                .reference_sequences()
-                .iter()
-                .map(|(name, reference)| {
+        let dictionary =
+            crate::local::header_reference_dictionary(header.reference_sequences().iter().map(
+                |(name, reference)| {
                     (
                         String::from_utf8_lossy(name.as_ref()).into_owned(),
                         reference.length().get() as u64,
                     )
-                })
-                .collect::<Vec<_>>(),
-        );
+                },
+            ))?;
         let index_overview = Some(match &index {
             RemoteIndex::Bai(index) => {
                 crate::AlignmentIndexOverview::from_binning_index(index, &dictionary)
@@ -695,18 +689,15 @@ impl RemoteCramAlignmentSource {
             .build_from_reader(source)?;
         let header = reader.read_header()?;
         let metadata = Arc::new(alignment_header_metadata_from_noodles(&header));
-        let dictionary = ReferenceDictionary::from_contigs(
-            header
-                .reference_sequences()
-                .iter()
-                .map(|(name, reference)| {
+        let dictionary =
+            crate::local::header_reference_dictionary(header.reference_sequences().iter().map(
+                |(name, reference)| {
                     (
                         String::from_utf8_lossy(name.as_ref()).into_owned(),
                         reference.length().get() as u64,
                     )
-                })
-                .collect::<Vec<_>>(),
-        );
+                },
+            ))?;
         let source_stamp = options.source_stamp_override.unwrap_or_else(|| {
             remote_source_stamp(
                 url,
@@ -791,14 +782,18 @@ fn split_remote_transfer_budget(
     )
 }
 
-/// Zero-based half-open reference span needed by the CRAM slice about to be decoded, shared
-/// between the decoder loop and the reference adapter. `None` means the whole sequence.
+/// Zero-based half-open reference spans needed by the CRAM slice about to be decoded, shared
+/// between the decoder loop and the reference adapter.
 type CramSliceSpan = Arc<CramSliceReference>;
+
+/// Spans by reference sequence name. A multi-reference slice has one per sequence it holds; a
+/// sequence without an entry is served whole.
+type NamedCramSliceSpans = std::collections::HashMap<Vec<u8>, (u64, u64)>;
 
 /// Decoder/adapter rendezvous for the slice being decoded.
 #[derive(Default)]
 struct CramSliceReference {
-    span: Mutex<Option<(u64, u64)>>,
+    span: Mutex<NamedCramSliceSpans>,
     /// Set by the adapter when it could not supply reference bases (fetch failure, budget,
     /// absent contig). Such a failure says nothing about the slice's span, so it must not be
     /// answered by fetching the whole sequence.
@@ -806,7 +801,7 @@ struct CramSliceReference {
 }
 
 impl CramSliceReference {
-    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Option<(u64, u64)>>> {
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, NamedCramSliceSpans>> {
         self.span.lock()
     }
 }
@@ -883,14 +878,15 @@ impl CramReferenceAdapter {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid FASTA contig ID"))?;
         let length = usize::try_from(contig.length())
             .map_err(|_| io::Error::other("CRAM reference contig length exceeds this platform"))?;
-        // A single-reference slice needs only its own span. The decoder addresses the sequence
-        // by absolute position, so the span is placed in a zero-filled buffer which the allocator
-        // maps lazily: only the fetched span is ever resident or transferred.
+        // A slice needs only the span it covers on each sequence it holds. The decoder addresses
+        // the sequence by absolute position, so the span is placed in a zero-filled buffer which
+        // the allocator maps lazily: only the fetched span is ever resident or transferred.
         let span = self
             .slice_span
             .lock()
             .map_err(|_| io::Error::other("CRAM reference span lock was poisoned"))?
-            .map(|(start, end)| (start.min(contig.length()), end.min(contig.length())))
+            .get(raw_name)
+            .map(|(start, end)| ((*start).min(contig.length()), (*end).min(contig.length())))
             .filter(|(start, end)| start < end);
         let (fetch_start, fetch_end) = span.unwrap_or((0, contig.length()));
         let fetched = usize::try_from(fetch_end - fetch_start)
@@ -1128,10 +1124,13 @@ impl AlignmentSource for RemoteCramAlignmentSource {
     }
 }
 
-/// Slices of one container selected for decoding, by landmark, each with the zero-based
-/// half-open reference span CRAI records for it. The span is `None` when the slice holds more
-/// than one reference sequence or the index gives no usable span.
-type SelectedCramSlices = BTreeMap<u64, Option<(u64, u64)>>;
+/// Zero-based half-open spans CRAI records for one slice, by reference sequence id. A
+/// multi-reference slice has one entry per sequence it holds. A sequence is absent when the
+/// index gives no usable span for it; it is then read whole.
+type CramSliceSpans = BTreeMap<usize, (u64, u64)>;
+
+/// Slices of one container selected for decoding, by landmark.
+type SelectedCramSlices = BTreeMap<u64, CramSliceSpans>;
 
 /// Containers and slices which CRAI says can intersect `interval`, in file order.
 fn select_cram_containers<R>(
@@ -1159,31 +1158,107 @@ where
             selected
                 .entry(index_record.offset())
                 .or_default()
-                .insert(index_record.landmark(), Some((start, end)));
+                .entry(index_record.landmark())
+                .or_default();
         }
     }
-    // A slice listed under any other reference (or with several spans) is multi-reference.
+    // Every index record of a selected slice contributes the span of its own sequence: a
+    // multi-reference slice is listed once per sequence it holds, and decoding it resolves the
+    // reference of each of its records, not only of those on the queried sequence.
+    let mut unusable = std::collections::BTreeSet::new();
     for index_record in reader.index() {
-        let Some(span) = selected
-            .get_mut(&index_record.offset())
-            .and_then(|slices| slices.get_mut(&index_record.landmark()))
+        let slice = (index_record.offset(), index_record.landmark());
+        let Some(spans) = selected
+            .get_mut(&slice.0)
+            .and_then(|slices| slices.get_mut(&slice.1))
         else {
             continue;
         };
-        let record_span = index_record.alignment_start().and_then(|start| {
-            let start = u64::try_from(start.get()).ok()?.saturating_sub(1);
-            Some((
-                start,
-                start.saturating_add(index_record.alignment_span() as u64),
-            ))
-        });
-        if index_record.reference_sequence_id() != Some(reference_sequence_id)
-            || record_span != *span
-        {
-            *span = None;
+        // Unmapped records need no reference.
+        let Some(sequence) = index_record.reference_sequence_id() else {
+            continue;
+        };
+        let record_span = index_record
+            .alignment_start()
+            .and_then(|start| {
+                let start = u64::try_from(start.get()).ok()?.saturating_sub(1);
+                Some((
+                    start,
+                    start.saturating_add(index_record.alignment_span() as u64),
+                ))
+            })
+            .filter(|(start, end)| start < end);
+        match record_span {
+            Some((start, end)) if !unusable.contains(&(slice, sequence)) => {
+                spans
+                    .entry(sequence)
+                    .and_modify(|span| *span = (span.0.min(start), span.1.max(end)))
+                    .or_insert((start, end));
+            }
+            _ => {
+                // No usable span for this sequence: read it whole, whatever else is listed.
+                unusable.insert((slice, sequence));
+                spans.remove(&sequence);
+            }
         }
     }
     Ok(selected)
+}
+
+fn reference_sequence_name(header: &sam::Header, reference_sequence_id: usize) -> Option<Vec<u8>> {
+    header
+        .reference_sequences()
+        .get_index(reference_sequence_id)
+        .map(|(name, _)| <_ as AsRef<[u8]>>::as_ref(name).to_vec())
+}
+
+/// Fails when a mapped record about to be returned lies outside the reference span its slice
+/// was decoded against: its bases would come from the zero-filled part of the buffer. `served`
+/// is `None` when the whole sequence was supplied.
+fn require_record_inside_served_span<R>(
+    record: &R,
+    (start, end): (u64, u64),
+    served: Option<(u64, u64)>,
+) -> Result<(), AlignmentError>
+where
+    R: sam::alignment::Record,
+{
+    if let Some((served_start, served_end)) = served
+        && (start < served_start || end > served_end)
+        && !record.flags()?.is_unmapped()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the CRAM index understates the reference span of a slice",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Reads the container CRAI places at `container_offset`.
+fn read_cram_container<R>(
+    reader: &mut cram::io::IndexedReader<R>,
+    container_offset: u64,
+) -> Result<cram::io::reader::Container, AlignmentError>
+where
+    R: io::Read + io::Seek,
+{
+    let repository = reader.reference_sequence_repository().clone();
+    let raw_reader = reader.get_mut();
+    raw_reader.seek(SeekFrom::Start(container_offset))?;
+    let mut direct_reader = cram::io::reader::Builder::default()
+        .set_reference_sequence_repository(repository)
+        .build_from_reader(&mut *raw_reader);
+    let mut container = cram::io::reader::Container::default();
+    if direct_reader.read_container(&mut container)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "CRAI points beyond the CRAM container stream",
+        )
+        .into());
+    }
+    Ok(container)
 }
 
 /// Decodes the selected slices of one CRAM container and visits every record intersecting
@@ -1205,29 +1280,20 @@ where
     ) -> Result<(), AlignmentError>,
 {
     let repository = reader.reference_sequence_repository().clone();
-    let raw_reader = reader.get_mut();
-    raw_reader.seek(SeekFrom::Start(container_offset))?;
-    let mut direct_reader = cram::io::reader::Builder::default()
-        .set_reference_sequence_repository(repository.clone())
-        .build_from_reader(&mut *raw_reader);
-    let mut container = cram::io::reader::Container::default();
-    if direct_reader.read_container(&mut container)? == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "CRAI points beyond the CRAM container stream",
-        )
-        .into());
-    }
+    let container = read_cram_container(reader, container_offset)?;
     let compression_header = container.compression_header()?;
     let landmarks = container.header().landmarks().to_vec();
-    let set_span = |span: Option<(u64, u64)>| -> Result<(), AlignmentError> {
+    let set_span = |spans: NamedCramSliceSpans| -> Result<(), AlignmentError> {
         *slice_span
             .lock()
-            .map_err(|_| io::Error::other("CRAM reference span lock was poisoned"))? = span;
+            .map_err(|_| io::Error::other("CRAM reference span lock was poisoned"))? = spans;
         // The repository caches by name; a cached span must not serve another slice.
         repository.clear();
         Ok(())
     };
+    let queried_sequence = usize::try_from(interval.contig().get())
+        .ok()
+        .and_then(|id| reference_sequence_name(header, id));
     for (slice_index, result) in container.slices().enumerate() {
         let slice = result?;
         let landmark = u64::try_from(
@@ -1236,17 +1302,28 @@ where
                 .ok_or_else(|| io::Error::other("CRAM slice has no container landmark"))?,
         )
         .map_err(|_| AlignmentError::CoordinateOverflow)?;
-        let Some(span) = selected_slices.get(&landmark) else {
+        let Some(spans) = selected_slices.get(&landmark) else {
             continue;
         };
         let (core_data_src, external_data_srcs) = slice.decode_blocks()?;
-        // Decode against the slice's own reference span. If the index understated that span the
-        // decoder's checksum or bounds check fails, and the slice is decoded once more against
-        // the whole sequence.
+        // Decode against the spans the index records for this slice, one per sequence it
+        // holds. If the index understated a span, the decoder's checksum or bounds check fails
+        // or (a multi-reference slice carries no reference checksum) a returned record lies
+        // outside the span it was decoded against; the slice is then decoded once more against
+        // whole sequences.
         let mut decoded = Vec::new();
-        let mut attempt = *span;
+        let mut attempt = spans
+            .iter()
+            .filter_map(|(sequence, span)| {
+                Some((reference_sequence_name(header, *sequence)?, *span))
+            })
+            .collect::<NamedCramSliceSpans>();
         loop {
-            set_span(attempt)?;
+            set_span(attempt.clone())?;
+            let served = queried_sequence
+                .as_ref()
+                .and_then(|name| attempt.get(name))
+                .copied();
             slice_span
                 .reference_unavailable
                 .store(false, Ordering::Relaxed);
@@ -1261,9 +1338,15 @@ where
                 for (record_index, record) in records.iter().enumerate() {
                     // Test placement on the lazy CRAM record: most records of a slice lie
                     // outside a narrow query and never need an owned copy.
-                    if !noodles_record_intersects(record, header, interval)? {
+                    let Some((start, end)) =
+                        noodles_record_span_on(record, header, interval.contig())?
+                    else {
+                        continue;
+                    };
+                    if !(start < interval.end() && interval.start() < end) {
                         continue;
                     }
+                    require_record_inside_served_span(record, (start, end), served)?;
                     let record_index = u32::try_from(record_index)
                         .map_err(|_| AlignmentError::CoordinateOverflow)?;
                     let record =
@@ -1276,20 +1359,20 @@ where
                 Ok(()) => break,
                 Err(_)
                     if retry_slice_against_whole_sequence(
-                        attempt.is_some(),
+                        !attempt.is_empty(),
                         slice_span.reference_unavailable.load(Ordering::Relaxed),
                     ) =>
                 {
                     decoded.clear();
-                    attempt = None;
+                    attempt.clear();
                 }
                 Err(error) => {
-                    set_span(None)?;
+                    set_span(NamedCramSliceSpans::new())?;
                     return Err(error);
                 }
             }
         }
-        set_span(None)?;
+        set_span(NamedCramSliceSpans::new())?;
         for (record, record_index) in decoded {
             visit(
                 record,
@@ -1391,20 +1474,32 @@ fn noodles_record_intersects<R>(
 where
     R: sam::alignment::Record,
 {
+    Ok(noodles_record_span_on(record, header, interval.contig())?
+        .is_some_and(|(start, end)| start < interval.end() && interval.start() < end))
+}
+
+/// Zero-based half-open reference span of a record placed on `contig`.
+fn noodles_record_span_on<R>(
+    record: &R,
+    header: &sam::Header,
+    contig: ContigId,
+) -> Result<Option<(u64, u64)>, AlignmentError>
+where
+    R: sam::alignment::Record,
+{
     let Some(reference_sequence_id) = record.reference_sequence_id(header).transpose()? else {
-        return Ok(false);
+        return Ok(None);
     };
-    if u32::try_from(reference_sequence_id).ok().map(ContigId::new) != Some(interval.contig()) {
-        return Ok(false);
+    if u32::try_from(reference_sequence_id).ok().map(ContigId::new) != Some(contig) {
+        return Ok(None);
     }
     let Some(start) = record.alignment_start().transpose()? else {
-        return Ok(false);
+        return Ok(None);
     };
     let start = u64::try_from(start.get())
         .map_err(|_| AlignmentError::CoordinateOverflow)?
         .saturating_sub(1);
-    let end = record_reference_end(record, start)?;
-    Ok(start < interval.end() && interval.start() < end)
+    Ok(Some((start, record_reference_end(record, start)?)))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3087,6 +3182,224 @@ mod tests {
         assert!(compared > 0);
     }
 
+    /// Three 2000-base contigs and, on each, five 50-base reads at 100, 300, 500, 700 and 900
+    /// (one mismatch each), written as one reference-compressed, indexed CRAM slice: a
+    /// multi-reference slice.
+    fn write_multi_reference_cram(directory: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        const CONTIG_BASES: usize = 2_000;
+        let names = ["ctgA", "ctgB", "ctgC"];
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let sequences = names.map(|_| {
+            (0..CONTIG_BASES)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    b"ACGT"[(state >> 33) as usize % 4]
+                })
+                .collect::<Vec<u8>>()
+        });
+        let reference = directory.join("multi.fa");
+        let mut fasta_bytes = Vec::new();
+        let mut fai = Vec::new();
+        for (name, sequence) in names.iter().zip(&sequences) {
+            fasta_bytes.extend_from_slice(format!(">{name}\n").as_bytes());
+            fai.extend_from_slice(
+                format!(
+                    "{name}\t{CONTIG_BASES}\t{}\t{CONTIG_BASES}\t{}\n",
+                    fasta_bytes.len(),
+                    CONTIG_BASES + 1
+                )
+                .as_bytes(),
+            );
+            fasta_bytes.extend_from_slice(sequence);
+            fasta_bytes.push(b'\n');
+        }
+        fs::write(&reference, fasta_bytes).unwrap();
+        fs::write(directory.join("multi.fa.fai"), fai).unwrap();
+
+        let mut sam_header = sam::Header::builder();
+        for name in names {
+            sam_header = sam_header.add_reference_sequence(
+                name,
+                Map::<ReferenceSequence>::new(NonZero::new(CONTIG_BASES).unwrap()),
+            );
+        }
+        let sam_header = sam_header.build();
+        let repository = fasta::Repository::new(
+            names
+                .iter()
+                .zip(&sequences)
+                .map(|(name, sequence)| {
+                    fasta::Record::new(
+                        fasta::record::Definition::new(*name, None),
+                        fasta::record::Sequence::from(sequence.clone()),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let cram = directory.join("multi.cram");
+        let mut writer = cram::io::writer::Builder::default()
+            .set_reference_sequence_repository(repository)
+            .build_from_writer(File::create(&cram).unwrap());
+        writer.write_header(&sam_header).unwrap();
+        for (reference_sequence_id, sequence) in sequences.iter().enumerate() {
+            for start in [100_usize, 300, 500, 700, 900] {
+                let mut bases = sequence[start..start + 50].to_vec();
+                bases[25] = if bases[25] == b'A' { b'C' } else { b'A' };
+                let record = RecordBuf::builder()
+                    .set_name(format!("read-{reference_sequence_id}-{start}"))
+                    .set_flags(Flags::empty())
+                    .set_reference_sequence_id(reference_sequence_id)
+                    .set_alignment_start(Position::try_from(start + 1).unwrap())
+                    .set_mapping_quality(MappingQuality::new(60).unwrap())
+                    .set_cigar([Op::new(CigarKind::Match, 50)].into_iter().collect())
+                    .set_sequence(Sequence::from(bases))
+                    .set_quality_scores(QualityScores::from(vec![30; 50]))
+                    .build();
+                writer.write_alignment_record(&sam_header, &record).unwrap();
+            }
+        }
+        writer.try_finish(&sam_header).unwrap();
+        drop(writer);
+        // htslib indexes a multi-reference slice from its record placements alone.
+        rust_htslib::bam::index::build(&cram, None, rust_htslib::bam::index::Type::Bai, 1).unwrap();
+        (cram, reference)
+    }
+
+    fn assert_cram_matches_htslib(
+        source: &mut LocalCramAlignmentSource,
+        oracle: &mut LocalAlignmentSource,
+        contig: u32,
+    ) {
+        let query_options = QueryOptions {
+            detail: QueryDetail::Full,
+            ..QueryOptions::default()
+        };
+        let interval = GenomicInterval::new(ContigId::new(contig), 0, 2_000).unwrap();
+        let decoded = source
+            .query(interval, query_options.clone(), &|| true)
+            .unwrap();
+        let expected = oracle.query(interval, query_options, &|| true).unwrap();
+        let records = |query: &AlignmentQuery| {
+            let mut records = (0..query.batch.len())
+                .map(|index| query.batch.materialize_record(index).unwrap())
+                .map(|record| {
+                    (
+                        record.start,
+                        record.read_name,
+                        record.cigar,
+                        record.sequence,
+                    )
+                })
+                .collect::<Vec<_>>();
+            records.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+            records
+        };
+        assert_eq!(decoded.batch.len(), 5, "contig {contig}");
+        assert_eq!(records(&decoded), records(&expected), "contig {contig}");
+    }
+
+    #[test]
+    fn multi_reference_cram_slices_fetch_only_the_spans_they_cover() {
+        let directory = tempfile::tempdir().unwrap();
+        let (cram, reference) = write_multi_reference_cram(directory.path());
+        // The premise: one slice is indexed under all three sequences, each with the span of
+        // its own reads, 100..950 (one-based start 101, span 850).
+        let index = cram::crai::fs::read(format!("{}.crai", cram.display())).unwrap();
+        let slices = index
+            .iter()
+            .map(|record| (record.offset(), record.landmark()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(slices.len(), 1, "htslib wrote one multi-reference slice");
+        assert_eq!(
+            index
+                .iter()
+                .map(|record| (
+                    record.reference_sequence_id(),
+                    record.alignment_start().map(usize::from),
+                    record.alignment_span()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (Some(0), Some(101), 850),
+                (Some(1), Some(101), 850),
+                (Some(2), Some(101), 850)
+            ]
+        );
+
+        let options = AlignmentOpenOptions {
+            reference_path: Some(reference),
+            ..AlignmentOpenOptions::default()
+        };
+        let mut source = LocalCramAlignmentSource::open(&cram, &options).unwrap();
+        let mut oracle = LocalAlignmentSource::open(&cram, &options).unwrap();
+        for contig in 0..3 {
+            assert_cram_matches_htslib(&mut source, &mut oracle, contig);
+            // Decoding the slice resolves the reference of all three sequences: 3 x 850 bases,
+            // where it used to read all 3 x 2000.
+            assert_eq!(
+                source.reference_query_bases.load(Ordering::Relaxed),
+                2_550,
+                "contig {contig}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_index_understating_a_multi_reference_span_falls_back_to_whole_sequences() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (cram, reference) = write_multi_reference_cram(directory.path());
+        // Rewrite the index so every sequence claims only 300..950: the read at 100 lies
+        // outside. A multi-reference slice carries no reference checksum and the read is inside
+        // the zero-filled buffer, so nothing but the returned records' own placement can expose
+        // the understated span.
+        let index = cram::crai::fs::read(format!("{}.crai", cram.display())).unwrap();
+        let understated = directory.path().join("understated.crai");
+        let mut encoder = flate2::write::GzEncoder::new(
+            File::create(&understated).unwrap(),
+            flate2::Compression::default(),
+        );
+        for record in &index {
+            writeln!(
+                encoder,
+                "{}\t301\t650\t{}\t{}\t{}",
+                record.reference_sequence_id().unwrap(),
+                record.offset(),
+                record.landmark(),
+                record.slice_length()
+            )
+            .unwrap();
+        }
+        encoder.finish().unwrap();
+
+        let options = AlignmentOpenOptions {
+            reference_path: Some(reference),
+            ..AlignmentOpenOptions::default()
+        };
+        let mut source = LocalCramAlignmentSource::open(
+            &cram,
+            &AlignmentOpenOptions {
+                index_path: Some(understated),
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        let mut oracle = LocalAlignmentSource::open(&cram, &options).unwrap();
+        for contig in 0..3 {
+            // Bases still match htslib: the slice was decoded again against whole sequences
+            // (3 x 650 claimed bases, then 3 x 2000).
+            assert_cram_matches_htslib(&mut source, &mut oracle, contig);
+            assert_eq!(
+                source.reference_query_bases.load(Ordering::Relaxed),
+                1_950 + 6_000,
+                "contig {contig}"
+            );
+        }
+    }
+
     #[test]
     fn local_cram_positioned_stream_matches_the_one_shot_query() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/manual-suite");
@@ -3207,7 +3520,7 @@ mod tests {
         let unavailable = || slice_span.reference_unavailable.load(Ordering::Relaxed);
 
         // A served span leaves the flag clear: a later decode error is about the slice.
-        *slice_span.lock().unwrap() = Some((4, 12));
+        slice_span.lock().unwrap().insert(b"chrA".to_vec(), (4, 12));
         let record = adapter.get(b"chrA").unwrap().unwrap();
         assert_eq!(&record.sequence().as_ref()[4..], b"ACGTACGT");
         assert_eq!(query_bases.load(Ordering::Relaxed), 8);

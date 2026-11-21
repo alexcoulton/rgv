@@ -15,6 +15,11 @@ const fn alignment_scene_post_submit_prefetch(
 impl Viewer {
     /// Poll, prepare, compose, and submit one application frame.
     pub(crate) fn render(&mut self) {
+        // Check the device before preparing anything: a frame laid out and uploaded against a
+        // lost device is wasted work. `submit_ui_frame` checks again for a loss during the frame.
+        if !self.ensure_gpu_device() {
+            return;
+        }
         let frame_started = Instant::now();
         self.begin_manual_diagnostic_frame();
         let phase_started = Instant::now();

@@ -188,7 +188,9 @@ fn depth_vertex(input: DepthInput) -> VertexOutput {
         input.vertex_index,
         vec2<f32>(left, top),
         vec2<f32>(right - left, height),
-        vec4<f32>(0.48, 0.48, 0.48, 0.90),
+        // Opaque: bars narrower than one point are widened to one point and then overlap their
+        // neighbours, and a translucent colour would blend twice in the overlap.
+        vec4<f32>(0.48, 0.48, 0.48, 1.0),
         visible,
     );
 }
@@ -337,6 +339,9 @@ fn junction_vertex(input: JunctionInput) -> VertexOutput {
     // itself is parameterised over the junction's full, unclamped span below. Clamping the span
     // instead would squeeze the whole parabola into the visible part, so an end that is really
     // off-screen would appear to land on the viewport edge.
+    // Offsets are signed: a junction entering the first prepared page from the left carries a
+    // negative `start_offset` (its true genomic start), which the double-single projection
+    // handles like any other page-relative coordinate.
     let full_left = project_x(input.start_offset);
     let full_right = project_x(input.end_offset);
     let left = max(full_left, frame.covered_clip_x.x);
@@ -443,7 +448,12 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         if input.shape == 2u {
             curve_y = input.pixel_size.y - input.stroke * 0.5 - inner_height * parabola;
         }
-        let distance = abs(input.local.y * input.pixel_size.y - curve_y);
+        // Perpendicular (not vertical) distance to the curve, so the stroke keeps its thickness
+        // on the steep flanks. Same first-order form as `rectangle.wgsl` and
+        // `junction_arc_geometry_at_point`; mirrored by `junction_arc_stroke_distance`.
+        let slope = 8.0 * inner_height * (input.local.x - 0.5) / max(input.pixel_size.x, 1.0);
+        let distance = abs(input.local.y * input.pixel_size.y - curve_y)
+            / sqrt(1.0 + slope * slope);
         var alpha = 1.0 - smoothstep(input.stroke * 0.5, input.stroke * 0.5 + 1.0, distance);
         if input.pixel_size.x >= 12.0 && input.junction_component < 2u {
             let marker_fraction = select(0.70, 0.30, input.junction_component == 1u);

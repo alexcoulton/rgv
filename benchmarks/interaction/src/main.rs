@@ -16,8 +16,8 @@ use rgv_alignment_scene::{
     PresentationContract, SummaryContract,
 };
 use rgv_core::{
-    AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, GenomicInterval,
-    OverlappingMatePolicy, ReadStackingMode, ReferenceDictionary, Viewport,
+    AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigAliases, GenomicInterval,
+    Locus, LocusRange, OverlappingMatePolicy, ReadStackingMode, ReferenceDictionary, Viewport,
 };
 use rgv_engine::{
     AlignmentCoordinatorFrame, AlignmentIndividualReadCapability, AlignmentSceneBuildContract,
@@ -728,32 +728,12 @@ fn wait_for_frames(
 }
 
 fn parse_locus(dictionary: &ReferenceDictionary, locus: &str) -> Result<GenomicInterval> {
-    let (name, range) = locus
-        .split_once(':')
-        .with_context(|| format!("locus must use name:start-end, got {locus}"))?;
-    let range = range.replace(',', "");
-    let (start, end) = range
-        .split_once('-')
-        .with_context(|| format!("locus must use name:start-end, got {locus}"))?;
-    let one_based_start: u64 = start.parse()?;
-    let one_based_end: u64 = end.parse()?;
+    let resolved = Locus::resolve(locus, dictionary, &ContigAliases::default())?;
     anyhow::ensure!(
-        one_based_start > 0 && one_based_end >= one_based_start,
-        "locus coordinates must be one-based and forward"
+        matches!(resolved.range, LocusRange::Interval { .. }),
+        "locus must use name:start-end, got {locus}"
     );
-    let contig_id = dictionary
-        .id_by_name(name)
-        .with_context(|| format!("unknown contig {name}"))?;
-    let contig_length = dictionary
-        .get(contig_id)
-        .context("reference dictionary is inconsistent")?
-        .length();
-    Ok(GenomicInterval::bounded(
-        contig_id,
-        one_based_start - 1,
-        one_based_end,
-        contig_length,
-    )?)
+    Ok(resolved.interval(0)?)
 }
 
 fn enforce_limit(label: &str, value: f64, limit: Option<f64>) -> Result<()> {
@@ -831,4 +811,34 @@ fn sha256(path: &Path) -> Result<String> {
         write!(&mut output, "{byte:02x}").expect("writing to a string cannot fail");
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn benchmark_loci_use_the_shared_grammar() {
+        let dictionary = ReferenceDictionary::from_contigs([
+            ("chr1".to_owned(), 1_000_000),
+            ("HLA-A*01:01:01:01".to_owned(), 3_503),
+        ]);
+        let interval = parse_locus(&dictionary, "chr1:1,001-2,000").unwrap();
+        assert_eq!((interval.start(), interval.end()), (1_000, 2_000));
+        let hla = parse_locus(&dictionary, "HLA-A*01:01:01:01:1-100").unwrap();
+        assert_eq!(
+            hla.contig(),
+            dictionary.id_by_name("HLA-A*01:01:01:01").unwrap()
+        );
+        assert_eq!((hla.start(), hla.end()), (0, 100));
+        assert_eq!(
+            parse_locus(&dictionary, "1:1-10").unwrap().contig(),
+            interval.contig()
+        );
+        // A benchmark window must be an explicit range on a known contig.
+        assert!(parse_locus(&dictionary, "chr1").is_err());
+        assert!(parse_locus(&dictionary, "chr1:500").is_err());
+        assert!(parse_locus(&dictionary, "chr9:1-10").is_err());
+        assert!(parse_locus(&dictionary, "chr1:0-10").is_err());
+    }
 }

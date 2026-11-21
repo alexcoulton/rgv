@@ -381,6 +381,25 @@ pub(super) fn reference_open_options(remote_index_url: Option<String>) -> FastaO
     }
 }
 
+/// Starts the annotation-track engine with the desktop's remote configuration, so remote
+/// bigWig, bigBed, TDF and text tracks get the same bearer authentication, cancellation and
+/// budgets as remote alignments instead of anonymous defaults.
+pub(super) fn spawn_track_engine(
+    specifications: Vec<(TrackSpec, BTreeMap<String, String>)>,
+) -> TrackEngine {
+    TrackEngine::spawn_with_remote_config(specifications, 8, remote_range_config())
+}
+
+/// [`spawn_track_engine`] for tracks that need no query-contig aliases.
+pub(super) fn spawn_track_engine_without_aliases(specifications: Vec<TrackSpec>) -> TrackEngine {
+    spawn_track_engine(
+        specifications
+            .into_iter()
+            .map(|specification| (specification, BTreeMap::new()))
+            .collect(),
+    )
+}
+
 pub(super) fn remote_range_config() -> HttpRangeConfig {
     let mut config = HttpRangeConfig {
         minimum_coalesced_chunks: NonZeroUsize::new(8).unwrap(),

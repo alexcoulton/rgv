@@ -293,7 +293,7 @@ pub fn layout_features_with_label_widths(
         let selected = options.selected_record == Some(index);
         let label_band = if row_has_label[row] { 10.0 } else { 0.0 };
         let y = row_top + label_band + 2.0;
-        let object_id = crate::record_object_id(options.object_id_base, index);
+        let object_id = crate::offset_object_id(options.object_id_base, index);
         add_feature(
             &mut display,
             feature,
@@ -450,7 +450,7 @@ pub fn layout_variants(
         let start_visible = variant.start >= viewport.interval().start();
         let (x, span_width) = clipped_geometry(variant.start, variant.end, viewport);
         let right = x + span_width;
-        let object_id = crate::record_object_id(options.object_id_base, index);
+        let object_id = crate::offset_object_id(options.object_id_base, index);
         let color = match settings.color_mode {
             VariantColorMode::Type => variant_color(
                 variant
@@ -725,7 +725,7 @@ pub fn layout_gwas(
             options.height,
             settings.maximum_score,
         );
-        let object_id = crate::record_object_id(options.object_id_base, index);
+        let object_id = crate::offset_object_id(options.object_id_base, index);
         if options.selected_record == Some(index) {
             let halo = point_size + 8.0;
             display.rectangles.push(RectPrimitive {
@@ -896,7 +896,7 @@ pub fn layout_interactions(
         if !source_here && !target_here {
             continue;
         }
-        let object_id = crate::record_object_id(options.object_id_base, index);
+        let object_id = crate::offset_object_id(options.object_id_base, index);
         let color = record
             .color
             .map_or(Rgba::new(0.48, 0.30, 0.76, 0.86), rgba_from_bytes);
@@ -1325,7 +1325,7 @@ pub fn layout_quantitative(
         let x = viewport.pixel_at_genomic(window.start) as f32;
         let right = viewport.pixel_at_genomic(window.end) as f32;
         let width = (right - x).max(1.0);
-        let object_id = crate::record_object_id(options.object_id_base, window.identity);
+        let object_id = crate::offset_object_id(options.object_id_base, window.identity);
         let Some(value) = window.value else {
             missing = missing.saturating_add(1);
             match settings.missing_mode {
@@ -1551,7 +1551,7 @@ pub fn layout_mutations(
         let y = rows_top + record.sample_index as f32 * row_height + 2.0;
         let height = (row_height - 4.0).max(4.0);
         let color = mutation_color(record, settings.color_mode);
-        let object_id = crate::record_object_id(options.object_id_base, record_index);
+        let object_id = crate::offset_object_id(options.object_id_base, record_index);
         if options.selected_record == Some(record_index) {
             display.rectangles.push(RectPrimitive {
                 x: x - 2.0,
@@ -1824,7 +1824,7 @@ pub fn layout_copy_number(
         let intensity = ((segment.value - baseline).abs()
             / (edge - baseline).abs().max(f32::EPSILON))
         .clamp(0.08, 1.0);
-        let object_id = crate::record_object_id(options.object_id_base, segment_index);
+        let object_id = crate::offset_object_id(options.object_id_base, segment_index);
         display.rectangles.push(RectPrimitive {
             x,
             y,

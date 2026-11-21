@@ -35,9 +35,9 @@ impl Viewer {
         }
         if st.lists.add_current_region {
             if st.lists.regions.len() >= MAXIMUM_REGIONS_OF_INTEREST {
-                self.data_status = format!(
+                self.report_error(format!(
                     "Cannot add another region: the {MAXIMUM_REGIONS_OF_INTEREST}-region workspace cap was reached"
-                );
+                ));
             } else if let Some(id) =
                 next_available_item_id(st.lists.regions.iter().map(|region| region.id))
             {
@@ -53,15 +53,14 @@ impl Viewer {
                 });
                 st.lists.regions_open = true;
             } else {
-                "Cannot add another region: no stable identifier is available"
-                    .clone_into(&mut self.data_status);
+                self.report_error("Cannot add another region: no stable identifier is available");
             }
         }
         if st.lists.add_current_review {
             if st.lists.review_items.len() >= MAXIMUM_REVIEW_ITEMS {
-                self.data_status = format!(
+                self.report_error(format!(
                     "Cannot add another review item: the {MAXIMUM_REVIEW_ITEMS}-item workspace cap was reached"
-                );
+                ));
             } else if let Some(id) =
                 next_available_item_id(st.lists.review_items.iter().map(|item| item.id))
             {
@@ -79,17 +78,18 @@ impl Viewer {
                 });
                 st.lists.review_open = true;
             } else {
-                "Cannot add another review item: no stable identifier is available"
-                    .clone_into(&mut self.data_status);
+                self.report_error(
+                    "Cannot add another review item: no stable identifier is available",
+                );
             }
         }
         if st.lists.add_selected_feature_to_review
             && let Some(inspector) = &st.snapshot.inspectors.feature_inspector
         {
             if st.lists.review_items.len() >= MAXIMUM_REVIEW_ITEMS {
-                self.data_status = format!(
+                self.report_error(format!(
                     "Cannot add another review item: the {MAXIMUM_REVIEW_ITEMS}-item workspace cap was reached"
-                );
+                ));
             } else if let Some(id) =
                 next_available_item_id(st.lists.review_items.iter().map(|item| item.id))
             {
@@ -295,7 +295,7 @@ impl Viewer {
         if let Some(locus) = st.lists.managed_locus_requested.take()
             && let Err(error) = self.navigate_to_locus(&locus)
         {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
         }
     }
 }

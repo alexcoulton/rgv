@@ -86,19 +86,19 @@ impl FastaReference {
         }
         if is_remote {
             let remote = RemoteFastaReference::open(&raw, options)?;
-            let dictionary = ReferenceDictionary::from_contigs(
+            let dictionary = crate::local::header_reference_dictionary(
                 remote
                     .entries
                     .iter()
                     .map(|entry| (entry.name.clone(), entry.length)),
-            );
+            )?;
             Ok(Self {
                 reader: FastaReader::Remote(Box::new(remote)),
                 dictionary,
             })
         } else {
             let reader = faidx::Reader::from_path(path)?;
-            let dictionary = ReferenceDictionary::from_contigs(
+            let dictionary = crate::local::header_reference_dictionary(
                 reader
                     .seq_names()?
                     .into_iter()
@@ -107,7 +107,7 @@ impl FastaReference {
                         (name, length)
                     })
                     .collect::<Vec<_>>(),
-            );
+            )?;
             Ok(Self {
                 reader: FastaReader::Local(reader),
                 dictionary,
@@ -165,7 +165,7 @@ impl FastaReference {
             contigs.push((name.to_owned(), length));
         }
         Ok(Self {
-            dictionary: ReferenceDictionary::from_contigs(contigs),
+            dictionary: crate::local::header_reference_dictionary(contigs)?,
             reader: FastaReader::TwoBit(Box::new(two_bit)),
         })
     }

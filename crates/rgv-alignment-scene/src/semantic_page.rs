@@ -15,8 +15,8 @@ use rgv_hts::{
     TemplateLengthBounds, UltimaEventUnavailable, UltimaIndelKind, UltimaQualitySource,
     aligned_position_for_sequencer_position, analyze_ultima_record, bisulfite_strand_is_reverse,
     classify_aligned_base, classify_bisulfite_observation, classify_sbx_insertion,
-    decode_modified_bases_parts, decode_smrt_kinetics, pair_evidence_view, sbx_tail_bounds,
-    sequencer_base_matches, smrt_kinetics_tag,
+    decode_modified_bases_parts_checked, decode_smrt_kinetics, modified_bases_resolvable,
+    pair_evidence_view, sbx_tail_bounds, sequencer_base_matches, smrt_kinetics_tag,
 };
 use thiserror::Error;
 
@@ -1144,23 +1144,41 @@ fn prepare_modified_base_overlays(
     let ml_upper = selection.auxiliary_field(index, *b"ML")?;
     let ml_lower = selection.auxiliary_field(index, *b"Ml")?;
     let ml = ml_upper.as_ref().or(ml_lower.as_ref());
-    let calls = match decode_modified_bases_parts(
+    // `MM` counts bases of the sequence it was written against. A hard-clipped record (or one
+    // whose `MN` disagrees with the stored sequence) would place every call on the wrong base,
+    // so it is reported unavailable: the same decision the exact modification summary makes.
+    let mn = selection.auxiliary_field(index, *b"MN")?;
+    let mn = mn.as_ref().map(|field| &field.value);
+    let hard_clipped = record
+        .cigar()
+        .iter()
+        .any(|operation| operation.kind == CigarOpKind::HardClip);
+    if !modified_bases_resolvable(bases.len(), mn, hard_clipped) {
+        push_unavailable(
+            output,
+            record,
+            tile,
+            SpecialistMode::ModifiedBases,
+            SpecialistUnavailableReason::MissingRecordData,
+        );
+        return Ok(());
+    }
+    let Ok(calls) = decode_modified_bases_parts_checked(
         bases,
         record.flags(),
         &mm.value,
         ml.map(|field| &field.value),
-    ) {
-        Ok(calls) => calls,
-        Err(_) => {
-            push_unavailable(
-                output,
-                record,
-                tile,
-                SpecialistMode::ModifiedBases,
-                SpecialistUnavailableReason::MalformedRecordData,
-            );
-            return Ok(());
-        }
+        mn,
+        hard_clipped,
+    ) else {
+        push_unavailable(
+            output,
+            record,
+            tile,
+            SpecialistMode::ModifiedBases,
+            SpecialistUnavailableReason::MalformedRecordData,
+        );
+        return Ok(());
     };
     let mut canonical_groups = Vec::<(u8, rgv_hts::ModificationCode, BTreeSet<usize>)>::new();
     for call in &calls {
@@ -2614,7 +2632,9 @@ fn validate_style_capabilities(
         tags.push(tag);
     }
     if family == AlignmentPageFamily::SpecialistOverlay && style.show_modified_bases {
-        tags.extend([*b"MM", *b"Mm", *b"ML", *b"Ml"]);
+        // `MN` decides whether `MM` still describes the stored sequence; without it retained,
+        // a hard-clipped read carrying a valid `MN` would be reported unavailable.
+        tags.extend([*b"MM", *b"Mm", *b"ML", *b"Ml", *b"MN"]);
     }
     tags.sort_unstable();
     tags.dedup();
@@ -2732,7 +2752,8 @@ fn semantic_page_dynamic_scratch_bytes(
                     } else {
                         0
                     };
-                    // One further slot covers the "unavailable" marker of a malformed tag.
+                    // One further slot covers the "unavailable" marker of a malformed or
+                    // unresolvable tag.
                     overlay_slots = overlay_slots
                         .saturating_add(explicit)
                         .saturating_add(canonical)
@@ -3947,6 +3968,261 @@ mod tests {
         assert!(snapshot.transient_high_water < (1 << 20));
     }
 
+    /// A six-base read `ACGCAC` at `start` with one `C+m` call and optional `MN`.
+    fn modified_read(
+        name: &[u8],
+        start: u64,
+        cigar: &[(CigarOpKind, u32)],
+        flags: u16,
+        mm: &str,
+        ml: Vec<u64>,
+        mn: Option<u64>,
+    ) -> AlignmentRecord {
+        let aligned = cigar
+            .iter()
+            .filter(|(kind, _)| *kind == CigarOpKind::Match)
+            .map(|(_, len)| u64::from(*len))
+            .sum::<u64>();
+        let mut record = record(name, start, start + aligned, cigar, b"ACGCAC");
+        record.flags = AlignmentFlags::from_bits(flags);
+        record.auxiliary_fields = vec![
+            AuxField {
+                tag: *b"MM",
+                value: AuxValue::String(mm.to_owned()),
+            },
+            AuxField {
+                tag: *b"ML",
+                value: AuxValue::UnsignedArray(ml),
+            },
+        ];
+        if let Some(length) = mn {
+            record.auxiliary_fields.push(AuxField {
+                tag: *b"MN",
+                value: AuxValue::Unsigned(length),
+            });
+        }
+        record
+    }
+
+    /// What one record's modified-base evidence came to, for the overlay page and for the exact
+    /// modification summary alike.
+    #[derive(Debug, Eq, PartialEq)]
+    enum ModificationOutcome {
+        /// `(reference position, read index, probability)` of each modified call.
+        Calls(Vec<(u64, u32, Option<u8>)>),
+        Unavailable,
+        Malformed,
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn overlays_and_the_modification_summary_decide_alike_for_every_record() {
+        const SUPPLEMENTARY: u16 = 0x800;
+        const REVERSE: u16 = 0x10;
+        let hard_clipped = [
+            (CigarOpKind::HardClip, 3),
+            (CigarOpKind::Match, 6),
+            (CigarOpKind::HardClip, 2),
+        ];
+        let soft_clipped = [(CigarOpKind::SoftClip, 2), (CigarOpKind::Match, 4)];
+        // Stored SEQ is ACGCAC; its cytosines are at read indices 1, 3 and 5.
+        let cases = [
+            // `C+m,1` skips one C: read index 3. 3H6M2H aligns index 3 at 40 + 3 = 43. `MN` = 6
+            // confirms `MM` was written for the stored (hard-clipped) sequence.
+            (
+                modified_read(
+                    b"hard-clipped-supplementary-valid-mn",
+                    40,
+                    &hard_clipped,
+                    SUPPLEMENTARY,
+                    "C+m,1;",
+                    vec![200],
+                    Some(6),
+                ),
+                ModificationOutcome::Calls(vec![(43, 3, Some(200))]),
+            ),
+            // Reverse strand: `MM` counts on the original read GTGCGT, whose first C is
+            // sequencer index 3, i.e. stored index 6 - 1 - 3 = 2, at 60 + 2 = 62.
+            (
+                modified_read(
+                    b"hard-clipped-reverse-supplementary-valid-mn",
+                    60,
+                    &hard_clipped,
+                    SUPPLEMENTARY | REVERSE,
+                    "C+m,0;",
+                    vec![150],
+                    Some(6),
+                ),
+                ModificationOutcome::Calls(vec![(62, 2, Some(150))]),
+            ),
+            // Without `MN` nothing says the tag was rewritten for the clipped sequence.
+            (
+                modified_read(
+                    b"hard-clipped-no-mn",
+                    40,
+                    &hard_clipped,
+                    SUPPLEMENTARY,
+                    "C+m,1;",
+                    vec![200],
+                    None,
+                ),
+                ModificationOutcome::Unavailable,
+            ),
+            // `MN` = 11 is the unclipped length: the tag describes bases that are not stored.
+            (
+                modified_read(
+                    b"hard-clipped-stale-mn",
+                    40,
+                    &hard_clipped,
+                    SUPPLEMENTARY,
+                    "C+m,1;",
+                    vec![200],
+                    Some(11),
+                ),
+                ModificationOutcome::Unavailable,
+            ),
+            // 2S4M: read index 3 is the second aligned base, at 40 + 1 = 41.
+            (
+                modified_read(
+                    b"soft-clipped-no-mn",
+                    40,
+                    &soft_clipped,
+                    0,
+                    "C+m,1;",
+                    vec![90],
+                    None,
+                ),
+                ModificationOutcome::Calls(vec![(41, 3, Some(90))]),
+            ),
+            (
+                modified_read(
+                    b"soft-clipped-stale-mn",
+                    40,
+                    &soft_clipped,
+                    0,
+                    "C+m,1;",
+                    vec![90],
+                    Some(9),
+                ),
+                ModificationOutcome::Unavailable,
+            ),
+            // One call but two probabilities.
+            (
+                modified_read(
+                    b"probability-count-mismatch",
+                    40,
+                    &soft_clipped,
+                    0,
+                    "C+m,1;",
+                    vec![90, 91],
+                    Some(6),
+                ),
+                ModificationOutcome::Malformed,
+            ),
+        ];
+        for (record, expected) in cases {
+            let name = String::from_utf8_lossy(&record.read_name).into_owned();
+            let ledger = AllocationLedger::new(8 << 20, 0);
+            let (evidence, atlas) =
+                evidence_and_atlas_for_records(&ledger, &[record], layout_contract());
+
+            let page = page_with_style(
+                &ledger,
+                &evidence,
+                &atlas,
+                0,
+                GeometryLod::Base,
+                None,
+                crate::AlignmentStyleContract::default(),
+                AlignmentPageFamily::SpecialistOverlay,
+            );
+            let mut calls = Vec::new();
+            let mut unavailable = Vec::new();
+            for primitive in page.primitives() {
+                match primitive.component {
+                    AlignmentComponent::ModifiedBase {
+                        read_index,
+                        canonical_base: b'C',
+                        probability,
+                        state: ModificationState::Modified,
+                        ..
+                    } => {
+                        assert_eq!(primitive.end_offset, primitive.start_offset + 1);
+                        calls.push((primitive.start_offset, read_index, probability));
+                    }
+                    AlignmentComponent::SpecialistUnavailable {
+                        mode: SpecialistMode::ModifiedBases,
+                        reason,
+                    } => unavailable.push(reason),
+                    other => panic!("{name}: unexpected overlay {other:?}"),
+                }
+            }
+            let overlay = match unavailable.as_slice() {
+                [] => ModificationOutcome::Calls(calls),
+                [SpecialistUnavailableReason::MissingRecordData] if calls.is_empty() => {
+                    ModificationOutcome::Unavailable
+                }
+                [SpecialistUnavailableReason::MalformedRecordData] if calls.is_empty() => {
+                    ModificationOutcome::Malformed
+                }
+                other => panic!("{name}: unexpected unavailable markers {other:?}"),
+            };
+
+            let tile = crate::ExactModificationSummaryTile::build(
+                &evidence,
+                CanonicalGenomicTile::new(ContigId::new(0), 0, NonZeroU64::new(100).unwrap()),
+                300,
+                crate::ModificationSummaryContract,
+                &ledger,
+                ReservationKind::Normal,
+                9,
+            )
+            .unwrap();
+            let summary = tile.summary();
+            assert_eq!(
+                summary.provenance.records_with_modification_tags, 1,
+                "{name}"
+            );
+            let summarized = match (
+                summary.provenance.unavailable_records,
+                summary.provenance.malformed_records,
+            ) {
+                (0, 0) => ModificationOutcome::Calls(
+                    summary
+                        .series
+                        .iter()
+                        .flat_map(|series| series.bins.iter().enumerate())
+                        .filter(|(_, bin)| bin.modified_calls > 0)
+                        .map(|(position, bin)| {
+                            assert_eq!(bin.modified_calls, 1, "{name}");
+                            // The summary keeps no read index; take it from the expectation
+                            // so position and probability are what is compared.
+                            let read_index = match &expected {
+                                ModificationOutcome::Calls(expected) => expected
+                                    .iter()
+                                    .find(|(start, _, _)| *start == position as u64)
+                                    .map_or(u32::MAX, |(_, read_index, _)| *read_index),
+                                _ => u32::MAX,
+                            };
+                            (
+                                position as u64,
+                                read_index,
+                                (bin.probability_observations == 1)
+                                    .then(|| u8::try_from(bin.probability_sum).unwrap()),
+                            )
+                        })
+                        .collect(),
+                ),
+                (1, 0) => ModificationOutcome::Unavailable,
+                (0, 1) => ModificationOutcome::Malformed,
+                other => panic!("{name}: unexpected provenance {other:?}"),
+            };
+
+            assert_eq!(overlay, expected, "{name}: overlay");
+            assert_eq!(summarized, expected, "{name}: summary");
+        }
+    }
+
     #[test]
     fn modified_base_call_bound_counts_calls_and_series_from_the_tag_text() {
         let bound = modified_base_call_bound(&AuxValue::String(
@@ -3967,7 +4243,8 @@ mod tests {
         let sequence = b"CCACCACCCCAAACCC";
         let mm = AuxValue::String("C+mh,0,1,2;A+a?,3;".to_owned());
         let decoded =
-            decode_modified_bases_parts(sequence, AlignmentFlags::from_bits(0), &mm, None).unwrap();
+            rgv_hts::decode_modified_bases_parts(sequence, AlignmentFlags::from_bits(0), &mm, None)
+                .unwrap();
         let bound = modified_base_call_bound(&mm);
         assert_eq!(decoded.len(), 7);
         assert_eq!(bound.calls, 7);

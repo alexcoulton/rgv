@@ -21,6 +21,10 @@ from rgv_mcp_qualification import (
 
 EPSILON = 0.05
 STATUS_HEIGHT = 24.0
+# The capture tools downscale to `max_width` (default 1600 px) before inlining. This script
+# compares captured dimensions with the committed layout pixel for pixel, so it asks for the
+# largest width the tools accept and therefore always receives the native-size image.
+NATIVE_CAPTURE_MAX_WIDTH = 16384
 
 
 def close(left: float, right: float, tolerance: float = EPSILON) -> bool:
@@ -475,7 +479,10 @@ def main() -> int:
         layout = layout_snapshot(current)
         result = client.call_tool(
             "rgv_capture_window",
-            {"wait_until_settled": wait_until_settled},
+            {
+                "wait_until_settled": wait_until_settled,
+                "max_width": NATIVE_CAPTURE_MAX_WIDTH,
+            },
         )
         saved = save_mcp_window_capture(evidence / f"{name}.png", result)
         effective_scale = layout["display_scale"] * layout["accessibility_scale"]
@@ -497,7 +504,11 @@ def main() -> int:
     def capture_logical(name: str, current: dict[str, Any]) -> None:
         result = client.call_tool(
             "rgv_capture_view",
-            {"scope": "visible_workspace", "wait_until_settled": True},
+            {
+                "scope": "visible_workspace",
+                "wait_until_settled": True,
+                "max_width": NATIVE_CAPTURE_MAX_WIDTH,
+            },
         )
         images = [item for item in result.get("content", []) if item.get("type") == "image"]
         if len(images) != 1 or images[0].get("mimeType") != "image/png":

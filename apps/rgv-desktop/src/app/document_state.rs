@@ -18,9 +18,6 @@ pub(crate) struct DocumentState {
     latest_load: u64,
     last_applied_save: u64,
     document: Option<SessionDocument>,
-    /// Window-shell policy state (unsaved-changes gate, gesture commits, notifications, …).
-    /// Hosted here so it is constructed together with the document identity.
-    pub(crate) shell: super::shell_state::ShellState,
 }
 
 impl DocumentState {

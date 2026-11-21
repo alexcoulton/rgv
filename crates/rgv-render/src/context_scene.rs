@@ -141,7 +141,8 @@ struct ContextCameraUniform {
     y_offset: f32,
     selected_object_id: u32,
     hovered_object_id: u32,
-    padding: u32,
+    /// Source-space x subtracted in the shader before scaling (per-frame projection origin).
+    x_origin: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -963,6 +964,16 @@ fn context_camera_uniform(
     if !x_scale.is_finite() || !x_offset.is_finite() {
         return None;
     }
+    // Project relative to the source coordinate under the panel's left edge. After a deep zoom
+    // over stale layout `x * scale` and `offset` are both huge and nearly cancel; folding the
+    // origin into the offset here, in f64, leaves the shader a small exact difference to scale.
+    // The origin is rounded to f32 first so the folded offset matches what the shader subtracts.
+    let origin = ((f64::from(camera.panel_left) - x_offset) / x_scale) as f32;
+    let x_origin = if origin.is_finite() { origin } else { 0.0 };
+    let x_offset = f64::from(x_origin) * x_scale + x_offset;
+    if !x_offset.is_finite() {
+        return None;
+    }
     Some(ContextCameraUniform {
         screen_size: [screen_size[0].max(1.0), screen_size[1].max(1.0)],
         x_scale: x_scale as f32,
@@ -970,11 +981,11 @@ fn context_camera_uniform(
         y_offset: camera.frame_top - camera.vertical_scroll,
         selected_object_id: camera.selected_object_id.unwrap_or_default(),
         hovered_object_id: camera.hovered_object_id.unwrap_or_default(),
-        padding: 0,
+        x_origin,
     })
 }
 
-/// CPU oracle for the shader's affine transform.
+/// CPU oracle for the shader's origin-relative affine transform and one-point minimum width.
 #[must_use]
 pub fn project_context_scene_rectangle(
     rectangle: RectPrimitive,
@@ -982,8 +993,11 @@ pub fn project_context_scene_rectangle(
 ) -> Option<RectPrimitive> {
     let uniform = context_camera_uniform([1.0, 1.0], camera)?;
     let mut projected = rectangle;
-    projected.x = rectangle.x.mul_add(uniform.x_scale, uniform.x_offset);
+    projected.x = (rectangle.x - uniform.x_origin).mul_add(uniform.x_scale, uniform.x_offset);
     projected.width = rectangle.width * uniform.x_scale;
+    if rectangle.width > 0.0 {
+        projected.width = projected.width.max(1.0);
+    }
     projected.y = rectangle.y + uniform.y_offset;
     Some(projected)
 }
@@ -1063,6 +1077,42 @@ mod tests {
         let projected = project_context_scene_rectangle(rectangle(), zoomed).unwrap();
         assert_eq!(projected.x, 140.0);
         assert_eq!(projected.width, 400.0);
+    }
+
+    #[test]
+    fn deep_zoom_over_stale_layout_projects_relative_to_a_frame_origin() {
+        // Layout made at 1000 bases per point, viewed at one base per point two billion bases
+        // into the contig: `x * scale` and the offset are both ~2e9, where f32 resolves 128
+        // points. The origin-relative form keeps the feature on its exact point.
+        let mut deep = camera();
+        deep.source_bases_per_pixel = 1_000.0;
+        deep.target_exact_start = 2_000_000_000.0;
+        let mut feature = rectangle();
+        feature.x = 2_000_000.5;
+        feature.width = 0.25;
+        let projected = project_context_scene_rectangle(feature, deep).unwrap();
+        assert!((projected.x - 540.0).abs() < 1.0e-3);
+        assert!((projected.width - 250.0).abs() < 1.0e-3);
+
+        let uniform = context_camera_uniform([1.0, 1.0], deep).unwrap();
+        assert!((uniform.x_origin - 2_000_000.0).abs() < 1.0e-3);
+        assert!((uniform.x_offset - 40.0).abs() < 1.0e-3);
+        // The naive single-f32 form this replaces cannot place the feature.
+        let naive_offset = (40.0_f64 - 2_000_000_000.0) as f32;
+        assert!((feature.x.mul_add(1_000.0, naive_offset) - 540.0).abs() > 1.0);
+    }
+
+    #[test]
+    fn zoomed_out_features_keep_a_one_point_minimum_width() {
+        let mut far = camera();
+        far.target_bases_per_pixel = 1_000.0;
+        let projected = project_context_scene_rectangle(rectangle(), far).unwrap();
+        assert!((projected.width - 1.0).abs() < 1.0e-6);
+
+        let mut empty = rectangle();
+        empty.width = 0.0;
+        let projected = project_context_scene_rectangle(empty, far).unwrap();
+        assert!(projected.width.abs() < 1.0e-6);
     }
 
     #[test]

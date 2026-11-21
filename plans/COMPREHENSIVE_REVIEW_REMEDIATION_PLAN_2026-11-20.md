@@ -18,113 +18,156 @@ Status key: `[ ]` open, `[x]` done and verified, `[~]` partly done (note says wh
 
 ## Wave 1 — discrete defects (no cross-crate API change)
 
+Status at 2026-11-21: Wave 1 and its cross-crate adoption are implemented. Verification is
+unit and integration tests only; nothing has been checked in the running application, and the CI
+workflow changes have not run on GitHub.
+
+
 Small, local, independently testable. Six parallel workstreams by file ownership.
 
 ### W1-A `crates/rgv-core`, `crates/rgv-layout`
-- [ ] CORE-1 tolerant IGV locus parse (All, bare contig, gene, multi-locus → default + notice;
+- [x] CORE-1 tolerant IGV locus parse (All, bare contig, gene, multi-locus → default + notice;
       last-colon split); URL schemes not treated as local paths
-- [ ] CORE-2 filter interactions to contig/viewport before the cap
-- [ ] CORE-3 interaction arcs via `RectShape::JunctionArcUp`, clipped
-- [ ] CORE-4 stable feature row packing (sort, pixel padding, overflow indicator)
-- [ ] CORE-5 label named features with no `feature_type`
-- [ ] CORE-6 ruler ticks on one-based round numbers
-- [ ] CORE-7 legacy group migration repairs non-contiguous groups; remove dead checks
-- [ ] CORE-8 `ReferenceDictionary` custom deserialize, index rebuild, duplicate rejection, no
+- [x] CORE-2 filter interactions to contig/viewport before the cap
+- [x] CORE-3 interaction arcs via `RectShape::JunctionArcUp`, clipped
+- [x] CORE-4 stable feature row packing (sort, pixel padding, overflow indicator)
+- [x] CORE-5 label named features with no `feature_type`
+- [x] CORE-6 ruler ticks on one-based round numbers
+- [x] CORE-7 legacy group migration repairs non-contiguous groups; remove dead checks
+- [x] CORE-8 `ReferenceDictionary` custom deserialize, index rebuild, duplicate rejection, no
       linear fallback
-- [ ] CORE-9 writer version + "written by a newer RGV" error
-- [ ] CORE-10 redact only credential-bearing query parameters
-- [ ] CORE-11 collision-free object ids
-- [ ] CORE-12 variants use clipped geometry
-- [ ] CORE-13 edge codons and reverse-frame phase
-- [ ] CORE-14 validated deserialize for `GenomicInterval`/`Viewport`; track cap; `:` in aliases
-- [ ] CORE-15 raw quantitative truncation covers the viewport
-- [ ] CORE-16 (part) canonical `Locus` parser in core; sorted landmark search; >2^32 tests
-- [ ] APP-8 / OPS-9 (core side) symlink-resolving containment in `automation.rs`
-- [ ] APP-11 (core side) atomic settings write
-- [ ] APP-2 (core side) navigation history carries contig name
+- [x] CORE-9 writer version + "written by a newer RGV" error
+- [x] CORE-10 redact only credential-bearing query parameters
+- [x] CORE-11 collision-free object ids
+- [~] CORE-12 variants use clipped geometry
+      — clipping done; row packing for overlapping variants remains
+- [x] CORE-13 edge codons and reverse-frame phase
+- [x] CORE-14 validated deserialize for `GenomicInterval`/`Viewport`; track cap; `:` in aliases
+      — session track cap chosen as 4096
+- [x] CORE-15 raw quantitative truncation covers the viewport
+- [x] CORE-16 (part) canonical `Locus` parser in core; sorted landmark search; >2^32 tests
+      — dictionary-scoped contig identity and multi-region view model move to Wave 3
+- [x] APP-8 / OPS-9 (core side) symlink-resolving containment in `automation.rs`
+      — control-opened sessions and URLs also restricted; `--control-allow-private-urls`
+- [x] APP-11 (core side) atomic settings write
+      — desktop uses `read_or_recover`; writes on a coalescing worker
+- [x] APP-2 (core side) navigation history carries contig name
 
 ### W1-B `crates/rgv-hts`
-- [ ] HTS-1 empty MM groups, `MN`/hard-clip guard
-- [ ] HTS-3 streaming remote query honouring `max_records`/filters/`keep_going`; lazy CRAM
+- [x] HTS-1 empty MM groups, `MN`/hard-clip guard
+      — hard-clipped reads without `MN` report modifications unavailable
+- [x] HTS-3 streaming remote query honouring `max_records`/filters/`keep_going`; lazy CRAM
       intersect
-- [ ] HTS-4 skip sequence decode when alleles are not collected; single CIGAR view per record
-- [ ] HTS-6 retry body-read failures, jittered backoff, `Retry-After`, shared client
-- [ ] HTS-7 strong ETags only in `If-Range`
-- [ ] HTS-9 tolerant BED/GFF parsing (whitespace, thick 0/0, `##FASTA`, percent-decoding,
+- [x] HTS-4 skip sequence decode when alleles are not collected; single CIGAR view per record
+- [x] HTS-6 retry body-read failures, jittered backoff, `Retry-After`, shared client
+- [x] HTS-7 strong ETags only in `If-Range`
+- [x] HTS-9 tolerant BED/GFF parsing (whitespace, thick 0/0, `##FASTA`, percent-decoding,
       skip-and-count bad lines)
-- [ ] HTS-10 remote config (auth, cancellation, budgets) for bbi/TDF/text tracks
-- [ ] HTS-11 transient slice errors do not escalate to whole-contig fetch
-- [ ] HTS-13 index overview and `.fai` duplicate check without quadratic passes
-- [ ] HTS-14 2bit allocation bounds; fuzz target writes an index
-- [ ] SCENE-6 pileup mate-overlap masking respects left-mate CIGAR/BQ and drains masks
-- [ ] HTS-5 `libdeflate` enabled for the app's noodles-bgzf
+      — malformed-line count surfaced per track
+- [~] HTS-10 remote config (auth, cancellation, budgets) for bbi/TDF/text tracks
+      — bbi/TDF/text-feature wired with auth, cancellation, budget; remote VCF/BCF still via htslib (HTS-2)
+- [~] HTS-11 transient slice errors do not escalate to whole-contig fetch
+      — multi-reference slices fetch per-sequence spans; a non-span decode error still retries whole sequences once
+- [~] HTS-13 index overview and `.fai` duplicate check without quadratic passes
+      — quadratic passes removed; BAI re-parse and index SHA-256 kept (the digest is the remote index identity)
+- [~] HTS-14 2bit allocation bounds; fuzz target writes an index
+      — 2bit bounds and alignment fuzz target done; no CRAI/FAI/2bit/VCF fuzz targets; fuzzer not run
+- [x] SCENE-6 pileup mate-overlap masking respects left-mate CIGAR/BQ and drains masks
+      — scene summaries match the direct hts query
+- [x] HTS-5 `libdeflate` enabled for the app's noodles-bgzf
 
 ### W1-C `crates/rgv-alignment-scene`
-- [ ] SCENE-1 MM scratch bounded by call count
-- [ ] SCENE-2 primitive/depth/modification reservations clipped to the tile
-- [ ] SCENE-5 prefer the current/largest containing atlas
-- [ ] SCENE-8 eviction skips pinned entries
-- [ ] SCENE-11 junctions starting left of the prepared interval
-- [ ] SCENE-12 keyed cache lookups; single overlap index build
-- [ ] SCENE-13 pair-consistent sampling; stale HashSet charge
-- [ ] SCENE-14 seeded property harness (extension vs clean build, seam sums, reservation ≥ actual)
+- [x] SCENE-1 MM scratch bounded by call count
+- [x] SCENE-2 primitive/depth/modification reservations clipped to the tile
+- [x] SCENE-5 prefer the current/largest containing atlas
+- [x] SCENE-8 eviction skips pinned entries
+- [x] SCENE-11 junctions starting left of the prepared interval
+      — GPU arc drawn from the true start
+- [~] SCENE-12 keyed cache lookups; single overlap index build
+      — summary caches and chunk admission keyed; `cached_chunk_fragment` and `record_index` still linear
+- [x] SCENE-13 pair-consistent sampling; stale HashSet charge
+- [x] SCENE-14 seeded property harness (extension vs clean build, seam sums, reservation ≥ actual)
+      — 20 seeds; no defects found; mutation-checked
 
 ### W1-D `crates/rgv-engine`
-- [ ] ENG-1 foreground presentation pressure/error latch
-- [ ] ENG-3 reclaim adopts newest request id, emits `Superseded`, errors carry the id
-- [ ] ENG-4 per-owner scene-build failure
-- [ ] ENG-5 per-owner speculation slots
-- [ ] ENG-6 explicit worker priority order
-- [ ] ENG-8 `catch_unwind` at thread roots; decoder respawn
-- [ ] ENG-9 wake instead of polling
-- [ ] ENG-10 cancellable search, persistent query pool
-- [ ] ENG-11 `CoalescingReceiver` `Drop`
-- [ ] ENG-13 bounded reference slices
-- [ ] ENG-14 single `satisfies` predicate (reproduce first)
+- [x] ENG-1 foreground presentation pressure/error latch
+- [x] ENG-3 reclaim adopts newest request id, emits `Superseded`, errors carry the id
+      — no fault injection for a real eviction error
+- [x] ENG-4 per-owner scene-build failure
+- [x] ENG-5 per-owner speculation slots
+- [x] ENG-6 explicit worker priority order
+      — reclaim no longer has absolute priority; needs on-screen soak
+- [x] ENG-8 `catch_unwind` at thread roots; decoder respawn
+      — decoder survives in place rather than respawning
+- [x] ENG-9 wake instead of polling
+- [x] ENG-10 cancellable search, persistent query pool
+- [x] ENG-11 `CoalescingReceiver` `Drop`
+- [x] ENG-13 bounded reference slices
+      — 128 Mb ceiling
+- [x] ENG-14 single `satisfies` predicate (reproduce first)
+      — payload predicate unified; reference coalescing half struck as not a defect
 
 ### W1-E `crates/rgv-render`, `apps/rgv-desktop/src/app/viewer_runtime.rs`
-- [ ] REND-1 categorical palettes per colour mode; golden-ratio hashing for open categories
-- [ ] REND-2 device-lost / uncaptured-error handling
-- [ ] REND-3 adapter fallback, downlevel limits, `WGPU_BACKEND`
-- [ ] REND-4 explicit surface format policy
-- [ ] REND-5 one-physical-pixel minimum for all shapes (shader + CPU projector)
-- [ ] REND-6 junction arcs parameterised over the unclamped span
-- [ ] REND-8 exact-size immutable page buffers
-- [ ] REND-10 one shared base palette
-- [ ] REND-12 scissor clamp at render time
-- [ ] REND-14 surface rectangle overflow to the user
-- [ ] REND-9 (part) export scale parameter
+- [x] REND-1 categorical palettes per colour mode; golden-ratio hashing for open categories
+- [~] REND-2 device-lost / uncaptured-error handling
+      — handlers, rebuild path and retry in place; never exercised against a real lost device
+- [x] REND-3 adapter fallback, downlevel limits, `WGPU_BACKEND`
+- [x] REND-4 explicit surface format policy
+      — colours darker where the backend listed sRGB first
+- [x] REND-5 one-physical-pixel minimum for all shapes (shader + CPU projector)
+      — minimum is one logical point
+- [x] REND-6 junction arcs parameterised over the unclamped span
+- [x] REND-8 exact-size immutable page buffers
+      — exact-size buffers; 16-byte instance is Wave 2
+- [~] REND-10 one shared base palette
+      — one shared base table; palette uniform, colour-blind and dark themes are Wave 2
+- [x] REND-12 scissor clamp at render time
+- [x] REND-14 surface rectangle overflow to the user
+- [~] REND-9 (part) export scale parameter
+      — interactive PNG at window scale; automation export still 1x
 
 ### W1-F `apps/rgv-desktop` (except `viewer_runtime.rs`), `apps/rgv-mcp`
-- [ ] UI-1 Escape never exits
-- [ ] APP-1 save/discard/cancel gate for exit, open, new, recover
-- [ ] UI-2 pinch, horizontal pan, scale-correct pixel deltas
-- [ ] UI-3 history and recent loci committed at gesture end
-- [ ] APP-2 name-based history (desktop side)
-- [ ] UI-6 locus parsing via the core parser; variant IDs; whitespace triples; case-insensitive
-- [ ] UI-7 single locus retargets the active panel only
-- [ ] UI-8 hover uses the unobstructed hit test
-- [ ] UI-9 stable auxiliary selection identity
-- [ ] UI-10 dialogs coexist
-- [ ] UI-4 per-frame clones gated/borrowed; UI-5 virtualised lists
-- [ ] UI-11, UI-12 small items
-- [ ] APP-3 landmark/cytoband I/O off the event loop
-- [ ] APP-4 autosave on dirty only, instance-scoped prefix
-- [ ] APP-5 per-pid run markers
-- [ ] APP-6 session open not rejected by background revisions
-- [ ] APP-7 typed notification log
-- [ ] APP-9 `/v1/status` Host check; APP-10 batch cancellation and wait deadlines
-- [ ] APP-12 idle polling; APP-13 drop handler; APP-14 monotonic TrackId
-- [ ] OPS-5 MCP error pass-through; OPS-6 schema descriptions; OPS-7 capture downscale and slim
+- [x] UI-1 Escape never exits
+- [x] APP-1 save/discard/cancel gate for exit, open, new, recover
+      — any navigation counts as dirty, so closing after browsing prompts
+- [x] UI-2 pinch, horizontal pan, scale-correct pixel deltas
+- [x] UI-3 history and recent loci committed at gesture end
+- [x] APP-2 name-based history (desktop side)
+- [x] UI-6 locus parsing via the core parser; variant IDs; whitespace triples; case-insensitive
+- [x] UI-7 single locus retargets the active panel only
+- [x] UI-8 hover uses the unobstructed hit test
+- [x] UI-9 stable auxiliary selection identity
+- [x] UI-10 dialogs coexist
+      — a newly requested dialog replaces the open one
+- [~] UI-4 per-frame clones gated/borrowed; UI-5 virtualised lists
+      — UI-4: clones gated/borrowed, read inspector cached; other inspector snapshots rebuild per frame. UI-5 done
+- [~] UI-11, UI-12 small items
+      — UI-12 done; keyboard scroll targets the hovered stack; hover in non-active panels remains
+- [x] APP-3 landmark/cytoband I/O off the event loop
+- [x] APP-4 autosave on dirty only, instance-scoped prefix
+- [x] APP-5 per-pid run markers
+- [x] APP-6 session open not rejected by background revisions
+- [~] APP-7 typed notification log
+      — 83 error writes routed to the log; two sites remain on keyword classification
+- [x] APP-9 `/v1/status` Host check; APP-10 batch cancellation and wait deadlines
+- [~] APP-12 idle polling; APP-13 drop handler; APP-14 monotonic TrackId
+      — APP-12, 13, 14 done; APP-15 synchronous file dialogs remain
+- [x] OPS-5 MCP error pass-through; OPS-6 schema descriptions; OPS-7 capture downscale and slim
       snapshot; OPS-12 temp PNG leak; OPS-13 schema range; OPS-9 docs
+      — read names pseudonymised by default in inlined exports
 
 ### W1-G repository and build (no Rust source)
-- [ ] OPS-1 `rust-toolchain.toml`, per-OS plain build job separate from lint
-- [ ] OPS-3 fuzz job `continue-on-error` per target
-- [ ] OPS-10 (part) benchmark-only backends out of default members
-- [ ] OPS-11 `[profile.release]`
-- [ ] OPS-14 `launch.rgv.sh`, `test.rgv.sh`, deny wildcard
-- [ ] DOC-1..DOC-8 documentation corrections
+- [~] OPS-1 `rust-toolchain.toml`, per-OS plain build job separate from lint
+      — done locally; workflows have not run on GitHub
+- [~] OPS-3 fuzz job `continue-on-error` per target
+      — done locally; not run on GitHub
+- [x] OPS-10 (part) benchmark-only backends out of default members
+- [x] OPS-11 `[profile.release]`
+      — fat-LTO dist build not run to completion
+- [~] OPS-14 `launch.rgv.sh`, `test.rgv.sh`, deny wildcard
+      — scripts and deny fixed; large tracked data files left in place
+- [~] DOC-1..DOC-8 documentation corrections
+      — all but DOC-7 (feature matrix pass/fail would need real results)
 
 ## Wave 2 — structural changes inside existing crates
 

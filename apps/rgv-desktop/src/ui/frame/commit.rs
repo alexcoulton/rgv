@@ -22,7 +22,11 @@ pub(crate) fn resolve_open_panel(
     if Some(first) != previous {
         return Some(first);
     }
-    Some(requested.find(|panel| Some(*panel) != previous).unwrap_or(first))
+    Some(
+        requested
+            .find(|panel| Some(*panel) != previous)
+            .unwrap_or(first),
+    )
 }
 
 impl Viewer {
@@ -91,7 +95,7 @@ impl Viewer {
     /// Notification-log edits and the answer to the unsaved-changes prompt.
     fn commit_shell_dialogs(&mut self, st: &mut ShellFrame) {
         let draft = &mut st.commands.shell;
-        let shell = &mut self.document_state.shell;
+        let shell = &mut self.shell;
         shell.notifications_open = draft.notifications_open;
         if draft.clear_notifications {
             shell.notifications.clear();

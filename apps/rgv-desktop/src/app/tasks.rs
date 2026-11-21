@@ -1,5 +1,6 @@
 use super::super::*;
 use super::document_state::DocumentTicket;
+use super::shell_state::{NewerWriterSave, NotificationSeverity};
 
 /// All writers share this key, including `SaveThenOpen` and recovery autosaves.
 fn normalized_session_destination(path: &Path) -> std::io::Result<PathBuf> {
@@ -115,9 +116,39 @@ pub(crate) struct SessionLoadTask {
     pub(crate) worker: JoinHandle<std::result::Result<LoadedSession, String>>,
 }
 
+/// What a local-control client may make RGV open (APP-8).
+#[derive(Clone, Debug)]
+pub(crate) struct ControlSourcePolicy {
+    pub(crate) root: PathBuf,
+    pub(crate) allow_private_network_urls: bool,
+}
+
+/// Why a project must not be opened, or `None` when it may be.
+///
+/// The project file itself was already confined to the control root, but the sources it names
+/// were not: a project inside the root could point the viewer at any file or URL. A project
+/// opened by a control client therefore has every source held to the same rules as a
+/// `load_track` command. Projects the user opens in the GUI are never restricted.
+pub(crate) fn control_project_refusal(
+    document: &SessionDocument,
+    policy: Option<&ControlSourcePolicy>,
+    opened_by_automation: bool,
+) -> Option<String> {
+    let policy = policy.filter(|_| opened_by_automation)?;
+    rgv_core::check_session_sources_within(
+        document,
+        &policy.root,
+        policy.allow_private_network_urls,
+    )
+    .err()
+    .map(|error| error.to_string())
+}
+
 pub(crate) struct LoadedSession {
     pub(crate) document: SessionDocument,
     pub(crate) igv_report: Option<IgvImportReport>,
+    /// Set when an imported IGV session's locus was not an interval.
+    pub(crate) igv_locus: Option<ImportedLocusRequest>,
 }
 
 pub(crate) struct WorkspaceListImportTask {
@@ -128,6 +159,24 @@ pub(crate) struct WorkspaceListImportTask {
 impl Viewer {
     pub(crate) fn start_export(&mut self, path: PathBuf, contents: String) {
         self.start_export_job(path, move |path| std::fs::write(path, contents));
+    }
+
+    /// Call after a project replaced the workspace: logs its migration notices so they are seen
+    /// without opening the project-information window, and arms the newer-writer save guard.
+    pub(crate) fn arm_newer_writer_guard(&mut self, origin: Option<&Path>) {
+        let origin = origin.and_then(|path| normalized_session_destination(path).ok());
+        self.shell.newer_writer_guard.project_opened(
+            origin.as_deref(),
+            rgv_core::newer_writer_notice(&self.session_migration_notices),
+        );
+        for notice in &self.session_migration_notices {
+            self.shell
+                .notifications
+                .push(NotificationSeverity::Warning, None, notice.clone());
+        }
+        if !self.session_migration_notices.is_empty() {
+            self.window.request_redraw();
+        }
     }
 
     pub(crate) fn start_session_save(&mut self, path: PathBuf) {
@@ -160,6 +209,18 @@ impl Viewer {
         automation_command: Option<usize>,
     ) -> Result<()> {
         let path = self.ensure_session_destination_available(&path)?;
+        if let NewerWriterSave::ConfirmFirst { warning } = self
+            .shell
+            .newer_writer_guard
+            .before_save(&path, same_session_destination)
+        {
+            // CORE-9: the data-loss notice must be seen before the newer file is replaced.
+            self.report_warning(warning.clone());
+            if automation_command.is_none() {
+                anyhow::bail!(warning);
+            }
+            // An unattended save cannot be asked twice; it proceeds with the warning logged.
+        }
         self.observe_document_changes();
         let document = self.session_document();
         let ticket = self.document_state.ticket();
@@ -209,7 +270,7 @@ impl Viewer {
         if !crate::app::shell_state::autosave_needed(
             self.document_state.is_dirty(),
             marker,
-            self.document_state.shell.last_autosaved,
+            self.shell.last_autosaved,
         ) {
             return;
         }
@@ -224,7 +285,7 @@ impl Viewer {
         let path = match self.ensure_session_destination_available(&path) {
             Ok(path) => path,
             Err(error) => {
-                self.data_status = error.to_string();
+                self.report_error(error.to_string());
                 return;
             }
         };
@@ -243,7 +304,7 @@ impl Viewer {
             Ok(worker) => {
                 // Recorded when the write starts; a failed write clears it so the next interval
                 // retries.
-                self.document_state.shell.last_autosaved = Some(marker);
+                self.shell.last_autosaved = Some(marker);
                 self.session_save_tasks.push(SessionSaveTask {
                     path,
                     kind: SessionSaveKind::Autosave,
@@ -281,7 +342,7 @@ impl Viewer {
                 (SessionSaveKind::Manual, _) => Some(false),
                 (SessionSaveKind::Autosave, Ok(Ok(()))) => None,
                 (SessionSaveKind::Autosave, _) => {
-                    self.document_state.shell.last_autosaved = None;
+                    self.shell.last_autosaved = None;
                     None
                 }
             };
@@ -413,6 +474,7 @@ impl Viewer {
                                 .map(|document| LoadedSession {
                                     document,
                                     igv_report: None,
+                                    igv_locus: None,
                                 })
                                 .map_err(|error| error.to_string())
                         }
@@ -423,6 +485,7 @@ impl Viewer {
                                     .map_err(|error| error.to_string())
                             })
                             .and_then(|imported| {
+                                let igv_locus = imported_locus_request(&imported.locus_resolution);
                                 let mut document = imported.document;
                                 let parent = path
                                     .parent()
@@ -439,6 +502,7 @@ impl Viewer {
                                 Ok(LoadedSession {
                                     document,
                                     igv_report: Some(report),
+                                    igv_locus,
                                 })
                             }),
                     }
@@ -535,20 +599,43 @@ impl Viewer {
             }
             let mut applied = false;
             let mut failure_code = AutomationErrorCode::InvalidState;
-            match task.worker.join() {
+            let joined = task.worker.join();
+            let refusal = joined.as_ref().ok().and_then(|loaded| {
+                loaded.as_ref().ok().and_then(|loaded| {
+                    control_project_refusal(
+                        &loaded.document,
+                        self.control_source_policy.as_ref(),
+                        task.automation_command.is_some(),
+                    )
+                })
+            });
+            match joined {
+                Ok(Ok(_)) if refusal.is_some() => {
+                    failure_code = AutomationErrorCode::InvalidCommand;
+                    self.report_error(format!(
+                        "Did not open {}: {}",
+                        path.display(),
+                        refusal.unwrap_or_default()
+                    ));
+                }
                 Ok(Ok(loaded)) => {
                     let LoadedSession {
                         document,
                         igv_report,
+                        igv_locus,
                     } = loaded;
                     let unresolved = document.unresolved_local_sources();
-                    match self.apply_session(&document) {
+                    match self
+                        .apply_session(&document)
+                        .and_then(|()| self.adopt_imported_locus(igv_locus))
+                    {
                         Ok(()) => {
                             applied = true;
                             self.bump_workspace_revision();
                             self.igv_import_report = igv_report;
                             match task.kind {
                                 SessionLoadKind::Native => {
+                                    self.arm_newer_writer_guard(Some(&path));
                                     self.document_state.mark_saved_baseline();
                                     self.current_session_path = Some(path.clone());
                                     self.settings.remember_session(path.display().to_string());
@@ -556,6 +643,7 @@ impl Viewer {
                                     self.data_status = opened_project_status(&path, &unresolved);
                                 }
                                 SessionLoadKind::IgvImport => {
+                                    self.arm_newer_writer_guard(None);
                                     self.current_session_path = None;
                                     self.settings.remember_session(path.display().to_string());
                                     self.persist_settings();
@@ -573,6 +661,7 @@ impl Viewer {
                                     self.open_panel = Some(UiPanel::IgvImportReport);
                                 }
                                 SessionLoadKind::Recovery => {
+                                    self.arm_newer_writer_guard(None);
                                     self.current_session_path = None;
                                     self.recovery_open = false;
                                     self.data_status = format!(
@@ -652,7 +741,7 @@ impl Viewer {
                 });
                 self.data_status = format!("Exporting {display_path}…");
             }
-            Err(error) => self.data_status = format!("Could not start export: {error}"),
+            Err(error) => self.report_error(format!("Could not start export: {error}")),
         }
     }
 
@@ -726,7 +815,7 @@ impl Viewer {
                     .push(WorkspaceListImportTask { path, worker });
                 self.data_status = format!("Importing {display_path}…");
             }
-            Err(error) => self.data_status = format!("Could not start import: {error}"),
+            Err(error) => self.report_error(format!("Could not start import: {error}")),
         }
     }
 
@@ -769,8 +858,8 @@ impl Viewer {
                     self.data_status =
                         format!("Imported {rows} sample rows and {columns} attributes from {path}");
                 }
-                Ok(Err(error)) => self.data_status = format!("Could not import {path}: {error}"),
-                Err(_) => self.data_status = format!("Import worker failed while reading {path}"),
+                Ok(Err(error)) => self.report_error(format!("Could not import {path}: {error}")),
+                Err(_) => self.report_error(format!("Import worker failed while reading {path}")),
             }
             self.mark_display_dirty("explicit display invalidation");
         }
@@ -786,6 +875,68 @@ impl Viewer {
                 }
                 Err(_) => tracing::warn!(%path, "workspace-list import worker panicked"),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod control_source_tests {
+    use super::*;
+
+    #[test]
+    fn only_projects_opened_by_a_control_client_are_held_to_the_control_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("allowed");
+        std::fs::create_dir(&root).unwrap();
+        let policy = ControlSourcePolicy {
+            root: root.clone(),
+            allow_private_network_urls: false,
+        };
+        let project = |source: TrackSource| {
+            let mut document = SessionDocument::new(SessionLocus {
+                contig: "chr1".to_owned(),
+                start: 0,
+                end: 100,
+            });
+            document.reference = Some(source);
+            document
+        };
+        let inside = project(TrackSource::Local {
+            path: root.join("ref.fa").display().to_string(),
+        });
+        let outside = project(TrackSource::Local {
+            path: directory.path().join("private.fa").display().to_string(),
+        });
+        let loopback = project(TrackSource::Remote {
+            url: "http://127.0.0.1:8080/ref.fa".to_owned(),
+        });
+
+        assert_eq!(control_project_refusal(&inside, Some(&policy), true), None);
+        let refusal = control_project_refusal(&outside, Some(&policy), true).unwrap();
+        assert!(
+            refusal.contains("outside the selected local-control root"),
+            "{refusal}"
+        );
+        assert!(control_project_refusal(&loopback, Some(&policy), true).is_some());
+
+        // The launch flag admits private URLs but never widens the filesystem root.
+        let permissive = ControlSourcePolicy {
+            allow_private_network_urls: true,
+            ..policy.clone()
+        };
+        assert_eq!(
+            control_project_refusal(&loopback, Some(&permissive), true),
+            None
+        );
+        assert!(control_project_refusal(&outside, Some(&permissive), true).is_some());
+
+        // The same projects opened from the GUI, or without local control, are unaffected.
+        for document in [&outside, &loopback] {
+            assert_eq!(
+                control_project_refusal(document, Some(&policy), false),
+                None
+            );
+            assert_eq!(control_project_refusal(document, None, true), None);
         }
     }
 }

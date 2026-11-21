@@ -500,7 +500,7 @@ impl Viewer {
             {
                 self.commit_navigation_gesture();
                 self.panels.active_mut().viewport = viewport;
-                self.panels.active_mut().navigation_history.visit(interval);
+                self.panels.active_mut().visit_history(interval);
                 self.horizontal_overview_drag = None;
                 self.viewport_changed();
             }
@@ -526,10 +526,7 @@ impl Viewer {
             {
                 self.commit_navigation_gesture();
                 self.panels.active_mut().viewport = viewport;
-                self.panels
-                    .active_mut()
-                    .navigation_history
-                    .visit(viewport.interval());
+                self.panels.active_mut().visit_history(viewport.interval());
                 self.viewport_changed();
             }
             return;

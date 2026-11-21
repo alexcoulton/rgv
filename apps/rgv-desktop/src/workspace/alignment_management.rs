@@ -1263,9 +1263,8 @@ impl Viewer {
             "aggregate alignment reclaim exhausted every registered owner"
         );
         self.settle_alignment_navigation_gpu_budget_limited(&message);
-        self.data_status = message;
+        self.report_warning(message);
         self.mark_display_dirty("explicit display invalidation");
-        self.window.request_redraw();
     }
 
     /// Polls a typed foreground refusal without converting the render loop into a retry clock.
@@ -1552,7 +1551,9 @@ impl Viewer {
             total_budget_bytes,
             total_budget_bytes,
         ) {
-            self.data_status = format!("Could not apply alignment resource limits: {error}");
+            self.report_error(format!(
+                "Could not apply alignment resource limits: {error}"
+            ));
         }
 
         let allowance = NonZeroUsize::new(alignment_budget_bytes)
@@ -1587,7 +1588,7 @@ impl Viewer {
             );
         }
         if let Some(error) = first_error {
-            self.data_status = format!("Could not apply cache budget: {error}");
+            self.report_error(format!("Could not apply cache budget: {error}"));
         }
     }
 
@@ -2397,7 +2398,7 @@ impl Viewer {
                         "rejected before target authority advanced; committed epoch retained"
                     ),
                 );
-                self.data_status.clone_from(&failure.message);
+                self.report_error(failure.message.clone());
                 self.queue_manual_diagnostic_trace_failure(
                     "alignment_publication",
                     "panel_scene_capture_failed",
@@ -2578,14 +2579,14 @@ impl Viewer {
         owned_reads.sort_by_key(|request| (request.panel_id, request.track_id));
         owned_summaries.sort_by_key(|request| (request.panel_id, request.track_id));
         if unsupported_interpretations > 0 {
-            self.data_status = format!(
+            self.report_error(format!(
                 "{unsupported_interpretations} coverage lane{} unavailable: this allele interpretation is not yet supported by the unified GPU renderer",
                 if unsupported_interpretations == 1 {
                     " is"
                 } else {
                     "s are"
                 }
-            );
+            ));
         }
 
         let read_requests = owned_reads
@@ -2854,7 +2855,7 @@ impl Viewer {
         let budget_bytes = match self.alignment_scene_ledger.progress() {
             Ok(snapshot) => snapshot.budget,
             Err(error) => {
-                self.data_status = format!("Could not inspect alignment GPU budget: {error}");
+                self.report_error(format!("Could not inspect alignment GPU budget: {error}"));
                 let message = self.data_status.clone();
                 self.freeze_manual_diagnostic_trace(
                     "alignment_publication",
@@ -2920,7 +2921,7 @@ impl Viewer {
                                 required_bytes.saturating_add((1 << 20) - 1) >> 20,
                             );
                             self.settle_alignment_navigation_gpu_budget_limited(&message);
-                            self.data_status = message;
+                            self.report_warning(message);
                             self.mark_display_dirty("explicit display invalidation");
                             self.window.request_redraw();
                             return;
@@ -3011,7 +3012,7 @@ impl Viewer {
                     failure.message
                 );
                 self.fail_alignment_navigation_gpu_candidates(&navigation_candidates, &message);
-                self.data_status = message;
+                self.report_error(message);
                 let message = self.data_status.clone();
                 self.freeze_manual_diagnostic_trace(
                     "alignment_publication",
@@ -3203,7 +3204,7 @@ impl Viewer {
                 }
             }
             if let Some(error) = capture_error {
-                self.data_status = format!("Could not resolve alignment scene lanes: {error}");
+                self.report_error(format!("Could not resolve alignment scene lanes: {error}"));
                 critical_capture_failure.get_or_insert_with(|| {
                     (
                         self.data_status.clone(),
@@ -3270,7 +3271,7 @@ impl Viewer {
             let store = panel_scene_stores.entry(panel_id).or_default();
             store.replace_visible_tracks(track_ids.iter().copied());
             if let Err(error) = store.set_coherence_groups(coherence_groups) {
-                self.data_status = format!("Could not set alignment coherence groups: {error}");
+                self.report_error(format!("Could not set alignment coherence groups: {error}"));
                 continue;
             }
             let mut admitted_panel_sources = Vec::new();
@@ -3278,7 +3279,7 @@ impl Viewer {
                 let track_id = source.track_id;
                 if source.snapshot.is_none() {
                     if let Err(error) = store.clear_lane(track_id) {
-                        self.data_status = format!("Could not clear alignment scene: {error}");
+                        self.report_error(format!("Could not clear alignment scene: {error}"));
                         continue;
                     }
                     admitted_panel_sources.push(source);
@@ -3293,7 +3294,7 @@ impl Viewer {
                     Ok(AlignmentPanelSceneAdmission::Stale) => {}
                     Ok(_) => admitted_panel_sources.push(source),
                     Err(error) => {
-                        self.data_status = format!("Could not admit alignment scene: {error}");
+                        self.report_error(format!("Could not admit alignment scene: {error}"));
                     }
                 }
             }
@@ -3401,7 +3402,7 @@ impl Viewer {
                     lane_sources.extend(admitted_panel_sources);
                 }
                 Err(error) => {
-                    self.data_status = format!("Could not capture alignment scene: {error}");
+                    self.report_error(format!("Could not capture alignment scene: {error}"));
                     critical_capture_failure.get_or_insert_with(|| {
                         (
                             self.data_status.clone(),
@@ -4556,7 +4557,7 @@ impl Viewer {
             self.alignment_gpu_prefetch.read_residency = None;
             self.alignment_gpu_prefetch.summary_residency = None;
             if retention_limited {
-                self.data_status = "Complete alignments remain available on demand; full-stack instant residency exceeds the current cache budget".to_owned();
+                self.report_warning("Complete alignments remain available on demand; full-stack instant residency exceeds the current cache budget");
             }
         }
         let pending = self.alignment_gpu_prefetch.pending();
@@ -5121,7 +5122,7 @@ impl Viewer {
                 if let Some(store) = self.alignment_panel_scene_stores.get_mut(&panel_id)
                     && let Err(error) = store.clear_lane(track_id)
                 {
-                    self.data_status = format!("Could not reset alignment scene lane: {error}");
+                    self.report_error(format!("Could not reset alignment scene lane: {error}"));
                 }
             }
             let promoted_template = self
@@ -5158,7 +5159,7 @@ impl Viewer {
                     continue;
                 }
                 Err(error) => {
-                    self.data_status = format!("Could not resolve alignment scene lanes: {error}");
+                    self.report_error(format!("Could not resolve alignment scene lanes: {error}"));
                     continue;
                 }
             };
@@ -5431,7 +5432,7 @@ impl Viewer {
                 self.rebuild_genomic_display();
                 self.mark_display_dirty("explicit display invalidation");
             }
-            Err(error) => self.data_status = error.to_string(),
+            Err(error) => self.report_error(error.to_string()),
         }
     }
 
@@ -5538,7 +5539,7 @@ impl Viewer {
                 self.data_status = format!("Opening {}…", source.redacted_label());
                 self.mark_display_dirty("explicit display invalidation");
             }
-            Err(error) => self.data_status = error.to_string(),
+            Err(error) => self.report_error(error.to_string()),
         }
     }
 
@@ -5552,7 +5553,7 @@ impl Viewer {
         remote_index_url: Option<String>,
     ) {
         if let Err(error) = self.ensure_engine_retirement_capacity(2) {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
             return;
         }
         self.reference_open_error = None;
@@ -5564,7 +5565,7 @@ impl Viewer {
             path.to_path_buf(),
             reference_open_options(self.remote_reference_index_url.clone()),
         ) {
-            self.data_status = error.to_string();
+            self.report_error(error.to_string());
             if let Some(worker) = engine.retire() {
                 self.engine_retirement_tasks.push(worker);
             }
@@ -5605,7 +5606,7 @@ impl Viewer {
                 .map(|track| track.config.clone())
                 .collect::<Vec<_>>();
             if let Err(error) = self.replace_alignment_track_controllers(configs) {
-                self.data_status = error.to_string();
+                self.report_error(error.to_string());
                 return;
             }
         }
