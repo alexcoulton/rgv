@@ -215,13 +215,14 @@ Run after Wave 1 is green. Each item is one reviewable change.
 
 ## Wave 3 — architecture
 
-Status at 2026-11-22: the lower-crate halves of ARCH-1 and ARCH-5 are built and tested but not
-yet wired into the desktop, so neither is visible in the running application.
+Status at 2026-11-22: the coverage pyramid is wired into the desktop and on by default. The
+track tile pipeline is wired only as an experimental, default-off setting covering plain
+annotation tracks. Nothing in this wave has been checked in the running application.
 
-- [~] ARCH-1 decode-time summary tiles and a streamed/persisted coverage pyramid
-      — pyramid type, streaming producer, sidecar cache, coverage engine and renderer done
-        and tested (all decoder paths agree with exact depth); desktop still shows the
-        index-density overview until wired
+- [x] ARCH-1 decode-time summary tiles and a streamed/persisted coverage pyramid
+      — on by default at ≥1000 bp/px and wherever read evidence does not cover the view;
+        ultra-deep tiles are flagged when mate overlap is not collapsed; no hover inspector
+        and absent from non-GPU exports
 - [~] ARCH-2 / ARCH-7 headless `rgv-session` crate (workspace state, `Action` reducer, engines,
       scene publication); desktop, CLI snapshot, MCP and automation drive it
       — `Action` model and reducer in the desktop for navigation, panels, track arrangement
@@ -232,10 +233,13 @@ yet wired into the desktop, so neither is visible in the running application.
         and wheel/junction hover still use the focused panel
 - [~] ARCH-5 public track contract `query(region, bp_per_px, cancel) → world-coordinate tiles`;
       one paged world-space renderer
-      — contract, tile engine, seam-stable world layout and renderer done and tested
-        (GPU readback); desktop still uses the old pipeline until wired
+      — lower crates complete. Desktop: experimental `track_pipeline = Tiles` (default
+        Legacy) routes plain BED/bigBed/GFF/GTF feature tracks only; quantitative, VCF,
+        interactions and the genotype matrix (PROD-3) are not wired; routed tracks lack full
+        inspector fields, exports and evidence stepping (see `docs/USER_GUIDE.md`)
 - [~] ARCH-6 shared I/O and decode pool keyed by visibility; lift the 64-track cap (PROD-9)
-      — process-wide decode allowance with foreground priority; cap not lifted
+      — process-wide decode allowance with foreground priority; cap left at 64 because each
+        track holds two file handles and the default macOS limit is 256
 - [x] ARCH-8 `rgv-model` crate split from `rgv-hts`; automation/stress out of `rgv-core`
       — `AlignmentError` and the `BackendRecord` logic stay in rgv-hts; rgv-core keeps
         tempfile, quick-xml and sha2 (all still used)

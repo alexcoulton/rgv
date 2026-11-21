@@ -1083,6 +1083,25 @@ pub(crate) fn fuzz_variant_index(bytes: &[u8]) -> bool {
     parsed
 }
 
+/// Fuzz entry: parses `inflated` as the uncompressed content of a `.tbi` (what remains once
+/// the BGZF framing, which stops most mutations, is removed) and queries every sequence.
+pub(crate) fn fuzz_inflated_tabix_index(inflated: &[u8]) -> bool {
+    let Ok((index, names, _columns)) = parse_tabix(inflated) else {
+        return false;
+    };
+    let index = RemoteVariantIndex::Tabix(index);
+    assert_eq!(index.reference_count(), names.len());
+    let maximum = usize::try_from(index.maximum_position()).unwrap_or(usize::MAX);
+    if let (Some(low), Some(high)) = (Position::new(1), Position::new(maximum)) {
+        for reference in 0..index.reference_count().min(8) {
+            let _ = index.query(reference, (low..=high).into());
+        }
+        // A reference the index does not have is an error, not a panic.
+        let _ = index.query(index.reference_count(), (low..=high).into());
+    }
+    true
+}
+
 /// Fuzz entry: the tabix position and end of one VCF data line.
 pub(crate) fn fuzz_variant_line_interval(line: &[u8]) -> Option<(i64, i64)> {
     tabix_vcf_interval(line).map(|interval| (interval.position, interval.end))

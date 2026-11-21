@@ -138,6 +138,7 @@ impl Viewer {
             self.prepare_alignment_scene_frame();
             self.window.request_redraw();
         }
+        self.update_track_tile_hover(hover_allowed);
         let cursor_in_genomic_canvas = self.cursor_in_genomic_canvas();
         let should_hit_test_junction_arc = hover_allowed;
         let junction_hit_started = self.diagnostics_open.then(Instant::now);

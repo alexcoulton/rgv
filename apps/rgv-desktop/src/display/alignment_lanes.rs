@@ -67,45 +67,28 @@ impl Viewer {
         if self.primary_alignment_source().is_some()
             && !collapsed_annotation_group_members.contains(&primary_alignment_id)
         {
-            let index_only_overview =
-                self.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview;
-            let mut frame = if index_only_overview {
-                let bottom = top + 48.0;
-                TrackFrame {
-                    key: TrackFrameKey::Alignment(primary_alignment_id),
-                    channel: ui::TrackPane::Annotation,
-                    name: primary_alignment_name,
-                    kind: TrackKind::Alignment,
-                    source_label: primary_source_label,
-                    top,
-                    bottom,
-                    visible: true,
-                    collapsed: !primary_annotation_desired,
-                    frozen_bottom: None,
-                    subtracks: vec![TrackSubtrack {
-                        alignment_subtrack: None,
-                        label: "Index-only overview".to_owned(),
-                        detail: Some(
-                            "BAI/CSI occupancy · no alignment records requested".to_owned(),
-                        ),
-                        top: top + 22.0,
-                        bottom,
-                        collapsed: false,
-                        composite_member: None,
-                    }],
-                }
-            } else if let Some(config) = self.alignment_tracks.first().map(|track| &track.config) {
-                alignment::alignment_scene_annotation_frame(
-                    config,
-                    self.panels.panel(panel_id).viewport,
-                    top,
-                    self.track_presentation
-                        .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
-                        .and_then(|node| node.preferred_height),
-                )
-            } else {
-                unreachable!("the primary source exists only with a primary track")
-            };
+            // Overview zoom keeps the same lane geometry as regional zoom: the coverage lane is
+            // then drawn from the coverage pyramid (or labelled as the index-only placeholder
+            // until its first publication) instead of from read evidence.
+            let mut frame =
+                if let Some(config) = self.alignment_tracks.first().map(|track| &track.config) {
+                    alignment::alignment_scene_annotation_frame(
+                        config,
+                        self.panels.panel(panel_id).viewport,
+                        top,
+                        self.track_presentation
+                            .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
+                            .and_then(|node| node.preferred_height),
+                    )
+                } else {
+                    unreachable!("the primary source exists only with a primary track")
+                };
+            if self.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview {
+                // The overview frame has always carried the primary track's display identity.
+                frame.name = primary_alignment_name;
+                frame.source_label = primary_source_label;
+            }
+            self.label_alignment_coverage_subtrack(panel_id, primary_alignment_id, &mut frame);
             if !primary_annotation_effective {
                 frame.bottom = frame.top + 26.0;
                 frame.subtracks.clear();
@@ -180,34 +163,7 @@ impl Viewer {
                 continue;
             }
 
-            let overview =
-                self.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview;
-            let mut frame = if overview {
-                let bottom = top + 48.0;
-                TrackFrame {
-                    key: TrackFrameKey::Alignment(track_id),
-                    channel: ui::TrackPane::Annotation,
-                    name: config.name.clone(),
-                    kind: TrackKind::Alignment,
-                    source_label: Some(config.source.redacted_label()),
-                    top,
-                    bottom,
-                    visible: true,
-                    collapsed: !annotation_desired,
-                    frozen_bottom: None,
-                    subtracks: vec![TrackSubtrack {
-                        alignment_subtrack: None,
-                        label: "Index-only overview".to_owned(),
-                        detail: Some(
-                            "BAI/CSI occupancy · no alignment records requested".to_owned(),
-                        ),
-                        top: top + 22.0,
-                        bottom,
-                        collapsed: false,
-                        composite_member: None,
-                    }],
-                }
-            } else if scene_backed {
+            let mut frame = if scene_backed {
                 alignment::alignment_scene_annotation_frame(
                     &config,
                     self.panels.panel(panel_id).viewport,
@@ -247,6 +203,7 @@ impl Viewer {
                     }],
                 }
             };
+            self.label_alignment_coverage_subtrack(panel_id, track_id, &mut frame);
             if !annotation_effective {
                 frame.bottom = frame.top + 26.0;
                 frame.subtracks.clear();

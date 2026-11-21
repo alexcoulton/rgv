@@ -164,6 +164,8 @@ impl Viewer {
             high_contrast: st.commands.high_contrast,
             interface_theme: st.commands.interface_theme,
             reduced_motion: st.commands.reduced_motion,
+            coverage_cache_enabled: st.commands.coverage_cache_enabled,
+            track_pipeline: st.commands.track_pipeline,
             clear_recent_requested: st.commands.clear_recent_requested,
             recent_alignment_requested: st.commands.recent_alignment_requested.clone(),
             recent_session_requested: st.commands.recent_session_requested.clone(),
@@ -195,6 +197,8 @@ impl Viewer {
         st.commands.high_contrast = system_dialogs.high_contrast;
         st.commands.interface_theme = system_dialogs.interface_theme;
         st.commands.reduced_motion = system_dialogs.reduced_motion;
+        st.commands.coverage_cache_enabled = system_dialogs.coverage_cache_enabled;
+        st.commands.track_pipeline = system_dialogs.track_pipeline;
         st.commands.clear_recent_requested = system_dialogs.clear_recent_requested;
         st.commands.recent_alignment_requested = system_dialogs.recent_alignment_requested;
         st.commands.recent_session_requested = system_dialogs.recent_session_requested;

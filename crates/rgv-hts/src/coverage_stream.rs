@@ -10,7 +10,7 @@
 
 use std::ops::Range;
 
-use rgv_core::{ContigId, GenomicInterval, ReferenceDictionary};
+use rgv_core::{ContigId, GenomicInterval, OverlappingMatePolicy, ReferenceDictionary};
 use rgv_model::{
     CoverageAccumulation, CoverageAccumulator, CoverageAccumulatorTelemetry, CoverageEligibility,
     CoveragePyramidError, CoveragePyramidParameters, CoverageTile, pileup::MateAlignment,
@@ -44,9 +44,18 @@ pub struct CoverageTileProduction {
     /// Records that passed eligibility and were counted.
     pub records_eligible: u64,
     pub collapsed_mate_bases: u64,
-    /// False when the count-once window overflowed; the tiles are then an upper bound of the
-    /// exact depth and must not be cached or presented as exact.
+    /// False when the count-once window overflowed: the tiles are not the count-once depth
+    /// the request asked for and must not be cached or presented as that. What they are
+    /// instead is said by `mate_overlap_not_collapsed`.
     pub overlap_collapse_complete: bool,
+    /// True when the tiles count every mate independently although the request asked for
+    /// overlapping mates to be counted once: the count-once window overflowed (more than
+    /// [`rgv_model::pileup::MAX_PENDING_PAIR_OVERLAPS`] earlier mates were waiting for theirs
+    /// at once, as over an ultra-deep amplicon), so the tiles were built again without it.
+    /// They are then exact for [`OverlappingMatePolicy::CountBoth`]: where two mates of a
+    /// template overlap, depth is one higher than the count-once depth. Present them, and
+    /// say so. Always false for a request that asked for both mates to be counted.
+    pub mate_overlap_not_collapsed: bool,
     pub telemetry: CoverageAccumulatorTelemetry,
 }
 
@@ -56,6 +65,48 @@ pub enum CoverageTileOutcome {
     Complete(CoverageTileProduction),
     /// The cancellation probe fired; nothing is returned.
     Cancelled,
+}
+
+impl CoverageTileRequest {
+    /// The same tiles with every mate counted independently: the request that degrades this
+    /// one honestly when its count-once window overflows.
+    #[must_use]
+    pub fn counting_mates_independently(&self) -> Self {
+        let mut request = self.clone();
+        request.eligibility.overlapping_mate_policy = OverlappingMatePolicy::CountBoth;
+        request
+    }
+}
+
+/// Runs `produce` for `request` and, when the count-once window overflowed, once more with
+/// every mate counted independently, flagging the result
+/// ([`CoverageTileProduction::mate_overlap_not_collapsed`]).
+///
+/// The first pass stays within the window's fixed bound and the second keeps no window at
+/// all, so working memory does not grow with depth; the cost is a second decode of the
+/// affected tiles only. A cancelled or failed second pass is a cancelled or failed request.
+pub(crate) fn with_mate_overlap_fallback(
+    request: &CoverageTileRequest,
+    mut produce: impl FnMut(&CoverageTileRequest) -> Result<CoverageTileOutcome, AlignmentError>,
+) -> Result<CoverageTileOutcome, AlignmentError> {
+    let outcome = produce(request)?;
+    let overflowed = matches!(
+        &outcome,
+        CoverageTileOutcome::Complete(production) if !production.overlap_collapse_complete
+    );
+    if !overflowed
+        || request.eligibility.overlapping_mate_policy == OverlappingMatePolicy::CountBoth
+    {
+        return Ok(outcome);
+    }
+    Ok(match produce(&request.counting_mates_independently())? {
+        CoverageTileOutcome::Complete(mut production) => {
+            production.overlap_collapse_complete = false;
+            production.mate_overlap_not_collapsed = true;
+            CoverageTileOutcome::Complete(production)
+        }
+        CoverageTileOutcome::Cancelled => CoverageTileOutcome::Cancelled,
+    })
 }
 
 /// The decode-time accumulator shared by every backend.
@@ -161,6 +212,7 @@ impl CoverageStream {
             records_eligible: eligible_records,
             collapsed_mate_bases,
             overlap_collapse_complete,
+            mate_overlap_not_collapsed: false,
             telemetry,
         }))
     }

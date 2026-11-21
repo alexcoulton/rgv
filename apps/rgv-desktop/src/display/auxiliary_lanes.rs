@@ -109,6 +109,10 @@ impl Viewer {
                     .iter()
                     .filter(|member| member.visible && !member.collapsed)
                 {
+                    if self.track_tiles.is_routed(member.id) {
+                        // Drawn by the tile pipeline; it reports its own readiness below.
+                        continue;
+                    }
                     let key = ContextLaneKey::Auxiliary(member.id);
                     visible_context_lanes.insert(
                         key,
@@ -138,6 +142,14 @@ impl Viewer {
                     .iter()
                     .filter(|member| member.visible && !member.collapsed)
                 {
+                    if self.track_tiles.is_routed(member.id) {
+                        if let Some(subtrack) =
+                            self.track_tile_lane_subtrack(panel_id, member.id, top, bottom)
+                        {
+                            subtracks.push(subtrack);
+                        }
+                        continue;
+                    }
                     let Some(snapshot) = self
                         .panels
                         .panel(panel_id)

@@ -1,3 +1,4 @@
+pub(super) mod alignment_coverage;
 pub(super) mod alignment_management;
 pub(super) mod alignment_navigation;
 pub(super) mod alignments;
@@ -11,5 +12,6 @@ pub(super) mod navigation_transaction;
 pub(super) mod panels;
 pub(super) mod queries;
 pub(super) mod session_controller;
+pub(super) mod track_tiles;
 pub(super) mod tracks;
 mod worker_retirement;

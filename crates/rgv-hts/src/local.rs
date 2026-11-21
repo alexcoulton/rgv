@@ -768,6 +768,13 @@ impl LocalAlignmentSource {
             )
             .into());
         }
+        if encoding != LocalAlignmentEncoding::Cram {
+            // Before `HTSlib` is given an index whose reference count it would trust.
+            crate::htslib_guard::ensure_bam_index_matches_header(
+                path,
+                options.index_path.as_deref(),
+            )?;
+        }
         let mut reader = if let Some(index_path) = &options.index_path {
             bam::IndexedReader::from_path_and_index(path, index_path)?
         } else {
@@ -2918,6 +2925,66 @@ mod tests {
         fs::copy(source, &path).unwrap();
         fs::write(index, b"not a BAI").unwrap();
         assert!(LocalAlignmentSource::open(path, &AlignmentOpenOptions::default()).is_err());
+    }
+
+    #[test]
+    fn indexed_open_rejects_an_index_claiming_other_references_without_asking_htslib() {
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        let source_index = PathBuf::from(format!("{}.bai", source.display()));
+        if !source.exists() || !source_index.exists() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hostile-index.bam");
+        let index = PathBuf::from(format!("{}.bai", path.display()));
+        fs::copy(&source, &path).unwrap();
+
+        // Eight bytes: the magic and a claim of 2^31 - 1 references. HTSlib takes tens of
+        // seconds to give up on this; the count is refused before HTSlib sees the file.
+        let mut hostile = b"BAI\x01".to_vec();
+        hostile.extend_from_slice(&i32::MAX.to_le_bytes());
+        fs::write(&index, &hostile).unwrap();
+        let started = std::time::Instant::now();
+        let Err(error) = LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()) else {
+            panic!("a hostile index must be refused");
+        };
+        assert!(
+            error.to_string().contains("2147483647 reference sequences"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        // The same claim as an explicit index, and as a CSI, is refused too.
+        let explicit = directory.path().join("elsewhere.bai");
+        fs::write(&explicit, &hostile).unwrap();
+        fs::remove_file(&index).unwrap();
+        assert!(
+            LocalAlignmentSource::open(
+                &path,
+                &AlignmentOpenOptions {
+                    index_path: Some(explicit),
+                    ..AlignmentOpenOptions::default()
+                },
+            )
+            .is_err()
+        );
+        let mut csi = b"CSI\x01".to_vec();
+        for word in [14_i32, 5, 0, i32::MAX] {
+            csi.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &csi).unwrap();
+        fs::write(
+            PathBuf::from(format!("{}.csi", path.display())),
+            encoder.finish().unwrap(),
+        )
+        .unwrap();
+        assert!(LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).is_err());
+
+        // The file's own index still opens it.
+        fs::remove_file(PathBuf::from(format!("{}.csi", path.display()))).unwrap();
+        fs::copy(&source_index, &index).unwrap();
+        assert!(LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).is_ok());
     }
 
     #[test]

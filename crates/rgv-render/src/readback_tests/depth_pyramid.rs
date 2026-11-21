@@ -452,3 +452,97 @@ fn bands_of_one_bin_stack_exactly_and_bins_never_overlap() {
         .fold(0.0, f64::max);
     assert!((2.5..=2.6).contains(&widest), "{widest}");
 }
+
+#[test]
+fn gpu_pages_are_charged_to_the_shared_ledger_exactly_and_released_with_the_pages() {
+    use rgv_alignment_scene::AllocationOwner;
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    // The tiles themselves are charged to the store's own ledger (`store_with`), so this one
+    // sees only what the renderer charges.
+    let ledger = AllocationLedger::new(64 << 20, 0);
+    let gpu_charged = || ledger.owner_usage(AllocationOwner::Gpu).unwrap().charged;
+    let mut renderer = AlignmentDepthPyramidGpuRenderer::new(&gpu.device, FORMAT);
+    renderer.set_ledger(ledger.clone());
+    assert_eq!(gpu_charged(), 0);
+
+    let level = 2;
+    let tile_bases = parameters().tile_bases(level).unwrap();
+    let first = 200_000_000 / tile_bases;
+    let mut store = store_with((first..first + 6).map(|index| synthetic_tile(level, index)));
+    let camera_a = camera(200_000_000, 100.0, 0.37);
+    let lane = store.lane(&view(camera_a));
+    let transform = CoverageScaleTransform::Linear;
+    let (_, stats) = render(&gpu, &mut renderer, &lane, camera_a, 60, transform);
+    assert!(stats.pages_uploaded >= 2);
+    assert_eq!(stats.pages_refused, 0);
+    // Every byte uploaded is charged, plus the page table, and nothing else is.
+    let page_bytes = renderer.resident_page_bytes();
+    assert_eq!(page_bytes, stats.uploaded_bytes);
+    assert_eq!(page_bytes, renderer.resident_page_count() * 64 * 12);
+    let charged = gpu_charged();
+    assert_eq!(charged, renderer.ledger_charged_bytes().unwrap());
+    assert!(charged > page_bytes, "the page table is charged too");
+    let table_bytes = charged - page_bytes;
+
+    // Drawing the same pages again charges nothing more.
+    let (_, again) = render(&gpu, &mut renderer, &lane, camera_a, 60, transform);
+    assert_eq!(
+        (again.pages_uploaded, again.pages_reused),
+        (0, stats.pages_uploaded)
+    );
+    assert_eq!(gpu_charged(), charged);
+
+    // Evicted pages give their charge back: with a byte cap of zero only the pages of the
+    // current frame stay, after a pan onto other tiles.
+    renderer.set_page_byte_limit(0);
+    let camera_b = camera(200_000_000 + 4 * tile_bases, 100.0, 0.0);
+    let lane_b = store.lane(&view(camera_b));
+    let (_, moved) = render(&gpu, &mut renderer, &lane_b, camera_b, 60, transform);
+    assert!(moved.pages_uploaded >= 1 && moved.pages_evicted >= 1);
+    assert_eq!(
+        renderer.resident_page_bytes(),
+        renderer.resident_page_count() * 64 * 12
+    );
+    assert_eq!(gpu_charged(), renderer.ledger_charged_bytes().unwrap());
+    // What remains charged is the resident pages and a page table (which may have grown
+    // while old and new pages were resident together), not the evicted pages.
+    assert!(gpu_charged() - renderer.resident_page_bytes() <= 4 * table_bytes);
+
+    // Dropping the device resources releases everything.
+    renderer.discard_device_resources();
+    assert_eq!(gpu_charged(), 0);
+    assert_eq!(renderer.resident_page_count(), 0);
+
+    // A ledger with room for one page but not for the frame: the pages that fit are drawn,
+    // the rest are refused and reported, and the budget is never exceeded.
+    let budget = table_bytes + 64 * 12 + 64;
+    let small = AllocationLedger::new(budget, 0);
+    let mut renderer = AlignmentDepthPyramidGpuRenderer::new(&gpu.device, FORMAT);
+    renderer.set_ledger(small.clone());
+    let (frame, tight) = renderer
+        .prepare(
+            &gpu.device,
+            &gpu.queue,
+            &[AlignmentDepthPyramidGpuRequest {
+                lane: &lane,
+                camera: camera_a,
+                screen_size_points: [TARGET[0] as f32, TARGET[1] as f32],
+                scissor: SCISSOR,
+                scale_maximum: 60,
+                transform,
+            }],
+        )
+        .unwrap();
+    assert!(tight.pages_refused >= 1, "{tight:?}");
+    assert_eq!(
+        tight.pages_uploaded + tight.pages_refused,
+        stats.pages_uploaded
+    );
+    assert_eq!(frame.draw_count(), tight.draws);
+    assert!(tight.draws < stats.draws);
+    let used = small.owner_usage(AllocationOwner::Gpu).unwrap().charged;
+    assert_eq!(used, renderer.ledger_charged_bytes().unwrap());
+    assert!(used <= budget);
+}

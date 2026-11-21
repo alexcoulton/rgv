@@ -121,7 +121,7 @@ impl Viewer {
                 });
             if settled > 0 {
                 self.data_status = format!(
-                    "Index-only overview for {settled} alignment track(s); no records requested"
+                    "Overview for {settled} alignment track(s): coverage only, reads are not loaded"
                 );
             }
             self.prepare_alignment_scene_frame();

@@ -541,6 +541,14 @@ impl Viewer {
                     self.request_all_panel_queries();
                 }
             }
+            AutomationSetting::TrackPipeline { value } => {
+                deferred_shell_change = self.settings.track_pipeline != *value;
+                if deferred_shell_change {
+                    self.settings.track_pipeline = *value;
+                    self.persist_settings();
+                    self.apply_track_pipeline_setting();
+                }
+            }
             AutomationSetting::PropertiesPanelExpanded { value } => {
                 let id = egui::Id::new("properties-panel-expanded");
                 let current = self

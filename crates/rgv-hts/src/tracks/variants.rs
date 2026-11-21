@@ -14,7 +14,9 @@ pub(super) use remote::{
     TabixColumns, combine_stats as combine_remote_stats, parse_text_index,
     read_line as read_bgzf_line, strtoll,
 };
-pub(crate) use remote::{fuzz_variant_index, fuzz_variant_line_interval};
+pub(crate) use remote::{
+    fuzz_inflated_tabix_index, fuzz_variant_index, fuzz_variant_line_interval,
+};
 
 /// VCF/BCF source. A local BGZF-compressed file with an index is queried through `HTSlib`; any
 /// other local VCF/BCF (plain or gzip-compressed text, or a file without a usable index) is
@@ -116,12 +118,24 @@ impl LocalVariantSource {
                 local::LocalVariantFile::Memory(file) => VariantBackend::Memory(file),
             }
         };
+        let raw_header = match &backend {
+            VariantBackend::Htslib(reader) => reader.header(),
+            VariantBackend::Memory(file) => file.header(),
+            VariantBackend::Remote(remote) => remote.raw_header(),
+        };
+        // `HeaderView::header_records` unwraps the UTF-8 conversion of every key and value.
+        // The header text was validated before `HTSlib` read it, but `HTSlib` then adds a
+        // line for every contig, filter and tag it meets that no header line declares (from
+        // the records of an unindexed file, or from the sequence names of a tabix index),
+        // with the bytes as they stand in the file.
+        crate::htslib_guard::contain_panic(|| raw_header.header_records()).map_err(|_| {
+            TrackError::Backend(format!(
+                "{} names a contig, filter or tag that is not valid UTF-8",
+                path.display()
+            ))
+        })?;
         let (header, omitted_info_schemas, omitted_format_schemas, omitted_header_samples) =
-            decode_variant_header(match &backend {
-                VariantBackend::Htslib(reader) => reader.header(),
-                VariantBackend::Memory(file) => file.header(),
-                VariantBackend::Remote(remote) => remote.raw_header(),
-            });
+            decode_variant_header(raw_header);
         let total_samples = header.samples.len().saturating_add(omitted_header_samples);
         let declared_filters = match &backend {
             VariantBackend::Htslib(reader) => std::iter::once("PASS")

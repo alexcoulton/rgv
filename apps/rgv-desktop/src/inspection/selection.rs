@@ -113,7 +113,14 @@ impl Viewer {
         self.panels.active_mut().selected_mutation = None;
         self.panels.active_mut().selected_interaction = None;
         self.panels.active_mut().selected_alignment_hit = None;
-        if let Some(selection) = self.feature_at_cursor() {
+        if self.select_track_tile_feature_at_cursor() {
+            // A feature of a lane drawn by the experimental tile pipeline.
+            self.panels.active_mut().selected_alignment_track = None;
+            self.panels.active_mut().selected_pileup_position = None;
+            self.panels.active_mut().selected_modification_position = None;
+            self.panels.active_mut().selected_junction = None;
+            self.panels.active_mut().selected_chain = None;
+        } else if let Some(selection) = self.feature_at_cursor() {
             self.panels.active_mut().selected_feature = Some(selection);
             self.panels.active_mut().selected_alignment_track = None;
             self.panels.active_mut().selected_pileup_position = None;
@@ -668,6 +675,9 @@ impl Viewer {
             return None;
         }
         let selection = self.panels.active().selected_feature?;
+        if let Some(snapshot) = self.track_tile_feature_inspector_snapshot() {
+            return Some(snapshot);
+        }
         self.panels
             .active()
             .track_snapshots

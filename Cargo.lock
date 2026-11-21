@@ -4070,6 +4070,7 @@ dependencies = [
  "rgv-engine",
  "rgv-hts",
  "rgv-layout",
+ "rgv-model",
  "rgv-render",
  "serde",
  "serde_json",

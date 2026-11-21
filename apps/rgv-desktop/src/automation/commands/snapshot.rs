@@ -482,6 +482,17 @@ impl Viewer {
                         .collect(),
                     selected_presentation_nodes: panel.selected_presentation_nodes.clone(),
                     presentation_selection_anchor: panel.presentation_selection_anchor,
+                    coverage_sources: self
+                        .alignment_tracks
+                        .iter()
+                        .map(|track| rgv_automation::AutomationCoverageSourceSnapshot {
+                            track_id: track.config.id,
+                            source: self
+                                .alignment_coverage_mode(panel.id, track.config.id)
+                                .automation_name()
+                                .to_owned(),
+                        })
+                        .collect(),
                 }
             })
             .collect();

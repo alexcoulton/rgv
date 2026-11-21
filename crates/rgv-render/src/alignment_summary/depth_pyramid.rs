@@ -10,13 +10,24 @@
 //! The lane's level is chosen so a bin is at least one pixel wide; a pixel column then shows
 //! exactly one bin and nothing a bin records can fall between pixel centres.
 //!
-//! GPU pages of this lane are small (12 KiB for a full tile) and are kept in their own
-//! least-recently-used cache with a fixed byte cap. They are not charged to the shared
-//! allocation ledger.
+//! # GPU memory
+//!
+//! GPU pages of this lane are small (12 KiB for a full tile) and are kept in a
+//! least-recently-used cache with its own byte cap
+//! ([`ALIGNMENT_DEPTH_PYRAMID_DEFAULT_GPU_BYTES`]). Once the renderer is given the workspace's
+//! allocation ledger ([`AlignmentDepthPyramidGpuRenderer::set_ledger`]) every page buffer and
+//! the page table are also charged to it as [`AllocationClass::GpuPage`], by exactly the bytes
+//! they hold, through the [`PagedGpuCache`] the summary and track-tile renderers use; the GPU
+//! owner's accounting then includes this lane. A page that does not fit the GPU budget even
+//! after this renderer's idle pages are evicted is not uploaded: its segment is left out of
+//! the frame and counted in [`AlignmentDepthPyramidGpuPrepareStats::pages_refused`]. Without
+//! a ledger the pages are bounded by the byte cap alone, as before.
 
-use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 
-use rgv_alignment_scene::{DepthPyramidLane, DepthPyramidSegment};
+use rgv_alignment_scene::{
+    AllocationClass, AllocationLedger, DepthPyramidLane, DepthPyramidSegment, ReservationKind,
+};
 use rgv_model::CoverageTile;
 
 // The family modules share the parent module's namespace, exactly as when they were one file.
@@ -309,13 +320,39 @@ pub struct AlignmentDepthPyramidGpuPrepareStats {
     pub pages_reused: usize,
     pub pages_evicted: usize,
     pub draws: usize,
+    /// Pages the shared ledger had no room for; their segments are not drawn this frame.
+    /// Always zero without a ledger.
+    pub pages_refused: usize,
 }
 
 #[derive(Debug)]
 struct GpuPyramidPage {
+    key: AllocationId,
     buffer: wgpu::Buffer,
     bytes: usize,
     last_used: u64,
+    /// Ledger charge of `buffer`; `None` when the renderer has no ledger.
+    allocation: Option<AllocationLease>,
+}
+
+impl CachedGpuPage for GpuPyramidPage {
+    type Key = AllocationId;
+
+    fn key(&self) -> AllocationId {
+        self.key
+    }
+
+    fn last_used_revision(&self) -> u64 {
+        self.last_used
+    }
+
+    fn set_last_used_revision(&mut self, revision: u64) {
+        self.last_used = revision;
+    }
+
+    fn allocation(&self) -> Option<&AllocationLease> {
+        self.allocation.as_ref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -342,7 +379,9 @@ pub struct AlignmentDepthPyramidGpuRenderer {
     uniform_bind_group: Option<wgpu::BindGroup>,
     uniform_capacity: usize,
     palette: crate::palette::PaletteBinding,
-    pages: HashMap<AllocationId, GpuPyramidPage>,
+    cache: PagedGpuCache<GpuPyramidPage>,
+    ledger: Option<AllocationLedger>,
+    keys_inspected: AtomicU64,
     page_bytes: usize,
     page_byte_limit: usize,
     revision: u64,
@@ -422,7 +461,9 @@ impl AlignmentDepthPyramidGpuRenderer {
             uniform_bind_group: None,
             uniform_capacity: 0,
             palette,
-            pages: HashMap::new(),
+            cache: PagedGpuCache::default(),
+            ledger: None,
+            keys_inspected: AtomicU64::new(0),
             page_bytes: 0,
             page_byte_limit: ALIGNMENT_DEPTH_PYRAMID_DEFAULT_GPU_BYTES,
             revision: 0,
@@ -451,9 +492,25 @@ impl AlignmentDepthPyramidGpuRenderer {
         self.page_byte_limit = bytes;
     }
 
+    /// Charges this renderer's GPU pages and page table to `ledger` from now on: pass the
+    /// workspace's shared ledger, so the pages are accounted to the GPU owner with every
+    /// other page. Pages already resident were uploaded uncharged and are dropped (they are
+    /// uploaded again, charged, when next drawn); frames captured before this call no longer
+    /// render.
+    pub fn set_ledger(&mut self, ledger: AllocationLedger) {
+        self.discard_device_resources();
+        self.ledger = Some(ledger);
+    }
+
+    /// Bytes this renderer currently has charged to the ledger: every page buffer and the
+    /// page table. Zero without a ledger.
+    pub fn ledger_charged_bytes(&self) -> Result<usize, LedgerError> {
+        self.cache.charged_bytes()
+    }
+
     #[must_use]
     pub fn resident_page_count(&self) -> usize {
-        self.pages.len()
+        self.cache.pages.len()
     }
 
     /// Bytes of instance buffers currently resident.
@@ -465,7 +522,7 @@ impl AlignmentDepthPyramidGpuRenderer {
     /// Drops every device resource that can be rebuilt (after device loss, or under memory
     /// pressure). Frames captured before this call no longer render.
     pub fn discard_device_resources(&mut self) {
-        self.pages.clear();
+        self.cache.clear();
         self.page_bytes = 0;
         self.uniform_buffer = None;
         self.uniform_bind_group = None;
@@ -505,14 +562,18 @@ impl AlignmentDepthPyramidGpuRenderer {
                     continue;
                 }
                 let page = segment.tile.allocation().id();
-                if let Some(resident) = self.pages.get_mut(&page) {
-                    if resident.last_used != revision {
+                if let Some(index) = self.cache.page_index(page) {
+                    if self.cache.pages[index].last_used != revision {
                         stats.pages_reused += 1;
+                        self.cache.touch_page_at(index, revision);
                     }
-                    resident.last_used = revision;
                 } else {
                     let instances = pack_alignment_depth_pyramid_tile(segment.tile.tile());
                     let bytes = size_of_val(instances.as_slice());
+                    let Ok(allocation) = self.charge_page(bytes, revision, &mut stats) else {
+                        stats.pages_refused += 1;
+                        continue;
+                    };
                     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("RGV alignment depth pyramid page"),
                         size: bytes.max(size_of::<AlignmentDepthPyramidGpuInstance>()) as u64,
@@ -520,14 +581,22 @@ impl AlignmentDepthPyramidGpuRenderer {
                         mapped_at_creation: false,
                     });
                     queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&instances));
-                    self.pages.insert(
-                        page,
+                    let index = self
+                        .cache
+                        .pages
+                        .binary_search_by_key(&page, CachedGpuPage::key)
+                        .unwrap_or_else(|index| index);
+                    self.cache.pages.insert(
+                        index,
                         GpuPyramidPage {
+                            key: page,
                             buffer,
                             bytes,
                             last_used: revision,
+                            allocation,
                         },
                     );
+                    self.cache.reclaim_index.insert((revision, page));
                     self.page_bytes = self.page_bytes.saturating_add(bytes);
                     stats.pages_uploaded += 1;
                     stats.uploaded_bytes += bytes;
@@ -605,21 +674,27 @@ impl AlignmentDepthPyramidGpuRenderer {
 
         // Least recently used pages go first; nothing this frame draws is evicted.
         if self.page_bytes > self.page_byte_limit {
-            let mut order = self
-                .pages
-                .iter()
-                .filter(|(_, page)| page.last_used != revision)
-                .map(|(id, page)| (page.last_used, *id))
-                .collect::<Vec<_>>();
-            order.sort_unstable();
-            for (_, id) in order {
-                if self.page_bytes <= self.page_byte_limit {
+            let mut victims = Vec::new();
+            let mut remaining = self.page_bytes;
+            // The reclaim index is the LRU order.
+            for (last_used, id) in &self.cache.reclaim_index {
+                if remaining <= self.page_byte_limit {
                     break;
                 }
-                if let Some(page) = self.pages.remove(&id) {
-                    self.page_bytes = self.page_bytes.saturating_sub(page.bytes);
-                    stats.pages_evicted += 1;
+                if *last_used == revision {
+                    continue;
                 }
+                if let Some(page) = self.cache.page(*id) {
+                    remaining = remaining.saturating_sub(page.bytes);
+                    victims.push(*id);
+                }
+            }
+            stats.pages_evicted += victims.len();
+            self.cache.remove_reclaim_candidates(&victims);
+            self.page_bytes = remaining;
+            if let Some(ledger) = &self.ledger {
+                // A failure leaves the larger (still exactly charged) table in place.
+                let _ = self.cache.reclaim_sparse_page_table(ledger, revision);
             }
         }
         Ok((
@@ -630,6 +705,63 @@ impl AlignmentDepthPyramidGpuRenderer {
             },
             stats,
         ))
+    }
+
+    /// Charges one page of `bytes` (and room for it in the page table) to the ledger. When
+    /// the GPU budget is full, this renderer's pages that the current frame does not draw are
+    /// evicted, least recently used first, and the charge is tried once more. `Ok(None)`
+    /// without a ledger.
+    fn charge_page(
+        &mut self,
+        bytes: usize,
+        revision: u64,
+        stats: &mut AlignmentDepthPyramidGpuPrepareStats,
+    ) -> Result<Option<AllocationLease>, PageTableError> {
+        let Some(ledger) = self.ledger.clone() else {
+            return Ok(None);
+        };
+        let attempt = |cache: &mut PagedGpuCache<GpuPyramidPage>| {
+            cache.ensure_page_table_capacity(
+                &ledger,
+                cache.pages.len() + 1,
+                ReservationKind::Normal,
+                revision,
+            )?;
+            if bytes == 0 {
+                return Ok(None);
+            }
+            Ok(Some(
+                ledger
+                    .reserve(AllocationClass::GpuPage, bytes, ReservationKind::Normal)?
+                    .register(bytes, revision)?,
+            ))
+        };
+        match attempt(&mut self.cache) {
+            Err(PageTableError::Ledger(LedgerError::BudgetExceeded {
+                requested, limit, ..
+            })) if requested <= limit => {
+                let drawn = self
+                    .cache
+                    .pages
+                    .iter()
+                    .filter(|page| page.last_used == revision)
+                    .map(|page| page.key)
+                    .collect::<Vec<_>>();
+                let before = self.cache.pages.len();
+                self.cache.evict_unpinned_pages_for_excluding(
+                    &ledger,
+                    requested,
+                    limit,
+                    &drawn,
+                    revision,
+                    &self.keys_inspected,
+                )?;
+                stats.pages_evicted += before - self.cache.pages.len();
+                self.page_bytes = self.cache.pages.iter().map(|page| page.bytes).sum();
+                attempt(&mut self.cache)
+            }
+            other => other,
+        }
     }
 
     /// Replays the latest prepared frame.
@@ -670,8 +802,8 @@ impl AlignmentDepthPyramidGpuRenderer {
         let stride = size_of::<AlignmentDepthPyramidGpuInstance>() as u64;
         for draw in &frame.draws {
             let page = self
-                .pages
-                .get(&draw.page)
+                .cache
+                .page(draw.page)
                 .ok_or(AlignmentDepthPyramidGpuError::MissingPage(draw.page))?;
             let Some([x, y, width, height]) = crate::clamp_scissor_to_target(
                 [

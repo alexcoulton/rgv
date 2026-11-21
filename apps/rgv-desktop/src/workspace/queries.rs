@@ -999,7 +999,12 @@ impl Viewer {
             None,
         );
         let request = self.panels.panel(panel_id).request();
-        let track_ids = auxiliary_query_track_ids(self.tracks.tracks());
+        // Tracks drawn by the experimental tile pipeline are read by its engine only. Nothing
+        // is routed under the default setting, which leaves the list untouched.
+        let track_ids = crate::workspace::track_tiles::legacy_query_track_ids(
+            auxiliary_query_track_ids(self.tracks.tracks()),
+            self.track_tiles.routed(),
+        );
         let queried = track_ids.iter().copied().collect::<HashSet<_>>();
         let variant_settings = self
             .tracks
@@ -1286,6 +1291,8 @@ impl Viewer {
             self.retry_deferred_alignment_gpu_publication();
         }
         self.top_up_partial_alignment_gpu_residency();
+        self.synchronize_alignment_coverage();
+        self.synchronize_track_tiles();
         self.poll_track_events();
         self.synchronize_alignment_contextual_product_states();
         self.poll_alignment_retirement_tasks();
@@ -1401,12 +1408,30 @@ impl Viewer {
                 tracing::warn!("alignment reaper panicked");
             }
         }
+        // Coverage workers are counted apart from scene workers: they stop within one
+        // cancellation poll and must not consume the scene-retirement admission bound.
+        let mut index = 0;
+        while index < self.alignment_coverage_retirement_tasks.len() {
+            if !self.alignment_coverage_retirement_tasks[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            let task = self.alignment_coverage_retirement_tasks.remove(index);
+            if task.join().is_err() {
+                tracing::warn!("alignment coverage reaper panicked");
+            }
+        }
     }
 
     pub(crate) fn finish_alignment_retirement_tasks(&mut self) {
         for task in self.alignment_retirement_tasks.drain(..) {
             if task.join().is_err() {
                 tracing::warn!("alignment reaper panicked during shutdown");
+            }
+        }
+        for task in self.alignment_coverage_retirement_tasks.drain(..) {
+            if task.join().is_err() {
+                tracing::warn!("alignment coverage reaper panicked during shutdown");
             }
         }
     }

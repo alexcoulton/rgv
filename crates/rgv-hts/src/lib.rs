@@ -117,7 +117,7 @@ pub use supplementary::{
     MAX_SUPPLEMENTARY_CIGAR_OPERATIONS, MAX_SUPPLEMENTARY_SEGMENTS, SupplementaryChain,
     SupplementarySegment, decode_supplementary_chain,
 };
-pub use tdf::{TdfMetadata, TdfSource};
+pub use tdf::{TdfMetadata, TdfSource, TdfSummaryQuery};
 pub use tracks::{
     BigBedFeatureFormat, BigBedSource, BigWigSource, BreakendPartner, BreakpointOrientation,
     CopyNumberQuery, CopyNumberQueryProvenance, CopyNumberSegment, CopyNumberValueSemantics,
@@ -173,8 +173,203 @@ pub mod fuzzing {
         crate::tracks::fuzz_variant_index(bytes)
     }
 
+    /// Parses the uncompressed content of a `.tbi` with the tabix parser written for the
+    /// remote VCF and annotation paths, and queries it.
+    pub fn parse_inflated_tabix_index(inflated: &[u8]) -> bool {
+        crate::tracks::fuzz_inflated_tabix_index(inflated)
+    }
+
+    /// Decodes a coverage sidecar tile file (`.rgvcov`) as the sidecar cache does, with and
+    /// without a recomputed checksum.
+    pub fn decode_coverage_sidecar_tile(bytes: &[u8]) -> bool {
+        crate::coverage_sidecar::fuzz_decode_tile(bytes)
+    }
+
     /// Computes the tabix interval of one VCF data line as the remote VCF path does.
     pub fn variant_line_interval(line: &[u8]) -> Option<(i64, i64)> {
         crate::tracks::fuzz_variant_line_interval(line)
+    }
+}
+
+/// A deterministic mutation sweep over the entry points of the `tabix_index`,
+/// `coverage_sidecar` and `vcf_in_memory` fuzz targets. It is no substitute for running the
+/// targets under libFuzzer; it keeps the entry points honest in an ordinary test run, where no
+/// fuzzing engine is installed.
+#[cfg(test)]
+mod fuzzing_smoke_tests {
+    use std::io::Read as _;
+
+    /// xorshift64*: deterministic, so a failure reproduces.
+    struct Mutator(u64);
+
+    impl Mutator {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound.max(1) as u64) as usize
+        }
+
+        /// One to four edits: a flipped bit, an interesting integer, a truncation, a removed
+        /// or duplicated run.
+        fn mutate(&mut self, seed: &[u8]) -> Vec<u8> {
+            let mut bytes = seed.to_vec();
+            for _ in 0..=self.below(4) {
+                if bytes.is_empty() {
+                    bytes.push(self.next() as u8);
+                    continue;
+                }
+                let at = self.below(bytes.len());
+                match self.below(6) {
+                    0 => bytes[at] ^= 1 << self.below(8),
+                    1 => bytes[at] = self.next() as u8,
+                    2 => {
+                        let value = [0_u32, 1, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0x0001_0000]
+                            [self.below(6)];
+                        let end = (at + 4).min(bytes.len());
+                        bytes[at..end].copy_from_slice(&value.to_le_bytes()[..end - at]);
+                    }
+                    3 => bytes.truncate(at),
+                    4 => {
+                        let end = (at + 1 + self.below(16)).min(bytes.len());
+                        bytes.drain(at..end);
+                    }
+                    _ => {
+                        let end = (at + 1 + self.below(16)).min(bytes.len());
+                        let run = bytes[at..end].to_vec();
+                        bytes.splice(at..at, run);
+                    }
+                }
+            }
+            bytes
+        }
+    }
+
+    #[test]
+    fn mutated_tabix_indexes_are_parsed_or_refused() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmark-data/manual-suite/data/variants/cohort.vcf.gz.tbi");
+        let Ok(stored) = std::fs::read(path) else {
+            return;
+        };
+        let mut seed = Vec::new();
+        flate2::read::MultiGzDecoder::new(stored.as_slice())
+            .read_to_end(&mut seed)
+            .unwrap();
+        assert!(crate::fuzzing::parse_inflated_tabix_index(&seed));
+        assert!(crate::fuzzing::parse_variant_index(&stored));
+        let mut mutator = Mutator(0x9E37_79B9_7F4A_7C15);
+        let mut accepted = 0_usize;
+        for _ in 0..20_000 {
+            let input = mutator.mutate(&seed);
+            accepted += usize::from(crate::fuzzing::parse_inflated_tabix_index(&input));
+            let _ = crate::fuzzing::parse_variant_index(&input);
+        }
+        // Both outcomes occur: the sweep reaches past the first rejection.
+        assert!(accepted > 0 && accepted < 20_000, "{accepted}");
+    }
+
+    #[test]
+    fn mutated_coverage_sidecar_tiles_are_decoded_or_refused() {
+        use rgv_model::{CoverageBin, CoveragePyramidParameters, CoverageTile, CoverageTileId};
+        let parameters = CoveragePyramidParameters::DEFAULT;
+        let id = CoverageTileId::new(rgv_core::ContigId::new(3), 0, 0);
+        let contig_length = 1_000_000;
+        let count = parameters.tile_bin_count(id, contig_length).unwrap();
+        let bases = parameters.bin_bases(0).unwrap();
+        let tile = CoverageTile::from_bins(
+            id,
+            parameters,
+            contig_length,
+            (0..count as u64)
+                .map(|bin| CoverageBin {
+                    depth_sum: (bin % 7) * bases,
+                    minimum_depth: (bin % 7) as u32,
+                    maximum_depth: (bin % 7) as u32,
+                })
+                .collect(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let cache = crate::CoverageSidecarCache::open(directory.path(), 1 << 30).unwrap();
+        let key = crate::CoverageSidecarKey::new(
+            rgv_model::AlignmentSourceStamp::new([1; 16], [2; 16]),
+            &rgv_model::CoverageEligibility::default(),
+            parameters,
+        );
+        cache.store(key, &tile).unwrap();
+        let mut stored = None;
+        for entry in walk(directory.path()) {
+            if entry
+                .extension()
+                .is_some_and(|extension| extension == "rgvcov")
+            {
+                stored = Some(std::fs::read(entry).unwrap());
+            }
+        }
+        let stored = stored.expect("the cache wrote a tile file");
+        // The file without its checksum is the form the resealing entry point accepts.
+        let seed = &stored[..stored.len() - 32];
+        assert!(crate::fuzzing::decode_coverage_sidecar_tile(seed));
+        assert!(!crate::fuzzing::decode_coverage_sidecar_tile(&stored));
+        let mut mutator = Mutator(0xD1B5_4A32_D192_ED03);
+        let mut accepted = 0_usize;
+        for _ in 0..20_000 {
+            accepted += usize::from(crate::fuzzing::decode_coverage_sidecar_tile(
+                &mutator.mutate(seed),
+            ));
+        }
+        assert!(accepted > 0 && accepted < 20_000, "{accepted}");
+    }
+
+    fn walk(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(directory).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(walk(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn mutated_unindexed_vcf_text_is_loaded_or_refused() {
+        const SEED: &[u8] = b"##fileformat=VCFv4.2\n\
+            ##contig=<ID=chr1,length=1000000>\n\
+            ##INFO=<ID=END,Number=1,Type=Integer,Description=\"End\">\n\
+            ##INFO=<ID=AF,Number=A,Type=Float,Description=\"Frequency\">\n\
+            ##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n\
+            ##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Depth\">\n\
+            #CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n\
+            chr1\t100\trs1\tA\tT\t50\tPASS\tAF=0.5\tGT:DP\t0/1:10\t1|1:20\n\
+            chr1\t200\trs2\tN\t<DEL>\t.\t.\tEND=900\tGT:DP\t./.:.\t0/0:3\n\
+            chr1\t300\t.\tAC\tA,ACC\t9.5\tq10\tAF=0.1,0.2\tGT\t1/2\t0/1\n";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.vcf");
+        let mut mutator = Mutator(0xA076_1D64_78BD_642F);
+        let mut opened = 0_usize;
+        for round in 0..1_500 {
+            let input = if round == 0 {
+                SEED.to_vec()
+            } else {
+                mutator.mutate(SEED)
+            };
+            std::fs::write(&path, &input).unwrap();
+            let Ok(mut source) = crate::LocalVariantSource::open(&path) else {
+                continue;
+            };
+            opened += 1;
+            let _ = source.query("chr1", 0, 1 << 28, 256);
+            let _ = source.query("chr1", 100, 101, 256);
+            let _ = source.search_ids("rs", 16);
+        }
+        assert!(opened > 0 && opened < 1_500, "{opened}");
     }
 }

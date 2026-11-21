@@ -1036,6 +1036,9 @@ pub(crate) struct AlignmentHighlightCacheKey {
 
 #[derive(Default)]
 pub(crate) struct AlignmentPanelProjection {
+    /// Coverage-pyramid request and presented authority of this panel; see
+    /// `workspace::alignment_coverage`.
+    pub(crate) coverage: crate::workspace::alignment_coverage::AlignmentCoverageProjection,
     pub(crate) clock: GenerationClock,
     pub(crate) unavailable: Option<String>,
     /// The viewport is at overview detail and is intentionally represented by
@@ -1207,6 +1210,11 @@ pub(crate) struct AlignmentTrackController {
     pub(crate) config: SessionAlignmentTrack,
     /// New source-scoped immutable-scene authority.
     pub(crate) scene_engine: Option<AlignmentSceneEngine<PositionedAlignmentBackend>>,
+    /// Multi-resolution coverage worker of the same source (ARCH-1). Independent of the scene
+    /// engine: its own source handle and thread, decoding below foreground reads.
+    pub(crate) coverage_engine: Option<rgv_engine::AlignmentCoverageEngine>,
+    /// Last engine publication counter the UI observed; a change redraws the coverage lane.
+    pub(crate) coverage_publication_sequence: u64,
     pub(crate) scene_metadata: Option<AlignmentSceneSourceMetadata>,
     /// Last Complete-read admission policy submitted to the source actor. This avoids flooding
     /// the bounded control mailbox while still making the user setting live and retryable.
@@ -2277,15 +2285,13 @@ pub(crate) fn connect_reference_slice_sinks<'a>(
     }
 }
 
-pub(crate) fn spawn_alignment_track_controller(
-    config: SessionAlignmentTrack,
-    cache_bytes: NonZeroUsize,
-    scene_ledger: AllocationLedger,
+/// Where and how one alignment source is opened: the path (or URL) and the open options shared
+/// by its scene engine and its coverage engine.
+pub(crate) fn alignment_source_open_request(
+    config: &SessionAlignmentTrack,
     reference_path: Option<PathBuf>,
     remote_reference_index_url: Option<String>,
-    panel_ids: &[PanelId],
-) -> Result<AlignmentTrackController> {
-    let (filter_editor, active_filters) = filter_state_from_session(&config.filters)?;
+) -> (PathBuf, rgv_hts::AlignmentOpenOptions) {
     let source_location = match &config.source {
         TrackSource::Local { path } => path.clone(),
         TrackSource::Remote { url } => url.clone(),
@@ -2296,16 +2302,40 @@ pub(crate) fn spawn_alignment_track_controller(
     let decode_reference = alignment_source_is_cram(&source_location)
         .then_some(reference_path)
         .flatten();
+    (
+        PathBuf::from(source_location),
+        alignment_open_options(
+            decode_reference,
+            config.remote_index_url.clone(),
+            remote_reference_index_url,
+        ),
+    )
+}
+
+pub(crate) fn spawn_alignment_track_controller(
+    config: SessionAlignmentTrack,
+    cache_bytes: NonZeroUsize,
+    scene_ledger: AllocationLedger,
+    reference_path: Option<PathBuf>,
+    remote_reference_index_url: Option<String>,
+    panel_ids: &[PanelId],
+    coverage_sidecar: Option<Arc<rgv_hts::CoverageSidecarCache>>,
+) -> Result<AlignmentTrackController> {
+    let (filter_editor, active_filters) = filter_state_from_session(&config.filters)?;
+    let (source_path, open_options) =
+        alignment_source_open_request(&config, reference_path, remote_reference_index_url);
     let query_options = alignment_scene_source_query_options(&config, &active_filters);
+    let coverage_engine = crate::workspace::alignment_coverage::spawn_alignment_coverage_engine(
+        source_path.clone(),
+        open_options.clone(),
+        scene_ledger.clone(),
+        coverage_sidecar,
+    );
     let (scene_engine, lifecycle) = (
         Some(AlignmentSceneEngine::spawn_local_bam(
             LocalAlignmentSceneEngineConfig {
-                path: PathBuf::from(source_location),
-                open_options: alignment_open_options(
-                    decode_reference,
-                    config.remote_index_url.clone(),
-                    remote_reference_index_url,
-                ),
+                path: source_path,
+                open_options,
                 query_options,
                 ledger: scene_ledger,
                 mailbox_control_capacity: NonZeroUsize::new(32)
@@ -2322,6 +2352,8 @@ pub(crate) fn spawn_alignment_track_controller(
     Ok(AlignmentTrackController {
         config,
         scene_engine,
+        coverage_engine,
+        coverage_publication_sequence: 0,
         scene_metadata: None,
         scene_complete_read_limit,
         lifecycle,

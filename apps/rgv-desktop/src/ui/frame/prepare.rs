@@ -726,6 +726,8 @@ impl Viewer {
         let high_contrast = self.settings.high_contrast;
         let interface_theme = self.settings.theme;
         let reduced_motion = self.settings.reduced_motion;
+        let coverage_cache_enabled = self.settings.coverage_cache_enabled;
+        let track_pipeline = self.settings.track_pipeline;
         let recent_loci = self.settings.recent_loci.clone();
         let current_session_path = self.current_session_path.clone();
         let clear_recent_requested = false;
@@ -787,6 +789,8 @@ impl Viewer {
             high_contrast,
             interface_theme,
             reduced_motion,
+            coverage_cache_enabled,
+            track_pipeline,
             recent_loci,
             current_session_path,
             clear_recent_requested,

@@ -99,9 +99,20 @@ impl IndexedTextFeatures {
         // `tbx::Reader` dereferences the null handle `HTSlib` returns for a path it cannot
         // read (a directory, a file without read permission).
         crate::htslib_guard::ensure_readable_file(path)?;
-        let reader = rust_htslib::tbx::Reader::from_path(path)
-            .map_err(|error| TrackError::Backend(error.to_string()))?;
-        let contigs = reader.seqnames();
+        // It also unwraps the UTF-8 conversion of every leading comment line and of every
+        // sequence name in the index, so both calls are contained here: a file with a
+        // non-UTF-8 comment is a clean error for this track, whoever the caller is.
+        let not_text = |_| {
+            TrackError::Backend(format!(
+                "{} has a comment line or an indexed sequence name that is not valid UTF-8",
+                path.display()
+            ))
+        };
+        let reader =
+            crate::htslib_guard::contain_panic(|| rust_htslib::tbx::Reader::from_path(path))
+                .map_err(not_text)?
+                .map_err(|error| TrackError::Backend(error.to_string()))?;
+        let contigs = crate::htslib_guard::contain_panic(|| reader.seqnames()).map_err(not_text)?;
         Ok(Self {
             format,
             contigs,
@@ -170,8 +181,12 @@ impl IndexedTextFeatures {
                 reader
                     .fetch(tid, start, end)
                     .map_err(|error| TrackError::Backend(error.to_string()))?;
-                while reader
-                    .read(&mut line)
+                // `tbx::Reader::read` unwraps the UTF-8 conversion of the line it has just
+                // read; the reader itself stays usable for the next query.
+                while crate::htslib_guard::contain_panic(|| reader.read(&mut line))
+                    .map_err(|_| {
+                        TrackError::Backend("indexed feature line is not UTF-8".to_owned())
+                    })?
                     .map_err(|error| TrackError::Backend(error.to_string()))?
                 {
                     if !accept(&line)? {

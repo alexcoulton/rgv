@@ -306,6 +306,14 @@ impl Viewer {
                     if let Some(projection) = track.projections.remove(&panel_id) {
                         projection.advance_scene_generation();
                     }
+                    // The closed panel's coverage request, publication and retained lane.
+                    if let Some(engine) = &track.coverage_engine {
+                        engine.release(
+                            crate::workspace::alignment_coverage::alignment_coverage_owner(
+                                panel_id,
+                            ),
+                        );
+                    }
                 }
                 self.invalidate_navigation_contract("view panel removed");
                 self.synchronize_panel_widths();

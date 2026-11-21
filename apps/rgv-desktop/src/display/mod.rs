@@ -367,7 +367,7 @@ pub(super) fn collapsed_alignment_subtrack(
     }
 }
 
-pub(super) fn primary_pinned_gene_id(tracks: &[TrackConfig]) -> Option<TrackId> {
+pub(crate) fn primary_pinned_gene_id(tracks: &[TrackConfig]) -> Option<TrackId> {
     tracks
         .iter()
         .find(|track| track.visible && track.kind == TrackKind::GeneModel)

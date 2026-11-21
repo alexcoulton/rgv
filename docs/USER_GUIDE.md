@@ -206,9 +206,18 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   down/up to zoom in/out around the press position, click to recenter, and double-click to show the
   complete contig. Indexed BAM sources contribute a stable, logarithmic whole-contig occupancy
   preview derived from BAI/CSI metadata, so zooming into a small query does not erase the rest of
-  the navigation map. At Overview detail the alignment lanes also settle in this index-only state:
-  RGV does not request or decode BAM/CRAM records until the viewport returns to Regional, Reads, or
-  Bases detail. This preview estimates alignment density without scanning every record;
+  the navigation map. At Overview detail (1,000 bp per pixel and wider) individual reads are not
+  loaded; each alignment track's **Coverage** lane is drawn from a multi-resolution coverage
+  pyramid that a background worker streams from the BAM/CRAM without retaining reads. The lane is
+  labelled **Coverage (loading…)** while only the index-only placeholder or a coarser stand-in is
+  available and **Coverage** once the visible span is shown at the resolution of the view; each
+  bin shows minimum, mean and maximum depth as three bands. Between 10 and 1,000 bp per pixel the
+  same pyramid fills the Coverage lane wherever exact read-derived coverage is not available for
+  the whole visible span (for example where reads exceed the Complete read limit). The pyramid
+  follows the track's MAPQ, secondary/supplementary, SAM-flag and auxiliary-tag filters and the
+  overlapping-mate policy; view filters it cannot evaluate from a streamed record are named on
+  the lane as not applied. The navigation-map preview estimates alignment density without
+  scanning every record;
   sources without a spatial index summary fall back to loaded alignment coverage, where a faint
   band distinguishes the queried span from unqueried portions of the contig. Pan and zoom can be
   combined in one diagonal gesture. Horizontal movement is
@@ -946,6 +955,48 @@ Diagnostics report workspace-wide alignment/cache/layout totals followed by the 
 retained-record count, and decoded-cache residency of every alignment track, so a failed or
 unavailable sample remains distinguishable from healthy samples. They list every visible panel's
 stable ID, locus, and query generation and identify the active panel.
+### Experimental track pipeline
+
+Settings › "Experimental: draw annotation tracks with the tile pipeline" (off by default; the
+automation setting is `{"setting": "track_pipeline", "value": "tiles"}` or `"legacy"`) switches
+some annotation tracks to a new pipeline that reads each track as cached tiles and draws them
+with a dedicated GPU renderer. It is provided for evaluation. With the setting off nothing
+changes.
+
+**Covered track kinds.** Only plain feature tracks: BED, bigBed, GFF3 and GTF files (recognised
+by file name) that use the default *Expanded* feature display mode. Every other track stays on
+the established pipeline even when the setting is on: bigWig, bedGraph, WIG and TDF signal,
+VCF/BCF, BEDPE and interact, SEG, MAF, GWAS, narrowPeak, broadPeak, PSL, genePred, refFlat,
+bigGenePred, bigNarrowPeak, the built-in Genes track, the pinned gene track (the first visible
+gene-model track), and any covered track switched to *Collapsed* or *Squished*.
+
+**What a covered track keeps.** Its place, height, collapse and visibility controls, gutter row
+and scrolling; row height (the track height divided into twelve rows) and feature labels once
+rows are at least 16 points tall; hover highlight, click selection and the feature inspector;
+annotation search, next/previous feature and automation feature queries (still answered by the
+established pipeline).
+
+**Known gaps of a covered track.**
+
+- Dense regions are drawn as a feature-density summary instead of individual features; the
+  established pipeline draws packed features with an overflow marker.
+- Rows are packed per tile in genomic space, so row assignment differs from the established
+  layout, and features below the twelfth row are not drawn (the gutter says how many rows are
+  hidden) instead of being summarised by an overflow marker.
+- A label band is reserved above every row when rows are tall enough, not only above rows that
+  have a label. Labels are measured in the font they are painted in.
+- Strand colours come from the theme's track palette and differ slightly from the established
+  colours; the score does not change a feature's opacity, and strand is shown by an arrow-shaped
+  end (and chevrons on intron lines) rather than repeated direction markers.
+- The inspector shows name, interval, strand and score only. Feature type, attributes
+  (including gene and transcript identifiers), exon blocks, the coding interval and "show all
+  transcripts" are not available.
+- Keyboard stepping through loaded evidence skips covered tracks.
+- PNG, SVG and semantic exports rendered from the display list, and the automation render-lane
+  and context-lane reports, do not include covered tracks. A native window capture does.
+- A lane that is loading, failed, or has hidden rows says so in a gutter row ("Loading…",
+  "Unavailable", "Rows hidden").
+
 ### Accessibility and keyboard operation
 
 RGV enables the native AccessKit integration supplied by its window stack. Standard controls,
@@ -1098,6 +1149,17 @@ authenticate remote BAM and index requests; the value is never written to the se
 The default cache hierarchy is 512 MiB and can be changed in Settings; a new budget takes effect on
 restart. **Clear cache** removes decoded alignment and layout entries. The HTTP range cache is a
 bounded temporary disk cache removed with its reader.
+
+Alignment coverage computed for the Coverage lane is kept in a per-user disk cache so a file opened
+again shows its overview at once. The cache holds only depth statistics (minimum, total and
+maximum depth per bin), keyed by a digest of the source identity and the filter settings; it
+contains no reads, read names or sequence. Its location is `~/Library/Caches/RGV/coverage` on
+macOS, `%LOCALAPPDATA%\RGV\Cache\coverage` on Windows, and `$XDG_CACHE_HOME/rgv/coverage` (or
+`~/.cache/rgv/coverage`) elsewhere; set `RGV_COVERAGE_CACHE_DIR` to an absolute path to move it.
+It is bounded to 256 MiB, evicting the least recently used tiles. Turn it off with **Settings >
+Performance > Keep alignment coverage in a disk cache** (coverage is then held in memory only;
+the change applies immediately), and empty it with **Tools > Clear caches**, which deletes the
+cached tiles as well as the in-memory ones.
 
 Periodic recovery autosave is disabled until enabled in **Settings > Recovery autosave**. The
 interval is bounded to 30–3,600 seconds and retention to 1–20 snapshots per project. Snapshots are

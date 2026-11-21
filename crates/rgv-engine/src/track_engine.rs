@@ -28,7 +28,11 @@ use crate::{
         CoalescingReceiver, CoalescingSender, bounded_coalescing_to_ui, panic_message, reap_worker,
         run_thread_root,
     },
-    track_source::{SearchRequest, TdfChannel, TrackQuerySettings, TrackSource},
+    track_source::{
+        ClosedTrackSource, SearchRequest, SharedTrackSource, TdfChannel, TrackQuerySettings,
+        TrackSource,
+    },
+    track_tile_engine::TrackTileSourceRegistrar,
 };
 
 /// Most tracks queried at the same time for one viewport request.
@@ -198,6 +202,10 @@ enum TrackEngineRequest {
         query_contig_aliases: BTreeMap<String, String>,
     },
     Remove(Vec<TrackId>),
+    ShareTileSources {
+        ids: Vec<TrackId>,
+        registrar: TrackTileSourceRegistrar,
+    },
     Query {
         request: PanelGeneration,
         clock: GenerationClock,
@@ -512,6 +520,46 @@ impl TrackEngine {
             .map_err(map_send_error)
     }
 
+    /// Serves `ids` in `tile_engine` from the readers this engine already has open, instead
+    /// of the tile engine opening each file a second time ([`crate::TrackTileEngine::add_track`]
+    /// does that). Use it for a track that is in this engine and is to be drawn through the
+    /// tile engine: both engines then read through one reader, one operation at a time.
+    ///
+    /// The tracks are registered in `tile_engine` at once, so views may be requested
+    /// immediately; `TrackOpened` follows on the tile engine's event queue when the source has
+    /// been handed over, or `TrackOpenFailed` for an id this engine has not (or not
+    /// successfully) opened. Requests are handled in order, so sharing a track right after
+    /// [`Self::try_add`] waits for that open. The track's query contig aliases are carried
+    /// over. Nothing changes for this engine's own queries, searches and feature steps,
+    /// except that they wait while the tile engine reads the same file, and vice versa.
+    /// Removing the track from either engine leaves the other's handle working; the file is
+    /// closed when both have let go.
+    pub fn try_share_tile_sources(
+        &self,
+        ids: Vec<TrackId>,
+        tile_engine: &crate::TrackTileEngine,
+    ) -> Result<(), EngineQueueError> {
+        let registrar = tile_engine.registrar();
+        registrar.expect(&ids);
+        let awaited = ids.clone();
+        let result = self
+            .input
+            .as_ref()
+            .ok_or(EngineQueueError::Disconnected)
+            .and_then(|input| {
+                input
+                    .try_send(TrackEngineRequest::ShareTileSources {
+                        ids,
+                        registrar: registrar.clone(),
+                    })
+                    .map_err(map_send_error)
+            });
+        if result.is_err() {
+            registrar.withdraw(&awaited);
+        }
+        result
+    }
+
     pub fn try_search(
         &self,
         generation: u64,
@@ -678,6 +726,9 @@ fn worker_loop(
                     send_event(output, TrackEngineEvent::TracksRemoved { ids: removed });
                 }
             }
+            TrackEngineRequest::ShareTileSources { ids, registrar } => {
+                share_tile_sources(&mut tracks, &query_contig_aliases, ids, &registrar);
+            }
             TrackEngineRequest::Query {
                 request,
                 clock,
@@ -823,6 +874,38 @@ fn remove_tracks(
     query_contig_aliases.retain(|id, _| !removed_set.contains(id));
     tdf_sources.retain(|_, source| Arc::strong_count(source) > 1);
     removed
+}
+
+/// Hands the tile engine a handle on the reader of each of `ids`. A track shared for the
+/// first time has its reader moved behind a [`SharedTrackSource`]; this engine keeps reading
+/// through its own handle.
+fn share_tile_sources(
+    tracks: &mut [OpenTrack],
+    query_contig_aliases: &HashMap<TrackId, BTreeMap<String, String>>,
+    ids: Vec<TrackId>,
+    registrar: &TrackTileSourceRegistrar,
+) {
+    for id in ids {
+        let Some(track) = tracks.iter_mut().find(|track| track.id == id) else {
+            registrar.fail(id, "the track is not open in the track engine");
+            continue;
+        };
+        let handle = track.source.share_handle().unwrap_or_else(|| {
+            let source = std::mem::replace(&mut track.source, Box::new(ClosedTrackSource));
+            let shared = SharedTrackSource::new(source);
+            let handle = shared.handle();
+            track.source = Box::new(shared);
+            handle
+        });
+        registrar.supply(
+            id,
+            track.name.clone(),
+            query_contig_aliases.get(&id).cloned().unwrap_or_default(),
+            Box::new(crate::track_tile_source::LegacyTrackTileSource::new(
+                Box::new(handle),
+            )),
+        );
+    }
 }
 
 fn send_tdf_discovery(
@@ -2877,5 +2960,61 @@ mod tests {
         engine.try_remove_many(vec![TrackId::new(50)]).unwrap();
         wait_for(&|event| matches!(event, TrackEngineEvent::TracksRemoved { .. }));
         assert!(engine.source_diagnostics().is_empty());
+    }
+
+    #[test]
+    fn sharing_moves_the_reader_behind_one_lock_and_never_opens_another() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genes.bed");
+        std::fs::write(&path, "chr1\t100\t200\talpha\n").unwrap();
+        let mut tracks = vec![
+            open_track(&TrackSpec {
+                id: TrackId::new(3),
+                name: "genes".to_owned(),
+                path,
+                kind: TrackSpecKind::Bed,
+            })
+            .unwrap(),
+        ];
+        assert!(tracks[0].source.share_handle().is_none());
+        let tiles = crate::TrackTileEngine::spawn(crate::TrackTileEngineConfig::default());
+        let registrar = tiles.registrar();
+        registrar.expect(&[TrackId::new(3)]);
+        share_tile_sources(
+            &mut tracks,
+            &HashMap::new(),
+            vec![TrackId::new(3)],
+            &registrar,
+        );
+        // The legacy handle, the tile engine's handle, and the one taken here to count.
+        let count = |tracks: &[OpenTrack]| {
+            tracks[0]
+                .source
+                .share_handle()
+                .expect("the track is shared")
+                .handle_count()
+        };
+        assert_eq!(count(&tracks), 3);
+        // The legacy engine still reads, through the same reader.
+        let TrackSnapshotData::Features(features) = tracks[0]
+            .source
+            .query("chr1", 0, 1_000, TrackQuerySettings::default())
+            .unwrap()
+        else {
+            panic!("expected features");
+        };
+        assert_eq!(features.len(), 1);
+        // Sharing again (a second tile engine, or the same after a reset) adds a handle; the
+        // reader is not wrapped twice.
+        registrar.expect(&[TrackId::new(3)]);
+        share_tile_sources(
+            &mut tracks,
+            &HashMap::new(),
+            vec![TrackId::new(3)],
+            &registrar,
+        );
+        // The first tile-engine handle was dropped with the registration it belonged to.
+        assert_eq!(count(&tracks), 3);
+        drop(tiles);
     }
 }

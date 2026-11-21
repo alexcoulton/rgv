@@ -232,6 +232,82 @@ impl BigBedSource {
         }
     }
 
+    /// As [`Self::query`], but stops after `limit` records instead of failing at the
+    /// per-query record limit. The flag is true when the interval holds more records than
+    /// were returned; the caller then knows the view is dense without having read all of it.
+    pub fn query_limited(
+        &mut self,
+        contig: &str,
+        start: u64,
+        end: u64,
+        limit: usize,
+    ) -> Result<(Vec<FeatureRecord>, bool), TrackError> {
+        let limit = limit.min(MAX_FEATURE_RECORDS_PER_QUERY);
+        match &mut self.reader {
+            BigBedBackend::Local(reader) => {
+                query_bigbed_limited(reader, self.format, contig, start, end, limit)
+            }
+            BigBedBackend::Remote(reader) => {
+                query_bigbed_limited(reader, self.format, contig, start, end, limit)
+            }
+        }
+    }
+
+    /// Bases per summary of every precomputed zoom level of the file, finest first. Empty
+    /// for a file written without zoom levels.
+    #[must_use]
+    pub fn zoom_reductions(&self) -> Vec<u32> {
+        let headers = match &self.reader {
+            BigBedBackend::Local(reader) => &reader.info().zoom_headers,
+            BigBedBackend::Remote(reader) => &reader.info().zoom_headers,
+        };
+        let mut reductions = headers
+            .iter()
+            .map(|header| header.reduction_level)
+            .filter(|reduction| *reduction > 0)
+            .collect::<Vec<_>>();
+        reductions.sort_unstable();
+        reductions.dedup();
+        reductions
+    }
+
+    /// Feature coverage of `[start, end)` from the file's precomputed zoom summaries, without
+    /// reading any feature.
+    ///
+    /// The level read is the coarsest whose summaries span at most `maximum_reduction` bases,
+    /// or the finest level when every level is coarser; `provenance.summary_reduction_bases`
+    /// names it. `None` when the file has no zoom level. Each record is one summary: `mean`
+    /// is the mean number of features over its bases (uncovered bases count as zero),
+    /// `maximum` the deepest overlap, and `minimum` the shallowest (zero unless every base
+    /// of the summary is covered). Summaries without any covered base are omitted.
+    pub fn query_coverage_summary(
+        &mut self,
+        contig: &str,
+        start: u64,
+        end: u64,
+        maximum_reduction: u64,
+    ) -> Result<Option<QuantitativeSummaryQuery>, TrackError> {
+        let reductions = self.zoom_reductions();
+        let Some(reduction) = reductions
+            .iter()
+            .copied()
+            .filter(|reduction| u64::from(*reduction) <= maximum_reduction)
+            .max()
+            .or_else(|| reductions.first().copied())
+        else {
+            return Ok(None);
+        };
+        match &mut self.reader {
+            BigBedBackend::Local(reader) => {
+                query_bigbed_zoom(reader, contig, start, end, reduction)
+            }
+            BigBedBackend::Remote(reader) => {
+                query_bigbed_zoom(reader, contig, start, end, reduction)
+            }
+        }
+        .map(Some)
+    }
+
     pub fn search(
         &mut self,
         query: &str,
@@ -471,6 +547,72 @@ fn query_bigbed<R: BBIFileRead>(
         records.push(parse_bigbed_record(contig, &entry, format)?);
     }
     Ok(records)
+}
+
+fn query_bigbed_limited<R: BBIFileRead>(
+    reader: &mut BigBedRead<R>,
+    format: BigBedFeatureFormat,
+    contig: &str,
+    start: u64,
+    end: u64,
+    limit: usize,
+) -> Result<(Vec<FeatureRecord>, bool), TrackError> {
+    let start = u32::try_from(start).map_err(|_| TrackError::Coordinate)?;
+    let end = u32::try_from(end).map_err(|_| TrackError::Coordinate)?;
+    let intervals = reader
+        .get_interval(contig, start, end)
+        .map_err(|error| TrackError::Backend(error.to_string()))?;
+    let mut records = Vec::new();
+    for result in intervals {
+        let entry = result.map_err(|error| TrackError::Backend(error.to_string()))?;
+        if records.len() == limit {
+            return Ok((records, true));
+        }
+        records.push(parse_bigbed_record(contig, &entry, format)?);
+    }
+    Ok((records, false))
+}
+
+fn query_bigbed_zoom<R: BBIFileRead>(
+    reader: &mut BigBedRead<R>,
+    contig: &str,
+    start: u64,
+    end: u64,
+    reduction: u32,
+) -> Result<QuantitativeSummaryQuery, TrackError> {
+    let start = u32::try_from(start).map_err(|_| TrackError::Coordinate)?;
+    let end = u32::try_from(end).map_err(|_| TrackError::Coordinate)?;
+    let mut query = QuantitativeSummaryQuery::default();
+    query.provenance.summary_reduction_bases = Some(reduction);
+    let summaries = reader
+        .get_zoom_interval(contig, start, end, reduction)
+        .map_err(|error| TrackError::Backend(error.to_string()))?;
+    for result in summaries {
+        let summary = result.map_err(|error| TrackError::Backend(error.to_string()))?;
+        let bases = u64::from(summary.end.saturating_sub(summary.start));
+        if summary.summary.bases_covered == 0 || bases == 0 {
+            continue;
+        }
+        query.provenance.records_examined = query.provenance.records_examined.saturating_add(1);
+        if query.records.len() == MAX_QUANTITATIVE_RECORDS_PER_QUERY {
+            query.provenance.records_truncated = true;
+            break;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+        query.records.push(QuantitativeSummaryRecord {
+            start: u64::from(summary.start),
+            end: u64::from(summary.end),
+            minimum: if summary.summary.bases_covered >= bases {
+                summary.summary.min_val as f32
+            } else {
+                0.0
+            },
+            mean: (summary.summary.sum / bases as f64) as f32,
+            maximum: summary.summary.max_val as f32,
+        });
+    }
+    query.provenance.records_retained = query.records.len();
+    Ok(query)
 }
 
 pub(super) fn ensure_bigbed_query_capacity(current_records: usize) -> Result<(), TrackError> {

@@ -550,3 +550,140 @@ fn probe_waiting(shared: &Arc<Shared>) -> std::thread::JoinHandle<bool> {
     let probe = probe(shared);
     std::thread::spawn(move || probe.acquire())
 }
+
+/// A SAM file of one amplicon: `templates` pairs whose first mates all cover `[1000, 1020)`
+/// and whose second mates all cover `[1010, 1030)`.
+fn amplicon_sam(directory: &Path, templates: usize) -> PathBuf {
+    use std::fmt::Write as _;
+    let mut text = String::from("@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:amplicon\tLN:100000\n");
+    for (flags, position, mate, length) in [(99, 1_001, 1_011, 30), (147, 1_011, 1_001, -30)] {
+        for template in 0..templates {
+            writeln!(
+                text,
+                "t{template}\t{flags}\tamplicon\t{position}\t60\t20M\t=\t{mate}\t{length}\t*\t*"
+            )
+            .unwrap();
+        }
+    }
+    let path = directory.join("amplicon.sam");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn an_ultra_deep_amplicon_gets_pyramid_coverage_flagged_as_mate_overlap_not_collapsed() {
+    let directory = tempfile::tempdir().unwrap();
+    // More first mates wait for theirs at once than the count-once window holds.
+    let templates = rgv_model::pileup::MAX_PENDING_PAIR_OVERLAPS + 20_000;
+    let path = amplicon_sam(directory.path(), templates);
+    let sidecar =
+        Arc::new(CoverageSidecarCache::open(directory.path().join("cache"), 1 << 30).unwrap());
+    let engine = AlignmentCoverageEngine::spawn(AlignmentCoverageEngineConfig {
+        sidecar: Some(Arc::clone(&sidecar)),
+        ..AlignmentCoverageEngineConfig::new(path, AlignmentOpenOptions::default(), ledger())
+    })
+    .unwrap();
+    let request = AlignmentCoverageRequest {
+        generation: 1,
+        contig: ContigId::new(0),
+        start: 0,
+        end: 100_000,
+        bases_per_pixel: 100.0,
+        eligibility: CoverageEligibility::default(),
+        exact_read_depth_ready: false,
+    };
+    engine.request(OWNER, request.clone());
+    let publication = engine
+        .wait_for_publication(OWNER, WAIT, |publication| {
+            !matches!(publication.state, AlignmentCoverageState::Refining { .. })
+        })
+        .expect("the amplicon is answered");
+    // Coverage, not a refusal: every mate counted, and the publication says so.
+    assert!(
+        matches!(publication.state, AlignmentCoverageState::Complete { .. }),
+        "{:?}",
+        publication.state
+    );
+    assert!(publication.mate_overlap_not_collapsed);
+    let lane = publication.lane.as_ref().unwrap();
+    let depth = u32::try_from(templates).unwrap();
+    assert_eq!(lane.maximum_depth(0, 100_000), 2 * depth);
+    assert_eq!(lane.maximum_depth(50_000, 60_000), 0);
+    assert!(engine.wait_until_idle(WAIT));
+    let telemetry = engine.telemetry();
+    assert_eq!(telemetry.units_failed, 0);
+    assert_eq!(telemetry.units_mate_overlap_not_collapsed, 1);
+    assert_eq!(telemetry.units_decoded, 1);
+    // A degraded tile is never persisted under the count-once key.
+    assert_eq!(telemetry.sidecar_tiles_stored, 0);
+    assert_eq!(sidecar.stats().stored, 0);
+
+    // Asked to count both mates, the same file is exact and carries no flag.
+    engine.request(
+        OWNER,
+        AlignmentCoverageRequest {
+            generation: 2,
+            eligibility: CoverageEligibility {
+                overlapping_mate_policy: rgv_core::OverlappingMatePolicy::CountBoth,
+                ..CoverageEligibility::default()
+            },
+            ..request
+        },
+    );
+    let publication = engine
+        .wait_for_publication(OWNER, WAIT, |publication| {
+            publication.generation == 2
+                && !matches!(publication.state, AlignmentCoverageState::Refining { .. })
+        })
+        .unwrap();
+    assert!(matches!(
+        publication.state,
+        AlignmentCoverageState::Complete { .. }
+    ));
+    assert!(!publication.mate_overlap_not_collapsed);
+    assert_eq!(
+        publication.lane.as_ref().unwrap().maximum_depth(0, 100_000),
+        2 * depth
+    );
+}
+
+#[test]
+fn retiring_or_dropping_the_engine_never_waits_for_the_unit_in_flight() {
+    let source = mixed();
+    if !source.exists() {
+        return;
+    }
+    let ledger = ledger();
+    for retire in [true, false] {
+        let engine =
+            AlignmentCoverageEngine::spawn(small_config(source.clone(), ledger.clone())).unwrap();
+        engine.request(OWNER, whole(1, 0));
+        // Work is in flight (or about to be): twelve units cannot all be done yet.
+        let started = Instant::now();
+        let reaper = if retire {
+            engine.retire()
+        } else {
+            drop(engine);
+            None
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stopping the engine blocked for {:?}",
+            started.elapsed()
+        );
+        if let Some(reaper) = reaper {
+            reaper.join().unwrap();
+            // The worker is gone, and with it every resident tile and its charge.
+            assert_eq!(summary_charged(&ledger), 0);
+        }
+    }
+    // The dropped engine's worker stops too, one probe later at most.
+    let deadline = Instant::now() + WAIT;
+    while summary_charged(&ledger) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the dropped engine never stopped"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

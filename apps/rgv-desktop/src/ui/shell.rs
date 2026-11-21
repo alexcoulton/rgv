@@ -41,6 +41,8 @@ impl Viewer {
         let first_egui_frame = self.egui_context.cumulative_frame_nr() == 0;
         if !first_egui_frame {
             self.rebuild_display_list();
+            // Feature labels of routed lanes are painted by the shell frame below.
+            self.plan_track_tile_lanes();
         }
         self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::FirstDisplayRebuild,

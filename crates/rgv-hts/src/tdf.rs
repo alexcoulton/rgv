@@ -12,8 +12,8 @@ use rgv_core::MAXIMUM_TDF_CHANNELS;
 use crate::{HttpRangeConfig, HttpRangeReader, tracks::TrackError};
 
 use crate::tracks::{
-    MAX_QUANTITATIVE_RECORDS_PER_QUERY, QuantitativeQuery, QuantitativeRecord,
-    QuantitativeSourceMetadata, TdfQueryMetadata,
+    MAX_QUANTITATIVE_RECORDS_PER_QUERY, QuantitativeQuery, QuantitativeQueryProvenance,
+    QuantitativeRecord, QuantitativeSourceMetadata, QuantitativeSummaryRecord, TdfQueryMetadata,
 };
 
 const FIXED_HEADER_BYTES: usize = 24;
@@ -41,6 +41,28 @@ pub struct TdfMetadata {
     pub compressed: bool,
     pub contigs: Vec<String>,
 }
+
+/// Result of [`TdfSource::query_with_extremes`].
+///
+/// A TDF archive stores one dataset per zoom level *and window function*. Every archive has
+/// the mean; `igvtools` writes minimum and maximum datasets only when it is asked to
+/// (`-f min,max,mean`). The two flags say what this file really provided.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TdfSummaryQuery {
+    /// The records [`TdfSource::query`] returns for the same arguments, in the same order
+    /// (`mean` is its `value`), each with the extremes the file has for it.
+    pub records: Vec<QuantitativeSummaryRecord>,
+    pub provenance: QuantitativeQueryProvenance,
+    pub source_metadata: Option<QuantitativeSourceMetadata>,
+    /// `minimum` is the file's own: its `min` dataset of the zoom level read, or raw values.
+    /// When false the file has no such dataset and `minimum` repeats `mean`.
+    pub minimum_from_file: bool,
+    /// As `minimum_from_file`, for `maximum` and the `max` dataset.
+    pub maximum_from_file: bool,
+}
+
+/// Most extreme-dataset records examined for one mean record; a well-formed archive has one.
+const MAX_EXTREME_RECORDS_PER_RECORD: usize = 64;
 
 #[derive(Clone, Debug)]
 struct IndexEntry {
@@ -382,6 +404,142 @@ impl TdfSource {
             compressed: self.metadata.compressed,
         }));
         Ok(query)
+    }
+
+    /// As [`Self::query`], with the minimum and maximum behind every record where the
+    /// archive carries them; see [`TdfSummaryQuery`].
+    pub fn query_with_extremes(
+        &mut self,
+        contig: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<TdfSummaryQuery, TrackError> {
+        self.query_channel_with_extremes(self.selected_track, contig, start, end)
+    }
+
+    /// As [`Self::query_channel`], with the minimum and maximum behind every record where the
+    /// archive carries them; see [`TdfSummaryQuery`].
+    ///
+    /// The mean records come from the dataset `query_channel` chooses. When that is a zoom
+    /// level, the `min` and `max` datasets of the same level are read too, if they exist. Raw
+    /// values are their own extremes.
+    pub fn query_channel_with_extremes(
+        &mut self,
+        track_index: usize,
+        contig: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<TdfSummaryQuery, TrackError> {
+        let query = self.query_channel(track_index, contig, start, end)?;
+        let Some(QuantitativeSourceMetadata::Tdf(metadata)) = &query.source_metadata else {
+            return Ok(TdfSummaryQuery::default());
+        };
+        let raw = metadata.zoom.is_none();
+        let mut extremes = [None, None];
+        if !raw {
+            for (slot, function) in extremes.iter_mut().zip(["min", "max"]) {
+                if metadata.window_function.eq_ignore_ascii_case(function) {
+                    // The only dataset of this level is the extreme itself.
+                    *slot = Some(query.records.clone());
+                } else if let Some(name) = self.sibling_dataset(&metadata.dataset, function) {
+                    *slot = self.dataset_records(&name, track_index, start, end)?;
+                }
+            }
+        }
+        let [minima, maxima] = extremes.map(|records| {
+            records.map(|mut records: Vec<QuantitativeRecord>| {
+                records.sort_by_key(|record| (record.start, record.end));
+                records
+            })
+        });
+        let extreme = |records: &Option<Vec<QuantitativeRecord>>,
+                       record: &QuantitativeRecord,
+                       pick: fn(f32, f32) -> f32| {
+            let Some(records) = records else {
+                return record.value;
+            };
+            let first = records.partition_point(|candidate| candidate.end <= record.start);
+            records[first..]
+                .iter()
+                .take(MAX_EXTREME_RECORDS_PER_RECORD)
+                .take_while(|candidate| candidate.start < record.end)
+                .filter(|candidate| candidate.end > record.start)
+                .fold(record.value, |value, candidate| {
+                    pick(value, candidate.value)
+                })
+        };
+        Ok(TdfSummaryQuery {
+            records: query
+                .records
+                .iter()
+                .map(|record| QuantitativeSummaryRecord {
+                    start: record.start,
+                    end: record.end,
+                    minimum: extreme(&minima, record, f32::min),
+                    mean: record.value,
+                    maximum: extreme(&maxima, record, f32::max),
+                })
+                .collect(),
+            minimum_from_file: raw || minima.is_some(),
+            maximum_from_file: raw || maxima.is_some(),
+            provenance: query.provenance,
+            source_metadata: query.source_metadata,
+        })
+    }
+
+    /// The dataset of the same contig and zoom level as `dataset` whose window function is
+    /// `function` (compared without regard to case), if the archive has one.
+    fn sibling_dataset(&self, dataset: &str, function: &str) -> Option<String> {
+        let (level, _) = dataset.rsplit_once('/')?;
+        // `/contig/zN/function`: a version-1 name (`/contig/zN`) has no siblings.
+        if level.matches('/').count() != 2 {
+            return None;
+        }
+        let prefix = format!("{level}/");
+        self.datasets
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(name, _)| name)
+            .take_while(|name| name.starts_with(&prefix))
+            .find(|name| name[prefix.len()..].eq_ignore_ascii_case(function))
+            .cloned()
+    }
+
+    /// The finite records of one channel of `name` overlapping `[start, end)`. `None` when
+    /// there are more than one query may hold; the dataset then cannot serve as an extreme.
+    fn dataset_records(
+        &mut self,
+        name: &str,
+        track_index: usize,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<Vec<QuantitativeRecord>>, TrackError> {
+        let dataset = self.load_dataset(name)?.clone();
+        let start_tile = usize::try_from(start / dataset.width).unwrap_or(usize::MAX);
+        let end_tile = usize::try_from((end - 1) / dataset.width).unwrap_or(usize::MAX);
+        let final_tile = end_tile.min(dataset.positions.len().saturating_sub(1));
+        let mut records = Vec::new();
+        if start_tile > final_tile {
+            return Ok(Some(records));
+        }
+        for tile_index in start_tile..=final_tile {
+            let Some(position) = dataset.positions[tile_index] else {
+                continue;
+            };
+            let bytes = self.tile_bytes(position, dataset.sizes[tile_index])?;
+            for record in parse_tile(&bytes, self.metadata.track_names.len(), track_index)? {
+                if record.end <= start || record.start >= end || !record.value.is_finite() {
+                    continue;
+                }
+                if records.len() == MAX_QUANTITATIVE_RECORDS_PER_QUERY {
+                    return Ok(None);
+                }
+                records.push(record);
+            }
+        }
+        Ok(Some(records))
     }
 
     fn resolve_contig(&self, contig: &str) -> Option<String> {
@@ -1055,6 +1213,166 @@ mod tests {
         assert_eq!(metadata.track_count, 2);
         assert_eq!(metadata.zoom, Some(0));
         assert_eq!(metadata.window_function, "mean");
+    }
+
+    /// A version-4 archive with one channel and one zoom level holding a dataset per entry of
+    /// `functions` (window function name and its three fixed-step values from position 100).
+    fn build_tdf_with_functions(functions: &[(&str, [f32; 3])]) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(&(functions.len() as u32).to_le_bytes());
+        for (function, _) in functions {
+            put_string(&mut header, function);
+        }
+        put_string(&mut header, "OTHER");
+        put_string(&mut header, "track type=wiggle_0");
+        header.extend_from_slice(&1_u32.to_le_bytes());
+        put_string(&mut header, "signal");
+        put_string(&mut header, "hg38");
+        header.extend_from_slice(&0_u32.to_le_bytes());
+
+        let mut body = Vec::new();
+        let mut entries = Vec::new();
+        let base = (FIXED_HEADER_BYTES + header.len()) as u64;
+        for (function, values) in functions {
+            let tile_position = base + body.len() as u64;
+            let mut tile = Vec::new();
+            put_string(&mut tile, "fixedStep");
+            tile.extend_from_slice(&3_u32.to_le_bytes());
+            tile.extend_from_slice(&100_i32.to_le_bytes());
+            tile.extend_from_slice(&10_f32.to_le_bytes());
+            for value in values {
+                tile.extend_from_slice(&value.to_le_bytes());
+            }
+            body.extend_from_slice(&tile);
+            let dataset_position = base + body.len() as u64;
+            let mut dataset = Vec::new();
+            dataset.extend_from_slice(&0_u32.to_le_bytes());
+            put_string(&mut dataset, "FLOAT");
+            dataset.extend_from_slice(&1_000_f32.to_le_bytes());
+            dataset.extend_from_slice(&1_u32.to_le_bytes());
+            dataset.extend_from_slice(&i64::try_from(tile_position).unwrap().to_le_bytes());
+            dataset.extend_from_slice(&(tile.len() as u32).to_le_bytes());
+            body.extend_from_slice(&dataset);
+            entries.push((
+                format!("/chr1/z0/{function}"),
+                dataset_position,
+                dataset.len() as u32,
+            ));
+        }
+        let mut index = Vec::new();
+        index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (name, position, size) in &entries {
+            put_string(&mut index, name);
+            index.extend_from_slice(&position.to_le_bytes());
+            index.extend_from_slice(&size.to_le_bytes());
+        }
+        index.extend_from_slice(&0_u32.to_le_bytes());
+        let index_position = base + body.len() as u64;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TDF4");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&index_position.to_le_bytes());
+        bytes.extend_from_slice(&(index.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&index);
+        bytes
+    }
+
+    fn extremes(query: &TdfSummaryQuery) -> Vec<(u64, u64, f32, f32, f32)> {
+        query
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.start,
+                    record.end,
+                    record.minimum,
+                    record.mean,
+                    record.maximum,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extremes_come_from_the_min_and_max_datasets_of_the_zoom_level_read() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&build_tdf_with_functions(&[
+            ("mean", [2.0, 5.0, 3.0]),
+            ("MIN", [0.0, 4.0, f32::NAN]),
+            ("max", [9.0, 250.0, 3.5]),
+        ]))
+        .unwrap();
+        let mut source = TdfSource::open(file.path()).unwrap();
+        assert_eq!(source.metadata().window_functions, ["mean", "MIN", "max"]);
+        let plain = source.query("chr1", 0, 1_000).unwrap();
+        let query = source.query_with_extremes("chr1", 0, 1_000).unwrap();
+        assert!(query.minimum_from_file && query.maximum_from_file);
+        assert_eq!(
+            extremes(&query),
+            [
+                (100, 110, 0.0, 2.0, 9.0),
+                // A peak the mean barely shows.
+                (110, 120, 4.0, 5.0, 250.0),
+                // A non-finite extreme is ignored; the mean stands in.
+                (120, 130, 3.0, 3.0, 3.5),
+            ]
+        );
+        // The mean records, provenance and metadata are exactly those of the plain query.
+        assert_eq!(
+            query
+                .records
+                .iter()
+                .map(|record| (record.start, record.end, record.mean))
+                .collect::<Vec<_>>(),
+            plain
+                .records
+                .iter()
+                .map(|record| (record.start, record.end, record.value))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(query.provenance, plain.provenance);
+        assert_eq!(query.source_metadata, plain.source_metadata);
+        // A narrower query pairs the same bins.
+        let narrow = source.query_with_extremes("chr1", 112, 118).unwrap();
+        assert_eq!(extremes(&narrow), [(110, 120, 4.0, 5.0, 250.0)]);
+    }
+
+    #[test]
+    fn an_archive_with_the_mean_only_says_that_its_extremes_are_the_mean() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&build_tdf_with_functions(&[("mean", [2.0, 5.0, 3.0])]))
+            .unwrap();
+        let mut source = TdfSource::open(file.path()).unwrap();
+        let query = source.query_with_extremes("chr1", 0, 1_000).unwrap();
+        assert!(!query.minimum_from_file && !query.maximum_from_file);
+        assert_eq!(
+            extremes(&query),
+            [
+                (100, 110, 2.0, 2.0, 2.0),
+                (110, 120, 5.0, 5.0, 5.0),
+                (120, 130, 3.0, 3.0, 3.0),
+            ]
+        );
+
+        // One extreme only: the other still repeats the mean, and says so.
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&build_tdf_with_functions(&[
+            ("mean", [2.0, 5.0, 3.0]),
+            ("max", [9.0, 250.0, 3.5]),
+        ]))
+        .unwrap();
+        let mut source = TdfSource::open(file.path()).unwrap();
+        let query = source.query_with_extremes("chr1", 0, 1_000).unwrap();
+        assert!(!query.minimum_from_file && query.maximum_from_file);
+        assert_eq!(extremes(&query)[1], (110, 120, 5.0, 5.0, 250.0));
+
+        // Nothing on the contig: an empty answer that claims nothing.
+        let empty = source.query_with_extremes("chr9", 0, 1_000).unwrap();
+        assert_eq!(empty, TdfSummaryQuery::default());
     }
 
     #[test]

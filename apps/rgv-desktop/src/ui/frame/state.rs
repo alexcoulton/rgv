@@ -240,6 +240,8 @@ pub(super) struct CommandDraft {
     pub(super) high_contrast: bool,
     pub(super) interface_theme: rgv_core::InterfaceTheme,
     pub(super) reduced_motion: bool,
+    pub(super) coverage_cache_enabled: bool,
+    pub(super) track_pipeline: rgv_core::TrackPipeline,
     pub(super) recent_loci: Vec<String>,
     pub(super) current_session_path: Option<PathBuf>,
     pub(super) clear_recent_requested: bool,

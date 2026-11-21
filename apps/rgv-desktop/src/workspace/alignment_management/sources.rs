@@ -135,6 +135,7 @@ impl Viewer {
             .max(1);
         let cache_bytes = NonZeroUsize::new(self.alignment_scene_budget.budget_bytes.max(1))
             .expect("scene budget is non-zero");
+        let coverage_sidecar = self.alignment_coverage_sidecar();
         let controller = spawn_alignment_track_controller(
             configs.remove(0),
             cache_bytes,
@@ -142,6 +143,7 @@ impl Viewer {
             self.reference_source.as_ref().map(source_path),
             self.remote_reference_index_url.clone(),
             &self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>(),
+            coverage_sidecar,
         );
         match controller {
             Ok(controller) => {
@@ -287,6 +289,7 @@ impl Viewer {
         }
         let cache_bytes = NonZeroUsize::new(self.alignment_scene_budget.budget_bytes.max(1))
             .expect("scene budget is non-zero");
+        let coverage_sidecar = self.alignment_coverage_sidecar();
         let mut controllers = Vec::with_capacity(configs.len());
         for config in configs {
             match spawn_alignment_track_controller(
@@ -296,6 +299,7 @@ impl Viewer {
                 reference_path.clone(),
                 remote_reference_index_url.clone(),
                 panel_ids,
+                coverage_sidecar.clone(),
             ) {
                 Ok(controller) => controllers.push(controller),
                 Err(error) => {
@@ -379,9 +383,19 @@ impl Viewer {
         for projection in controller.projections.values() {
             projection.advance_scene_generation();
         }
-        let AlignmentTrackController { scene_engine, .. } = controller;
+        let AlignmentTrackController {
+            scene_engine,
+            coverage_engine,
+            ..
+        } = controller;
         if let Some(task) = scene_engine.and_then(AlignmentSceneEngine::retire) {
             self.alignment_retirement_tasks.push(task);
+        }
+        // The coverage worker ends with its track; stopping it never blocks the UI thread.
+        if let Some(task) = coverage_engine
+            .and_then(crate::workspace::alignment_coverage::retire_alignment_coverage_engine)
+        {
+            self.alignment_coverage_retirement_tasks.push(task);
         }
     }
 

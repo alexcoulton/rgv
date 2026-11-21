@@ -154,19 +154,66 @@ impl ControlClient {
 }
 
 fn batch_mutates_viewer(batch: &AutomationBatch) -> bool {
-    batch.commands.iter().any(|command| {
-        !matches!(
-            command,
-            AutomationCommand::DescribeWorkspace
-                | AutomationCommand::DescribeSelection
-                | AutomationCommand::DescribeInteractionTrace
-                | AutomationCommand::DescribeInteractionRecording
-                | AutomationCommand::WaitUntilSettled { .. }
-                | AutomationCommand::Snapshot { .. }
-                | AutomationCommand::Export { .. }
-                | AutomationCommand::Save { .. }
-        )
-    })
+    batch.commands.iter().any(command_mutates_viewer)
+}
+
+/// Whether `command` can change the viewer's state, so that losing its response leaves the
+/// client unsure what the viewer now shows.
+///
+/// The match is exhaustive on purpose (no wildcard arm): a command added to `rgv-automation`
+/// does not compile here until it is classified, so it cannot default to either class.
+/// Commands that only write a file the caller named (`snapshot`, `export`, `save`) or only wait
+/// do not change viewer state and count as read-only.
+const fn command_mutates_viewer(command: &AutomationCommand) -> bool {
+    match command {
+        // Pure observations of the workspace, a selection, a queue, a history or loaded tracks.
+        AutomationCommand::DescribeWorkspace
+        | AutomationCommand::DescribeSelection
+        | AutomationCommand::DescribeInteractionTrace
+        | AutomationCommand::DescribeInteractionRecording
+        | AutomationCommand::DescribeReviewQueue
+        | AutomationCommand::DescribeNavigationHistory { .. }
+        | AutomationCommand::DescribeRelatedAlignments
+        | AutomationCommand::QueryFeatures { .. }
+        | AutomationCommand::WaitUntilSettled { .. }
+        | AutomationCommand::Snapshot { .. }
+        | AutomationCommand::Export { .. }
+        | AutomationCommand::Save { .. } => false,
+        // Recording and tracing state.
+        AutomationCommand::StartInteractionRecording { .. }
+        | AutomationCommand::StopInteractionRecording
+        | AutomationCommand::BeginNativeObservation { .. }
+        | AutomationCommand::EndNativeObservation
+        | AutomationCommand::CheckpointInteractionRecording { .. }
+        | AutomationCommand::StartDiagnosticTrace
+        | AutomationCommand::StopDiagnosticTrace
+        // Selection, workspace content, viewport and display state. `find_alignments`
+        // invalidates the handles of earlier calls, and `goto_gene` navigates a panel.
+        | AutomationCommand::ClearSelection
+        | AutomationCommand::RefreshSelection
+        | AutomationCommand::NewWorkspace
+        | AutomationCommand::OpenWorkspace { .. }
+        | AutomationCommand::SetGenome { .. }
+        | AutomationCommand::LoadTrack { .. }
+        | AutomationCommand::RemoveTrack { .. }
+        | AutomationCommand::Goto { .. }
+        | AutomationCommand::ChangeViewport { .. }
+        | AutomationCommand::AddPanel { .. }
+        | AutomationCommand::ClosePanel { .. }
+        | AutomationCommand::SetOption { .. }
+        | AutomationCommand::Configure { .. }
+        | AutomationCommand::Group { .. }
+        | AutomationCommand::Sort { .. }
+        | AutomationCommand::Filter { .. }
+        | AutomationCommand::Select { .. }
+        | AutomationCommand::FindAlignments { .. }
+        | AutomationCommand::SelectAlignment { .. }
+        | AutomationCommand::NavigateRelatedAlignment { .. }
+        | AutomationCommand::NavigateReviewItem { .. }
+        | AutomationCommand::NavigateHistory { .. }
+        | AutomationCommand::GotoGene { .. }
+        | AutomationCommand::Exit => true,
+    }
 }
 
 struct MutationUncertainty {
@@ -392,5 +439,104 @@ mod tests {
             .await
             .unwrap();
         assert!(worker.join().unwrap().contains("describe_workspace"));
+    }
+    fn command(json: serde_json::Value) -> AutomationCommand {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn read_only_commands_are_not_treated_as_mutations() {
+        for read_only in [
+            command(serde_json::json!({"command": "describe_workspace"})),
+            command(serde_json::json!({"command": "describe_review_queue"})),
+            command(serde_json::json!({"command": "describe_related_alignments"})),
+            command(serde_json::json!({"command": "describe_navigation_history", "panel_id": 1})),
+            command(serde_json::json!({
+                "command": "query_features", "contig": "chr1", "start": 0, "end": 1000
+            })),
+            command(serde_json::json!({"command": "wait_until_settled"})),
+        ] {
+            assert!(
+                !command_mutates_viewer(&read_only),
+                "{} is read-only",
+                read_only.name()
+            );
+        }
+        for mutating in [
+            command(serde_json::json!({"command": "goto_gene", "query": "TP53"})),
+            command(serde_json::json!({"command": "clear_selection"})),
+            command(serde_json::json!({"command": "new_workspace"})),
+            command(serde_json::json!({"command": "exit"})),
+        ] {
+            assert!(
+                command_mutates_viewer(&mutating),
+                "{} changes the viewer",
+                mutating.name()
+            );
+        }
+        let batch = |commands| AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands,
+        };
+        assert!(!batch_mutates_viewer(&batch(vec![
+            AutomationCommand::DescribeWorkspace,
+            command(serde_json::json!({
+                "command": "query_features", "contig": "chr1", "start": 0, "end": 1000
+            })),
+        ])));
+        assert!(batch_mutates_viewer(&batch(vec![
+            AutomationCommand::DescribeWorkspace,
+            command(serde_json::json!({"command": "goto_gene", "query": "TP53"})),
+        ])));
+    }
+
+    /// The variants of `AutomationCommand`, read from the `name()` match in its source (which
+    /// the compiler keeps exhaustive).
+    fn automation_command_variants() -> Vec<String> {
+        let source = include_str!("../../rgv-automation/src/automation.rs");
+        let start = source
+            .find("pub const fn name(&self) -> &'static str {")
+            .expect("AutomationCommand::name exists");
+        let body = &source[start..];
+        let body = &body[..body.find("\n    }\n").expect("name() ends")];
+        body.lines()
+            .filter_map(|line| line.trim().strip_prefix("Self::"))
+            .map(|rest| {
+                rest.chars()
+                    .take_while(char::is_ascii_alphanumeric)
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_automation_command_has_an_explicit_classification() {
+        let variants = automation_command_variants();
+        assert!(variants.len() >= 43, "found only {}", variants.len());
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("const fn command_mutates_viewer")
+            .expect("the classifier exists");
+        let classifier = &source[start..];
+        let classifier = &classifier[..classifier.find("\n}\n").expect("classifier ends")];
+        // No arm may catch commands it does not name.
+        for line in classifier.lines() {
+            let line = line.trim();
+            assert!(
+                !(line.starts_with("_ ") || line.starts_with("| _ ") || line.starts_with("_ =>")),
+                "the classifier must not have a wildcard arm: {line}"
+            );
+        }
+        for variant in &variants {
+            let named = format!("AutomationCommand::{variant}");
+            let occurrences = classifier
+                .match_indices(&named)
+                .filter(|(index, _)| {
+                    !classifier[index + named.len()..]
+                        .starts_with(|next: char| next.is_ascii_alphanumeric())
+                })
+                .count();
+            assert_eq!(occurrences, 1, "{variant} must be classified exactly once");
+        }
     }
 }

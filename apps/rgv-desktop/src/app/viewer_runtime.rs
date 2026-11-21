@@ -392,6 +392,12 @@ impl Viewer {
             surface_config.format,
             initial_theme.palette(),
         );
+        let mut alignment_depth_pyramid_gpu_renderer =
+            rgv_render::AlignmentDepthPyramidGpuRenderer::with_palette(
+                &device,
+                surface_config.format,
+                initial_theme.palette(),
+            );
         let egui_context = egui::Context::default();
         egui_context.set_visuals(initial_theme.visuals());
         let egui_state = egui_winit::State::new(
@@ -462,6 +468,8 @@ impl Viewer {
             total_cache_bytes,
         );
         let alignment_gpu_ledger_progress = alignment_gpu_ledger.subscribe_progress();
+        // Pyramid pages are charged to the GPU ledger with every other alignment page.
+        alignment_depth_pyramid_gpu_renderer.set_ledger(alignment_gpu_ledger.clone());
         let context_lane_gpu_budget_bytes = total_cache_bytes;
         let (track_specifications, tracks) = build_track_specs(&options);
         let contig_aliases = launch_contig_aliases(&options)?;
@@ -691,6 +699,12 @@ impl Viewer {
         );
         let alignment_scene_budget_bytes =
             NonZeroUsize::new(total_cache_bytes).expect("scene budget is non-zero");
+        // One persistent coverage cache for the process, unless the user turned it off.
+        let coverage_sidecar = settings
+            .coverage_cache_enabled
+            .then(rgv_hts::CoverageSidecarCache::open_default)
+            .flatten()
+            .map(Arc::new);
         let mut alignment_tracks = Vec::with_capacity(alignment_track_configs.len());
         for config in alignment_track_configs {
             alignment_tracks.push(spawn_alignment_track_controller(
@@ -700,6 +714,7 @@ impl Viewer {
                 options.reference.clone(),
                 remote_reference_index_url.clone(),
                 &panel_ids,
+                coverage_sidecar.clone(),
             )?);
         }
         crate::workspace::alignments::connect_reference_slice_sinks(
@@ -900,6 +915,11 @@ impl Viewer {
                 maximum_alignments: workspace_alignment_limit,
             },
             alignment_retirement_tasks: Vec::new(),
+            alignment_coverage_retirement_tasks: Vec::new(),
+            alignment_coverage_sidecar: coverage_sidecar,
+            alignment_depth_pyramid_gpu_renderer,
+            alignment_depth_pyramid_gpu_frame: None,
+            alignment_depth_pyramid_pages_refused: 0,
             engine_retirement_tasks: Vec::new(),
             reference_engine,
             reference_revision: None,
@@ -1047,6 +1067,7 @@ impl Viewer {
             exit_confirmation_open: false,
             user_exit_requested: false,
             context_lane_gpu_budget_bytes,
+            track_tiles: crate::workspace::track_tiles::TrackTilePipelineState::default(),
             alignment_scene_budget: initial_alignment_scene_budget,
             locus_editor,
             resizing_annotation_track: None,
@@ -1217,8 +1238,24 @@ impl Viewer {
             .rebuild_for_device(&device, format);
         self.alignment_summary_gpu_renderer
             .rebuild_for_device(&device, format);
+        // Pyramid pages are plain uploads of resident CPU tiles: a new renderer re-uploads them
+        // on its first frame, charged to the GPU ledger like the pages it replaces (whose
+        // charges end with the old renderer).
+        self.alignment_depth_pyramid_gpu_frame = None;
+        self.alignment_depth_pyramid_gpu_renderer =
+            rgv_render::AlignmentDepthPyramidGpuRenderer::with_palette(
+                &device,
+                format,
+                crate::theme::active().palette(),
+            );
+        self.alignment_depth_pyramid_gpu_renderer
+            .set_ledger(self.alignment_gpu_ledger.clone());
+        self.alignment_depth_pyramid_pages_refused = 0;
         self.context_scene_gpu_renderer = ContextSceneGpuRenderer::new(&device, format);
         self.context_scene_gpu_frame = ContextSceneGpuFrame::default();
+        // Track tile pages are plain uploads of the engine's cached scenes: the renderer (and
+        // its ledger) is rebuilt for the new device on the next frame that has a routed lane.
+        self.track_tiles.device_lost();
         self.rectangle_renderer = RectangleRenderer::new(&device, format);
         self.egui_renderer = egui_wgpu::Renderer::new(&device, format, RendererOptions::default());
         // The new egui renderer has none of the textures egui believes it already delivered.
@@ -1234,6 +1271,27 @@ impl Viewer {
         self.surface_config = surface_config;
         self.reconfigure_surface();
         Ok(())
+    }
+
+    /// Draws the coverage pyramid below the exact lanes: where both exist the pyramid is
+    /// scissored to the spans the exact coverage lane does not draw.
+    fn render_alignment_coverage_pyramid<'pass>(
+        &'pass self,
+        pass: &mut wgpu::RenderPass<'pass>,
+        target_size: [u32; 2],
+        failures: &mut Vec<AlignmentRendererFailure>,
+    ) {
+        if let Some(frame) = &self.alignment_depth_pyramid_gpu_frame
+            && let Err(error) =
+                self.alignment_depth_pyramid_gpu_renderer
+                    .render_within(pass, frame, target_size)
+        {
+            tracing::error!(%error, "could not render the alignment coverage pyramid");
+            failures.push(AlignmentRendererFailure {
+                lane: "coverage pyramid",
+                message: error.to_string(),
+            });
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1275,12 +1333,19 @@ impl Viewer {
             ) {
                 pass.set_scissor_rect(x, y, width, height);
                 self.rectangle_renderer.render(&mut pass);
+                // Lanes of the experimental tile pipeline occupy the position of the legacy
+                // context lanes they replace. Each draw is scissored to its tile's columns of
+                // its lane; the genomic scissor is restored for the renderers that follow.
+                if self.track_tiles.render(&mut pass) {
+                    pass.set_scissor_rect(x, y, width, height);
+                }
                 self.context_scene_gpu_renderer.render_within(
                     &mut pass,
                     &self.context_scene_gpu_frame,
                     target_size,
                 );
             }
+            self.render_alignment_coverage_pyramid(&mut pass, target_size, &mut failures);
             if let Some(bundle) = self
                 .alignment_presented_epoch
                 .as_ref()
@@ -1355,6 +1420,8 @@ impl Viewer {
             // prepared buffers belong to the old device, so it is dropped, not presented.
             return;
         }
+        self.prepare_alignment_coverage_pyramid_frame(self.window.scale_factor() as f32);
+        self.prepare_track_tile_frame(self.window.scale_factor() as f32);
         let paint_jobs = self
             .egui_context
             .tessellate(full_output.shapes, full_output.pixels_per_point);

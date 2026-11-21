@@ -144,6 +144,11 @@ impl Viewer {
                 &workspace_layout,
             );
             ui::paint_genomic_text(ui, geometry.genomic, &frame_genomic_texts);
+            // Labels of lanes drawn by the experimental tile pipeline; none under `Legacy`.
+            let tile_label_texts = self.track_tiles.label_texts().cloned().collect::<Vec<_>>();
+            if !tile_label_texts.is_empty() {
+                ui::paint_genomic_text(ui, geometry.genomic, &tile_label_texts);
+            }
             for ((_, panel_id, locus), panel_layout) in
                 st.nav.panel_controls.iter().zip(&workspace_layout.panels)
             {

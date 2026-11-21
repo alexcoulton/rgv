@@ -1338,6 +1338,17 @@ struct Viewer {
     alignment_tracks: Vec<AlignmentTrackController>,
     empty_alignment: EmptyAlignmentState,
     alignment_retirement_tasks: Vec<JoinHandle<()>>,
+    /// Coverage workers being stopped off the UI thread; see `workspace::alignment_coverage`.
+    alignment_coverage_retirement_tasks: Vec<JoinHandle<()>>,
+    /// Persistent coverage-tile cache shared by every alignment source. `None` until first
+    /// used, while the setting disables it, or when no cache directory can be created.
+    alignment_coverage_sidecar: Option<Arc<rgv_hts::CoverageSidecarCache>>,
+    alignment_depth_pyramid_gpu_renderer: rgv_render::AlignmentDepthPyramidGpuRenderer,
+    /// This frame's coverage-pyramid draws, captured after the pane layout is final.
+    alignment_depth_pyramid_gpu_frame: Option<rgv_render::AlignmentDepthPyramidGpuFrame>,
+    /// Pyramid pages the GPU ledger refused in the last prepared frame; while non-zero a
+    /// pyramid lane is presented as pending, not complete.
+    alignment_depth_pyramid_pages_refused: usize,
     engine_retirement_tasks: Vec<JoinHandle<()>>,
     reference_engine: Option<ReferenceEngine>,
     /// Identity of the currently open FASTA handle. A panel slice is usable only when it carries
@@ -1463,6 +1474,9 @@ struct Viewer {
     /// Independent ceiling for non-alignment contextual lane geometry. Alignment resources are
     /// admitted exclusively through `alignment_scene_ledger`.
     context_lane_gpu_budget_bytes: usize,
+    /// The experimental track tile pipeline: its engine, renderer and per-lane state. Empty
+    /// and untouched while `settings.track_pipeline` is `Legacy`.
+    track_tiles: workspace::track_tiles::TrackTilePipelineState,
     alignment_scene_budget: AlignmentSceneBudgetSnapshot,
     locus_editor: String,
     resizing_annotation_track: Option<(TrackFrameKey, f32)>,

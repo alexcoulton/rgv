@@ -151,6 +151,14 @@ pub struct AlignmentCoveragePublication {
     /// Present whenever the pyramid is the authority, possibly with no segment yet.
     pub lane: Option<Arc<DepthPyramidLane>>,
     pub state: AlignmentCoverageState,
+    /// Some of the coverage under the visible span counts every mate independently although
+    /// the request asked for overlapping mates to be counted once: the region is so deep that
+    /// the count-once window overflowed (see
+    /// [`rgv_hts::CoverageTileProduction::mate_overlap_not_collapsed`]). The lane is still
+    /// exact for what it counts; where two mates of a template overlap it is one higher than
+    /// the count-once depth. The UI should say so (for instance "mate overlap not
+    /// collapsed"). Such tiles are kept in memory only, never in the sidecar cache.
+    pub mate_overlap_not_collapsed: bool,
 }
 
 /// Counters of one engine.
@@ -178,6 +186,9 @@ pub struct AlignmentCoverageTelemetry {
     /// Largest depth-state working set of any unit, in bytes.
     pub peak_unit_working_bytes: usize,
     pub source_opened: bool,
+    /// Units decoded with every mate counted independently because the count-once window
+    /// overflowed; also counted in `units_decoded`.
+    pub units_mate_overlap_not_collapsed: u64,
 }
 
 struct OwnerRequest {
@@ -375,8 +386,10 @@ impl AlignmentCoverageEngine {
     }
 }
 
-impl Drop for AlignmentCoverageEngine {
-    fn drop(&mut self) {
+impl AlignmentCoverageEngine {
+    /// Tells the worker to stop: the unit in flight is cancelled at its next probe (every few
+    /// hundred records, and every range request of a remote source).
+    fn signal_shutdown(&self) {
         {
             let mut state = self.shared.lock();
             state.shutdown = true;
@@ -386,8 +399,32 @@ impl Drop for AlignmentCoverageEngine {
         self.shared.shutdown.store(true, Ordering::Release);
         self.shared.work.notify_all();
         self.shared.allowance.wake();
+    }
+
+    /// Stops the engine without waiting for it, like [`crate::TrackEngine::retire`]: the
+    /// worker is told to stop and its join is handed to a reaper thread, whose handle is
+    /// returned for callers that want to observe the exit. `None` when the worker had already
+    /// finished. The source handle, the resident tiles and their ledger charge are released
+    /// when the worker exits, which is at the latest one cancellation probe away.
+    pub fn retire(mut self) -> Option<JoinHandle<()>> {
+        self.signal_shutdown();
+        let worker = self.worker.take()?;
+        crate::mailbox::reap_worker(worker, "rgv-coverage-reaper", "alignment coverage worker")
+    }
+}
+
+impl Drop for AlignmentCoverageEngine {
+    /// Signals the worker exactly as [`Self::retire`] does and returns without joining it: an
+    /// engine dropped on the UI thread must not wait for the decode or transfer in flight. A
+    /// reaper thread waits for the worker instead.
+    fn drop(&mut self) {
+        self.signal_shutdown();
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            drop(crate::mailbox::reap_worker(
+                worker,
+                "rgv-coverage-reaper",
+                "alignment coverage worker",
+            ));
         }
     }
 }
@@ -489,11 +526,18 @@ struct Worker {
     /// Tiles the sidecar is known not to hold.
     sidecar_absent: HashSet<CoverageTileId>,
     failed_units: HashMap<CoverageTileId, Arc<str>>,
+    /// Units whose resident tile counts every mate independently (count-once overflowed).
+    uncollapsed_units: HashSet<CoverageTileId>,
     seen_retry: u64,
     last_signatures: HashMap<SourceOwnerId, PublicationSignature>,
 }
 
-type PublicationSignature = (u64, AlignmentCoverageState, Vec<(CoverageTileId, u64, u64)>);
+type PublicationSignature = (
+    u64,
+    AlignmentCoverageState,
+    Vec<(CoverageTileId, u64, u64)>,
+    bool,
+);
 
 /// One owner's request resolved against the open source.
 struct ActiveView {
@@ -519,6 +563,7 @@ impl Worker {
             sidecar_key: None,
             sidecar_absent: HashSet::new(),
             failed_units: HashMap::new(),
+            uncollapsed_units: HashSet::new(),
             seen_retry: 0,
             last_signatures: HashMap::new(),
         }
@@ -582,6 +627,7 @@ impl Worker {
                     DepthLaneAuthority::ExactReadEvidence,
                     None,
                     AlignmentCoverageState::DeferredToReadEvidence,
+                    false,
                 );
             }
         }
@@ -593,6 +639,7 @@ impl Worker {
             self.store.clear();
             self.sidecar_absent.clear();
             self.failed_units.clear();
+            self.uncollapsed_units.clear();
             self.eligibility = Some(newest.eligibility.clone());
             self.sidecar_key = None;
         }
@@ -612,6 +659,7 @@ impl Worker {
                         DepthLaneAuthority::Pyramid,
                         None,
                         AlignmentCoverageState::Failed(Arc::clone(&message)),
+                        false,
                     );
                 }
                 return false;
@@ -645,6 +693,7 @@ impl Worker {
                         "the alignment source has no contig {}",
                         request.contig.get()
                     ))),
+                    false,
                 );
                 continue;
             };
@@ -840,7 +889,10 @@ impl Worker {
         let mut decoded = None;
         match outcome {
             Ok(CoverageTileOutcome::Complete(production)) => {
-                if production.overlap_collapse_complete {
+                // An overflowed count-once window is not a refusal: the source has rebuilt
+                // the unit with every mate counted independently and says so. Only a
+                // production that is neither exact nor flagged is unusable.
+                if production.overlap_collapse_complete || production.mate_overlap_not_collapsed {
                     decoded = Some(production);
                 } else {
                     failure = Some(Arc::<str>::from(
@@ -858,11 +910,22 @@ impl Worker {
         let mut stored = 0_u64;
         let mut records = 0_u64;
         let mut working_bytes = 0_usize;
+        let mut uncollapsed = false;
         if let Some(production) = decoded {
             records = production.records_seen;
             working_bytes = production.telemetry.peak_depth_state_bytes();
+            uncollapsed = production.mate_overlap_not_collapsed;
+            if uncollapsed {
+                self.uncollapsed_units.insert(unit);
+            } else {
+                self.uncollapsed_units.remove(&unit);
+            }
             for tile in production.tiles {
-                if let (Some(sidecar), Some(key)) = (&self.config.sidecar, self.sidecar_key) {
+                // The sidecar is keyed by the requested (count-once) settings and has no
+                // place for the flag, so a degraded tile is never persisted under that key.
+                if !uncollapsed
+                    && let (Some(sidecar), Some(key)) = (&self.config.sidecar, self.sidecar_key)
+                {
                     if sidecar.store(key, &tile).is_ok() {
                         stored += 1;
                     }
@@ -890,6 +953,7 @@ impl Worker {
             telemetry.units_failed += 1;
         } else {
             telemetry.units_decoded += 1;
+            telemetry.units_mate_overlap_not_collapsed += u64::from(uncollapsed);
         }
     }
 
@@ -914,12 +978,23 @@ impl Worker {
                     missing_margin_units: plan.missing_margin.len(),
                 }
             };
+            // Any degraded unit under the visible span, at whatever level it was produced:
+            // the tiles derived from it carry its counts.
+            let (visible_start, visible_end) = active.view.visible();
+            let parameters = self.config.parameters;
+            let uncollapsed = self.uncollapsed_units.iter().any(|unit| {
+                unit.contig == active.view.contig
+                    && parameters
+                        .tile_span(*unit, active.view.contig_length)
+                        .is_some_and(|(start, end)| start < visible_end && end > visible_start)
+            });
             self.publish(
                 active.owner,
                 active.generation,
                 DepthLaneAuthority::Pyramid,
                 Some(lane),
                 state,
+                uncollapsed,
             );
         }
     }
@@ -932,6 +1007,7 @@ impl Worker {
         authority: DepthLaneAuthority,
         lane: Option<DepthPyramidLane>,
         state: AlignmentCoverageState,
+        mate_overlap_not_collapsed: bool,
     ) {
         let signature: PublicationSignature = (
             generation,
@@ -939,6 +1015,7 @@ impl Worker {
             lane.as_ref()
                 .map(DepthPyramidLane::signature)
                 .unwrap_or_default(),
+            mate_overlap_not_collapsed,
         );
         if self.last_signatures.get(&owner) == Some(&signature) {
             return;
@@ -965,6 +1042,7 @@ impl Worker {
                 authority,
                 lane: lane.map(Arc::new),
                 state,
+                mate_overlap_not_collapsed,
             }),
         );
         drop(shared);

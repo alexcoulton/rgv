@@ -313,3 +313,132 @@ fn an_unsorted_stream_is_an_error_not_a_wrong_answer() {
         Err(AlignmentError::UnknownContig(7))
     ));
 }
+
+/// One amplicon at `depth` templates: every first mate covers `[1024, 1184)` and every second
+/// mate `[1120, 1280)` (bin-aligned, 64 bases shared), so all first mates wait for theirs at
+/// the same time. Returns the outcome and
+/// the telemetry of every pass made.
+fn amplicon_at_depth(depth: u64) -> (CoverageTileProduction, Vec<CoverageAccumulatorTelemetry>) {
+    const READ: u32 = 160;
+    let request = whole_contig(CoverageEligibility::default());
+    let cigar = [CigarOp {
+        kind: CigarOpKind::Match,
+        len: READ,
+    }];
+    let mut passes = Vec::new();
+    let outcome = with_mate_overlap_fallback(&request, |request| {
+        let mut stream = CoverageStream::new(request, &dictionary())?;
+        let mut name = Vec::with_capacity(16);
+        for (flags, start, mate_start) in [
+            (0x1 | 0x20 | 0x40, 1_024, 1_120),
+            (0x1 | 0x10 | 0x80, 1_120, 1_024),
+        ] {
+            for template in 0..depth {
+                name.clear();
+                name.extend_from_slice(b"t");
+                name.extend_from_slice(template.to_string().as_bytes());
+                let record = PayloadFree {
+                    name: &name,
+                    flags,
+                    start,
+                    mapping_quality: 60,
+                    mate_start: Some(mate_start),
+                    cigar: &cigar,
+                };
+                assert!(stream.add(&record, &|| true)?);
+            }
+        }
+        let outcome = stream.finish()?;
+        if let CoverageTileOutcome::Complete(production) = &outcome {
+            passes.push(production.telemetry);
+        }
+        Ok(outcome)
+    })
+    .unwrap();
+    let CoverageTileOutcome::Complete(production) = outcome else {
+        panic!("not cancelled");
+    };
+    (production, passes)
+}
+
+fn amplicon_depths(production: &CoverageTileProduction) -> [u32; 4] {
+    let tile = &production.tiles[0];
+    [(896, 1_024), (1_024, 1_120), (1_120, 1_184), (1_184, 1_280)].map(|(start, end)| {
+        let (bin, _) = tile.aggregate(start, end).unwrap();
+        assert_eq!(bin.minimum_depth, bin.maximum_depth);
+        bin.maximum_depth
+    })
+}
+
+#[test]
+fn a_two_hundred_thousand_fold_amplicon_gets_coverage_flagged_as_not_collapsed() {
+    // Below the window every overlap is collapsed, exactly, and nothing is flagged.
+    let (shallow, passes) = amplicon_at_depth(50_000);
+    assert!(shallow.overlap_collapse_complete && !shallow.mate_overlap_not_collapsed);
+    assert_eq!(amplicon_depths(&shallow), [0, 50_000, 50_000, 50_000]);
+    assert_eq!(shallow.collapsed_mate_bases, 50_000 * 64);
+    assert_eq!(passes.len(), 1);
+
+    // At 200,000 templates twice as many mates are pending as the window holds. Coverage is
+    // still produced: every mate counted independently, and flagged as exactly that.
+    let (deep, passes) = amplicon_at_depth(200_000);
+    assert_eq!(deep.tiles.len(), shallow.tiles.len());
+    assert!(deep.mate_overlap_not_collapsed);
+    assert!(!deep.overlap_collapse_complete);
+    assert_eq!(deep.records_seen, 400_000);
+    assert_eq!(deep.records_eligible, 400_000);
+    // Both mates cover the 64 shared bases: 400,000 there, 200,000 on either side.
+    assert_eq!(amplicon_depths(&deep), [0, 200_000, 400_000, 200_000]);
+    assert_eq!(deep.collapsed_mate_bases, 0);
+
+    // In bounded memory: the first pass never held more mates than the window, the second
+    // held none, and the depth state of both is as small as at any other depth.
+    assert_eq!(passes.len(), 2);
+    assert_eq!(passes[0].peak_pending_mates, MAX_PENDING_PAIR_OVERLAPS);
+    assert_eq!(passes[1].peak_pending_mates, 0);
+    assert_eq!(deep.telemetry, passes[1]);
+    for pass in &passes {
+        assert_eq!(pass.bins, shallow.telemetry.bins);
+        assert!(pass.peak_pending_boundaries <= 8);
+        assert!(pass.peak_depth_state_bytes() < 80 * 1024);
+    }
+
+    // A request that already counts both mates has nothing to degrade to and is not flagged.
+    let both = whole_contig(CoverageEligibility {
+        overlapping_mate_policy: OverlappingMatePolicy::CountBoth,
+        ..CoverageEligibility::default()
+    });
+    assert_eq!(
+        both,
+        whole_contig(CoverageEligibility::default()).counting_mates_independently()
+    );
+    let mut calls = 0;
+    let outcome = with_mate_overlap_fallback(&both, |request| {
+        calls += 1;
+        CoverageStream::new(request, &dictionary())?.finish()
+    })
+    .unwrap();
+    let CoverageTileOutcome::Complete(production) = outcome else {
+        panic!("not cancelled");
+    };
+    assert_eq!(calls, 1);
+    assert!(!production.mate_overlap_not_collapsed);
+
+    // A cancelled second pass is a cancelled request, not a half-answer.
+    let mut calls = 0;
+    let outcome =
+        with_mate_overlap_fallback(&whole_contig(CoverageEligibility::default()), |request| {
+            calls += 1;
+            if calls == 2 {
+                return Ok(CoverageTileOutcome::Cancelled);
+            }
+            let mut production = match CoverageStream::new(request, &dictionary())?.finish()? {
+                CoverageTileOutcome::Complete(production) => production,
+                CoverageTileOutcome::Cancelled => unreachable!(),
+            };
+            production.overlap_collapse_complete = false;
+            Ok(CoverageTileOutcome::Complete(production))
+        })
+        .unwrap();
+    assert_eq!((calls, outcome), (2, CoverageTileOutcome::Cancelled));
+}

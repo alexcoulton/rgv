@@ -379,3 +379,76 @@ fn the_cache_directory_is_absolute_and_never_the_working_directory() {
         assert!(directory.ends_with("coverage"));
     }
 }
+
+#[test]
+fn clear_removes_the_caches_own_files_and_nothing_else() {
+    let directory = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = directory.path().join("coverage");
+    let cache = CoverageSidecarCache::open(&root, 1 << 30).unwrap();
+    for revision in 1..=3 {
+        for index in 0..4 {
+            cache.store(key(revision), &tile(0, index, 1)).unwrap();
+        }
+    }
+    let tiles = tile_files(&root);
+    assert_eq!(tiles.len(), 12);
+    let tile_bytes = tiles
+        .iter()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum::<u64>();
+    let key_directory = tiles[0].parent().unwrap().to_owned();
+    // A leftover of an interrupted write: the cache's own, removed with the tiles.
+    fs::write(key_directory.join(".tile-abc.tmp"), [0_u8; 10]).unwrap();
+
+    // Things that are not the cache's: a stray file beside the tiles, a file and a directory
+    // at the root, a tile-named file in a directory that is not a key directory, and links
+    // out of the root (to a directory named like a key, and to a tile-named file).
+    fs::write(key_directory.join("notes.txt"), b"mine").unwrap();
+    fs::write(root.join("README"), b"mine").unwrap();
+    fs::create_dir(root.join("other")).unwrap();
+    fs::write(root.join("other").join("c0-l0-t0.rgvcov"), b"mine").unwrap();
+    let precious = outside.path().join("precious.rgvcov");
+    fs::write(&precious, b"do not delete").unwrap();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            outside.path(),
+            root.join("0123456789abcdef0123456789abcdef"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&precious, key_directory.join("c9-l0-t9.rgvcov")).unwrap();
+    }
+
+    let freed = cache.clear().unwrap();
+    assert_eq!(freed, tile_bytes + 10);
+    assert_eq!(cache.stats().bytes, 0);
+    assert_eq!(fs::read(&precious).unwrap(), b"do not delete");
+    assert_eq!(fs::read(key_directory.join("notes.txt")).unwrap(), b"mine");
+    assert_eq!(fs::read(root.join("README")).unwrap(), b"mine");
+    assert!(root.join("other").join("c0-l0-t0.rgvcov").exists());
+    #[cfg(unix)]
+    assert!(fs::symlink_metadata(key_directory.join("c9-l0-t9.rgvcov")).is_ok());
+    // The two emptied pyramid directories are gone; the one with a stranger's file stays.
+    let remaining = fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .filter(|entry| fs::symlink_metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir()))
+        .count();
+    assert_eq!(remaining, 2);
+
+    // The cache still works, and clearing an empty cache frees nothing.
+    assert!(
+        cache
+            .load(
+                key(1),
+                tile(0, 0, 1).id(),
+                CoveragePyramidParameters::DEFAULT,
+                1
+            )
+            .is_none()
+    );
+    cache.store(key(1), &tile(0, 0, 1)).unwrap();
+    assert!(cache.clear().unwrap() > 0);
+    assert_eq!(cache.clear().unwrap(), 0);
+}

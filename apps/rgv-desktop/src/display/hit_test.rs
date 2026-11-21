@@ -112,7 +112,12 @@ pub(crate) fn alignment_lane_in_pane_layout(
             return None;
         }
         item.frame.subtracks.iter().find_map(|subtrack| {
-            if subtrack.label != label || subtrack.collapsed {
+            // A lane with a stable identity is found by it: its display label may carry state
+            // ("Coverage (loading…)") that must not hide the lane from hit testing.
+            let names_lane = subtrack
+                .alignment_subtrack
+                .map_or(subtrack.label == label, |kind| kind.label() == label);
+            if !names_lane || subtrack.collapsed {
                 return None;
             }
             let top = subtrack.top - layout.scroll_points;

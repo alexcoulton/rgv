@@ -414,6 +414,7 @@ impl ApplicationHandler for Application {
                 || !viewer.workspace_list_import_tasks.is_empty()
                 || !viewer.genome_tasks.is_empty()
                 || !viewer.alignment_retirement_tasks.is_empty()
+                || !viewer.alignment_coverage_retirement_tasks.is_empty()
                 || !viewer.engine_retirement_tasks.is_empty()
                 || viewer
                     .automation

@@ -246,6 +246,9 @@ impl Viewer {
             .set_palette(&self.queue, theme.palette());
         self.alignment_summary_gpu_renderer
             .set_palette(&self.queue, theme.palette());
+        self.alignment_depth_pyramid_gpu_renderer
+            .set_palette(&self.queue, theme.palette());
+        self.apply_theme_to_track_tiles();
     }
 
     pub(super) fn apply_settings_changes(&mut self, st: &mut ShellFrame) {
@@ -260,7 +263,12 @@ impl Viewer {
         let read_browsing_buffer_changed =
             self.settings.read_browsing_buffer_percent != st.commands.read_browsing_buffer_percent;
         let cache_budget_changed = self.settings.cache_budget_mib != st.commands.cache_budget_mib;
+        let coverage_cache_changed =
+            self.settings.coverage_cache_enabled != st.commands.coverage_cache_enabled;
+        let track_pipeline_changed = self.settings.track_pipeline != st.commands.track_pipeline;
         let settings_changed = cache_budget_changed
+            || coverage_cache_changed
+            || track_pipeline_changed
             || read_browsing_buffer_changed
             || self.settings.diagnostics_opt_in != st.commands.diagnostics_opt_in
             || autosave_schedule_changed
@@ -276,6 +284,14 @@ impl Viewer {
         self.settings.high_contrast = st.commands.high_contrast;
         self.settings.theme = st.commands.interface_theme;
         self.settings.reduced_motion = st.commands.reduced_motion;
+        self.settings.coverage_cache_enabled = st.commands.coverage_cache_enabled;
+        if coverage_cache_changed {
+            self.apply_coverage_cache_setting();
+        }
+        self.settings.track_pipeline = st.commands.track_pipeline;
+        if track_pipeline_changed {
+            self.apply_track_pipeline_setting();
+        }
         if accessibility_changed {
             apply_accessibility_preferences(&self.egui_context, &self.settings);
             self.apply_theme_to_renderers();
@@ -496,6 +512,7 @@ impl Viewer {
                     }
                 }
             }
+            self.clear_alignment_coverage_caches();
         }
         if st.commands.clear_cache_requested {
             // Dropping the native derivative is not itself a navigation transaction. Reissue

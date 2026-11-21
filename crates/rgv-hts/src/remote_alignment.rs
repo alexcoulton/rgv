@@ -391,7 +391,25 @@ impl ProductionAlignmentSource {
     /// ignored for a local file and cleared again before returning.
     ///
     /// On the `HTSlib` backend this abandons any unfinished positioned stream of this handle.
+    ///
+    /// When the request asks for overlapping mates to be counted once and more earlier mates
+    /// are pending at once than the count-once window holds (an ultra-deep amplicon), the
+    /// tiles are not refused: they are built a second time with every mate counted
+    /// independently and returned with
+    /// [`crate::CoverageTileProduction::mate_overlap_not_collapsed`] set. The second pass
+    /// has the same cancellation and a fresh `transfer_budget`.
     pub fn coverage_tiles(
+        &mut self,
+        request: &crate::CoverageTileRequest,
+        transfer_budget: Option<RemoteTransferBudget>,
+        cancellation: &RemoteCancellation,
+    ) -> Result<crate::CoverageTileOutcome, AlignmentError> {
+        crate::coverage_stream::with_mate_overlap_fallback(request, |request| {
+            self.coverage_tiles_once(request, transfer_budget, cancellation)
+        })
+    }
+
+    fn coverage_tiles_once(
         &mut self,
         request: &crate::CoverageTileRequest,
         transfer_budget: Option<RemoteTransferBudget>,

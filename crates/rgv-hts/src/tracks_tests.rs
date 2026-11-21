@@ -274,6 +274,79 @@ fn write_test_bigbed(path: &Path, autosql: &str, contents: &str) {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
+fn bigbed_zoom_summaries_give_coverage_without_reading_features() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dense.bb");
+    // 40,000 features of 20 bases every 10 bases on the first 400 kb of chr1 (depth 2 nearly
+    // everywhere), and one lone feature far away.
+    let mut contents = String::new();
+    for index in 0..40_000_u32 {
+        let start = index * 10;
+        writeln!(contents, "chr1\t{start}\t{}\tf{index}", start + 20).unwrap();
+    }
+    contents.push_str("chr1\t900000\t900100\tlone\n");
+    write_test_bigbed(
+        &path,
+        "table bed\n\"Dense\"\n(\nstring chrom;\nuint chromStart;\nuint chromEnd;\nstring name;\n)\n",
+        &contents,
+    );
+    let mut source = BigBedSource::open(&path).unwrap();
+    let reductions = source.zoom_reductions();
+    assert!(!reductions.is_empty(), "the writer produced zoom levels");
+    assert!(reductions.is_sorted());
+
+    // A bounded detail read says "dense" after `limit` records, never the hard error.
+    let (records, more) = source.query_limited("chr1", 0, 1_000_000, 1_000).unwrap();
+    assert_eq!((records.len(), more), (1_000, true));
+    let (records, more) = source
+        .query_limited("chr1", 890_000, 1_000_000, 1_000)
+        .unwrap();
+    assert_eq!((records.len(), more), (1, false));
+    assert_eq!(records[0].name.as_deref(), Some("lone"));
+
+    // The summary of the whole contig at the coarsest level that is no coarser than asked.
+    let asked = u64::from(*reductions.last().unwrap());
+    let query = source
+        .query_coverage_summary("chr1", 0, 1_000_000, asked)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        query.provenance.summary_reduction_bases,
+        Some(*reductions.last().unwrap())
+    );
+    assert!(!query.records.is_empty());
+    assert!(!query.provenance.records_truncated);
+    // Coverage is conserved: 40,000 * 20 + 100 feature bases in total.
+    let covered = query
+        .records
+        .iter()
+        .map(|record| f64::from(record.mean) * (record.end - record.start) as f64)
+        .sum::<f64>();
+    assert!((covered - 800_100.0).abs() < 800.0, "{covered}");
+    for record in &query.records {
+        assert!(record.minimum <= record.mean && record.mean <= record.maximum);
+        assert!(record.maximum <= 2.0);
+    }
+    assert!(query.records.iter().any(|record| record.maximum == 2.0));
+    // Nothing between the dense block and the lone feature.
+    let gap = source
+        .query_coverage_summary("chr1", 500_000, 800_000, asked)
+        .unwrap()
+        .unwrap();
+    assert!(gap.records.iter().all(|record| record.mean == 0.0) || gap.records.is_empty());
+    // Asking for finer than the file has reads its finest level and says which.
+    let finest = source
+        .query_coverage_summary("chr1", 0, 100_000, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        finest.provenance.summary_reduction_bases,
+        Some(reductions[0])
+    );
+}
+
+#[test]
 fn bedgraph_queries_are_zero_based_half_open_and_overlap_aware() {
     let source = TextQuantitativeSource::from_reader(
         std::io::Cursor::new(
@@ -1037,6 +1110,78 @@ fn gtf_names_are_decoded() {
     .unwrap();
     assert_eq!(record.name.as_deref(), Some("ABC"));
     assert_eq!(record.score, Some(1.5));
+}
+
+/// Writes `text` bgzip-compressed with a tabix index built by `HTSlib` (VCF preset: sequence
+/// in column 1, position in column 2, `#` comment lines).
+fn write_tabix_indexed_text(path: &Path, text: &[u8]) {
+    use std::io::Write as _;
+    let mut writer = rust_htslib::bgzf::Writer::from_path(path).unwrap();
+    writer.write_all(text).unwrap();
+    drop(writer);
+    index::build(path, None, 1, index::Type::Tbx).unwrap();
+}
+
+#[test]
+fn non_utf8_lines_of_an_indexed_annotation_are_errors_not_panics() {
+    let directory = tempfile::tempdir().unwrap();
+    let header = b"##fileformat=VCFv4.2\n##contig=<ID=chr1,length=1000000>\n".to_vec();
+    let columns = b"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
+
+    // A comment line that is not UTF-8: `rust-htslib` panics while opening the file.
+    let comment = directory.path().join("comment.gff.gz");
+    let mut text = header.clone();
+    text.extend_from_slice(b"##note=caf\xe9 \xff\xfe\n");
+    text.extend_from_slice(columns);
+    text.extend_from_slice(b"chr1\t100\ta\tA\tT\t.\t.\t.\n");
+    write_tabix_indexed_text(&comment, &text);
+    let Err(error) = TextFeatureSource::open(&comment, FeatureFormat::Gff3) else {
+        panic!("a non-UTF-8 comment line must be refused");
+    };
+    assert!(error.to_string().contains("not valid UTF-8"), "{error}");
+
+    // A data line that is not UTF-8: `rust-htslib` panics while reading the region.
+    let data = directory.path().join("data.gff.gz");
+    let mut text = header;
+    text.extend_from_slice(columns);
+    text.extend_from_slice(b"chr1\t100\t\xff\xfe\tA\tT\t.\t.\t.\n");
+    text.extend_from_slice(b"chr1\t900000\tb\tA\tT\t.\t.\t.\n");
+    write_tabix_indexed_text(&data, &text);
+    let source = TextFeatureSource::open(&data, FeatureFormat::Gff3).unwrap();
+    assert!(source.is_indexed());
+    let Err(error) = source.query("chr1", 0, 1_000) else {
+        panic!("a non-UTF-8 data line must be an error");
+    };
+    assert!(error.to_string().contains("not UTF-8"), "{error}");
+    // The reader survives: a later query is answered (its lines do not parse as GFF and are
+    // counted as skipped, which is the point of asking again).
+    assert!(source.query("chr1", 899_000, 901_000).unwrap().is_empty());
+    assert!(source.query("chr1", 0, 1_000).is_err());
+}
+
+#[test]
+fn a_non_utf8_name_htslib_adds_to_the_variant_header_is_an_error_not_a_panic() {
+    // Found by the mutation sweep over the `vcf_in_memory` fuzz entry point. The header is
+    // valid UTF-8; the contig of the record is not declared, so HTSlib adds it to the header
+    // as it stands, and `rust-htslib` unwraps the conversion of every header value.
+    let directory = tempfile::tempdir().unwrap();
+    for (name, line) in [
+        ("contig.vcf", &b"\xff\t100\t.\tA\tT\t.\t.\t.\n"[..]),
+        ("filter.vcf", &b"chr1\t100\t.\tA\tT\t.\tq\xff\t.\n"[..]),
+    ] {
+        let path = directory.path().join(name);
+        let mut text =
+            b"##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n".to_vec();
+        text.extend_from_slice(line);
+        std::fs::write(&path, text).unwrap();
+        let Err(error) = LocalVariantSource::open(&path) else {
+            panic!("{name}: a non-UTF-8 name must be refused");
+        };
+        assert!(
+            error.to_string().contains("is not valid UTF-8"),
+            "{name}: {error}"
+        );
+    }
 }
 
 #[test]

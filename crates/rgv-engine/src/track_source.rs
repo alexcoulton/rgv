@@ -13,7 +13,13 @@ use rgv_hts::{
     TextGwasSource, TextInteractionSource, TextMutationSource, TextQuantitativeSource,
 };
 
-use crate::{TrackSnapshotData, TrackSourceDiagnostics};
+use rgv_model::{TrackTile, TrackTileRequest};
+
+use crate::{
+    TrackSnapshotData, TrackSourceDiagnostics,
+    track_engine::REMOTE_TRACK_OPERATION_TRANSFER_BUDGET,
+    track_tile_source::{bigbed_native_tile, bigwig_native_tile, tdf_native_tile},
+};
 
 /// Upper bound on variant records returned for one viewport query.
 const MAX_VARIANT_QUERY_RECORDS: usize = 100_000;
@@ -45,6 +51,17 @@ pub(crate) struct SearchRequest<'a> {
     pub(crate) normalized: &'a str,
     pub(crate) limit: usize,
     pub(crate) include_variant_ids: bool,
+}
+
+/// What a source can answer for a tile from its own precomputed summaries.
+pub(crate) enum NativeTile {
+    /// Nothing better than `query`: the tile adapter reads the interval and builds the tile.
+    Generic,
+    /// The finished tile.
+    Tile(Box<TrackTile>),
+    /// Every feature of the tile's own interval, already read: the adapter continues from
+    /// them instead of reading the interval again.
+    Features(Vec<FeatureRecord>),
 }
 
 pub(crate) trait TrackSource: Send {
@@ -91,6 +108,146 @@ pub(crate) trait TrackSource: Send {
     /// Input the source had to skip; `None` for kinds that do not track it.
     fn diagnostics(&self) -> Option<TrackSourceDiagnostics> {
         None
+    }
+
+    /// The tile of `request` from the file's own summaries (zoom levels with their extremes,
+    /// coverage of a dense interval), where the format has them. The remote control installed
+    /// by `set_remote_control` governs it like any other operation.
+    fn query_native_tile(&mut self, _request: &TrackTileRequest) -> Result<NativeTile, String> {
+        Ok(NativeTile::Generic)
+    }
+
+    /// Another handle on the same reader, when this source is already shared between the
+    /// legacy engine and the tile engine.
+    fn share_handle(&self) -> Option<SharedTrackSource> {
+        None
+    }
+}
+
+/// One reader used by both the legacy [`crate::TrackEngine`] and the tile engine.
+///
+/// Each engine holds a handle. An operation locks the reader for its whole duration and
+/// installs the handle's own remote control (cancellation and transfer budget) while it holds
+/// the lock, so neither engine can abandon or starve the other's read. While one engine reads,
+/// the other waits for the same file, which is the price of not opening it twice.
+pub(crate) struct SharedTrackSource {
+    reader: Arc<Mutex<Box<dyn TrackSource>>>,
+    keep_going: Option<RemoteCancellation>,
+    budget: Option<RemoteTransferBudget>,
+    /// Fixed when the file was opened.
+    channels: Option<(Vec<String>, usize)>,
+    /// As of this handle's last operation; reading it never waits for the other engine.
+    diagnostics: Option<TrackSourceDiagnostics>,
+}
+
+impl SharedTrackSource {
+    pub(crate) fn new(source: Box<dyn TrackSource>) -> Self {
+        Self {
+            channels: source.channels(),
+            diagnostics: source.diagnostics(),
+            reader: Arc::new(Mutex::new(source)),
+            keep_going: None,
+            budget: Some(REMOTE_TRACK_OPERATION_TRANSFER_BUDGET),
+        }
+    }
+
+    /// A second handle on the same reader, with remote control of its own.
+    pub(crate) fn handle(&self) -> Self {
+        Self {
+            reader: Arc::clone(&self.reader),
+            keep_going: None,
+            budget: Some(REMOTE_TRACK_OPERATION_TRANSFER_BUDGET),
+            channels: self.channels.clone(),
+            diagnostics: self.diagnostics.clone(),
+        }
+    }
+
+    /// Handles on the reader, this one included.
+    #[cfg(test)]
+    pub(crate) fn handle_count(&self) -> usize {
+        Arc::strong_count(&self.reader)
+    }
+
+    fn with<T>(
+        &mut self,
+        operation: impl FnOnce(&mut dyn TrackSource) -> Result<T, String>,
+    ) -> Result<T, String> {
+        // A reader that panicked under the other engine is in an unknown state.
+        let mut reader = self
+            .reader
+            .lock()
+            .map_err(|_| "the track reader failed in another operation".to_owned())?;
+        reader.set_remote_control(self.keep_going.clone(), self.budget);
+        let result = operation(reader.as_mut());
+        // The other engine's next operation must not inherit this one's (possibly stale) check.
+        reader.set_remote_control(None, self.budget);
+        self.diagnostics = reader.diagnostics();
+        result
+    }
+}
+
+impl TrackSource for SharedTrackSource {
+    fn query(
+        &mut self,
+        contig: &str,
+        start: u64,
+        end: u64,
+        settings: TrackQuerySettings<'_>,
+    ) -> Result<TrackSnapshotData, String> {
+        self.with(|reader| reader.query(contig, start, end, settings))
+    }
+
+    fn adjacent_feature(
+        &mut self,
+        contig: &str,
+        position: u64,
+        forward: bool,
+    ) -> Result<Option<FeatureRecord>, String> {
+        self.with(|reader| reader.adjacent_feature(contig, position, forward))
+    }
+
+    fn search(&mut self, request: SearchRequest<'_>) -> Result<Option<SourceSearch>, String> {
+        self.with(|reader| reader.search(request))
+    }
+
+    fn channels(&self) -> Option<(Vec<String>, usize)> {
+        self.channels.clone()
+    }
+
+    fn set_remote_control(
+        &mut self,
+        keep_going: Option<RemoteCancellation>,
+        budget: Option<RemoteTransferBudget>,
+    ) {
+        self.keep_going = keep_going;
+        self.budget = budget;
+    }
+
+    fn diagnostics(&self) -> Option<TrackSourceDiagnostics> {
+        self.diagnostics.clone()
+    }
+
+    fn query_native_tile(&mut self, request: &TrackTileRequest) -> Result<NativeTile, String> {
+        self.with(|reader| reader.query_native_tile(request))
+    }
+
+    fn share_handle(&self) -> Option<SharedTrackSource> {
+        Some(self.handle())
+    }
+}
+
+/// Stands in for a source for the instant it is being wrapped for sharing.
+pub(crate) struct ClosedTrackSource;
+
+impl TrackSource for ClosedTrackSource {
+    fn query(
+        &mut self,
+        _contig: &str,
+        _start: u64,
+        _end: u64,
+        _settings: TrackQuerySettings<'_>,
+    ) -> Result<TrackSnapshotData, String> {
+        Err("the track reader is closed".to_owned())
     }
 }
 
@@ -185,6 +342,10 @@ impl TrackSource for BigBedSource {
     ) {
         self.set_remote_cancellation(keep_going);
         self.set_remote_transfer_budget(budget);
+    }
+
+    fn query_native_tile(&mut self, request: &TrackTileRequest) -> Result<NativeTile, String> {
+        bigbed_native_tile(self, request)
     }
 }
 
@@ -312,6 +473,10 @@ impl TrackSource for BigWigSource {
         self.set_remote_cancellation(keep_going);
         self.set_remote_transfer_budget(budget);
     }
+
+    fn query_native_tile(&mut self, request: &TrackTileRequest) -> Result<NativeTile, String> {
+        bigwig_native_tile(self, request).map(|tile| NativeTile::Tile(Box::new(tile)))
+    }
 }
 
 impl TrackSource for TextQuantitativeSource {
@@ -429,6 +594,18 @@ impl TrackSource for TdfChannel {
     fn channels(&self) -> Option<(Vec<String>, usize)> {
         let source = self.source.lock().ok()?;
         Some((source.metadata().track_names.clone(), self.track_index))
+    }
+
+    fn query_native_tile(&mut self, request: &TrackTileRequest) -> Result<NativeTile, String> {
+        let mut source = self
+            .source
+            .lock()
+            .map_err(|_| "the TDF reader failed in another query".to_owned())?;
+        source.set_remote_cancellation(self.keep_going.clone());
+        source.set_remote_transfer_budget(self.budget);
+        let result = tdf_native_tile(&mut source, self.track_index, request);
+        source.set_remote_cancellation(None);
+        result.map(|tile| NativeTile::Tile(Box::new(tile)))
     }
 }
 

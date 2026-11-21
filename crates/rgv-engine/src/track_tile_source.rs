@@ -9,10 +9,23 @@
 //!
 //! * Quantitative sources (bigWig, TDF, bedGraph, WIG) return [`TRACK_TILE_BINS`] regular bins
 //!   of minimum / mean / maximum. bigWig reads the zoom level its reader picks for the tile's
-//!   span and keeps the file's own extremes ([`BigWigSource::query_with_extremes`]).
+//!   span and keeps the file's own extremes ([`BigWigSource::query_with_extremes`]). TDF does
+//!   the same where the archive has them ([`TdfSource::query_channel_with_extremes`]): a TDF
+//!   zoom level is one dataset per window function, and most archives were written with the
+//!   mean only. For such an archive a bin's minimum and maximum are the extremes of the
+//!   *means* that touch it, as before; an archive written with `min` and `max` datasets
+//!   keeps a peak narrower than a bin.
 //! * Feature sources return a coverage summary instead of features once the tile holds more
 //!   than `settings.feature_summary_features_per_point` features per nominal point
 //!   (default [`rgv_model::DEFAULT_FEATURE_SUMMARY_FEATURES_PER_POINT`]).
+//! * bigBed decides that without reading the whole tile. It reads at most the number of
+//!   features that makes the tile dense ([`BigBedSource::query_limited`]); if there are more,
+//!   the summary comes from the file's own zoom level no coarser than a bin
+//!   ([`BigBedSource::query_coverage_summary`]) and no further feature is read. A dense tile
+//!   therefore costs a bounded read however many features it holds, and an interval beyond
+//!   the per-query record limit is a summary instead of an error. Bins of such a summary
+//!   hold the shallowest, mean and deepest feature overlap. A bigBed without zoom levels is
+//!   read like any other feature source.
 //! * Variant sources return per-bin counts above
 //!   `settings.variant_summary_variants_per_point`
 //!   (default [`rgv_model::DEFAULT_VARIANT_SUMMARY_VARIANTS_PER_POINT`]).
@@ -20,7 +33,10 @@
 use std::{collections::HashMap, sync::Arc};
 
 use rgv_core::CopyNumberValueMode;
-use rgv_hts::{BigWigSource, RemoteCancellation, RemoteTransferBudget};
+use rgv_hts::{
+    BigBedSource, BigWigSource, QuantitativeSourceMetadata, RemoteCancellation,
+    RemoteTransferBudget, TdfSource,
+};
 use rgv_layout::{
     WorldRowItem, cluster_closure_extent, lay_out_bin_tile, lay_out_feature_tile,
     lay_out_interaction_tile, lay_out_variant_tile, pack_seam_stable_rows,
@@ -39,7 +55,7 @@ use rgv_model::{
 use crate::{
     TrackSnapshotData, TrackSourceDiagnostics,
     track_engine::REMOTE_TRACK_OPERATION_TRANSFER_BUDGET,
-    track_source::{SearchRequest, TrackQuerySettings, TrackSource},
+    track_source::{NativeTile, SearchRequest, TrackQuerySettings, TrackSource},
 };
 
 /// Most times a feature tile widens its read to reach the end of the overlap clusters that
@@ -848,7 +864,20 @@ impl LegacyTrackTileSource {
         cancel: &TrackCancellation,
     ) -> Result<TrackTile, TrackTileError> {
         let key = request.tile;
-        let data = self.query(request, key.start(), key.end(), cancel)?;
+        cancel.check()?;
+        // A source with summaries of its own answers from them.
+        let data = match self
+            .source
+            .query_native_tile(request)
+            .map_err(|message| source_error(message, cancel))?
+        {
+            NativeTile::Tile(tile) => {
+                cancel.check()?;
+                return Ok(*tile);
+            }
+            NativeTile::Features(records) => TrackSnapshotData::Features(records),
+            NativeTile::Generic => self.query(request, key.start(), key.end(), cancel)?,
+        };
         let mut provenance = TrackTileProvenance::default();
         // The one match over the legacy snapshot enum: it stays inside this adapter.
         let (payload, lod) = match data {
@@ -951,43 +980,223 @@ impl TrackTileSource for BigWigTileSource {
         cancel: &TrackCancellation,
     ) -> Result<TrackTile, TrackTileError> {
         cancel.check()?;
-        let key = request.tile;
         let (keep_going, budget) = remote_control(request.transfer_budget, cancel);
         self.source.set_remote_cancellation(keep_going);
         self.source.set_remote_transfer_budget(budget);
-        let result = self
-            .source
-            .query_with_extremes(&request.contig, key.start(), key.end());
+        let result = bigwig_native_tile(&mut self.source, request);
         self.source.set_remote_cancellation(None);
-        let query = result.map_err(|error| source_error(error.to_string(), cancel))?;
-        Ok(TrackTile {
-            contig: request.contig.clone(),
-            key,
-            lod: if query.provenance.summary_reduction_bases.is_some() {
-                TrackTileLod::Summary
-            } else {
-                TrackTileLod::Detail
-            },
-            payload: TrackTilePayload::Bins(rebin(
-                key,
-                query.records.iter().map(|record| {
-                    (
-                        record.start,
-                        record.end,
-                        record.minimum,
-                        record.mean,
-                        record.maximum,
-                    )
-                }),
-            )),
-            provenance: TrackTileProvenance {
-                records_examined: query.provenance.records_examined,
-                records_truncated: query.provenance.records_truncated,
-                source_reduction_bases: query.provenance.summary_reduction_bases,
-                ..TrackTileProvenance::default()
-            },
-        })
+        result.map_err(|message| source_error(message, cancel))
     }
+}
+
+/// A bigWig tile with the file's own zoom-level extremes.
+pub(crate) fn bigwig_native_tile(
+    source: &mut BigWigSource,
+    request: &TrackTileRequest,
+) -> Result<TrackTile, String> {
+    let key = request.tile;
+    let query = source
+        .query_with_extremes(&request.contig, key.start(), key.end())
+        .map_err(|error| error.to_string())?;
+    Ok(TrackTile {
+        contig: request.contig.clone(),
+        key,
+        lod: if query.provenance.summary_reduction_bases.is_some() {
+            TrackTileLod::Summary
+        } else {
+            TrackTileLod::Detail
+        },
+        payload: TrackTilePayload::Bins(rebin(
+            key,
+            query.records.iter().map(|record| {
+                (
+                    record.start,
+                    record.end,
+                    record.minimum,
+                    record.mean,
+                    record.maximum,
+                )
+            }),
+        )),
+        provenance: TrackTileProvenance {
+            records_examined: query.provenance.records_examined,
+            records_truncated: query.provenance.records_truncated,
+            source_reduction_bases: query.provenance.summary_reduction_bases,
+            ..TrackTileProvenance::default()
+        },
+    })
+}
+
+/// A TDF tile with the archive's `min` and `max` datasets where it has them; see the module
+/// documentation for what a mean-only archive yields.
+pub(crate) fn tdf_native_tile(
+    source: &mut TdfSource,
+    track_index: usize,
+    request: &TrackTileRequest,
+) -> Result<TrackTile, String> {
+    let key = request.tile;
+    let query = source
+        .query_channel_with_extremes(track_index, &request.contig, key.start(), key.end())
+        .map_err(|error| error.to_string())?;
+    let from_zoom_level = matches!(
+        &query.source_metadata,
+        Some(QuantitativeSourceMetadata::Tdf(metadata)) if metadata.zoom.is_some()
+    );
+    Ok(TrackTile {
+        contig: request.contig.clone(),
+        key,
+        lod: if from_zoom_level {
+            TrackTileLod::Summary
+        } else {
+            TrackTileLod::Detail
+        },
+        payload: TrackTilePayload::Bins(rebin(
+            key,
+            query.records.iter().map(|record| {
+                (
+                    record.start,
+                    record.end,
+                    record.minimum,
+                    record.mean,
+                    record.maximum,
+                )
+            }),
+        )),
+        provenance: TrackTileProvenance {
+            records_examined: query.provenance.records_examined,
+            records_truncated: query.provenance.records_truncated,
+            source_reduction_bases: query.provenance.summary_reduction_bases,
+            ..TrackTileProvenance::default()
+        },
+    })
+}
+
+/// Most features a tile may hold before it is summarised: the largest count that
+/// [`exceeds_density`] does not reject. `None` when the threshold is disabled.
+fn detail_feature_limit(request: &TrackTileRequest) -> Option<usize> {
+    let threshold = request.settings.feature_summary_features_per_point;
+    if !(threshold.is_finite() && threshold > 0.0) {
+        return None;
+    }
+    let limit = (f64::from(threshold) * request.tile_points().max(1.0)).floor();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Some(if limit >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        limit as usize
+    })
+}
+
+/// Feature-density bins from a source's own coverage summaries: per bin the shallowest
+/// overlap (zero unless summaries cover the whole bin), the mean overlap over the bin, and
+/// the deepest overlap of any summary touching it.
+fn summary_density_bins(
+    key: TrackTileKey,
+    records: impl Iterator<Item = SummaryRecord>,
+) -> BinTile {
+    let width = key.nominal_bases_per_point().max(1);
+    let mut sums = vec![(0.0_f64, 0_u64); TRACK_TILE_BINS];
+    let mut bins = vec![
+        TileBin {
+            minimum: f32::INFINITY,
+            mean: 0.0,
+            maximum: 0.0,
+        };
+        TRACK_TILE_BINS
+    ];
+    for (start, end, minimum, mean, maximum) in records {
+        let (start, end) = (start.max(key.start()), end.min(key.end()));
+        if start >= end || !mean.is_finite() {
+            continue;
+        }
+        let (local_start, local_end) = (start - key.start(), end - key.start());
+        #[allow(clippy::cast_possible_truncation)]
+        for bin in (local_start / width) as usize..=((local_end - 1) / width) as usize {
+            let bin_start = bin as u64 * width;
+            let overlap = local_end.min(bin_start + width) - local_start.max(bin_start);
+            #[allow(clippy::cast_precision_loss)]
+            {
+                sums[bin].0 += f64::from(mean) * overlap as f64;
+            }
+            sums[bin].1 += overlap;
+            bins[bin].minimum = bins[bin].minimum.min(minimum);
+            bins[bin].maximum = bins[bin].maximum.max(maximum);
+        }
+    }
+    for (bin, (sum, covered)) in bins.iter_mut().zip(sums) {
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        {
+            bin.mean = (sum / width as f64) as f32;
+        }
+        if covered < width || !bin.minimum.is_finite() {
+            bin.minimum = 0.0;
+        }
+        bin.minimum = bin.minimum.min(bin.mean);
+        bin.maximum = bin.maximum.max(bin.mean);
+    }
+    BinTile {
+        bin_width: width,
+        bins,
+        semantics: BinSemantics::FeatureDensity,
+    }
+}
+
+/// A bigBed tile: the features when there are few enough to show, read once, or the file's
+/// own zoom-level coverage when the tile is dense. See the module documentation.
+pub(crate) fn bigbed_native_tile(
+    source: &mut BigBedSource,
+    request: &TrackTileRequest,
+) -> Result<NativeTile, String> {
+    if source.zoom_reductions().is_empty() {
+        return Ok(NativeTile::Generic);
+    }
+    let key = request.tile;
+    let limit = detail_feature_limit(request)
+        .unwrap_or(usize::MAX)
+        .min(rgv_model::MAX_FEATURE_RECORDS_PER_QUERY - 1);
+    let (records, more) = source
+        .query_limited(&request.contig, key.start(), key.end(), limit)
+        .map_err(|error| error.to_string())?;
+    if !more {
+        return Ok(NativeTile::Features(records));
+    }
+    let Some(summary) = source
+        .query_coverage_summary(
+            &request.contig,
+            key.start(),
+            key.end(),
+            key.nominal_bases_per_point().max(1),
+        )
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(NativeTile::Generic);
+    };
+    Ok(NativeTile::Tile(Box::new(TrackTile {
+        contig: request.contig.clone(),
+        key,
+        lod: TrackTileLod::Summary,
+        payload: TrackTilePayload::Bins(summary_density_bins(
+            key,
+            summary.records.iter().map(|record| {
+                (
+                    record.start,
+                    record.end,
+                    record.minimum,
+                    record.mean,
+                    record.maximum,
+                )
+            }),
+        )),
+        provenance: TrackTileProvenance {
+            // Features read before the tile proved dense, then summaries.
+            records_examined: records
+                .len()
+                .saturating_add(summary.provenance.records_examined),
+            records_truncated: summary.provenance.records_truncated,
+            source_reduction_bases: summary.provenance.summary_reduction_bases,
+            ..TrackTileProvenance::default()
+        },
+    })))
 }
 
 #[cfg(test)]
@@ -1438,5 +1647,222 @@ mod tests {
             scene.instances[0].color(),
             TrackColor::Inline([200, 0, 0, 255])
         );
+    }
+
+    /// A version-4 TDF with one channel and one zoom level holding a dataset per entry of
+    /// `functions`: three fixed-step values of ten bases each from position 100.
+    fn tdf_with_functions(functions: &[(&str, [f32; 3])]) -> Vec<u8> {
+        fn string(bytes: &mut Vec<u8>, value: &str) {
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0);
+        }
+        let mut header = Vec::new();
+        header.extend_from_slice(&(functions.len() as u32).to_le_bytes());
+        for (function, _) in functions {
+            string(&mut header, function);
+        }
+        string(&mut header, "OTHER");
+        string(&mut header, "");
+        header.extend_from_slice(&1_u32.to_le_bytes());
+        string(&mut header, "signal");
+        string(&mut header, "hg38");
+        header.extend_from_slice(&0_u32.to_le_bytes());
+        let base = (24 + header.len()) as u64;
+        let mut body = Vec::new();
+        let mut entries = Vec::new();
+        for (function, values) in functions {
+            let tile_position = base + body.len() as u64;
+            let mut tile = Vec::new();
+            string(&mut tile, "fixedStep");
+            tile.extend_from_slice(&3_u32.to_le_bytes());
+            tile.extend_from_slice(&100_i32.to_le_bytes());
+            tile.extend_from_slice(&10_f32.to_le_bytes());
+            for value in values {
+                tile.extend_from_slice(&value.to_le_bytes());
+            }
+            body.extend_from_slice(&tile);
+            let dataset_position = base + body.len() as u64;
+            let mut dataset = Vec::new();
+            dataset.extend_from_slice(&0_u32.to_le_bytes());
+            string(&mut dataset, "FLOAT");
+            dataset.extend_from_slice(&1_000_f32.to_le_bytes());
+            dataset.extend_from_slice(&1_u32.to_le_bytes());
+            dataset.extend_from_slice(&i64::try_from(tile_position).unwrap().to_le_bytes());
+            dataset.extend_from_slice(&(tile.len() as u32).to_le_bytes());
+            body.extend_from_slice(&dataset);
+            entries.push((
+                format!("/chr1/z0/{function}"),
+                dataset_position,
+                dataset.len() as u32,
+            ));
+        }
+        let mut index = Vec::new();
+        index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (name, position, size) in &entries {
+            string(&mut index, name);
+            index.extend_from_slice(&position.to_le_bytes());
+            index.extend_from_slice(&size.to_le_bytes());
+        }
+        index.extend_from_slice(&0_u32.to_le_bytes());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"TDF4");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&(base + body.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(index.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&index);
+        bytes
+    }
+
+    #[test]
+    fn tdf_tiles_keep_the_archives_own_extremes_and_fall_back_to_the_mean_without_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let bins_of = |name: &str, functions: &[(&str, [f32; 3])]| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, tdf_with_functions(functions)).unwrap();
+            let mut source = open(&path, TrackSpecKind::Tdf);
+            // Level 0: one base per bin, so bins 100..130 are the three records.
+            let tile = source
+                .query_tile(&request(0, 0), &TrackCancellation::never())
+                .unwrap();
+            assert_eq!(tile.lod, TrackTileLod::Summary);
+            assert_eq!(tile.provenance.records_examined, 3);
+            let TrackTilePayload::Bins(bins) = tile.payload else {
+                panic!("expected bins");
+            };
+            assert_eq!(bins.semantics, BinSemantics::Signal);
+            assert!(bins.bins[99].mean.is_nan() && bins.bins[130].mean.is_nan());
+            [bins.bins[100], bins.bins[115], bins.bins[129]]
+        };
+        // Written with min and max: a 250-high spike inside a bin whose mean is 5 survives.
+        let with_extremes = bins_of(
+            "extremes.tdf",
+            &[
+                ("mean", [2.0, 5.0, 3.0]),
+                ("min", [0.0, 4.0, 1.0]),
+                ("max", [9.0, 250.0, 3.5]),
+            ],
+        );
+        assert_eq!(
+            with_extremes,
+            [
+                TileBin {
+                    minimum: 0.0,
+                    mean: 2.0,
+                    maximum: 9.0
+                },
+                TileBin {
+                    minimum: 4.0,
+                    mean: 5.0,
+                    maximum: 250.0
+                },
+                TileBin {
+                    minimum: 1.0,
+                    mean: 3.0,
+                    maximum: 3.5
+                },
+            ]
+        );
+        // Written with the mean only (what igvtools does by default): the mean is all there
+        // is, and the tile says no more than that.
+        let mean_only = bins_of("mean.tdf", &[("mean", [2.0, 5.0, 3.0])]);
+        assert_eq!(
+            mean_only,
+            [2.0_f32, 5.0, 3.0].map(|value| TileBin {
+                minimum: value,
+                mean: value,
+                maximum: value
+            })
+        );
+    }
+
+    #[test]
+    fn a_dense_bigbed_tile_is_summarised_from_the_files_zoom_level() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmark-data/demo-tracks/features.bigBed");
+        if !path.exists() {
+            return;
+        }
+        // Two features on chrVariants, [8700, 9000) and [12100, 12500), and one zoom level
+        // of 10,240 bases per summary.
+        assert_eq!(
+            rgv_hts::BigBedSource::open(&path)
+                .unwrap()
+                .zoom_reductions(),
+            [10_240]
+        );
+        let mut source = open(&path, TrackSpecKind::BigBed);
+        let request_at = |threshold: f32| {
+            let mut request = TrackTileRequest::new(
+                "chrVariants",
+                TrackTileKey { level: 5, index: 0 },
+                rgv_model::TrackTileSettings::default(),
+            );
+            request.settings.feature_summary_features_per_point = threshold;
+            request
+        };
+        // At the default threshold two features in 1,024 points are detail, read once.
+        let detail = source
+            .query_tile(&request_at(0.5), &TrackCancellation::never())
+            .unwrap();
+        assert_eq!(detail.lod, TrackTileLod::Detail);
+        let TrackTilePayload::Features(features) = &detail.payload else {
+            panic!("expected features");
+        };
+        assert_eq!(
+            features
+                .features
+                .iter()
+                .map(|feature| (feature.start, feature.end))
+                .collect::<Vec<_>>(),
+            [(8_700, 9_000), (12_100, 12_500)]
+        );
+        assert_eq!(detail.provenance.source_reduction_bases, None);
+
+        // A threshold of one feature per tile makes the same tile dense. One feature is read
+        // to find that out; the summary then comes from the zoom level, and says so.
+        let summary = source
+            .query_tile(&request_at(0.001), &TrackCancellation::never())
+            .unwrap();
+        assert_eq!(summary.lod, TrackTileLod::Summary);
+        assert_eq!(summary.provenance.source_reduction_bases, Some(10_240));
+        assert!(!summary.provenance.records_truncated);
+        let TrackTilePayload::Bins(bins) = &summary.payload else {
+            panic!("expected a density summary");
+        };
+        assert_eq!(bins.semantics, BinSemantics::FeatureDensity);
+        assert_eq!((bins.bin_width, bins.bins.len()), (32, 1_024));
+        // The summary conserves coverage: 300 + 400 feature bases.
+        let covered = bins
+            .bins
+            .iter()
+            .map(|bin| f64::from(bin.mean) * 32.0)
+            .sum::<f64>();
+        assert!((covered - 700.0).abs() < 1.0, "{covered}");
+        for bin in &bins.bins {
+            assert!(
+                bin.minimum <= bin.mean && bin.mean <= bin.maximum,
+                "{bin:?}"
+            );
+            assert!(bin.maximum <= 1.0);
+        }
+        // Nothing before the first feature or far beyond the last.
+        assert_eq!(bins.bins[0].maximum, 0.0);
+        assert_eq!(bins.bins[1_000].maximum, 0.0);
+        assert!(bins.bins.iter().any(|bin| bin.maximum == 1.0));
+
+        // The same through the generic adapter over a shared reader (what the legacy engine
+        // hands the tile engine): the native summary is reached through the lock too.
+        let shared = crate::track_source::SharedTrackSource::new(Box::new(
+            rgv_hts::BigBedSource::open(&path).unwrap(),
+        ));
+        let mut through_lock = LegacyTrackTileSource::new(Box::new(shared.handle()));
+        let again = through_lock
+            .query_tile(&request_at(0.001), &TrackCancellation::never())
+            .unwrap();
+        assert_eq!(again.lod, TrackTileLod::Summary);
+        assert_eq!(again.provenance.source_reduction_bases, Some(10_240));
     }
 }

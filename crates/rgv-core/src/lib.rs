@@ -80,7 +80,7 @@ pub use settings::{
     MAXIMUM_INTERFACE_SCALE_PERCENT, MAXIMUM_READ_BROWSING_BUFFER_PERCENT,
     MINIMUM_AUTOSAVE_INTERVAL_SECONDS, MINIMUM_AUTOSAVE_RETENTION, MINIMUM_CACHE_BUDGET_MIB,
     MINIMUM_INTERFACE_SCALE_PERCENT, MINIMUM_READ_BROWSING_BUFFER_PERCENT, SETTINGS_SCHEMA_VERSION,
-    SettingsError, SettingsRecovery,
+    SettingsError, SettingsRecovery, TrackPipeline,
 };
 pub use source::{
     ClassifiedGenomicSource, GenomicSourceFormat, classify_genomic_source,

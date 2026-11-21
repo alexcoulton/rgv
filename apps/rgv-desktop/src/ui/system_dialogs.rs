@@ -39,6 +39,8 @@ pub(crate) struct SystemDialogDraft {
     pub(crate) high_contrast: bool,
     pub(crate) interface_theme: rgv_core::InterfaceTheme,
     pub(crate) reduced_motion: bool,
+    pub(crate) coverage_cache_enabled: bool,
+    pub(crate) track_pipeline: rgv_core::TrackPipeline,
     pub(crate) clear_recent_requested: bool,
     pub(crate) recent_alignment_requested: Option<TrackSource>,
     pub(crate) recent_session_requested: Option<String>,
@@ -281,6 +283,39 @@ pub(crate) fn show_system_dialogs(
                         ui.small(
                             "The 1× default targets one viewport or visible row-window on each side. 0× disables speculative adjacent preparation but keeps canonical page reuse. Remote sources acquire genomic margins conservatively and stop at hard transfer bounds.",
                         );
+                        ui.checkbox(
+                            &mut draft.coverage_cache_enabled,
+                            "Keep alignment coverage in a disk cache",
+                        )
+                        .on_hover_text(
+                            "Coverage computed for the overview is stored per alignment file so it appears at once next time. Off keeps coverage in memory only. Tools › Clear caches empties the cache.",
+                        );
+                        ui.small(match rgv_hts::default_coverage_cache_directory() {
+                            Some(directory) => format!(
+                                "Coverage cache: {} (at most {} MiB; applies immediately).",
+                                directory.display(),
+                                rgv_hts::COVERAGE_SIDECAR_DEFAULT_MAXIMUM_BYTES / (1024 * 1024),
+                            ),
+                            None => "Coverage cache: no per-user cache directory is available; coverage stays in memory.".to_owned(),
+                        });
+                        let mut tile_pipeline =
+                            draft.track_pipeline == rgv_core::TrackPipeline::Tiles;
+                        if ui
+                            .checkbox(
+                                &mut tile_pipeline,
+                                "Experimental: draw annotation tracks with the tile pipeline",
+                            )
+                            .on_hover_text(
+                                "Off by default. When on, plain BED, bigBed, GFF3 and GTF annotation tracks with default display settings are read as cached tiles and drawn by the new track renderer; every other track keeps the established pipeline. Known gaps are listed in the user guide under “Experimental track pipeline”. Applies immediately.",
+                            )
+                            .changed()
+                        {
+                            draft.track_pipeline = if tile_pipeline {
+                                rgv_core::TrackPipeline::Tiles
+                            } else {
+                                rgv_core::TrackPipeline::Legacy
+                            };
+                        }
                         let budget = viewer.alignment_scene_budget;
                         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
                         let context_gpu = viewer.context_scene_gpu_renderer.resident_bytes();

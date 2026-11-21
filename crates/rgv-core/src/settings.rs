@@ -51,6 +51,19 @@ pub enum InterfaceTheme {
     DarkColorBlind,
 }
 
+/// Which pipeline draws auxiliary (non-alignment) tracks.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TrackPipeline {
+    /// Every track is queried and drawn by the established per-viewport path.
+    #[default]
+    Legacy,
+    /// Experimental: the track kinds the desktop has opted in are read as cached world-space
+    /// tiles and drawn by the paged tile renderer. Every other track stays on `Legacy`.
+    Tiles,
+}
+
 /// User-controlled desktop preferences. Diagnostics are disabled unless the
 /// user explicitly opts in.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -77,6 +90,11 @@ pub struct DesktopSettings {
     pub reduced_motion: bool,
     /// Absent in files written before themes existed, which therefore load as Light.
     pub theme: InterfaceTheme,
+    /// Whether alignment coverage tiles are persisted in the per-user coverage cache directory.
+    /// Off keeps coverage in memory only. Absent in older files, which load as enabled.
+    pub coverage_cache_enabled: bool,
+    /// Which pipeline draws auxiliary tracks. Absent in older files, which load as `Legacy`.
+    pub track_pipeline: TrackPipeline,
 }
 
 impl Default for DesktopSettings {
@@ -97,6 +115,8 @@ impl Default for DesktopSettings {
             high_contrast: false,
             reduced_motion: false,
             theme: InterfaceTheme::default(),
+            coverage_cache_enabled: true,
+            track_pipeline: TrackPipeline::Legacy,
         }
     }
 }
@@ -434,6 +454,54 @@ mod tests {
             invalid.to_json(),
             Err(SettingsError::InvalidAutosaveRetention(_))
         ));
+    }
+
+    #[test]
+    fn coverage_cache_is_enabled_for_older_files_and_round_trips() {
+        assert!(DesktopSettings::default().coverage_cache_enabled);
+        let mut older: serde_json::Value =
+            serde_json::from_str(&DesktopSettings::default().to_json().unwrap()).unwrap();
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("coverage_cache_enabled")
+            .unwrap();
+        let loaded = DesktopSettings::from_json(&older.to_string()).unwrap();
+        assert!(loaded.coverage_cache_enabled);
+        let disabled = DesktopSettings {
+            coverage_cache_enabled: false,
+            ..DesktopSettings::default()
+        };
+        let reloaded = DesktopSettings::from_json(&disabled.to_json().unwrap()).unwrap();
+        assert!(!reloaded.coverage_cache_enabled);
+    }
+
+    #[test]
+    fn track_pipeline_defaults_to_legacy_for_older_files_and_round_trips() {
+        assert_eq!(
+            DesktopSettings::default().track_pipeline,
+            TrackPipeline::Legacy
+        );
+        let mut older: serde_json::Value =
+            serde_json::from_str(&DesktopSettings::default().to_json().unwrap()).unwrap();
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("track_pipeline")
+            .unwrap();
+        let loaded = DesktopSettings::from_json(&older.to_string()).unwrap();
+        assert_eq!(loaded.track_pipeline, TrackPipeline::Legacy);
+        let tiles = DesktopSettings {
+            track_pipeline: TrackPipeline::Tiles,
+            ..DesktopSettings::default()
+        };
+        let json = tiles.to_json().unwrap();
+        assert!(
+            json.contains("\"track_pipeline\": \"tiles\"")
+                || json.contains("\"track_pipeline\":\"tiles\"")
+        );
+        let reloaded = DesktopSettings::from_json(&json).unwrap();
+        assert_eq!(reloaded.track_pipeline, TrackPipeline::Tiles);
     }
 
     #[test]

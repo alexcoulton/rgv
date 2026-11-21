@@ -84,3 +84,24 @@ path = "fuzz_targets/vcf_text.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tabix_index"
+path = "fuzz_targets/tabix_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coverage_sidecar"
+path = "fuzz_targets/coverage_sidecar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vcf_in_memory"
+path = "fuzz_targets/vcf_in_memory.rs"
+test = false
+doc = false
+bench = false

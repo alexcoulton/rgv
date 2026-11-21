@@ -1043,6 +1043,13 @@ pub enum AutomationSetting {
         #[cfg_attr(feature = "schema", schemars(range(min = 128, max = 4096)))]
         value: usize,
     },
+    /// Choose the pipeline that draws auxiliary tracks. Saved to the user's desktop settings, so
+    /// it outlives the workspace. `tiles` is experimental and covers only the track kinds the
+    /// viewer has opted in (see the user guide); every other track keeps the legacy pipeline.
+    TrackPipeline {
+        /// `legacy` (the default) or `tiles`.
+        value: rgv_core::TrackPipeline,
+    },
     /// Expand or collapse the Properties panel.
     PropertiesPanelExpanded {
         /// True expands the Properties panel, false collapses it.
@@ -2173,6 +2180,21 @@ pub struct AutomationPanelSnapshot {
     pub selected_presentation_nodes: Vec<rgv_core::PresentationNodeId>,
     #[serde(default)]
     pub presentation_selection_anchor: Option<rgv_core::PresentationNodeId>,
+    /// What each alignment track's coverage lane is drawn from in this panel. Absent in
+    /// snapshots written before the coverage pyramid existed.
+    #[serde(default)]
+    pub coverage_sources: Vec<AutomationCoverageSourceSnapshot>,
+}
+
+/// The authority of one alignment track's coverage lane in one panel.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationCoverageSourceSnapshot {
+    pub track_id: TrackId,
+    /// `read-evidence` (exact depth from loaded reads), `pyramid-exact` (coverage pyramid at
+    /// the resolution of the view), `pyramid-coarse` (a coarser or partial pyramid stand-in,
+    /// still refining), `index-density` (index-only placeholder before any coverage arrived)
+    /// or `pending` (regional zoom with nothing to draw yet).
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3665,6 +3687,7 @@ mod tests {
                 read_panel_states: Vec::new(),
                 selected_presentation_nodes: Vec::new(),
                 presentation_selection_anchor: None,
+                coverage_sources: Vec::new(),
             }],
             tracks: Vec::new(),
             read_browsing_buffer_percent: rgv_core::DEFAULT_READ_BROWSING_BUFFER_PERCENT,
@@ -4661,6 +4684,36 @@ mod tests {
             scale: 2.0,
         };
         assert!(native.validate().is_err());
+    }
+
+    #[test]
+    fn the_track_pipeline_setting_round_trips_and_rejects_unknown_pipelines() {
+        let wire = serde_json::json!({ "setting": "track_pipeline", "value": "tiles" });
+        let setting: AutomationSetting = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            setting,
+            AutomationSetting::TrackPipeline {
+                value: rgv_core::TrackPipeline::Tiles
+            }
+        );
+        assert!(setting.validate().is_ok());
+        assert_eq!(serde_json::to_value(&setting).unwrap(), wire);
+        let legacy: AutomationSetting = serde_json::from_value(
+            serde_json::json!({ "setting": "track_pipeline", "value": "legacy" }),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy,
+            AutomationSetting::TrackPipeline {
+                value: rgv_core::TrackPipeline::Legacy
+            }
+        );
+        assert!(
+            serde_json::from_value::<AutomationSetting>(
+                serde_json::json!({ "setting": "track_pipeline", "value": "fast" })
+            )
+            .is_err()
+        );
     }
 
     #[test]

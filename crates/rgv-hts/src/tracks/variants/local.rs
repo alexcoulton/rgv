@@ -73,7 +73,8 @@ pub(super) fn open(path: &Path) -> Result<LocalVariantFile, TrackError> {
     // Proves that `HTSlib` recognises the file as VCF or BCF and parses its header, which the
     // indexed reader assumes without checking.
     let reader = open_reader(path)?;
-    if compression == Compression::Bgzf && index_is_loadable(path, format) {
+    let contigs = reader.header().contig_count();
+    if compression == Compression::Bgzf && index_is_loadable(path, format, contigs) {
         drop(reader);
         return bcf::IndexedReader::from_path(path)
             .map(LocalVariantFile::Indexed)
@@ -207,20 +208,22 @@ fn preflight(path: &Path) -> Result<(Compression, Format), TrackError> {
     Ok((compression, format))
 }
 
-/// Whether `HTSlib` will load an index for the BGZF-compressed `path`. It must not be asked
-/// to open the file through the index otherwise: see the module documentation.
-fn index_is_loadable(path: &Path, format: Format) -> bool {
-    match format {
-        // `tbx::Reader` loads the index with the call the indexed reader makes
-        // (`tbx_index_load`) and checks its result. It unwraps the UTF-8 conversion of the
-        // leading comment lines, which `preflight` has validated. It is not asked when no
-        // index file exists, because it leaks its file handle when the load fails.
-        Format::Vcf => {
-            index_candidates(path, &["csi", "tbi"])
-                .iter()
-                .any(|candidate| std::fs::metadata(candidate).is_ok())
-                && rust_htslib::tbx::Reader::from_path(path).is_ok()
-        }
+/// Whether `HTSlib` will load an index for the BGZF-compressed `path`, whose header declares
+/// `contigs` contigs. It must not be asked to open the file through `bcf::IndexedReader`
+/// otherwise: see the module documentation.
+///
+/// Two independent proofs are required. First the cheap checks made in Rust, which keep
+/// `HTSlib` away from an index it handles badly. Then [`htslib_adds_indexed_reader`]: the
+/// very call `bcf::IndexedReader` makes, through the one `rust-htslib` wrapper that checks
+/// its result, so an index the Rust-side parser accepts and `HTSlib` rejects is a refusal
+/// here (and the in-memory path for the caller), never a null dereference.
+fn index_is_loadable(path: &Path, format: Format, contigs: u32) -> bool {
+    let plausible = match format {
+        // Not asked when no index file exists: `HTSlib` then reports the failure on standard
+        // error for a file that is simply unindexed.
+        Format::Vcf => index_candidates(path, &["csi", "tbi"])
+            .iter()
+            .any(|candidate| std::fs::metadata(candidate).is_ok()),
         Format::Bcf => bcf_index_path(path).is_some_and(|index| {
             let mut bytes = Vec::new();
             File::open(index)
@@ -231,9 +234,28 @@ fn index_is_loadable(path: &Path, format: Format) -> bool {
                 .is_ok_and(|read| read as u64 <= MAX_LOCAL_VARIANT_INDEX_BYTES)
                 && csi::io::Reader::new(io::Cursor::new(bytes))
                     .read_index()
-                    .is_ok()
+                    .is_ok_and(|index| bcf_index_fits_header(&index, contigs))
         }),
-    }
+    };
+    plausible && htslib_adds_indexed_reader(path)
+}
+
+/// Whether a BCF's CSI index names no reference the header does not declare. The reference
+/// ids of a BCF index are the header's contig ids; `HTSlib` resolves every indexed id to a
+/// contig name when it attaches the reader and does not expect that to fail.
+fn bcf_index_fits_header(index: &csi::Index, contigs: u32) -> bool {
+    index.reference_sequences().len() <= contigs as usize
+}
+
+/// Asks `HTSlib` to attach `path` as an indexed reader, exactly as `bcf::IndexedReader::new`
+/// does (`bcf_sr_add_reader` with an index required), through `SyncedReader`, which checks the
+/// allocation and the result of that call instead of dereferencing the reader it expects.
+fn htslib_adds_indexed_reader(path: &Path) -> bool {
+    let Ok(mut probe) = bcf::synced::SyncedReader::new() else {
+        return false;
+    };
+    probe.set_require_index(true);
+    probe.add_reader(path).is_ok()
 }
 
 /// Where `hts_idx_check_local` looks for an index of each extension, in its order:
@@ -496,6 +518,78 @@ mod tests {
         let plain = directory.path().join("plain.vcf");
         std::fs::write(&plain, VCF).unwrap();
         assert!(matches!(open(&plain), Ok(LocalVariantFile::Memory(_))));
+    }
+
+    fn write_bcf(path: &Path, contigs: &[&str], records: &[(u32, i64)]) {
+        let mut header = bcf::Header::new();
+        for contig in contigs {
+            header.push_record(format!("##contig=<ID={contig},length=1000000>").as_bytes());
+        }
+        let mut writer = bcf::Writer::from_path(path, &header, false, bcf::Format::Bcf).unwrap();
+        for (rid, position) in records {
+            let mut record = writer.empty_record();
+            record.set_rid(Some(*rid));
+            record.set_pos(*position);
+            record.set_alleles(&[b"A", b"T"]).unwrap();
+            writer.write(&record).unwrap();
+        }
+    }
+
+    #[test]
+    fn htslib_itself_is_asked_whether_it_attaches_the_indexed_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let indexed = directory.path().join("indexed.bcf");
+        write_bcf(&indexed, &["chr1", "chr2"], &[(0, 100), (1, 200)]);
+        // No index yet: HTSlib refuses, and the refusal is an answer, not a crash.
+        assert!(!htslib_adds_indexed_reader(&indexed));
+        assert!(matches!(open(&indexed), Ok(LocalVariantFile::Memory(_))));
+        bcf::index::build(&indexed, None, 1, bcf::index::Type::Csi(14)).unwrap();
+        assert!(htslib_adds_indexed_reader(&indexed));
+        assert!(matches!(open(&indexed), Ok(LocalVariantFile::Indexed(_))));
+
+        // An index that parses but that HTSlib cannot load for this file: truncated after
+        // its header block, so the Rust-side parser and HTSlib both see a CSI.
+        let truncated = directory.path().join("truncated.bcf");
+        std::fs::copy(&indexed, &truncated).unwrap();
+        let index = std::fs::read(directory.path().join("indexed.bcf.csi")).unwrap();
+        std::fs::write(
+            directory.path().join("truncated.bcf.csi"),
+            &index[..index.len() / 2],
+        )
+        .unwrap();
+        assert!(matches!(open(&truncated), Ok(LocalVariantFile::Memory(_))));
+    }
+
+    #[test]
+    fn a_bcf_index_naming_contigs_the_header_lacks_is_never_given_to_htslib() {
+        let directory = tempfile::tempdir().unwrap();
+        // A well-formed index, of another file with more contigs.
+        let other = directory.path().join("other.bcf");
+        write_bcf(
+            &other,
+            &["chr1", "chr2", "chr3"],
+            &[(0, 100), (1, 200), (2, 300)],
+        );
+        bcf::index::build(&other, None, 1, bcf::index::Type::Csi(14)).unwrap();
+        let path = directory.path().join("one-contig.bcf");
+        write_bcf(&path, &["chr1"], &[(0, 100), (0, 200)]);
+        std::fs::copy(
+            directory.path().join("other.bcf.csi"),
+            directory.path().join("one-contig.bcf.csi"),
+        )
+        .unwrap();
+
+        let (compression, format) = preflight(&path).unwrap();
+        assert_eq!((compression, format), (Compression::Bgzf, Format::Bcf));
+        let index = csi::fs::read(directory.path().join("one-contig.bcf.csi")).unwrap();
+        assert!(!bcf_index_fits_header(&index, 1));
+        assert!(bcf_index_fits_header(&index, 3));
+        assert!(!index_is_loadable(&path, format, 1));
+        // The file is still served, from memory.
+        let Ok(LocalVariantFile::Memory(file)) = open(&path) else {
+            panic!("expected the in-memory path");
+        };
+        assert_eq!(file.records().count(), 2);
     }
 
     #[test]

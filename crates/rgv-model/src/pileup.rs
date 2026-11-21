@@ -407,6 +407,11 @@ pub struct OverlapCollapser {
     /// True once a sweep discarded entries on the strength of coordinate order.
     swept_entries: bool,
     next_sweep: usize,
+    /// Placement at which the last sweep ran. A sweep keeps exactly the entries whose mate
+    /// starts at or after the current placement, so sweeping again at the same placement
+    /// removes nothing; skipping it keeps a full window (thousands of templates starting at
+    /// one position, as over an amplicon) from being rescanned for every further record.
+    swept_at: Option<(ContigId, u64)>,
 }
 
 impl OverlapCollapser {
@@ -420,6 +425,7 @@ impl OverlapCollapser {
             coordinate_ordered: true,
             swept_entries: false,
             next_sweep: PENDING_SWEEP_FLOOR,
+            swept_at: None,
         }
     }
 
@@ -566,6 +572,10 @@ impl OverlapCollapser {
         let Some(current) = self.last_placement.filter(|_| self.coordinate_ordered) else {
             return;
         };
+        if self.swept_at == Some(current) {
+            return;
+        }
+        self.swept_at = Some(current);
         let before = self.pending.len();
         self.pending
             .retain(|_, pending| (pending.contig, pending.mate_start) >= current);

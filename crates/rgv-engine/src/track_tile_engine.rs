@@ -15,7 +15,14 @@
 //!   aborts remote transfers mid-request; a tile that is still wanted keeps loading and is
 //!   delivered under the new generation.
 //! * **Priorities.** Helpers take, in order: sources to open, name-search and feature-step
-//!   parts, visible tiles, margin tiles; round-robin over tracks within a class.
+//!   parts, visible tiles, margin tiles; round-robin over tracks within a class. The order
+//!   holds across tracks, not only when a helper picks its next job: margin reads may occupy
+//!   only part of the pool ([`margin_read_limit`]), and when a visible tile has no free
+//!   helper, margin reads already in flight are cancelled to make room (they are read again
+//!   later). A track whose own in-flight read is a margin tile gives it up for a visible one.
+//! * **One reader per track.** A track the legacy [`crate::TrackEngine`] already has open can
+//!   be served from that engine's reader instead of a second one:
+//!   [`crate::TrackEngine::try_share_tile_sources`].
 //!
 //! The engine never blocks its caller: every method takes one short lock and returns.
 
@@ -46,12 +53,28 @@ use crate::{
 
 /// Default byte budget of one track's tile cache.
 pub const DEFAULT_TRACK_TILE_CACHE_BYTES: usize = 64 << 20;
-/// Most helper threads the engine starts, whatever the number of tracks.
+/// Most helper threads [`TrackTileEngine::spawn`] starts, whatever the number of tracks.
 pub const MAXIMUM_TRACK_TILE_HELPERS: usize = 8;
+/// Most helper threads any engine starts ([`TrackTileEngine::spawn_with_helper_limit`]).
+pub const MAXIMUM_CONFIGURABLE_TRACK_TILE_HELPERS: usize = 64;
+
+/// How many of `helpers` helpers may read margin tiles at the same time. At least one helper
+/// in four (and always one, when there is more than one) is kept for visible tiles, searches
+/// and opens, so prefetching can never occupy the whole pool.
+#[must_use]
+pub const fn margin_read_limit(helpers: usize) -> usize {
+    if helpers <= 1 {
+        return 1;
+    }
+    let reserved = if helpers / 4 > 1 { helpers / 4 } else { 1 };
+    helpers - reserved
+}
 
 #[derive(Clone)]
 pub struct TrackTileEngineConfig {
-    /// Helper threads; clamped to `1..=MAXIMUM_TRACK_TILE_HELPERS`.
+    /// Helper threads; clamped to `1..=MAXIMUM_TRACK_TILE_HELPERS` by
+    /// [`TrackTileEngine::spawn`], or to the limit given to
+    /// [`TrackTileEngine::spawn_with_helper_limit`].
     pub helpers: usize,
     pub cache_bytes_per_track: usize,
     /// Tiles prefetched on each side of the visible ones, after every visible tile of every
@@ -271,6 +294,8 @@ impl TileCache {
 
 struct View {
     generation: u64,
+    /// Contig as the workspace spells it.
+    contig: Arc<str>,
     source_contig: Arc<str>,
     level: u8,
     digest: u64,
@@ -298,12 +323,19 @@ impl View {
             && key.contig == self.source_contig
             && (self.visible.contains(&key.tile) || self.margin.contains(&key.tile))
     }
+
+    /// Whether `key` is one of the tiles the view shows (not merely prefetches).
+    fn shows(&self, key: &CacheKey) -> bool {
+        key.digest == self.digest
+            && key.contig == self.source_contig
+            && self.visible.contains(&key.tile)
+    }
 }
 
 enum SourceSlot {
     Unopened(TrackSpec),
     Idle(Box<dyn TrackTileSource>),
-    /// Lent to a helper, or being opened by one.
+    /// Lent to a helper, or being opened by one, or awaited from the legacy track engine.
     Busy,
     Failed,
 }
@@ -315,6 +347,9 @@ struct InFlight {
 }
 
 struct TrackState {
+    /// Distinguishes this registration from an earlier one under the same id: an operation
+    /// started for a replaced registration must not hand its source to the new one.
+    epoch: u64,
     name: String,
     aliases: BTreeMap<String, String>,
     source: SourceSlot,
@@ -326,8 +361,35 @@ struct TrackState {
 }
 
 impl TrackState {
+    fn new(
+        epoch: u64,
+        name: String,
+        aliases: BTreeMap<String, String>,
+        source: SourceSlot,
+    ) -> Self {
+        Self {
+            epoch,
+            name,
+            aliases,
+            source,
+            in_flight: None,
+            views: BTreeMap::new(),
+            cache: TileCache::default(),
+            stats: TrackTileCacheStats::default(),
+            diagnostics: None,
+        }
+    }
+
     fn wanted(&self, key: &CacheKey) -> bool {
         self.views.values().any(|view| view.wants(key))
+    }
+
+    /// The tile of an in-flight read that no view shows: a margin read, or one whose view
+    /// has moved on.
+    fn in_flight_margin(&self) -> Option<&InFlight> {
+        let in_flight = self.in_flight.as_ref()?;
+        let tile = in_flight.tile.as_ref()?;
+        (!self.views.values().any(|view| view.shows(tile))).then_some(in_flight)
     }
 }
 
@@ -360,6 +422,11 @@ struct State {
     /// Track served last, for round-robin fairness.
     cursor: Option<TrackId>,
     next_generation: u64,
+    next_epoch: u64,
+    /// Helper threads started.
+    helpers: usize,
+    /// Helpers waiting for work right now.
+    waiting: usize,
     search: Option<FanOut>,
     adjacent: Option<FanOut>,
 }
@@ -438,6 +505,19 @@ pub struct TrackTileEngine {
 impl TrackTileEngine {
     #[must_use]
     pub fn spawn(config: TrackTileEngineConfig) -> Self {
+        Self::spawn_with_helper_limit(config, MAXIMUM_TRACK_TILE_HELPERS)
+    }
+
+    /// As [`Self::spawn`], with `config.helpers` clamped to `1..=maximum_helpers` instead of
+    /// the default limit (itself at most [`MAXIMUM_CONFIGURABLE_TRACK_TILE_HELPERS`]).
+    ///
+    /// A track occupies a helper for as long as its source takes to answer, so a workspace
+    /// with more simultaneously slow tracks (remote files on a slow link) than helpers makes
+    /// the remaining tracks wait until one answers or is cancelled. A larger pool is the
+    /// remedy; its threads sleep while there is nothing to read.
+    #[must_use]
+    pub fn spawn_with_helper_limit(config: TrackTileEngineConfig, maximum_helpers: usize) -> Self {
+        let maximum_helpers = maximum_helpers.clamp(1, MAXIMUM_CONFIGURABLE_TRACK_TILE_HELPERS);
         let (output_tx, output) = bounded_coalescing_to_ui(config.event_capacity.max(1));
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
@@ -449,7 +529,7 @@ impl TrackTileEngine {
             cache_bytes_per_track: config.cache_bytes_per_track,
             margin_tiles: config.margin_tiles,
         });
-        let helpers = (0..config.helpers.clamp(1, MAXIMUM_TRACK_TILE_HELPERS))
+        let helpers = (0..config.helpers.clamp(1, maximum_helpers))
             .filter_map(|ordinal| {
                 let shared = Arc::clone(&shared);
                 thread::Builder::new()
@@ -460,7 +540,8 @@ impl TrackTileEngine {
                     )
                     .ok()
             })
-            .collect();
+            .collect::<Vec<_>>();
+        shared.lock().helpers = helpers.len();
         Self {
             shared,
             output,
@@ -468,22 +549,29 @@ impl TrackTileEngine {
         }
     }
 
+    /// Helper threads this engine runs.
+    #[must_use]
+    pub fn helper_count(&self) -> usize {
+        self.helpers.len()
+    }
+
+    /// The handle through which the legacy track engine registers the sources it shares.
+    pub(crate) fn registrar(&self) -> TrackTileSourceRegistrar {
+        TrackTileSourceRegistrar {
+            shared: Arc::downgrade(&self.shared),
+        }
+    }
+
     /// Registers a file-backed track. It is opened on a helper; `TrackOpened` or
     /// `TrackOpenFailed` follows. Views may be requested immediately.
     pub fn add_track(&self, specification: TrackSpec, aliases: BTreeMap<String, String>) {
         let mut state = self.shared.lock();
-        state.tracks.insert(
+        register_track(
+            &mut state,
             specification.id,
-            TrackState {
-                name: specification.name.clone(),
-                aliases,
-                source: SourceSlot::Unopened(specification),
-                in_flight: None,
-                views: BTreeMap::new(),
-                cache: TileCache::default(),
-                stats: TrackTileCacheStats::default(),
-                diagnostics: None,
-            },
+            specification.name.clone(),
+            aliases,
+            SourceSlot::Unopened(specification),
         );
         drop(state);
         self.shared.work.notify_all();
@@ -492,18 +580,12 @@ impl TrackTileEngine {
     /// Registers a track backed by any [`TrackTileSource`]: the plugin entry point.
     pub fn add_source(&self, id: TrackId, name: String, source: Box<dyn TrackTileSource>) {
         let mut state = self.shared.lock();
-        state.tracks.insert(
+        register_track(
+            &mut state,
             id,
-            TrackState {
-                name,
-                aliases: BTreeMap::new(),
-                source: SourceSlot::Idle(source),
-                in_flight: None,
-                views: BTreeMap::new(),
-                cache: TileCache::default(),
-                stats: TrackTileCacheStats::default(),
-                diagnostics: None,
-            },
+            name,
+            BTreeMap::new(),
+            SourceSlot::Idle(source),
         );
         drop(state);
         self.shared.work.notify_all();
@@ -576,6 +658,7 @@ impl TrackTileEngine {
         }
         let new_view = View {
             generation,
+            contig: Arc::from(view.contig.as_str()),
             source_contig,
             level,
             digest: view.settings.digest(),
@@ -603,6 +686,8 @@ impl TrackTileEngine {
             in_flight.cancel.store(true, Ordering::Release);
         }
         settle_views(view.track, track, &mut events);
+        // Visible work that has no free helper takes one from the margin reads.
+        preempt_margin_reads(&mut state);
         drop(state);
         self.shared.work.notify_all();
         self.shared.publish(events);
@@ -789,6 +874,206 @@ impl Drop for TrackTileEngine {
     }
 }
 
+/// Registers `id`, replacing (and cancelling) an earlier registration under the same id.
+fn register_track(
+    state: &mut State,
+    id: TrackId,
+    name: String,
+    aliases: BTreeMap<String, String>,
+    source: SourceSlot,
+) {
+    state.next_epoch += 1;
+    let epoch = state.next_epoch;
+    if let Some(previous) = state
+        .tracks
+        .insert(id, TrackState::new(epoch, name, aliases, source))
+        && let Some(in_flight) = &previous.in_flight
+    {
+        in_flight.cancel.store(true, Ordering::Release);
+    }
+}
+
+/// Registers tracks whose source the legacy [`crate::TrackEngine`] owns and shares. Holds the
+/// tile engine weakly: sharing with an engine that has been dropped does nothing.
+#[derive(Clone)]
+pub(crate) struct TrackTileSourceRegistrar {
+    shared: std::sync::Weak<Shared>,
+}
+
+impl TrackTileSourceRegistrar {
+    /// Registers `ids` as awaited, so views may be requested before the legacy engine has
+    /// answered. Each must be followed by [`Self::supply`], [`Self::fail`] or
+    /// [`Self::withdraw`].
+    pub(crate) fn expect(&self, ids: &[TrackId]) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let mut state = shared.lock();
+        for id in ids {
+            register_track(
+                &mut state,
+                *id,
+                String::new(),
+                BTreeMap::new(),
+                SourceSlot::Busy,
+            );
+        }
+    }
+
+    /// Forgets awaited tracks whose request never reached the legacy engine.
+    pub(crate) fn withdraw(&self, ids: &[TrackId]) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let mut state = shared.lock();
+        for id in ids {
+            if state
+                .tracks
+                .get(id)
+                .is_some_and(|track| matches!(track.source, SourceSlot::Busy))
+            {
+                state.tracks.remove(id);
+            }
+        }
+    }
+
+    /// Hands the shared source of `id` to the tile engine.
+    pub(crate) fn supply(
+        &self,
+        id: TrackId,
+        name: String,
+        aliases: BTreeMap<String, String>,
+        source: Box<dyn TrackTileSource>,
+    ) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let mut state = shared.lock();
+        // Awaited: fill it in, keeping the views requested meanwhile. Otherwise (removed, or
+        // re-registered with a source of its own) the latest registration wins.
+        let awaited = state
+            .tracks
+            .get_mut(&id)
+            .filter(|track| track.in_flight.is_none() && matches!(track.source, SourceSlot::Busy));
+        let Some(track) = awaited else {
+            return;
+        };
+        track.name = name;
+        if track.aliases.is_empty() {
+            track.aliases = aliases;
+        }
+        // Views requested while the source was awaited were resolved without its aliases.
+        for view in track.views.values_mut() {
+            if let Some(source_contig) = track.aliases.get(&*view.contig) {
+                view.source_contig = Arc::from(source_contig.as_str());
+            }
+        }
+        track.diagnostics = source.diagnostics();
+        track.source = SourceSlot::Idle(source);
+        preempt_margin_reads(&mut state);
+        drop(state);
+        shared.work.notify_all();
+        shared.publish(vec![TrackTileEngineEvent::TrackOpened { track: id }]);
+    }
+
+    /// Reports that the legacy engine has no open source for `id`.
+    pub(crate) fn fail(&self, id: TrackId, message: &str) {
+        let Some(shared) = self.shared.upgrade() else {
+            return;
+        };
+        let mut events = Vec::new();
+        let mut state = shared.lock();
+        let awaited = state
+            .tracks
+            .get_mut(&id)
+            .filter(|track| track.in_flight.is_none() && matches!(track.source, SourceSlot::Busy));
+        let Some(track) = awaited else {
+            return;
+        };
+        fail_track_open(id, track, message, &mut events);
+        drop(state);
+        shared.publish(events);
+    }
+}
+
+/// Marks `track` as failed to open: every visible tile of every view fails with the message.
+fn fail_track_open(
+    id: TrackId,
+    track: &mut TrackState,
+    message: &str,
+    events: &mut Vec<TrackTileEngineEvent>,
+) {
+    track.source = SourceSlot::Failed;
+    let message = if track.name.is_empty() {
+        message.to_owned()
+    } else {
+        format!("{}: {message}", track.name)
+    };
+    for (panel, view) in &mut track.views {
+        for tile in view.visible.clone() {
+            view.failed.insert(tile, message.clone());
+            events.push(TrackTileEngineEvent::TileFailed {
+                panel: *panel,
+                track: id,
+                generation: view.generation,
+                key: tile,
+                message: message.clone(),
+            });
+        }
+    }
+    settle_views(id, track, events);
+    events.push(TrackTileEngineEvent::TrackOpenFailed { track: id, message });
+}
+
+/// Makes room for visible tiles that have no free helper.
+///
+/// * A track whose own in-flight read is a tile no view shows, while one of its views waits
+///   for a visible tile, gives that read up: the source can do only one thing at a time.
+/// * When more tracks have a visible tile ready to read than helpers are waiting, that many
+///   in-flight reads of tiles no view shows (margin tiles) are cancelled on other tracks.
+///
+/// A cancelled margin tile stays wanted and is read again once the visible tiles are served.
+/// Cancellation takes effect when the source next polls it; sources that never poll are
+/// bounded by [`margin_read_limit`] instead.
+fn preempt_margin_reads(state: &mut State) {
+    let mut runnable_visible = 0_usize;
+    for track in state.tracks.values() {
+        let visible_pending = next_tile(track, true).is_some();
+        if !visible_pending {
+            continue;
+        }
+        if track.in_flight.is_none() && matches!(track.source, SourceSlot::Idle(_)) {
+            runnable_visible += 1;
+        } else if let Some(in_flight) = track.in_flight_margin() {
+            in_flight.cancel.store(true, Ordering::Release);
+        }
+    }
+    let mut short = runnable_visible.saturating_sub(state.waiting);
+    for track in state.tracks.values() {
+        if short == 0 {
+            break;
+        }
+        if let Some(in_flight) = track.in_flight_margin()
+            && !in_flight.cancel.swap(true, Ordering::AcqRel)
+        {
+            short -= 1;
+        }
+    }
+}
+
+/// Margin reads in flight that have not been cancelled.
+fn margin_reads_in_flight(state: &State) -> usize {
+    state
+        .tracks
+        .values()
+        .filter(|track| {
+            track
+                .in_flight_margin()
+                .is_some_and(|in_flight| !in_flight.cancel.load(Ordering::Acquire))
+        })
+        .count()
+}
+
 /// Emits `ViewSettled` for every view of `track` whose visible tiles are all ready or failed.
 fn settle_views(id: TrackId, track: &mut TrackState, events: &mut Vec<TrackTileEngineEvent>) {
     let TrackState { views, cache, .. } = track;
@@ -895,6 +1180,8 @@ enum JobWork {
 
 struct Job {
     track: TrackId,
+    /// Registration the operation was started for.
+    epoch: u64,
     cancel: Arc<AtomicBool>,
     work: JobWork,
 }
@@ -977,9 +1264,11 @@ fn next_job(state: &mut State) -> Option<Job> {
                 cancel: Arc::clone(&cancel),
                 tile: None,
             });
+            let epoch = track.epoch;
             state.cursor = Some(*id);
             return Some(Job {
                 track: *id,
+                epoch,
                 cancel,
                 work: JobWork::Open(specification),
             });
@@ -1028,6 +1317,7 @@ fn next_job(state: &mut State) -> Option<Job> {
             *cursor = Some(*id);
             return Some(Job {
                 track: *id,
+                epoch: track.epoch,
                 cancel: Arc::clone(&fan_out.cancel),
                 work: JobWork::FanOut {
                     source: take_source(track),
@@ -1039,8 +1329,11 @@ fn next_job(state: &mut State) -> Option<Job> {
             });
         }
     }
-    // 3. Visible tiles of every track, then 4. margins.
+    // 3. Visible tiles of every track, then 4. margins, which never take the whole pool.
     for visible in [true, false] {
+        if !visible && margin_reads_in_flight(state) >= margin_read_limit(state.helpers) {
+            break;
+        }
         for id in &order {
             let track = state.tracks.get_mut(id)?;
             if !idle(track) {
@@ -1054,9 +1347,11 @@ fn next_job(state: &mut State) -> Option<Job> {
                 cancel: Arc::clone(&cancel),
                 tile: Some(key.clone()),
             });
+            let epoch = track.epoch;
             state.cursor = Some(*id);
             return Some(Job {
                 track: *id,
+                epoch,
                 cancel,
                 work: JobWork::Tile {
                     source: take_source(track),
@@ -1173,12 +1468,23 @@ fn complete_job(
     shared: &Shared,
     state: &mut State,
     id: TrackId,
+    epoch: u64,
     outcome: JobOutcome,
     events: &mut Vec<TrackTileEngineEvent>,
 ) {
+    // The registration the operation belongs to; `None` once it was removed or replaced.
+    let current = |state: &State| {
+        state
+            .tracks
+            .get(&id)
+            .is_some_and(|track| track.epoch == epoch)
+    };
     // The fan-out bookkeeping happens whether or not the track still exists.
     let (returned, tile_outcome) = match outcome {
         JobOutcome::Opened(result) => {
+            if !current(state) {
+                return;
+            }
             let Some(track) = state.tracks.get_mut(&id) else {
                 return;
             };
@@ -1189,24 +1495,7 @@ fn complete_job(
                     track.source = SourceSlot::Idle(source);
                     events.push(TrackTileEngineEvent::TrackOpened { track: id });
                 }
-                Err(message) => {
-                    track.source = SourceSlot::Failed;
-                    let message = format!("{}: {message}", track.name);
-                    for (panel, view) in &mut track.views {
-                        for tile in view.visible.clone() {
-                            view.failed.insert(tile, message.clone());
-                            events.push(TrackTileEngineEvent::TileFailed {
-                                panel: *panel,
-                                track: id,
-                                generation: view.generation,
-                                key: tile,
-                                message: message.clone(),
-                            });
-                        }
-                    }
-                    settle_views(id, track, events);
-                    events.push(TrackTileEngineEvent::TrackOpenFailed { track: id, message });
-                }
+                Err(message) => fail_track_open(id, track, &message, events),
             }
             return;
         }
@@ -1268,6 +1557,10 @@ fn complete_job(
             result,
         } => (source, Some((key, result))),
     };
+    if !current(state) {
+        // The source belongs to a registration that is gone; it is dropped here.
+        return;
+    }
     let Some(track) = state.tracks.get_mut(&id) else {
         return;
     };
@@ -1341,10 +1634,12 @@ fn helper_loop(shared: &Shared) {
                 if let Some(job) = next_job(&mut state) {
                     break job;
                 }
+                state.waiting += 1;
                 state = shared
                     .work
                     .wait(state)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.waiting -= 1;
             }
         };
         let cancel = TrackCancellation::from_flag(Arc::clone(&job.cancel));
@@ -1355,7 +1650,16 @@ fn helper_loop(shared: &Shared) {
             if state.shutdown {
                 return;
             }
-            complete_job(shared, &mut state, job.track, outcome, &mut events);
+            complete_job(
+                shared,
+                &mut state,
+                job.track,
+                job.epoch,
+                outcome,
+                &mut events,
+            );
+            // An opened source or a finished read may have made a visible tile runnable.
+            preempt_margin_reads(&mut state);
         }
         // The track is free again and a fan-out may have become runnable.
         shared.work.notify_all();
@@ -1393,6 +1697,9 @@ mod tests {
         /// When set, a read blocks until released or cancelled.
         gate: Option<Arc<AtomicBool>>,
         started: Option<mpsc::SyncSender<TrackTileKey>>,
+        /// A gated read does not poll its cancellation, like a source blocked in a system
+        /// call.
+        deaf: bool,
         fail: bool,
         panic: bool,
         payload_bytes: usize,
@@ -1411,7 +1718,7 @@ mod tests {
             if let Some(gate) = &self.gate {
                 let deadline = Instant::now() + WAIT;
                 while !gate.load(Ordering::Acquire) {
-                    if cancel.is_cancelled() {
+                    if !self.deaf && cancel.is_cancelled() {
                         self.cancelled.fetch_add(1, Ordering::AcqRel);
                         return Err(TrackTileError::Cancelled);
                     }
@@ -1962,6 +2269,354 @@ mod tests {
                     .is_some_and(|snapshot| snapshot.is_settled() && snapshot.tiles.len() == 2)
             })
         });
+    }
+
+    #[test]
+    fn the_helper_pool_size_is_configurable_beyond_the_default_limit() {
+        let config = |helpers| TrackTileEngineConfig {
+            helpers,
+            ..TrackTileEngineConfig::default()
+        };
+        // `spawn` keeps its limit; the explicit limit raises it, within the absolute one.
+        assert_eq!(TrackTileEngine::spawn(config(12)).helper_count(), 8);
+        assert_eq!(
+            TrackTileEngine::spawn_with_helper_limit(config(12), 16).helper_count(),
+            12
+        );
+        assert_eq!(
+            TrackTileEngine::spawn_with_helper_limit(config(12), 4).helper_count(),
+            4
+        );
+        assert_eq!(
+            TrackTileEngine::spawn_with_helper_limit(config(1_000), usize::MAX).helper_count(),
+            MAXIMUM_CONFIGURABLE_TRACK_TILE_HELPERS
+        );
+        assert_eq!(
+            [1, 2, 3, 4, 8, 12, 64].map(margin_read_limit),
+            [1, 1, 2, 3, 6, 9, 48]
+        );
+
+        // Twelve tracks that are slow at the same time are all being read at once by twelve
+        // helpers; the default pool of eight would leave four waiting.
+        let gate = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::sync_channel(32);
+        let engine = TrackTileEngine::spawn_with_helper_limit(
+            TrackTileEngineConfig {
+                helpers: 12,
+                margin_tiles: 0,
+                ..TrackTileEngineConfig::default()
+            },
+            12,
+        );
+        for track in 1..=12_u64 {
+            engine.add_source(
+                TrackId::new(track),
+                format!("slow{track}"),
+                Box::new(Probe {
+                    gate: Some(Arc::clone(&gate)),
+                    started: Some(started_tx.clone()),
+                    ..Probe::default()
+                }),
+            );
+            engine.request_view(view(track, 0.0, 500.0, 1.0)).unwrap();
+        }
+        for _ in 0..12 {
+            started_rx.recv_timeout(WAIT).unwrap();
+        }
+        gate.store(true, Ordering::Release);
+    }
+
+    /// Loads tiles 1 and 2 of `track` and their margin (0 and 3) while `gate` is open.
+    fn warm(engine: &TrackTileEngine, track: u64, probe: &Probe) {
+        let generation = engine
+            .request_view(view(track, 1_500.0, 3_000.0, 1.0))
+            .unwrap();
+        wait_for(engine, settled(track, generation));
+        wait_until(|| probe.queries.lock().unwrap().len() == 4);
+        wait_until(|| {
+            engine
+                .cache_stats(TrackId::new(track))
+                .is_some_and(|stats| stats.tiles == 4)
+        });
+    }
+
+    #[test]
+    fn margin_reads_never_occupy_the_whole_pool() {
+        // Two helpers, two tracks whose margin reads block and cannot be cancelled.
+        let gate = Arc::new(AtomicBool::new(true));
+        let (started_tx, started_rx) = mpsc::sync_channel(64);
+        let engine = engine(2, 1, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        let mut probes = Vec::new();
+        for track in [1_u64, 2] {
+            let probe = Probe {
+                gate: Some(Arc::clone(&gate)),
+                started: Some(started_tx.clone()),
+                deaf: true,
+                ..Probe::default()
+            };
+            engine.add_source(
+                TrackId::new(track),
+                format!("deaf{track}"),
+                Box::new(probe.clone()),
+            );
+            warm(&engine, track, &probe);
+            probes.push(probe);
+        }
+        while started_rx.try_recv().is_ok() {}
+        gate.store(false, Ordering::Release);
+        // Panning onto cached tiles: every visible tile is ready, and each track wants one
+        // new margin tile (4). Only one of the two reads may start.
+        for track in [1_u64, 2] {
+            let generation = engine
+                .request_view(view(track, 2_100.0, 3_600.0, 1.0))
+                .unwrap();
+            wait_for(&engine, settled(track, generation));
+        }
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap().index, 4);
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            started_rx.try_recv().is_err(),
+            "a second margin read took the last helper"
+        );
+        // So a third track's visible tiles are read at once, although the margin read in
+        // flight can neither finish nor be cancelled.
+        let fast = Probe::default();
+        engine.add_source(TrackId::new(3), "fast".to_owned(), Box::new(fast));
+        let generation = engine.request_view(view(3, 0.0, 2_000.0, 1.0)).unwrap();
+        wait_for(&engine, settled(3, generation));
+        assert_eq!(engine.view(1, TrackId::new(3)).unwrap().tiles.len(), 2);
+        // The other track's margin tile is read once the first is done.
+        gate.store(true, Ordering::Release);
+        wait_until(|| {
+            probes
+                .iter()
+                .all(|probe| probe.queries.lock().unwrap().len() == 5)
+        });
+    }
+
+    #[test]
+    fn a_visible_tile_without_a_free_helper_takes_one_from_another_tracks_margin_read() {
+        let gate = Arc::new(AtomicBool::new(true));
+        let (started_tx, started_rx) = mpsc::sync_channel(64);
+        let slow = Probe {
+            gate: Some(Arc::clone(&gate)),
+            started: Some(started_tx),
+            ..Probe::default()
+        };
+        // One helper: whatever it reads, nothing else is read.
+        let engine = engine(1, 1, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        engine.add_source(TrackId::new(1), "slow".to_owned(), Box::new(slow.clone()));
+        warm(&engine, 1, &slow);
+        while started_rx.try_recv().is_ok() {}
+        gate.store(false, Ordering::Release);
+        let panned = engine.request_view(view(1, 2_100.0, 3_600.0, 1.0)).unwrap();
+        wait_for(&engine, settled(1, panned));
+        // The only helper is now inside the slow track's margin read of tile 4.
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap().index, 4);
+
+        let fast = Probe::default();
+        engine.add_source(TrackId::new(2), "fast".to_owned(), Box::new(fast.clone()));
+        let generation = engine.request_view(view(2, 0.0, 2_000.0, 1.0)).unwrap();
+        // The margin read is cancelled for it, and the visible tiles are served.
+        wait_for(&engine, settled(2, generation));
+        assert_eq!(slow.cancelled.load(Ordering::Acquire), 1);
+        assert_eq!(engine.view(1, TrackId::new(2)).unwrap().tiles.len(), 2);
+        assert_eq!(engine.cache_stats(TrackId::new(1)).unwrap().cancelled, 1);
+
+        // The margin tile was only postponed: it is read again and cached.
+        gate.store(true, Ordering::Release);
+        wait_until(|| engine.cache_stats(TrackId::new(1)).unwrap().tiles == 5);
+        let indices = slow
+            .queries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|key| key.index)
+            .collect::<Vec<_>>();
+        assert_eq!(indices[4..], [4, 4]);
+    }
+
+    #[test]
+    fn a_track_gives_up_its_own_margin_read_for_a_visible_tile_of_another_panel() {
+        let gate = Arc::new(AtomicBool::new(true));
+        let (started_tx, started_rx) = mpsc::sync_channel(64);
+        let probe = Probe {
+            gate: Some(Arc::clone(&gate)),
+            started: Some(started_tx),
+            ..Probe::default()
+        };
+        let engine = engine(4, 1, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        engine.add_source(TrackId::new(1), "probe".to_owned(), Box::new(probe.clone()));
+        warm(&engine, 1, &probe);
+        while started_rx.try_recv().is_ok() {}
+        gate.store(false, Ordering::Release);
+        let panned = engine.request_view(view(1, 2_100.0, 3_600.0, 1.0)).unwrap();
+        wait_for(&engine, settled(1, panned));
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap().index, 4);
+
+        // A second panel shows tile 9 of the same track. Panel 1 still wants tile 4 as
+        // margin, so the read is not abandoned as unwanted; it yields to the visible tile.
+        let second = TrackTileView {
+            panel: 2,
+            ..view(1, 9_300.0, 9_800.0, 1.0)
+        };
+        let generation = engine.request_view(second).unwrap();
+        assert_eq!(started_rx.recv_timeout(WAIT).unwrap().index, 9);
+        assert_eq!(probe.cancelled.load(Ordering::Acquire), 1);
+        gate.store(true, Ordering::Release);
+        wait_for(&engine, |event| {
+            *event
+                == TrackTileEngineEvent::ViewSettled {
+                    panel: 2,
+                    track: TrackId::new(1),
+                    generation,
+                }
+        });
+        // Then the postponed margin tile, and the new panel's own margins.
+        wait_until(|| {
+            let queries = probe.queries.lock().unwrap();
+            queries.iter().filter(|key| key.index == 4).count() == 2
+        });
+    }
+
+    #[test]
+    fn a_replaced_registration_does_not_inherit_the_old_source() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = mpsc::sync_channel(8);
+        let old = Probe {
+            gate: Some(Arc::clone(&gate)),
+            started: Some(started_tx),
+            ..Probe::default()
+        };
+        let engine = engine(2, 0, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        engine.add_source(TrackId::new(1), "old".to_owned(), Box::new(old.clone()));
+        engine.request_view(view(1, 0.0, 500.0, 1.0)).unwrap();
+        started_rx.recv_timeout(WAIT).unwrap();
+        // Re-registered while the old source is lent to a helper.
+        let new = Probe::default();
+        engine.add_source(TrackId::new(1), "new".to_owned(), Box::new(new.clone()));
+        wait_until(|| old.cancelled.load(Ordering::Acquire) == 1);
+        let generation = engine.request_view(view(1, 0.0, 500.0, 1.0)).unwrap();
+        wait_for(&engine, settled(1, generation));
+        assert_eq!(new.queries.lock().unwrap().len(), 1);
+        // A later view is still read by the new source, not by the returned old one.
+        let later = engine
+            .request_view(view(1, 51_200.0, 51_700.0, 1.0))
+            .unwrap();
+        wait_for(&engine, settled(1, later));
+        assert_eq!(new.queries.lock().unwrap().len(), 2);
+        assert_eq!(old.queries.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_legacy_engine_shares_its_reader_instead_of_the_tile_engine_opening_a_second() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genes.bed");
+        std::fs::write(&path, "chr1\t100\t200\talpha\nchr1\t5000\t5100\tbeta\n").unwrap();
+        let specification = TrackSpec {
+            id: TrackId::new(7),
+            name: "genes".to_owned(),
+            path: path.clone(),
+            kind: TrackSpecKind::Bed,
+        };
+        let legacy = crate::TrackEngine::spawn_with_query_contig_aliases(
+            vec![(
+                specification,
+                BTreeMap::from([("1".to_owned(), "chr1".to_owned())]),
+            )],
+            8,
+        );
+        let tiles = engine(2, 0, DEFAULT_TRACK_TILE_CACHE_BYTES);
+        // The file is gone from disk before the tile engine hears of the track: whatever the
+        // tile engine shows can only come from the reader the legacy engine opened.
+        let deadline = Instant::now() + WAIT;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the legacy engine never became ready"
+            );
+            if matches!(
+                legacy.try_receive().unwrap(),
+                Some(crate::TrackEngineEvent::Ready { opened: 1, .. })
+            ) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        std::fs::remove_file(&path).unwrap();
+
+        legacy
+            .try_share_tile_sources(vec![TrackId::new(7), TrackId::new(8)], &tiles)
+            .unwrap();
+        // Views may be requested at once, under the workspace contig name: the aliases of the
+        // legacy track were carried over.
+        let mut aliased = view(7, 0.0, 1_000.0, 1.0);
+        aliased.contig = "1".to_owned();
+        let generation = tiles.request_view(aliased).unwrap();
+        let unknown = tiles.request_view(view(8, 0.0, 1_000.0, 1.0)).unwrap();
+        let mut pending = BTreeSet::from([generation, unknown]);
+        let events = wait_for(&tiles, |event| {
+            if let TrackTileEngineEvent::ViewSettled { generation, .. } = event {
+                pending.remove(generation);
+            }
+            pending.is_empty()
+        });
+        assert!(events.contains(&TrackTileEngineEvent::TrackOpened {
+            track: TrackId::new(7)
+        }));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TrackTileEngineEvent::TrackOpenFailed { track, message }
+                if *track == TrackId::new(8) && message.contains("not open")
+        )));
+        let snapshot = tiles.view(1, TrackId::new(7)).unwrap();
+        assert_eq!(snapshot.tiles[0].tile.contig, "chr1");
+        assert_eq!(
+            snapshot.tiles[0].scene.records[0].name.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(tiles.view(1, TrackId::new(8)).unwrap().failed.len(), 1);
+
+        // Both engines keep working through the one reader: a tile-engine search and a
+        // legacy search each find the feature.
+        tiles.search(1, "bet".to_owned(), 10, false);
+        let events = wait_for(&tiles, |event| {
+            matches!(event, TrackTileEngineEvent::SearchCompleted { .. })
+        });
+        let Some(TrackTileEngineEvent::SearchCompleted { results, .. }) = events.last() else {
+            panic!("expected the search result");
+        };
+        assert_eq!(results.hits.len(), 1);
+        legacy.try_search(1, "alph".to_owned(), 10, false).unwrap();
+        let deadline = Instant::now() + WAIT;
+        let hits = loop {
+            assert!(
+                Instant::now() < deadline,
+                "the legacy search never completed"
+            );
+            match legacy.try_receive().unwrap() {
+                Some(crate::TrackEngineEvent::SearchCompleted { results, .. }) => {
+                    break results.hits;
+                }
+                Some(_) => {}
+                None => thread::sleep(Duration::from_millis(2)),
+            }
+        };
+        assert_eq!(hits.len(), 1);
+
+        // Removing the track from the legacy engine leaves the tile engine's handle working.
+        legacy.try_remove_many(vec![TrackId::new(7)]).unwrap();
+        let later = tiles.request_view(view(7, 4_500.0, 5_200.0, 1.0)).unwrap();
+        // (workspace contig "chr1" is the source's own spelling)
+        wait_for(&tiles, settled(7, later));
+        let snapshot = tiles.view(1, TrackId::new(7)).unwrap();
+        assert!(snapshot.failed.is_empty());
+        assert!(snapshot.tiles.iter().any(|tile| {
+            tile.scene
+                .records
+                .iter()
+                .any(|record| record.name.as_deref() == Some("beta"))
+        }));
     }
 
     #[test]
