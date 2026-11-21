@@ -1,5 +1,6 @@
 //! Bounded background scheduling and cache coordination for RGV.
 
+mod alignment_coverage_engine;
 mod alignment_scene_coordinator;
 mod alignment_scene_engine;
 mod cache;
@@ -10,7 +11,14 @@ mod reference_engine;
 mod source_actor;
 mod track_engine;
 mod track_source;
+mod track_tile_engine;
+mod track_tile_source;
 
+pub use alignment_coverage_engine::{
+    ALIGNMENT_COVERAGE_DEFAULT_RESIDENT_BYTES, ALIGNMENT_COVERAGE_REMOTE_UNIT_TRANSFER_BUDGET,
+    AlignmentCoverageEngine, AlignmentCoverageEngineConfig, AlignmentCoveragePublication,
+    AlignmentCoverageRequest, AlignmentCoverageState, AlignmentCoverageTelemetry,
+};
 pub use alignment_scene_coordinator::{
     AlignmentCoordinatorEviction, AlignmentCoordinatorFrame, AlignmentCoordinatorPressure,
     AlignmentCoordinatorPump, AlignmentCoordinatorUpdate, AlignmentIndividualReadCapability,
@@ -55,6 +63,15 @@ pub use source_actor::{
 pub use track_engine::{
     TrackEngine, TrackEngineEvent, TrackSearchHit, TrackSearchResults, TrackSnapshot,
     TrackSnapshotData, TrackSourceDiagnostics, TrackSpec, TrackSpecKind,
+};
+pub use track_tile_engine::{
+    DEFAULT_TRACK_TILE_CACHE_BYTES, LaidOutTrackTile, MAXIMUM_TRACK_TILE_HELPERS,
+    TrackTileCacheStats, TrackTileEngine, TrackTileEngineConfig, TrackTileEngineEvent,
+    TrackTileView, TrackTileViewSnapshot,
+};
+pub use track_tile_source::{
+    MAXIMUM_CLUSTER_CLOSURE_ROUNDS, MAXIMUM_CLUSTER_CLOSURE_TILES, TrackTileLayoutFn,
+    TrackTileLayoutRegistry, TrackTileSearch, TrackTileSearchHits, TrackTileSource,
 };
 
 #[cfg(test)]

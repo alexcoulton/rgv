@@ -1128,11 +1128,11 @@ impl Viewer {
         self.diagnostics.manual_runtime.last_completed_frame_phase = Some("frame_finished");
     }
 
-    pub(crate) fn record_manual_navigation_intent(&mut self, kind: &str) {
+    pub(crate) fn record_manual_navigation_intent(&mut self, panel_id: PanelId, kind: &str) {
         if !self.diagnostics.recording() {
             return;
         }
-        let panel = self.panels.active();
+        let panel = self.panels.panel(panel_id);
         let causal_interaction_id = self
             .diagnostics
             .manual_runtime
@@ -1161,6 +1161,7 @@ impl Viewer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_manual_vertical_scroll_intent(
         &mut self,
+        panel_id: PanelId,
         track_id: TrackId,
         requested: f32,
         previous: f32,
@@ -1181,7 +1182,7 @@ impl Viewer {
             "vertical_navigation",
             "scroll_intent",
             object_fields(serde_json::json!({
-                "panel_id": self.panels.active().id.get(),
+                "panel_id": panel_id.get(),
                 "track_id": track_id.get(),
                 "source": source,
                 "causal_interaction_id": causal_interaction_id,
@@ -1189,7 +1190,7 @@ impl Viewer {
                 "previous_points": previous,
                 "maximum_points": maximum,
                 "applied_points": applied,
-                "row_authority": format!("{:?}", self.read_panel_row_authority(track_id)),
+                "row_authority": format!("{:?}", self.read_panel_row_authority(panel_id, track_id)),
             })),
         );
     }
@@ -1637,8 +1638,10 @@ impl Viewer {
         })
     }
 
-    pub(crate) fn manual_active_scroll_cache_diagnostic_state(&self) -> serde_json::Value {
-        let panel_id = self.panels.active().id;
+    pub(crate) fn manual_scroll_cache_diagnostic_state(
+        &self,
+        panel_id: PanelId,
+    ) -> serde_json::Value {
         serde_json::Value::Array(
             self.alignment_tracks
                 .iter()
@@ -1889,12 +1892,12 @@ impl Viewer {
                 );
                 let scroll = panel.read_panel_scroll_state(track.config.id);
                 let (clip_top, clip_bottom, actual_content_bottom) = self
-                    .read_panel_metrics(track.config.id)
+                    .read_panel_metrics(self.panels.active().id, track.config.id)
                     .unwrap_or((0.0, 0.0, 0.0));
                 let scroll_maximum = self
-                    .read_panel_metrics(track.config.id)
+                    .read_panel_metrics(self.panels.active().id, track.config.id)
                     .map_or(0.0, |(_, bottom, _)| {
-                        self.read_panel_presented_scroll_maximum(track.config.id, bottom)
+                        self.read_panel_presented_scroll_maximum(self.panels.active().id, track.config.id, bottom)
                     });
                 let presented = self
                     .presented_alignment_lane(panel.id, track.config.id)
@@ -1922,7 +1925,7 @@ impl Viewer {
                     "presented": presented,
                     "filtering": self.alignment_filter_diagnostic_state(panel.id, track.config.id),
                     "base_labels": self.alignment_base_label_diagnostic_state(panel.id, track.config.id),
-                    "row_authority": format!("{:?}", self.read_panel_row_authority(track.config.id)),
+                    "row_authority": format!("{:?}", self.read_panel_row_authority(self.panels.active().id, track.config.id)),
                     "scroll_cache_authority": self.manual_read_panel_scroll_cache_diagnostic_state(
                         panel.id,
                         track.config.id,

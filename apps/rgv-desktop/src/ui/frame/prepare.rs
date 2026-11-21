@@ -700,6 +700,10 @@ impl Viewer {
         let user_exit_requested = false;
         let command_search = self.command_search.clone();
         let palette_command = None;
+        let undo_requested = pending_command == Some(UiCommand::Undo);
+        let redo_requested = pending_command == Some(UiCommand::Redo);
+        let undo_label = self.undo_label();
+        let redo_label = self.redo_label();
         let remote_source_open = self.open_panel == Some(UiPanel::RemoteSource);
         let remote_source_editor = self.remote_source_editor.clone();
         let remote_source_request = None;
@@ -757,6 +761,10 @@ impl Viewer {
             user_exit_requested,
             command_search,
             palette_command,
+            undo_requested,
+            redo_requested,
+            undo_label,
+            redo_label,
             remote_source_open,
             remote_source_editor,
             remote_source_request,

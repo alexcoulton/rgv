@@ -115,6 +115,8 @@ impl super::super::Viewer {
     }
 
     pub(crate) fn replace_document_identity(&mut self, saved: bool) {
+        // Undo steps describe the document that was just replaced.
+        self.shell.undo.clear();
         let document = self.session_document();
         self.document_state.replace(document, saved);
     }

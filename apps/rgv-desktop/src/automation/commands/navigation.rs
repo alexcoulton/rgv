@@ -101,7 +101,7 @@ impl Viewer {
             item.locus.start.saturating_add(1),
             item.locus.end
         );
-        self.navigate_to_locus(&locus)?;
+        self.navigate_to_locus(self.panels.active().id, &locus)?;
         self.bump_workspace_revision();
         Ok(serde_json::json!({
             "review_item_id": item.id,
@@ -113,33 +113,30 @@ impl Viewer {
         }))
     }
 
+    /// The protocol entry point: `navigate_history` documents that its panel becomes the
+    /// focused panel, so its translation is a focus change followed by the history step.
     pub(crate) fn apply_automation_history_navigation(
         &mut self,
         panel_id: PanelId,
         action: AutomationHistoryNavigation,
     ) -> Result<serde_json::Value> {
         anyhow::ensure!(
-            self.panels.activate(panel_id),
+            self.panels.get(panel_id).is_some(),
             "panel {} was not found",
             panel_id.get()
         );
-        self.commit_navigation_gesture();
-        let entry = match action {
-            AutomationHistoryNavigation::Back => self.panels.active_mut().navigation_history.back(),
-            AutomationHistoryNavigation::Forward => {
-                self.panels.active_mut().navigation_history.forward()
-            }
-            AutomationHistoryNavigation::Index { index } => {
-                self.panels.active_mut().navigation_history.select(index)
-            }
-        }
-        .cloned()
-        .context("navigation history boundary was reached")?;
-        let interval = self.navigate_to_history_entry(&entry)?;
+        let outcome =
+            self.apply_command_translation(&rgv_automation::AutomationCommand::NavigateHistory {
+                panel_id,
+                action,
+            })?;
+        let interval = outcome
+            .interval
+            .context("navigation history boundary was reached")?;
         self.bump_workspace_revision();
         Ok(serde_json::json!({
             "panel_id": panel_id.get(),
-            "contig": self.panels.active().contig_name,
+            "contig": self.panels.panel(panel_id).contig_name,
             "start": interval.start(),
             "end": interval.end(),
             "settled": self.automation_is_settled(),

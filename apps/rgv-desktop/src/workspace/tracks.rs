@@ -282,7 +282,7 @@ impl Viewer {
         self.reconcile_presentation_interaction_state();
     }
 
-    fn reconcile_presentation_interaction_state(&mut self) {
+    pub(crate) fn reconcile_presentation_interaction_state(&mut self) {
         let alignment_ids = self
             .alignment_tracks
             .iter()
@@ -345,7 +345,20 @@ impl Viewer {
         }
     }
 
+    /// Reorders, shows, hides, resizes or groups tracks. This is the entry point the window and
+    /// automation share: it goes through the action path, so the edit is undoable.
     pub(crate) fn apply_track_intents(
+        &mut self,
+        intents: &[TrackIntent],
+    ) -> Result<TrackChangeSet> {
+        let outcome = self.apply_action(crate::action::Action::ApplyTrackIntents {
+            intents: intents.to_vec(),
+        })?;
+        Ok(outcome.track_changes.unwrap_or_default())
+    }
+
+    /// The implementation behind `Action::ApplyTrackIntents`; only the action path calls it.
+    pub(crate) fn apply_track_intents_now(
         &mut self,
         intents: &[TrackIntent],
     ) -> Result<TrackChangeSet> {
@@ -779,7 +792,7 @@ impl Viewer {
         if query_requested {
             self.request_all_alignment_queries();
         }
-        self.rebuild_genomic_display();
+        self.rebuild_genomic_display(self.panels.active().id);
         self.mark_display_dirty("explicit display invalidation");
         Ok(())
     }
@@ -1026,10 +1039,17 @@ impl Viewer {
         Ok(actual.len())
     }
 
-    pub(crate) fn remove_metadata_selected_tracks(
-        &mut self,
-        selected: &BTreeSet<TrackId>,
-    ) -> Result<usize> {
+    /// Removes tracks of any kind. This is the entry point the window and automation share:
+    /// it goes through the action path, so the removal is undoable.
+    pub(crate) fn remove_tracks(&mut self, selected: &BTreeSet<TrackId>) -> Result<usize> {
+        let outcome = self.apply_action(crate::action::Action::RemoveTracks {
+            track_ids: selected.iter().copied().collect(),
+        })?;
+        Ok(outcome.removed_tracks)
+    }
+
+    /// The implementation behind `Action::RemoveTracks`; only the action path calls it.
+    pub(crate) fn remove_tracks_now(&mut self, selected: &BTreeSet<TrackId>) -> Result<usize> {
         let auxiliary_ids = self
             .tracks
             .tracks()
@@ -1096,7 +1116,7 @@ impl Viewer {
             self.panels.active_mut().pending_queries.alignment = true;
         }
         if outcome.configuration_changed {
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(self.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if outcome.query_changed {

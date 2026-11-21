@@ -1,4 +1,3 @@
-use crate::automation::commands::automation_viewport_after_operation;
 use crate::automation::commands::evidence::{automation_locus, bounded_automation_text};
 use crate::automation::{
     automation_bool, automation_f32, automation_inspector_export, automation_name,
@@ -15,9 +14,24 @@ use rgv_automation::{
 };
 use rgv_core::{
     AlignmentViewPredicate, CoverageScaleTransform, PanelId, PresentationNodeId, ReadStackingMode,
-    TrackIntent,
+    TrackId, TrackIntent,
 };
 use std::time::Instant;
+
+/// Resolves the alignment track a per-track automation setting addresses. A named track must
+/// be an open alignment track; an unnamed one is the primary alignment, as before the settings
+/// could name a track.
+pub(crate) fn automation_alignment_target(
+    named: Option<TrackId>,
+    primary: TrackId,
+    is_alignment_track: impl Fn(TrackId) -> bool,
+) -> Result<TrackId> {
+    match named {
+        None => Ok(primary),
+        Some(track_id) if is_alignment_track(track_id) => Ok(track_id),
+        Some(track_id) => anyhow::bail!("alignment track {} was not found", track_id.get()),
+    }
+}
 
 impl Viewer {
     pub(crate) fn bump_workspace_revision(&mut self) -> u64 {
@@ -108,39 +122,67 @@ impl Viewer {
         });
     }
 
+    /// Applies an automation command that is a pure translation to actions (see
+    /// [`crate::action::translate::automation_command_actions`]) and returns the outcome of the
+    /// last one.
+    pub(crate) fn apply_command_translation(
+        &mut self,
+        command: &rgv_automation::AutomationCommand,
+    ) -> Result<crate::action::ActionOutcome> {
+        let focused = self.panels.active().id;
+        let actions = crate::action::translate::automation_command_actions(command, focused)
+            .ok_or_else(|| anyhow::anyhow!("the command is not an action translation"))??;
+        let mut outcome = crate::action::ActionOutcome::default();
+        for action in actions {
+            outcome = self.apply_action(action)?;
+        }
+        Ok(outcome)
+    }
+
+    /// The protocol entry point: `change_viewport` documents that its panel becomes the focused
+    /// panel, so its translation is a focus change followed by the navigation.
     pub(crate) fn apply_automation_viewport_operation(
         &mut self,
         panel_id: PanelId,
         operation: AutomationViewportOperation,
     ) -> Result<serde_json::Value> {
+        self.apply_viewport_operation(panel_id, operation, true)
+    }
+
+    /// Pans, zooms or fits `panel_id`. With `focus` false the focused panel is left alone.
+    pub(crate) fn apply_viewport_operation(
+        &mut self,
+        panel_id: PanelId,
+        operation: AutomationViewportOperation,
+        focus: bool,
+    ) -> Result<serde_json::Value> {
         let navigation_started = Instant::now();
         anyhow::ensure!(
-            self.panels.activate(panel_id),
+            self.panels.get(panel_id).is_some(),
             "panel {} was not found",
             panel_id.get()
         );
         let navigation_state = self.automation_navigation_state(panel_id);
-        let panel = self.panels.active();
-        let current = panel.viewport;
-        let contig_length = panel.contig_length;
-        let next = automation_viewport_after_operation(current, contig_length, operation)?;
-        self.panels.active_mut().viewport = next;
-        self.panels.active_mut().visit_history(next.interval());
-        self.viewport_changed();
-        if let Some(runner) = self.automation.as_mut() {
-            runner.begin_navigation(
+        let outcome = if focus {
+            self.apply_command_translation(&rgv_automation::AutomationCommand::ChangeViewport {
                 panel_id,
-                next.interval(),
-                &navigation_state,
-                navigation_started,
-            );
+                operation,
+            })?
+        } else {
+            self.apply_action(crate::action::translate::change_viewport(
+                panel_id, operation,
+            ))?
+        };
+        let next = self.panels.panel(panel_id).viewport;
+        let interval = outcome.interval.unwrap_or_else(|| next.interval());
+        if let Some(runner) = self.automation.as_mut() {
+            runner.begin_navigation(panel_id, interval, &navigation_state, navigation_started);
         }
         self.bump_workspace_revision();
-        let interval = next.interval();
         Ok(serde_json::json!({
             "panel_id": panel_id.get(),
-            "locus": automation_locus(&self.panels.active().contig_name, interval),
-            "contig": self.panels.active().contig_name,
+            "locus": automation_locus(&self.panels.panel(panel_id).contig_name, interval),
+            "contig": self.panels.panel(panel_id).contig_name,
             "start": interval.start(),
             "end": interval.end(),
             "detail_level": next.detail_level(),
@@ -155,6 +197,31 @@ impl Viewer {
         key: &str,
         value: &serde_json::Value,
     ) -> Result<()> {
+        self.apply_automation_option_for(scope, key, value, None)
+    }
+
+    /// The alignment track a per-track setting addresses: the one the command names, which
+    /// must be an open alignment track, else the primary alignment.
+    pub(crate) fn automation_alignment_target(&self, named: Option<TrackId>) -> Result<TrackId> {
+        automation_alignment_target(named, self.primary_alignment_track_id(), |track_id| {
+            self.alignment_tracks
+                .iter()
+                .any(|track| track.config.id == track_id)
+        })
+    }
+
+    /// [`Self::apply_automation_option`] with the alignment track that the per-track keys
+    /// (`show_reads`, `vertical_density`, `vertical_scroll_points`) address. `None` keeps their
+    /// historical meaning, the primary alignment.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn apply_automation_option_for(
+        &mut self,
+        scope: &AutomationOptionScope,
+        key: &str,
+        value: &serde_json::Value,
+        alignment_track: Option<TrackId>,
+    ) -> Result<()> {
+        let alignment_track = self.automation_alignment_target(alignment_track)?;
         match *scope {
             AutomationOptionScope::Workspace => {
                 let mut query_changed = false;
@@ -172,7 +239,7 @@ impl Viewer {
                         self.apply_track_intents(&[TrackIntent::SetNodeVisibility {
                             target: PresentationNodeId::Track {
                                 channel: ui::TrackPane::Reads,
-                                track_id: self.primary_alignment_track_id(),
+                                track_id: alignment_track,
                             },
                             visible,
                         }])?;
@@ -261,8 +328,7 @@ impl Viewer {
                             (MIN_VERTICAL_DENSITY..=MAX_VERTICAL_DENSITY).contains(&density),
                             "{key} must be between {MIN_VERTICAL_DENSITY} and {MAX_VERTICAL_DENSITY}"
                         );
-                        let track_id = self.primary_alignment_track_id();
-                        self.set_alignment_density_for_track(track_id, density);
+                        self.set_alignment_density_for_track(alignment_track, density);
                     }
                     "coverage_scale_maximum" => {
                         let maximum = automation_optional_u64(value, key)?
@@ -374,7 +440,9 @@ impl Viewer {
                 }
             }
             AutomationOptionScope::Panel { panel_id } => {
-                let primary_track_id = self.primary_alignment_track_id();
+                // The panel-level `vertical_scroll_points` field mirrors the primary track only.
+                let mirrors_primary = alignment_track == self.primary_alignment_track_id();
+                let primary_track_id = alignment_track;
                 if self.panels.get(panel_id).is_none() {
                     anyhow::bail!("panel {} was not found", panel_id.get());
                 }
@@ -403,7 +471,9 @@ impl Viewer {
                                     .max(0.0)
                             });
                         let scroll = scroll.min(maximum);
-                        panel.vertical_scroll_points = scroll;
+                        if mirrors_primary {
+                            panel.vertical_scroll_points = scroll;
+                        }
                         panel
                             .read_panel_scrolls
                             .entry(primary_track_id)
@@ -525,10 +595,11 @@ impl Viewer {
                 "show_coverage",
                 &serde_json::json!(value),
             )?,
-            AutomationSetting::ShowReads { value } => self.apply_automation_option(
+            AutomationSetting::ShowReads { value, track_id } => self.apply_automation_option_for(
                 &AutomationOptionScope::Workspace,
                 "show_reads",
                 &serde_json::json!(value),
+                *track_id,
             )?,
             AutomationSetting::ShowJunctions { value } => self.apply_automation_option(
                 &AutomationOptionScope::Workspace,
@@ -540,11 +611,13 @@ impl Viewer {
                 "view_as_pairs",
                 &serde_json::json!(value),
             )?,
-            AutomationSetting::AlignmentDensity { value } => self.apply_automation_option(
-                &AutomationOptionScope::Workspace,
-                "vertical_density",
-                &serde_json::json!(value),
-            )?,
+            AutomationSetting::AlignmentDensity { value, track_id } => self
+                .apply_automation_option_for(
+                    &AutomationOptionScope::Workspace,
+                    "vertical_density",
+                    &serde_json::json!(value),
+                    *track_id,
+                )?,
             AutomationSetting::IncludeSecondary { value } => self.apply_automation_option(
                 &AutomationOptionScope::Workspace,
                 "include_secondary",
@@ -698,66 +771,19 @@ impl Viewer {
                 self.request_all_alignment_queries();
                 self.rebuild_all_panel_displays();
             }
-            AutomationSetting::PresentationSectionExpanded { channel, value } => {
-                self.apply_track_intents(&[TrackIntent::SetSectionExpanded {
-                    channel: *channel,
-                    expanded: *value,
-                }])?;
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::PresentationNodeVisible { target, value } => {
-                self.apply_track_intents(&[TrackIntent::SetNodeVisibility {
-                    target: *target,
-                    visible: *value,
-                }])?;
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::PresentationNodeHeight { target, value } => {
-                self.apply_track_intents(&[TrackIntent::ResizeNode {
-                    target: *target,
-                    preferred_height: *value,
-                }])?;
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::PresentationGroupExpanded { target, value } => {
-                self.apply_track_intents(&[TrackIntent::SetGroupExpanded {
-                    target: *target,
-                    expanded: *value,
-                }])?;
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::PresentationGroupVisible { target, value } => {
-                self.apply_track_intents(&[TrackIntent::SetGroupVisibility {
-                    target: *target,
-                    visible: *value,
-                }])?;
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::PresentationCompositeVisible {
-                channel,
-                composite_id,
-                value,
-            } => {
-                self.apply_track_intents(&[TrackIntent::SetCompositeVisibility {
-                    channel: *channel,
-                    composite_id: *composite_id,
-                    visible: *value,
-                }])?;
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::PresentationGroup { channel, track_ids } => {
-                self.apply_track_intents(&[TrackIntent::GroupNodes {
-                    channel: *channel,
-                    members: track_ids.clone(),
-                }])?;
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::PresentationUngroup { target } => {
-                self.apply_track_intents(&[TrackIntent::Ungroup { target: *target }])?;
-                self.rebuild_all_panel_displays();
-            }
-            AutomationSetting::ReadPaneHeight { value } => {
-                self.apply_track_intents(&[TrackIntent::ResizeReadPane { height: *value }])?;
+            AutomationSetting::PresentationSectionExpanded { .. }
+            | AutomationSetting::PresentationNodeVisible { .. }
+            | AutomationSetting::PresentationNodeHeight { .. }
+            | AutomationSetting::PresentationGroupExpanded { .. }
+            | AutomationSetting::PresentationGroupVisible { .. }
+            | AutomationSetting::PresentationCompositeVisible { .. }
+            | AutomationSetting::PresentationGroup { .. }
+            | AutomationSetting::PresentationUngroup { .. }
+            | AutomationSetting::ReadPaneHeight { .. } => {
+                // A thin translation: the arrangement settings are track intents.
+                let intents = crate::action::translate::setting_track_intents(setting)
+                    .expect("every arrangement setting translates to track intents");
+                self.apply_action(crate::action::Action::ApplyTrackIntents { intents })?;
                 self.rebuild_all_panel_displays();
             }
             AutomationSetting::TrackHeight { track_id, value } => self.apply_automation_option(
@@ -781,14 +807,18 @@ impl Viewer {
                 "visible",
                 &serde_json::json!(value),
             )?,
-            AutomationSetting::VerticalScrollPoints { panel_id, value } => self
-                .apply_automation_option(
-                    &AutomationOptionScope::Panel {
-                        panel_id: *panel_id,
-                    },
-                    "vertical_scroll_points",
-                    &serde_json::json!(value),
-                )?,
+            AutomationSetting::VerticalScrollPoints {
+                panel_id,
+                value,
+                track_id,
+            } => self.apply_automation_option_for(
+                &AutomationOptionScope::Panel {
+                    panel_id: *panel_id,
+                },
+                "vertical_scroll_points",
+                &serde_json::json!(value),
+                *track_id,
+            )?,
             AutomationSetting::AnnotationScrollPoints { panel_id, value } => self
                 .apply_automation_option(
                     &AutomationOptionScope::Panel {
@@ -859,11 +889,22 @@ impl Viewer {
         let workspace = self.automation_workspace_snapshot();
         let after = serde_json::to_value(&workspace)?;
         let effective = match setting {
-            AutomationSetting::VerticalScrollPoints { panel_id, .. } => workspace
+            AutomationSetting::VerticalScrollPoints {
+                panel_id,
+                track_id: None,
+                ..
+            } => workspace
                 .panels
                 .iter()
                 .find(|panel| panel.id == *panel_id)
                 .map(|panel| serde_json::json!(panel.vertical_scroll_points)),
+            AutomationSetting::VerticalScrollPoints {
+                panel_id,
+                track_id: Some(track_id),
+                ..
+            } => self.panels.get(*panel_id).map(|panel| {
+                serde_json::json!(panel.read_panel_scroll_state(*track_id).scroll_points)
+            }),
             AutomationSetting::AnnotationScrollPoints { panel_id, .. } => workspace
                 .panels
                 .iter()
@@ -934,5 +975,30 @@ impl Viewer {
             "application_instance_id": self.application_instance_id,
             "workspace_revision": self.workspace_revision,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn per_track_settings_address_the_named_alignment_track_and_default_to_the_primary() {
+        let (primary, second) = (TrackId::new(1), TrackId::new(4));
+        let open = |track_id: TrackId| track_id == primary || track_id == second;
+        assert_eq!(
+            automation_alignment_target(None, primary, open).unwrap(),
+            primary
+        );
+        assert_eq!(
+            automation_alignment_target(Some(second), primary, open).unwrap(),
+            second
+        );
+        let error = automation_alignment_target(Some(TrackId::new(9)), primary, open).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("alignment track 9 was not found")
+        );
     }
 }

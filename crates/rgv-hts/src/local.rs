@@ -1071,6 +1071,44 @@ impl LocalAlignmentSource {
         }
     }
 
+    /// Builds coverage-pyramid tiles for `request` by streaming the region's records through
+    /// the shared decode-time accumulator; no read is retained. Works for BAM and CRAM.
+    ///
+    /// Like [`AlignmentSource::query`] this repositions the reader, so it abandons any
+    /// unfinished positioned stream of this handle. Background coverage should use a handle
+    /// of its own.
+    pub fn coverage_tiles(
+        &mut self,
+        request: &crate::CoverageTileRequest,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<crate::CoverageTileOutcome, AlignmentError> {
+        self.positioned_stream = None;
+        if let Some(guard) = &self.source_guard
+            && !guard.validate()?
+        {
+            return Err(AlignmentError::SourceChanged);
+        }
+        if !keep_going() {
+            return Ok(crate::CoverageTileOutcome::Cancelled);
+        }
+        let mut stream = crate::coverage_stream::CoverageStream::new(request, &self.dictionary)?;
+        let interval = stream.interval()?;
+        let tid = i32::try_from(interval.contig().get())
+            .map_err(|_| AlignmentError::CoordinateOverflow)?;
+        let start =
+            i64::try_from(interval.start()).map_err(|_| AlignmentError::CoordinateOverflow)?;
+        let end = i64::try_from(interval.end()).map_err(|_| AlignmentError::CoordinateOverflow)?;
+        self.reader.fetch((tid, start, end))?;
+        let mut record = bam::Record::new();
+        while let Some(result) = self.reader.read(&mut record) {
+            result?;
+            if !stream.add(&record, keep_going)? {
+                break;
+            }
+        }
+        stream.finish()
+    }
+
     fn finish_positioned_block(
         &mut self,
     ) -> Result<PositionedAlignmentStreamCheckpoint, AlignmentError> {

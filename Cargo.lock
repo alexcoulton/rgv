@@ -4091,6 +4091,8 @@ dependencies = [
  "rgv-alignment-scene",
  "rgv-core",
  "rgv-hts",
+ "rgv-layout",
+ "rgv-model",
  "tempfile",
  "thiserror 2.0.20",
  "tiny_http",

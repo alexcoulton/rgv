@@ -381,6 +381,44 @@ impl ProductionAlignmentSource {
         }
     }
 
+    /// Builds coverage-pyramid tiles for `request` from the region's record stream without
+    /// retaining any read; see [`crate::CoverageTileRequest`]. Memory is bounded by the bins
+    /// requested, the depth boundaries in flight and the count-once window, never by depth.
+    ///
+    /// `cancellation` is polled every few hundred records and, for a remote object, by every
+    /// range request. `transfer_budget` bounds the requests and bytes a remote object may
+    /// transfer for this call ([`RemoteError::TransferBudgetExceeded`] when crossed); it is
+    /// ignored for a local file and cleared again before returning.
+    ///
+    /// On the `HTSlib` backend this abandons any unfinished positioned stream of this handle.
+    pub fn coverage_tiles(
+        &mut self,
+        request: &crate::CoverageTileRequest,
+        transfer_budget: Option<RemoteTransferBudget>,
+        cancellation: &RemoteCancellation,
+    ) -> Result<crate::CoverageTileOutcome, AlignmentError> {
+        let keep_going = cancellation.as_ref();
+        match self {
+            Self::Htslib(source) => source.coverage_tiles(request, keep_going),
+            Self::LocalBam(source) => source.coverage_tiles(request, keep_going),
+            Self::LocalCram(source) => source.coverage_tiles(request, keep_going),
+            Self::RemoteBam(source) => {
+                source.set_cancellation(Some(Arc::clone(cancellation)));
+                source.set_transfer_budget(transfer_budget);
+                let result = source.coverage_tiles(request, keep_going);
+                source.set_transfer_budget(None);
+                cancelled_coverage(result, keep_going)
+            }
+            Self::RemoteCram(source) => {
+                source.set_cancellation(Some(Arc::clone(cancellation)));
+                source.set_transfer_budget(transfer_budget);
+                let result = source.coverage_tiles(request, keep_going);
+                source.set_transfer_budget(None);
+                cancelled_coverage(result, keep_going)
+            }
+        }
+    }
+
     pub fn query_with_cancellation(
         &mut self,
         interval: GenomicInterval,
@@ -401,6 +439,38 @@ impl ProductionAlignmentSource {
             }
         }
     }
+}
+
+/// A remote transfer interrupted by the cancellation probe is a cancelled request, not a
+/// failure.
+fn cancelled_coverage(
+    result: Result<crate::CoverageTileOutcome, AlignmentError>,
+    keep_going: &dyn Fn() -> bool,
+) -> Result<crate::CoverageTileOutcome, AlignmentError> {
+    match result {
+        Err(_) if !keep_going() => Ok(crate::CoverageTileOutcome::Cancelled),
+        other => other,
+    }
+}
+
+/// Feeds a noodles record stream into the shared coverage accumulator.
+fn coverage_from_noodles_records<R, I>(
+    records: I,
+    header: &sam::Header,
+    mut stream: crate::coverage_stream::CoverageStream,
+    keep_going: &dyn Fn() -> bool,
+) -> Result<crate::CoverageTileOutcome, AlignmentError>
+where
+    R: AsBackendRecord,
+    I: IntoIterator<Item = Result<(R, Option<crate::AlignmentSourcePosition>), AlignmentError>>,
+{
+    for result in records {
+        let (record, _) = result?;
+        if !stream.add(&record.backend_record(header), keep_going)? {
+            break;
+        }
+    }
+    stream.finish()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1068,6 +1138,85 @@ impl CramReferenceAdapter {
     }
 }
 
+impl RemoteBamAlignmentSource {
+    fn coverage_tiles(
+        &mut self,
+        request: &crate::CoverageTileRequest,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<crate::CoverageTileOutcome, AlignmentError> {
+        if !keep_going() {
+            return Ok(crate::CoverageTileOutcome::Cancelled);
+        }
+        let stream = crate::coverage_stream::CoverageStream::new(request, &self.dictionary)?;
+        let interval = stream.interval()?;
+        let region = remote_bam_region(&self.dictionary, interval)?;
+        positioned_bam_records(&mut self.reader, &self.index, interval, &region)?.coverage(
+            &self.header,
+            stream,
+            keep_going,
+        )
+    }
+}
+
+impl RemoteCramAlignmentSource {
+    fn coverage_tiles(
+        &mut self,
+        request: &crate::CoverageTileRequest,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<crate::CoverageTileOutcome, AlignmentError> {
+        if !keep_going() {
+            return Ok(crate::CoverageTileOutcome::Cancelled);
+        }
+        let stream = crate::coverage_stream::CoverageStream::new(request, &self.dictionary)?;
+        let interval = stream.interval()?;
+        self.reference_query_bases.store(0, Ordering::Relaxed);
+        self.reader.reference_sequence_repository().clear();
+        let result = positioned_cram_records(
+            &mut self.reader,
+            &self.header,
+            interval,
+            &self.reference_slice_span,
+        )
+        .and_then(|records| {
+            coverage_from_noodles_records(records, &self.header, stream, keep_going)
+        });
+        self.reader.reference_sequence_repository().clear();
+        result
+    }
+}
+
+impl LocalCramAlignmentSource {
+    /// Builds coverage-pyramid tiles from the region's record stream; see
+    /// [`ProductionAlignmentSource::coverage_tiles`].
+    pub fn coverage_tiles(
+        &mut self,
+        request: &crate::CoverageTileRequest,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<crate::CoverageTileOutcome, AlignmentError> {
+        if !self.source_guard.validate()? {
+            return Err(AlignmentError::SourceChanged);
+        }
+        if !keep_going() {
+            return Ok(crate::CoverageTileOutcome::Cancelled);
+        }
+        let stream = crate::coverage_stream::CoverageStream::new(request, &self.dictionary)?;
+        let interval = stream.interval()?;
+        self.reference_query_bases.store(0, Ordering::Relaxed);
+        self.reader.reference_sequence_repository().clear();
+        let result = positioned_cram_records(
+            &mut self.reader,
+            &self.header,
+            interval,
+            &self.reference_slice_span,
+        )
+        .and_then(|records| {
+            coverage_from_noodles_records(records, &self.header, stream, keep_going)
+        });
+        self.reader.reference_sequence_repository().clear();
+        result
+    }
+}
+
 impl AlignmentSource for RemoteBamAlignmentSource {
     fn reference_dictionary(&self) -> &ReferenceDictionary {
         &self.dictionary
@@ -1169,6 +1318,22 @@ impl<B: BamBlockStream> PositionedBamRecords<'_, B> {
                 end_position,
             )));
         }
+    }
+
+    /// Folds the region's records into coverage tiles; no record outlives its iteration.
+    fn coverage(
+        mut self,
+        header: &sam::Header,
+        mut stream: crate::coverage_stream::CoverageStream,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<crate::CoverageTileOutcome, AlignmentError> {
+        while self.advance()?.is_some() {
+            let record = self.record.backend_record(header);
+            if !stream.add(&record, keep_going)? {
+                break;
+            }
+        }
+        stream.finish()
     }
 
     /// Folds the region's records into a one-shot query result.
@@ -2074,6 +2239,7 @@ mod tests {
     };
     use tiny_http::{Header, Response, Server, StatusCode};
 
+    mod coverage;
     mod differential;
     mod in_memory;
     mod resume;

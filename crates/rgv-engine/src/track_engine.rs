@@ -37,10 +37,11 @@ const MAXIMUM_PARALLEL_TRACK_QUERIES: usize = 8;
 /// Most one track operation (a viewport query, a name search, a feature step) may transfer
 /// from a remote source before it fails with a clear error instead of downloading without
 /// limit. Each operation starts with a fresh allowance. Local sources ignore it.
-const REMOTE_TRACK_OPERATION_TRANSFER_BUDGET: RemoteTransferBudget = RemoteTransferBudget {
-    maximum_requests: 4_000,
-    maximum_response_bytes: 512 << 20,
-};
+pub(crate) const REMOTE_TRACK_OPERATION_TRANSFER_BUDGET: RemoteTransferBudget =
+    RemoteTransferBudget {
+        maximum_requests: 4_000,
+        maximum_response_bytes: 512 << 20,
+    };
 
 /// Input lines a track source skipped because they could not be parsed.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1288,7 +1289,30 @@ fn track_query_contig<'a>(
         .map_or(workspace_contig, String::as_str)
 }
 
-type TdfSourceCache = HashMap<PathBuf, Arc<Mutex<TdfSource>>>;
+pub(crate) type TdfSourceCache = HashMap<PathBuf, Arc<Mutex<TdfSource>>>;
+
+/// Opens one track behind the public tile contract. bigWig gets the adapter that keeps the
+/// file's zoom-level extremes; every other kind is opened exactly as [`open_track_with`] does
+/// and wrapped in the generic adapter.
+pub(crate) fn open_tile_source(
+    specification: &TrackSpec,
+    tdf_sources: &mut TdfSourceCache,
+    remote: &HttpRangeConfig,
+) -> Result<Box<dyn crate::TrackTileSource>, String> {
+    if specification.kind == TrackSpecKind::BigWig {
+        return BigWigSource::open_with_remote_config(&specification.path, remote.clone())
+            .map(|source| {
+                Box::new(crate::track_tile_source::BigWigTileSource::new(source))
+                    as Box<dyn crate::TrackTileSource>
+            })
+            .map_err(|error| error.to_string());
+    }
+    open_track_with(specification, tdf_sources, remote).map(|track| {
+        Box::new(crate::track_tile_source::LegacyTrackTileSource::new(
+            track.source,
+        )) as Box<dyn crate::TrackTileSource>
+    })
+}
 
 #[cfg(test)]
 fn open_track(specification: &TrackSpec) -> Result<OpenTrack, String> {

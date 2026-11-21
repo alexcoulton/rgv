@@ -22,11 +22,13 @@ use image::RgbaImage;
 use crate::gpu_export::{GpuExportLayout, GpuExportTarget};
 
 mod context;
+mod depth_pyramid;
 mod export;
 mod rectangle;
 mod scene;
 mod shaders;
 mod summary;
+mod track_tiles;
 
 /// Colour target used by the goldens: linear 8-bit, so readback bytes are `round(colour * 255)`.
 pub(crate) const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;

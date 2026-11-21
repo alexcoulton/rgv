@@ -341,8 +341,7 @@ impl Viewer {
         }
     }
 
-    fn mark_active_panel_navigation_queries_pending(&mut self) {
-        let panel_id = self.panels.active().id;
+    fn mark_panel_navigation_queries_pending(&mut self, panel_id: PanelId) {
         for track_index in 0..self.alignment_tracks.len() {
             self.queue_alignment_navigation_for_track(
                 track_index,
@@ -356,11 +355,11 @@ impl Viewer {
                 .projection(panel_id)
                 .is_some_and(|projection| projection.navigation.is_queued())
         });
-        let base_marks_visible =
-            self.panels.active().viewport.bases_per_pixel() <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL;
+        let base_marks_visible = self.panels.panel(panel_id).viewport.bases_per_pixel()
+            <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL;
         let reference_pending = self.reference_engine.is_some() && base_marks_visible;
         let tracks_pending = self.track_engine.is_some();
-        let panel = self.panels.active_mut();
+        let panel = self.panels.panel_mut(panel_id);
         panel.pending_queries.alignment = alignment_pending;
         panel.pending_queries.reference = reference_pending;
         panel.pending_queries.tracks = tracks_pending;
@@ -374,15 +373,15 @@ impl Viewer {
 
     pub(crate) fn begin_viewport_navigation(
         &mut self,
+        panel_id: PanelId,
         gesture_active: bool,
         hold_commit_until_end: bool,
     ) {
-        let panel_id = self.panels.active().id;
         if self
             .panels
-            .active()
+            .panel(panel_id)
             .navigation_presentation
-            .targets_viewport(self.panels.active().viewport)
+            .targets_viewport(self.panels.panel(panel_id).viewport)
         {
             return;
         }
@@ -393,7 +392,7 @@ impl Viewer {
                 || self.reference_engine.is_some()
                 || self.track_engine.is_some())
         {
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(panel_id);
             self.mark_display_dirty("explicit display invalidation");
             return;
         }
@@ -402,22 +401,22 @@ impl Viewer {
         self.retain_active_read_selection_for_query_refresh();
         let previous_target_generation = self
             .panels
-            .active()
+            .panel(panel_id)
             .navigation_presentation
             .target_generation;
-        let previous_phase = self.panels.active().navigation_presentation.phase;
-        self.panels.active().generation_clock.advance();
+        let previous_phase = self.panels.panel(panel_id).navigation_presentation.phase;
+        self.panels.panel(panel_id).generation_clock.advance();
         self.advance_alignment_generations(panel_id);
-        self.mark_active_panel_navigation_queries_pending();
-        let generation = self.panels.active().generation_clock.current().get();
-        let viewport = self.panels.active().viewport;
+        self.mark_panel_navigation_queries_pending(panel_id);
+        let generation = self.panels.panel(panel_id).generation_clock.current().get();
+        let viewport = self.panels.panel(panel_id).viewport;
         let target = NavigationQueryTarget {
             fingerprint: NavigationTargetFingerprint::from_viewport(viewport),
             generation,
         };
         let source_status = self.data_status.clone();
         let source_activity = self.status_activity();
-        let panel = self.panels.active_mut();
+        let panel = self.panels.panel_mut(panel_id);
         if previous_phase == NavigationPresentationPhase::Acquiring
             && previous_target_generation != generation
         {
@@ -440,16 +439,16 @@ impl Viewer {
         // Context lanes retain immutable buffered geometry and move immediately under the desired
         // camera. Acquisition remains independently scheduled below and replaces only the lane
         // whose new horizon becomes ready.
-        self.reproject_active_context_lanes();
+        self.reproject_panel_context_lanes(panel_id);
         if gesture_active {
             // Alignment cameras are not debounced with source queries. The bounded scene mailbox
             // replaces unread camera intents per panel, while the UI immediately reprojects the
             // resident immutable scene under this exact viewport.
-            self.dispatch_alignment_query();
+            self.dispatch_alignment_query(panel_id);
         } else {
             let target = self
                 .panels
-                .active_mut()
+                .panel_mut(panel_id)
                 .navigation_query_schedule
                 .take_immediate(now, false);
             if let Some(target) = target {
@@ -459,12 +458,11 @@ impl Viewer {
         self.window.request_redraw();
     }
 
-    pub(crate) fn finish_navigation_gesture(&mut self) {
+    pub(crate) fn finish_navigation_gesture(&mut self, panel_id: PanelId) {
         let now = Instant::now();
-        let panel_id = self.panels.active().id;
         let target = self
             .panels
-            .active_mut()
+            .panel_mut(panel_id)
             .navigation_query_schedule
             .take_immediate(now, true);
         if let Some(target) = target {
@@ -475,7 +473,6 @@ impl Viewer {
     }
 
     fn dispatch_due_navigation_queries(&mut self, now: Instant) {
-        let active_id = self.panels.active().id;
         let due = self
             .panels
             .iter_mut()
@@ -489,7 +486,6 @@ impl Viewer {
         for (panel_id, target) in due {
             self.dispatch_navigation_query_target(panel_id, target);
         }
-        self.panels.activate(active_id);
     }
 
     fn dispatch_navigation_query_target(
@@ -505,10 +501,9 @@ impl Viewer {
         {
             return;
         }
-        self.panels.activate(panel_id);
-        self.dispatch_alignment_query();
-        self.dispatch_reference_query();
-        self.dispatch_track_query();
+        self.dispatch_alignment_query(panel_id);
+        self.dispatch_reference_query(panel_id);
+        self.dispatch_track_query(panel_id);
     }
 
     pub(crate) fn panel_navigation_data_is_settled(&self, panel_id: PanelId) -> bool {
@@ -566,10 +561,8 @@ impl Viewer {
             })
             .map(|panel| panel.id)
             .collect::<Vec<_>>();
-        let active_id = self.panels.active().id;
         let mut ready = Vec::new();
         for panel_id in candidate_ids {
-            self.panels.activate(panel_id);
             let data_settled = self.panel_navigation_data_is_settled(panel_id);
             let panel = self
                 .panels
@@ -584,7 +577,6 @@ impl Viewer {
                 ready.push(panel_id);
             }
         }
-        self.panels.activate(active_id);
         if ready.is_empty() {
             return;
         }
@@ -666,11 +658,9 @@ impl Viewer {
         }
         self.pending_resolution_query_refresh = None;
         let mut source_refresh_requested = false;
-        let active_id = self.panels.active().id;
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
-            self.panels.activate(id);
-            let resolution = AlignmentSceneResolution::for_viewport(self.panels.active().viewport);
+            let resolution = AlignmentSceneResolution::for_viewport(self.panels.panel(id).viewport);
             let alignment_refresh_required = self.alignment_tracks.iter().any(|track| {
                 matches!(track.lifecycle, AlignmentTrackLifecycle::Ready)
                     && track.projection(id).is_none_or(|projection| {
@@ -682,45 +672,44 @@ impl Viewer {
             if alignment_refresh_required {
                 self.retain_active_read_selection_for_query_refresh();
                 self.advance_alignment_generations(id);
-                self.request_alignment_query();
+                self.request_alignment_query(id);
                 source_refresh_requested = true;
             }
             let reference_missing = self.reference_engine.is_some()
-                && self.panels.active().viewport.bases_per_pixel()
+                && self.panels.panel(id).viewport.bases_per_pixel()
                     <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
-                && (self.panels.active().reference_slice_revision != self.reference_revision
+                && (self.panels.panel(id).reference_slice_revision != self.reference_revision
                     || self
                         .panels
-                        .active()
+                        .panel(id)
                         .reference_slice
                         .as_ref()
                         .is_none_or(|slice| {
                             !slice
                                 .interval
-                                .contains_interval(self.panels.active().viewport.interval())
+                                .contains_interval(self.panels.panel(id).viewport.interval())
                         }));
             if reference_missing {
-                self.request_reference_query();
+                self.request_reference_query(id);
                 source_refresh_requested = true;
             }
         }
-        self.panels.activate(active_id);
         if source_refresh_requested {
             self.resize_query_refreshes = self.resize_query_refreshes.saturating_add(1);
         }
     }
 
-    pub(crate) fn request_track_query(&mut self) {
-        self.panels.active_mut().pending_queries.tracks = self.track_engine.is_some();
-        self.dispatch_track_query();
+    pub(crate) fn request_track_query(&mut self, panel_id: PanelId) {
+        self.panels.panel_mut(panel_id).pending_queries.tracks = self.track_engine.is_some();
+        self.dispatch_track_query(panel_id);
     }
 
-    pub(crate) fn request_reference_query(&mut self) {
-        let base_marks_visible = self.panels.active_mut().viewport.bases_per_pixel()
+    pub(crate) fn request_reference_query(&mut self, panel_id: PanelId) {
+        let base_marks_visible = self.panels.panel_mut(panel_id).viewport.bases_per_pixel()
             <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL;
-        self.panels.active_mut().pending_queries.reference =
+        self.panels.panel_mut(panel_id).pending_queries.reference =
             self.reference_engine.is_some() && base_marks_visible;
-        self.dispatch_reference_query();
+        self.dispatch_reference_query(panel_id);
     }
 
     /// Returns every live current lane which still requires the currently open FASTA revision.
@@ -846,23 +835,22 @@ impl Viewer {
         all_queued
     }
 
-    pub(crate) fn dispatch_reference_query(&mut self) {
-        if !self.panels.active().pending_queries.reference {
+    pub(crate) fn dispatch_reference_query(&mut self, panel_id: PanelId) {
+        if !self.panels.panel(panel_id).pending_queries.reference {
             return;
         }
-        let panel_id = self.panels.active().id;
         let Some(revision) = self.reference_revision else {
-            self.panels.active_mut().pending_queries.reference = false;
+            self.panels.panel_mut(panel_id).pending_queries.reference = false;
             return;
         };
         let reference_contig_name = match self.compatible_reference_contig_for_panel(panel_id) {
             Ok(Some(name)) => name,
             Ok(None) => {
-                self.panels.active_mut().pending_queries.reference = false;
+                self.panels.panel_mut(panel_id).pending_queries.reference = false;
                 return;
             }
             Err(reason) => {
-                let panel = self.panels.active_mut();
+                let panel = self.panels.panel_mut(panel_id);
                 panel.pending_queries.reference = false;
                 panel.reference_slice = None;
                 panel.reference_slice_revision = None;
@@ -897,8 +885,8 @@ impl Viewer {
             })
             .unwrap_or(AlignmentReferenceLanePlan::AllQueued);
         let contextual_interval = buffered_context_interval(
-            self.panels.active().viewport,
-            self.panels.active().contig_length,
+            self.panels.panel(panel_id).viewport,
+            self.panels.panel(panel_id).contig_length,
             self.settings.read_browsing_buffer_percent,
             Some(MAX_REFERENCE_QUERY_BASES),
         );
@@ -906,7 +894,7 @@ impl Viewer {
             .as_ref()
             .is_some_and(|slice| slice.interval.contains_interval(contextual_interval));
         if matches!(lane_plan, AlignmentReferenceLanePlan::AllQueued) && cached_covers_context {
-            let panel = self.panels.active_mut();
+            let panel = self.panels.panel_mut(panel_id);
             panel.pending_queries.reference = false;
             let generation = panel.generation_clock.current().get();
             panel.reference_slice_generation = Some(generation);
@@ -924,7 +912,7 @@ impl Viewer {
         {
             // The bases are already resident, so an unqueued owner can only be waiting for bounded
             // control-queue capacity. Keep the dispatch flag set and retry without duplicate I/O.
-            self.panels.active_mut().pending_queries.reference = true;
+            self.panels.panel_mut(panel_id).pending_queries.reference = true;
             return;
         }
         let already_requested = self.panels.get(panel_id).is_some_and(|panel| {
@@ -932,21 +920,22 @@ impl Viewer {
                 && panel.reference_request_interval == Some(interval)
         });
         if already_requested {
-            self.panels.active_mut().pending_queries.reference = false;
+            self.panels.panel_mut(panel_id).pending_queries.reference = false;
             return;
         }
         let Some(engine) = &self.reference_engine else {
-            self.panels.active_mut().pending_queries.reference = false;
+            self.panels.panel_mut(panel_id).pending_queries.reference = false;
             return;
         };
-        let query = ReferenceQueryIdentity::new(self.panels.active().request(), revision, interval);
+        let query =
+            ReferenceQueryIdentity::new(self.panels.panel(panel_id).request(), revision, interval);
         match engine.try_query(
             query,
-            self.panels.active_mut().generation_clock.clone(),
+            self.panels.panel_mut(panel_id).generation_clock.clone(),
             reference_contig_name,
         ) {
             Ok(()) => {
-                let panel = self.panels.active_mut();
+                let panel = self.panels.panel_mut(panel_id);
                 panel.reference_request_revision = Some(revision);
                 panel.reference_request_interval = Some(interval);
                 panel.pending_queries.reference = false;
@@ -955,73 +944,61 @@ impl Viewer {
                 self.set_busy_status("Reference queue busy; retrying the latest locus…");
             }
             Err(EngineQueueError::Disconnected) => {
-                self.panels.active_mut().pending_queries.reference = false;
+                self.panels.panel_mut(panel_id).pending_queries.reference = false;
                 self.report_error(EngineQueueError::Disconnected.to_string());
             }
         }
     }
 
     pub(crate) fn request_all_panel_queries(&mut self) {
-        let active_id = self.panels.active().id;
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
-            self.panels.activate(id);
             self.retain_active_read_selection_for_query_refresh();
-            self.request_alignment_query();
-            self.request_reference_query();
-            self.request_track_query();
+            self.request_alignment_query(id);
+            self.request_reference_query(id);
+            self.request_track_query(id);
         }
-        self.panels.activate(active_id);
     }
 
     pub(crate) fn request_all_alignment_queries(&mut self) {
-        let active_id = self.panels.active().id;
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
-            self.panels.activate(id);
             self.retain_active_read_selection_for_query_refresh();
-            self.request_alignment_query();
+            self.request_alignment_query(id);
         }
-        self.panels.activate(active_id);
     }
 
     pub(crate) fn request_all_auxiliary_track_queries(&mut self) {
-        let active_id = self.panels.active().id;
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
-            self.panels.activate(id);
-            self.request_track_query();
+            self.request_track_query(id);
         }
-        self.panels.activate(active_id);
     }
 
     pub(crate) fn invalidate_and_request_all_auxiliary_track_queries(&mut self) {
-        let active_id = self.panels.active().id;
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
-            self.panels.activate(id);
-            self.panels.active().generation_clock.advance();
-            self.request_reference_query();
-            self.request_track_query();
+            self.panels.panel(id).generation_clock.advance();
+            self.request_reference_query(id);
+            self.request_track_query(id);
         }
-        self.panels.activate(active_id);
     }
 
-    pub(crate) fn dispatch_track_query(&mut self) {
-        if !self.panels.active().pending_queries.tracks {
+    pub(crate) fn dispatch_track_query(&mut self, panel_id: PanelId) {
+        if !self.panels.panel(panel_id).pending_queries.tracks {
             return;
         }
         let Some(engine) = &self.track_engine else {
-            self.panels.active_mut().pending_queries.tracks = false;
+            self.panels.panel_mut(panel_id).pending_queries.tracks = false;
             return;
         };
         let interval = buffered_context_interval(
-            self.panels.active().viewport,
-            self.panels.active().contig_length,
+            self.panels.panel(panel_id).viewport,
+            self.panels.panel(panel_id).contig_length,
             self.settings.read_browsing_buffer_percent,
             None,
         );
-        let request = self.panels.active().request();
+        let request = self.panels.panel(panel_id).request();
         let track_ids = auxiliary_query_track_ids(self.tracks.tracks());
         let queried = track_ids.iter().copied().collect::<HashSet<_>>();
         let variant_settings = self
@@ -1047,8 +1024,8 @@ impl Viewer {
             .collect();
         match engine.try_query_selected_with_settings(
             request,
-            self.panels.active_mut().generation_clock.clone(),
-            self.panels.active_mut().contig_name.clone(),
+            self.panels.panel_mut(panel_id).generation_clock.clone(),
+            self.panels.panel_mut(panel_id).contig_name.clone(),
             interval,
             track_ids,
             variant_settings,
@@ -1056,7 +1033,7 @@ impl Viewer {
             copy_number_settings,
         ) {
             Ok(()) => {
-                let panel = self.panels.active_mut();
+                let panel = self.panels.panel_mut(panel_id);
                 panel.pending_queries.tracks = false;
                 panel.track_request_interval = Some(interval);
             }
@@ -1064,15 +1041,14 @@ impl Viewer {
                 self.set_busy_status("Track queue busy; retrying the latest locus…");
             }
             Err(EngineQueueError::Disconnected) => {
-                self.panels.active_mut().pending_queries.tracks = false;
-                self.panels.active_mut().track_request_interval = None;
+                self.panels.panel_mut(panel_id).pending_queries.tracks = false;
+                self.panels.panel_mut(panel_id).track_request_interval = None;
                 self.report_error(EngineQueueError::Disconnected.to_string());
             }
         }
     }
 
     pub(crate) fn retry_pending_queries(&mut self) {
-        let active_id = self.panels.active().id;
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
             let alignment_pending = self.alignment_tracks.iter().any(|track| {
@@ -1080,22 +1056,20 @@ impl Viewer {
                     .projection(id)
                     .is_some_and(|projection| projection.navigation.is_queued())
             });
-            self.panels.activate(id);
             if self
                 .panels
-                .active()
+                .panel(id)
                 .navigation_query_schedule
                 .pending
                 .is_some()
             {
                 continue;
             }
-            self.panels.active_mut().pending_queries.alignment = alignment_pending;
-            self.dispatch_alignment_query();
-            self.dispatch_reference_query();
-            self.dispatch_track_query();
+            self.panels.panel_mut(id).pending_queries.alignment = alignment_pending;
+            self.dispatch_alignment_query(id);
+            self.dispatch_reference_query(id);
+            self.dispatch_track_query(id);
         }
-        self.panels.activate(active_id);
     }
 
     /// Resumes paused, exact source intents only after their typed ledger obstruction has cleared.
@@ -1783,12 +1757,9 @@ impl Viewer {
             }
         }
         if !reference_panels_to_retry.is_empty() {
-            let restore = self.panels.active().id;
             for panel_id in reference_panels_to_retry {
-                self.panels.activate(panel_id);
-                self.dispatch_reference_query();
+                self.dispatch_reference_query(panel_id);
             }
-            self.panels.activate(restore);
         }
         if !highlight_panels_to_synchronize.is_empty() {
             for panel_id in highlight_panels_to_synchronize {
@@ -2716,13 +2687,10 @@ impl Viewer {
         }
 
         if !reference_panels_to_request.is_empty() {
-            let restore = self.panels.active().id;
             for panel_id in reference_panels_to_request {
-                self.panels.activate(panel_id);
-                self.panels.active_mut().pending_queries.reference = true;
-                self.dispatch_reference_query();
+                self.panels.panel_mut(panel_id).pending_queries.reference = true;
+                self.dispatch_reference_query(panel_id);
             }
-            self.panels.activate(restore);
         }
 
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
@@ -2887,6 +2855,11 @@ impl Viewer {
             self.report_track_source_diagnostics();
         }
         for event in events {
+            // An answer to an automation `query_features` or `goto_gene` command belongs to no
+            // panel and to no interactive search.
+            let Some(event) = self.route_automation_track_event(event) else {
+                continue;
+            };
             let stale_query_result = match &event {
                 TrackEngineEvent::QueryCompleted { request, .. }
                 | TrackEngineEvent::LaneCompleted { request, .. }
@@ -3038,7 +3011,7 @@ impl Viewer {
                         panel.selected_interaction = selections.interaction;
                         self.mark_display_dirty("explicit display invalidation");
                         if is_active {
-                            self.rebuild_genomic_display();
+                            self.rebuild_genomic_display(self.panels.active().id);
                         }
                     }
                 }
@@ -3056,7 +3029,7 @@ impl Viewer {
                         panel.track_settled_generation = Some(request.generation().get());
                         self.mark_display_dirty("explicit display invalidation");
                         if is_active {
-                            self.rebuild_genomic_display();
+                            self.rebuild_genomic_display(self.panels.active().id);
                         }
                     }
                 }

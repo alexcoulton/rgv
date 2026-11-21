@@ -2,6 +2,7 @@ mod artifacts;
 mod capture;
 mod config;
 mod evidence;
+mod features;
 mod redaction;
 mod server;
 

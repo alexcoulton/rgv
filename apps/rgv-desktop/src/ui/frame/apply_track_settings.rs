@@ -214,7 +214,7 @@ impl Viewer {
                 .map(modification_code_label)
                 .collect();
             self.invalidate_navigation_contract("alignment presentation changed");
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(self.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
     }
@@ -371,7 +371,7 @@ impl Viewer {
         if track_configuration_changed {
             self.invalidate_navigation_contract("auxiliary track presentation changed");
             self.reconcile_track_presentation();
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(self.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if auxiliary_query_membership_changed {
@@ -688,7 +688,7 @@ impl Viewer {
             );
         }
         if st.lists.metadata_bulk_remove_requested {
-            match self.remove_metadata_selected_tracks(&metadata_selected) {
+            match self.remove_tracks(&metadata_selected) {
                 Ok(removed) => {
                     self.data_status = format!("Removed {removed} selected tracks");
                 }
@@ -696,7 +696,7 @@ impl Viewer {
             }
         }
         if let Some(id) = alignment_track_to_remove
-            && let Err(error) = self.remove_alignment_track(id)
+            && let Err(error) = self.remove_tracks(&std::collections::BTreeSet::from([id]))
         {
             self.report_error(error.to_string());
         }

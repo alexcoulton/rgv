@@ -45,6 +45,28 @@ fn toggle_track_visibility(visible: &mut bool, collapsed: &mut bool) {
     }
 }
 
+/// The gutter requests that are a track intent on their own, needing no workspace state to
+/// phrase. The toggles and drags are resolved against the current arrangement by
+/// `dispatch_track_actions`.
+pub(crate) fn stateless_track_intent(action: &TrackUiAction) -> Option<TrackIntent> {
+    match action {
+        TrackUiAction::SetPaneRowsExpanded(channel, expanded) => {
+            Some(TrackIntent::SetPaneRowsExpanded {
+                channel: *channel,
+                expanded: *expanded,
+            })
+        }
+        TrackUiAction::ResetPaneRowHeights(channel) => {
+            Some(TrackIntent::ResetPaneRowHeights { channel: *channel })
+        }
+        TrackUiAction::SetNodeVisibility(target, visible) => Some(TrackIntent::SetNodeVisibility {
+            target: *target,
+            visible: *visible,
+        }),
+        _ => None,
+    }
+}
+
 fn intent_channel(intent: &TrackIntent) -> ui::TrackPane {
     match intent {
         TrackIntent::SetSectionExpanded { channel, .. }
@@ -178,15 +200,18 @@ impl Viewer {
                     }
                 }
                 TrackUiAction::SetPaneRowsExpanded(channel, expanded) => {
-                    presentation_intents
-                        .push(TrackIntent::SetPaneRowsExpanded { channel, expanded });
+                    presentation_intents.extend(stateless_track_intent(
+                        &TrackUiAction::SetPaneRowsExpanded(channel, expanded),
+                    ));
                     match channel {
                         ui::TrackPane::Annotation => outcome.annotation_geometry_changed = true,
                         ui::TrackPane::Reads => outcome.read_geometry_changed = true,
                     }
                 }
                 TrackUiAction::ResetPaneRowHeights(channel) => {
-                    presentation_intents.push(TrackIntent::ResetPaneRowHeights { channel });
+                    presentation_intents.extend(stateless_track_intent(
+                        &TrackUiAction::ResetPaneRowHeights(channel),
+                    ));
                     match channel {
                         ui::TrackPane::Annotation => outcome.annotation_geometry_changed = true,
                         ui::TrackPane::Reads => outcome.read_geometry_changed = true,
@@ -250,7 +275,9 @@ impl Viewer {
                 }
                 TrackUiAction::ToggleVisibility(TrackFrameKey::Group { .. }) => {}
                 TrackUiAction::SetNodeVisibility(target, visible) => {
-                    presentation_intents.push(TrackIntent::SetNodeVisibility { target, visible });
+                    presentation_intents.extend(stateless_track_intent(
+                        &TrackUiAction::SetNodeVisibility(target, visible),
+                    ));
                     match target {
                         PresentationNodeId::Reference => *draft.show_reference = visible,
                         PresentationNodeId::Track {
@@ -442,7 +469,7 @@ impl Viewer {
                 }
                 TrackUiAction::Export(_) => outcome.export_requested = true,
                 TrackUiAction::Remove(TrackFrameKey::Auxiliary(id)) => {
-                    match self.remove_auxiliary_tracks(&[id]) {
+                    match self.remove_tracks(&std::collections::BTreeSet::from([id])) {
                         Ok(removed) if removed > 0 => {
                             draft.metadata_selection.remove(&id);
                             if outcome.settings_panel == Some(TrackFrameKey::Auxiliary(id)) {

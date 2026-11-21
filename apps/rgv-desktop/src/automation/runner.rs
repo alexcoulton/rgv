@@ -105,6 +105,12 @@ pub(crate) enum AutomationWait {
         previous_selection: Option<(String, u64)>,
         deadline: Instant,
     },
+    /// A `query_features` or `goto_gene` command waiting for the track engine's answer.
+    TrackReply {
+        command_index: usize,
+        deadline: Instant,
+        pending: super::commands::PendingTrackReply,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -382,7 +388,8 @@ impl AutomationRunner {
                     | AutomationWait::Reference { command_index, .. }
                     | AutomationWait::AlignmentTrack { command_index, .. }
                     | AutomationWait::AuxiliaryTrack { command_index, .. }
-                    | AutomationWait::ExactBaseSelection { command_index, .. } => *command_index,
+                    | AutomationWait::ExactBaseSelection { command_index, .. }
+                    | AutomationWait::TrackReply { command_index, .. } => *command_index,
                 })
             })
     }
@@ -446,7 +453,8 @@ impl AutomationRunner {
             | AutomationWait::Reference { command_index, .. }
             | AutomationWait::AlignmentTrack { command_index, .. }
             | AutomationWait::AuxiliaryTrack { command_index, .. }
-            | AutomationWait::ExactBaseSelection { command_index, .. } => *command_index,
+            | AutomationWait::ExactBaseSelection { command_index, .. }
+            | AutomationWait::TrackReply { command_index, .. } => *command_index,
         }) && waiting_index != command_index
         {
             return false;

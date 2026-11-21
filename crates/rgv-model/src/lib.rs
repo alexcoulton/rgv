@@ -10,6 +10,7 @@
 
 pub mod alignment;
 pub mod bisulfite;
+pub mod coverage_pyramid;
 pub mod exact_depth;
 pub mod filter;
 pub mod junction;
@@ -24,6 +25,7 @@ pub mod smrt_kinetics;
 pub mod source_position;
 pub mod source_revision;
 pub mod supplementary;
+pub mod track_tile;
 pub mod tracks;
 pub mod ultima;
 
@@ -38,6 +40,13 @@ pub use alignment::{
 pub use bisulfite::{
     BisulfiteObservation, BisulfiteSummary, bisulfite_context_matches, bisulfite_strand_is_reverse,
     classify_bisulfite_observation, summarize_bisulfite_record,
+};
+pub use coverage_pyramid::{
+    COVERAGE_PYRAMID_BASE_BIN_BASES, COVERAGE_PYRAMID_LEVEL_FACTOR, COVERAGE_PYRAMID_MAX_LEVELS,
+    COVERAGE_PYRAMID_TILE_BINS, CoverageAccumulation, CoverageAccumulator,
+    CoverageAccumulatorTelemetry, CoverageBin, CoverageEligibility, CoveragePyramidError,
+    CoveragePyramidParameters, CoverageTile, CoverageTileId, add_counted_depth_segments,
+    derive_coarser_tiles,
 };
 pub use exact_depth::{ExactDepthRun, ExactDepthTile, ExactDepthTileBuilder};
 pub use filter::{AlignmentFilter, AuxComparison, AuxPredicate, FilterParseError, FilterValue};
@@ -86,6 +95,7 @@ pub use supplementary::{
     MAX_SUPPLEMENTARY_CIGAR_OPERATIONS, MAX_SUPPLEMENTARY_SEGMENTS, SupplementaryChain,
     SupplementarySegment, decode_supplementary_chain,
 };
+pub use track_tile::*;
 pub use tracks::*;
 pub use ultima::{
     MAX_ULTIMA_VALUES_PER_RECORD, UltimaEventUnavailable, UltimaEvidenceError, UltimaIndelEvidence,

@@ -19,6 +19,8 @@ pub enum UiCommand {
     Metadata,
     Regions,
     ReviewQueue,
+    Undo,
+    Redo,
 }
 
 pub const SEARCHABLE_COMMANDS: &[(&str, UiCommand)] = &[
@@ -50,6 +52,8 @@ pub const SEARCHABLE_COMMANDS: &[(&str, UiCommand)] = &[
     ("Open sample metadata", UiCommand::Metadata),
     ("Open regions of interest", UiCommand::Regions),
     ("Open review queue", UiCommand::ReviewQueue),
+    ("Undo last edit", UiCommand::Undo),
+    ("Redo last undone edit", UiCommand::Redo),
 ];
 
 pub fn command_matches(label: &str, search: &str) -> bool {

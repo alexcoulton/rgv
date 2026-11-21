@@ -2,7 +2,7 @@ use std::{mem::size_of, sync::Arc};
 
 use rgv_model::{
     AlignmentMateAlignment, AlignmentMateOverlapCollapser, CigarOpKind, ExactDepthRun,
-    ExactDepthTile, ExactDepthTileBuilder,
+    ExactDepthTile, ExactDepthTileBuilder, add_counted_depth_segments,
 };
 use thiserror::Error;
 
@@ -132,15 +132,16 @@ impl ExactDepthSummaryTile {
 
         let mut depth_builder = ExactDepthTileBuilder::new(interval);
         let mut collapser = AlignmentMateOverlapCollapser::new(contract.overlapping_mate_policy());
+        let mut aligned_segments = Vec::<(u64, u64)>::new();
         for index in 0..selection.len() {
             let record = selection
                 .record_view(index)
                 .ok_or(EvidenceSelectionError::InvalidChunkIndex)?;
             let flags = record.flags();
             let reverse = flags.is_reverse();
-            // Depth collapses only where the earlier mate has an aligned base; its deletions and
-            // `N` skips leave the later mate's bases counted, as in the direct rgv-hts query.
-            let overlap_mask = collapser.mask_for_alignment(
+            // The count-once depth rule is the one the streaming coverage pyramid uses.
+            add_counted_depth_segments(
+                &mut collapser,
                 AlignmentMateAlignment {
                     read_name: record.read_name(),
                     contig: record.contig(),
@@ -150,65 +151,19 @@ impl ExactDepthSummaryTile {
                     mate_contig: record.mate_contig(),
                     mate_start: record.mate_start(),
                 },
-                record.cigar().iter().copied(),
-                |_| true,
-            );
-            let mut reference_position = record.start();
-            let mut aligned_segments = Vec::<(u64, u64)>::new();
-            for operation in record.cigar() {
-                if reference_position >= interval.end() {
-                    // Nothing further along this read can reach the tile.
-                    break;
-                }
-                let end = reference_position.saturating_add(u64::from(operation.len));
-                match operation.kind {
-                    CigarOpKind::Match
-                    | CigarOpKind::SequenceMatch
-                    | CigarOpKind::SequenceMismatch => {
-                        if end <= interval.start() {
-                            // Entirely left of the tile: contributes no depth here, so it is
-                            // neither retained nor charged.
-                        } else if let Some((_, merged_end)) = aligned_segments.last_mut()
-                            && reference_position <= *merged_end
-                        {
-                            *merged_end = (*merged_end).max(end);
-                        } else {
-                            aligned_segments.push((reference_position, end));
-                        }
-                        reference_position = end;
-                    }
-                    CigarOpKind::Deletion | CigarOpKind::ReferenceSkip => {
-                        reference_position = end;
-                    }
-                    CigarOpKind::Insertion
-                    | CigarOpKind::SoftClip
-                    | CigarOpKind::HardClip
-                    | CigarOpKind::Padding => {}
-                }
-            }
-            let mut collapsed = 0_u64;
-            for (start, end) in aligned_segments {
-                let start = start.max(interval.start());
-                let end = end.min(interval.end());
-                if start >= end {
-                    continue;
-                }
-                let mut add = |start, end| {
+                record.cigar(),
+                interval.start(),
+                interval.end(),
+                &mut aligned_segments,
+                |start, end| {
                     depth_builder.add_aligned_segment(
                         start,
                         end,
                         reverse,
                         record.mapping_quality(),
                     );
-                };
-                if let Some(mask) = &overlap_mask {
-                    collapsed =
-                        collapsed.saturating_add(mask.add_unmasked_depth_range(start, end, add));
-                } else {
-                    add(start, end);
-                }
-            }
-            collapser.note_collapsed(collapsed);
+                },
+            );
         }
         if !collapser.complete() {
             return Err(ExactDepthSummaryError::MateOverlapCapacityExceeded);
@@ -798,5 +753,161 @@ mod tests {
         ));
         assert_eq!(summary_ledger.snapshot().unwrap().charged, 0);
         assert_eq!(summary_ledger.snapshot().unwrap().reserved, 0);
+    }
+
+    /// The streaming coverage pyramid and the read-derived exact depth summary agree wherever
+    /// both exist: a level-0 pyramid tile equals the exact tiles' runs aggregated to its bins.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_coverage_pyramid_equals_exact_read_derived_depth_aggregated_to_bins() {
+        use rgv_model::{
+            AlignmentMateAlignment, CoverageAccumulator, CoveragePyramidParameters, CoverageTile,
+        };
+
+        use crate::{DepthPyramidStore, DepthPyramidView};
+
+        const CONTIG_LENGTH: u64 = 400;
+        // 4-base bins, 64-base tiles: the 400-base contig has seven tiles, the last partial.
+        let parameters = CoveragePyramidParameters::new(4, 4, 16).unwrap();
+        let mut state = 0x5eed_u64;
+        let mut random = move |bound: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % bound
+        };
+        for policy in [
+            OverlappingMatePolicy::CountOnce,
+            OverlappingMatePolicy::CountBoth,
+        ] {
+            for round in 0..6 {
+                let mut records = Vec::new();
+                for template in 0..120 {
+                    let name = format!("t{round}-{template}").into_bytes();
+                    let cigar = |random: &mut dyn FnMut(u64) -> u64| {
+                        let mut cigar = vec![(CigarOpKind::Match, 1 + random(25) as u32)];
+                        match random(4) {
+                            0 => cigar.push((CigarOpKind::Deletion, 1 + random(6) as u32)),
+                            1 => cigar.push((CigarOpKind::ReferenceSkip, 1 + random(40) as u32)),
+                            2 => cigar.push((CigarOpKind::Insertion, 2)),
+                            _ => return cigar,
+                        }
+                        cigar.push((CigarOpKind::SequenceMatch, 1 + random(20) as u32));
+                        cigar
+                    };
+                    let start = random(300);
+                    let first = cigar(&mut random);
+                    if random(3) == 0 {
+                        records.push(record(&name, start, &first, 0, None));
+                        continue;
+                    }
+                    let mate_start = start + random(30);
+                    let second = cigar(&mut random);
+                    records.push(record(&name, start, &first, 0x1 | 0x40, Some(mate_start)));
+                    records.push(record(
+                        &name,
+                        mate_start,
+                        &second,
+                        0x1 | 0x80 | 0x10,
+                        Some(start),
+                    ));
+                }
+                records.sort_by_key(|record| record.start);
+                assert!(records.iter().all(|record| record.end <= CONTIG_LENGTH));
+
+                // Read-level authority: exact depth tiles derived from resident evidence.
+                let ledger = AllocationLedger::new(64 << 20, 0);
+                let root = evidence(&records, &ledger);
+                let exact = (0..CONTIG_LENGTH.div_ceil(64))
+                    .map(|coordinate| {
+                        ExactDepthSummaryTile::build(
+                            &root,
+                            CanonicalGenomicTile::new(
+                                ContigId::new(0),
+                                coordinate,
+                                NonZeroU64::new(64).unwrap(),
+                            ),
+                            CONTIG_LENGTH,
+                            DepthSummaryContract::new(policy),
+                            &ledger,
+                            ReservationKind::Normal,
+                            3,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(exact.len(), 7);
+                if policy == OverlappingMatePolicy::CountOnce {
+                    assert!(exact.iter().any(|tile| tile.collapsed_mate_bases() > 0));
+                }
+
+                // The pyramid: the same records streamed once, nothing retained.
+                let tiles = parameters.tile_range(0, 0, CONTIG_LENGTH, CONTIG_LENGTH);
+                let mut accumulator = CoverageAccumulator::new(
+                    parameters,
+                    ContigId::new(0),
+                    CONTIG_LENGTH,
+                    0,
+                    tiles,
+                    policy,
+                )
+                .unwrap();
+                for record in &records {
+                    accumulator
+                        .add_record(
+                            AlignmentMateAlignment {
+                                read_name: &record.read_name,
+                                contig: record.contig,
+                                start: record.start,
+                                end: record.end,
+                                flags: record.flags,
+                                mate_contig: record.mate_contig,
+                                mate_start: record.mate_start,
+                            },
+                            &record.cigar,
+                        )
+                        .unwrap();
+                }
+                let pyramid = accumulator.finish().unwrap();
+                assert!(pyramid.overlap_collapse_complete);
+                assert_eq!(pyramid.tiles.len(), exact.len());
+
+                let mut store = DepthPyramidStore::new(parameters, ledger.clone(), 8 << 20);
+                for (tile, exact_tile) in pyramid.tiles.iter().zip(&exact) {
+                    assert_eq!(
+                        tile.span(),
+                        (
+                            exact_tile.depth().interval().start(),
+                            exact_tile.depth().interval().end()
+                        )
+                    );
+                    let aggregated = CoverageTile::from_depth_runs(
+                        tile.id(),
+                        parameters,
+                        CONTIG_LENGTH,
+                        exact_tile.depth().runs(),
+                    )
+                    .unwrap();
+                    assert_eq!(tile, &aggregated, "{policy:?}, round {round}");
+                    store.insert(tile.clone()).unwrap();
+                }
+                // And through the lane product: any range's maximum equals the exact one.
+                let lane = store.lane(&DepthPyramidView {
+                    contig: ContigId::new(0),
+                    contig_length: CONTIG_LENGTH,
+                    start: 0,
+                    end: CONTIG_LENGTH,
+                    bases_per_pixel: 1.0,
+                });
+                assert!(lane.is_exact_at_target());
+                for exact_tile in &exact {
+                    let interval = exact_tile.depth().interval();
+                    assert_eq!(
+                        Some(lane.maximum_depth(interval.start(), interval.end())),
+                        exact_tile.depth().maximum_depth(interval)
+                    );
+                }
+            }
+        }
     }
 }

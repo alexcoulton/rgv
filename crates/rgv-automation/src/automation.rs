@@ -26,6 +26,16 @@ pub const MAXIMUM_AUTOMATION_ALIGNMENT_RESULTS: usize = 128;
 pub const MAXIMUM_AUTOMATION_HISTORY_ENTRIES: usize = 256;
 pub const MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS: u64 = 100;
 pub const MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS: u64 = 600_000;
+/// Most features one `query_features` page may return.
+pub const MAXIMUM_AUTOMATION_FEATURE_RESULTS: usize = 500;
+/// Widest interval, in bases, one `query_features` command may ask about (10 Mb).
+pub const MAXIMUM_AUTOMATION_FEATURE_QUERY_SPAN: u64 = 10_000_000;
+/// Largest `query_features` paging offset.
+pub const MAXIMUM_AUTOMATION_FEATURE_OFFSET: usize = 1_000_000;
+/// Longest `goto_gene` query, in bytes; the same bound the interactive annotation search uses.
+pub const MAXIMUM_AUTOMATION_GENE_QUERY_BYTES: usize = 256;
+/// Largest `goto_gene` flank, in bases, added on each side of the matched feature (10 Mb).
+pub const MAXIMUM_AUTOMATION_GENE_FLANK_BASES: u64 = 10_000_000;
 pub use rgv_core::MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -438,6 +448,67 @@ pub enum AutomationCommand {
         /// Step back, step forward, or jump to an entry.
         action: AutomationHistoryNavigation,
     },
+    /// List the annotation features (genes, transcripts, BED intervals, peaks) that overlap one
+    /// genomic interval. Read-only and independent of every panel: it reads the loaded feature
+    /// and gene-model tracks directly, so it does not navigate, select, or change the workspace,
+    /// and the interval need not be shown by any panel. All coordinates are zero-based and
+    /// half-open `[start, end)`. Results are ordered by track (workspace order), then `start`,
+    /// `end`, and `name`, so `offset`/`limit` paging is stable. Fails with `resource_not_found`
+    /// when no feature track is loaded or a named track or the contig does not exist,
+    /// `too_dense` when a track holds more records in the interval than one query may read
+    /// (ask for a narrower interval), and `timeout` when the tracks do not answer in time.
+    QueryFeatures {
+        /// Contig (reference sequence) name as the workspace reports it, e.g. `chr1`; non-empty,
+        /// at most 16384 bytes. Aliases the viewer accepts in a locus (`1` for `chr1`) are
+        /// resolved when a reference dictionary is loaded.
+        contig: String,
+        /// Zero-based inclusive start of the interval, in bases (one less than the one-based
+        /// coordinate in a locus string). 0 to `end` - 1.
+        start: u64,
+        /// Zero-based exclusive end of the interval, in bases (half-open `[start, end)`; equals
+        /// the one-based inclusive end). Must be greater than `start` and at most `start` +
+        /// 10000000 (a 10 Mb span). Clamped to the contig length when that is known.
+        end: u64,
+        /// Positive stable IDs of the feature or gene-model tracks to read (`tracks[].id` in
+        /// the workspace snapshot); 1 to 1024 entries. Omit to read every loaded feature and
+        /// gene-model track. A track of another kind fails with `invalid_command`.
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
+        track_ids: Option<Vec<TrackId>>,
+        /// Number of matching features to skip, for paging; 0 to 1000000 (default 0).
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(range(min = 0, max = 1_000_000)))]
+        offset: usize,
+        /// Maximum number of features to return, 1 to 500 (default 100). `truncated` reports
+        /// whether matching features remain beyond this page.
+        #[serde(default = "default_feature_result_limit")]
+        #[cfg_attr(feature = "schema", schemars(range(min = 1, max = 500)))]
+        limit: usize,
+    },
+    /// Find one gene or other named annotation feature by name or identifier and navigate one
+    /// panel to it. The search covers every loaded searchable annotation track and is
+    /// case-insensitive. The command navigates only when the match is unambiguous: exactly one
+    /// feature matches the whole query, or the query matches nothing exactly and exactly one
+    /// feature matches it by prefix. It fails with `resource_not_found` when nothing matches or
+    /// no searchable track is loaded, `ambiguous_match` when several features match and none is
+    /// preferred (nothing is navigated), and `timeout` when the search does not answer in time.
+    /// The result reports the zero-based half-open interval the panel now shows. An interactive
+    /// annotation search still running in the window is superseded by this command.
+    GotoGene {
+        /// Gene symbol, feature name, or feature identifier to search for, e.g. `BRCA1`;
+        /// non-empty, at most 256 bytes. Matching ignores case and surrounding whitespace.
+        query: String,
+        /// Positive stable ID of the panel to navigate (`panels[].id` in the workspace
+        /// snapshot). Omit to navigate the focused panel. Other panels are not moved and the
+        /// focused panel does not change.
+        #[serde(default)]
+        panel_id: Option<PanelId>,
+        /// Bases (base pairs) of context added on each side of the matched feature, 0 to
+        /// 10000000 (default 0). The padded interval is clamped to the contig.
+        #[serde(default)]
+        #[cfg_attr(feature = "schema", schemars(range(min = 0, max = 10_000_000)))]
+        flank_bases: u64,
+    },
     /// Wait until every pending query and render has settled, so later commands observe the
     /// final state. Fails with `timeout` when the deadline passes.
     WaitUntilSettled {
@@ -531,6 +602,8 @@ impl AutomationCommand {
             Self::NavigateRelatedAlignment { .. } => "navigate_related_alignment",
             Self::NavigateReviewItem { .. } => "navigate_review_item",
             Self::NavigateHistory { .. } => "navigate_history",
+            Self::QueryFeatures { .. } => "query_features",
+            Self::GotoGene { .. } => "goto_gene",
             Self::WaitUntilSettled { .. } => "wait_until_settled",
             Self::Snapshot { .. } => "snapshot",
             Self::Export { .. } => "export",
@@ -714,6 +787,61 @@ impl AutomationCommand {
                 _ => Ok(()),
             },
             Self::NavigateReviewItem { action } => action.validate(),
+            Self::QueryFeatures {
+                contig,
+                start,
+                end,
+                track_ids,
+                offset,
+                limit,
+            } => {
+                validate_string(contig, "contig")?;
+                if start >= end {
+                    return Err(
+                        "end must be greater than start (zero-based, half-open interval)"
+                            .to_owned(),
+                    );
+                }
+                if end - start > MAXIMUM_AUTOMATION_FEATURE_QUERY_SPAN {
+                    return Err(format!(
+                        "the interval must span no more than {MAXIMUM_AUTOMATION_FEATURE_QUERY_SPAN} bases"
+                    ));
+                }
+                if let Some(track_ids) = track_ids {
+                    validate_track_selection(track_ids)?;
+                }
+                if *offset > MAXIMUM_AUTOMATION_FEATURE_OFFSET {
+                    return Err(format!(
+                        "offset must be no greater than {MAXIMUM_AUTOMATION_FEATURE_OFFSET}"
+                    ));
+                }
+                if !(1..=MAXIMUM_AUTOMATION_FEATURE_RESULTS).contains(limit) {
+                    return Err(format!(
+                        "limit must be between 1 and {MAXIMUM_AUTOMATION_FEATURE_RESULTS}"
+                    ));
+                }
+                Ok(())
+            }
+            Self::GotoGene {
+                query,
+                panel_id,
+                flank_bases,
+            } => {
+                if query.trim().is_empty() || query.len() > MAXIMUM_AUTOMATION_GENE_QUERY_BYTES {
+                    return Err(format!(
+                        "query must be non-empty and no more than {MAXIMUM_AUTOMATION_GENE_QUERY_BYTES} bytes"
+                    ));
+                }
+                if let Some(panel_id) = panel_id {
+                    validate_panel_id(*panel_id)?;
+                }
+                if *flank_bases > MAXIMUM_AUTOMATION_GENE_FLANK_BASES {
+                    return Err(format!(
+                        "flank_bases must be no greater than {MAXIMUM_AUTOMATION_GENE_FLANK_BASES}"
+                    ));
+                }
+                Ok(())
+            }
             Self::WaitUntilSettled { timeout_millis } => validate_settle_timeout(*timeout_millis),
             Self::Snapshot {
                 path, scope, scale, ..
@@ -945,11 +1073,16 @@ pub enum AutomationSetting {
         /// True shows alignment coverage, false hides it.
         value: bool,
     },
-    /// Show or hide the reads row of the first (primary) alignment track. Other alignment
-    /// tracks are not changed; use `presentation_node_visible` to address a specific track.
+    /// Show or hide the reads row of one alignment track: the track named by `track_id`, or
+    /// the first (primary) alignment track when `track_id` is omitted. Other alignment tracks
+    /// are not changed.
     ShowReads {
-        /// True shows the primary alignment track's reads, false hides them.
+        /// True shows the track's reads, false hides them.
         value: bool,
+        /// Positive stable ID of the alignment track to change, as reported in the workspace
+        /// snapshot. Omitted or `null` addresses the first (primary) alignment track.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track_id: Option<TrackId>,
     },
     /// Show or hide splice-junction arcs. Stored in the first (primary) alignment track's
     /// display settings.
@@ -1034,9 +1167,14 @@ pub enum AutomationSetting {
         #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
     },
-    /// Set the default read-row density of the first (primary) alignment track and clear that
-    /// track's per-panel density overrides.
+    /// Set the default read-row density of one alignment track and clear that track's
+    /// per-panel density overrides: the track named by `track_id`, or the first (primary)
+    /// alignment track when `track_id` is omitted.
     AlignmentDensity {
+        /// Positive stable ID of the alignment track to change, as reported in the workspace
+        /// snapshot. Omitted or `null` addresses the first (primary) alignment track.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track_id: Option<TrackId>,
         /// Read-row height multiplier: a row is 7 logical points tall at 1.0 and larger values
         /// draw taller rows. Batch validation accepts 0.25 to 4, but the viewer rejects values
         /// below 0.35 with `setting_out_of_range`, so the usable range is 0.35 to 4.
@@ -1184,8 +1322,14 @@ pub enum AutomationSetting {
         /// True shows the row's content, false hides it.
         value: bool,
     },
-    /// Scroll the read panel of the first (primary) alignment track in one genomic panel.
+    /// Scroll one alignment track's read panel in one genomic panel: the track named by
+    /// `track_id`, or the first (primary) alignment track when `track_id` is omitted.
     VerticalScrollPoints {
+        /// Positive stable ID of the alignment track whose read panel to scroll, as reported
+        /// in the workspace snapshot. Omitted or `null` addresses the first (primary) alignment
+        /// track.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track_id: Option<TrackId>,
         /// Positive stable ID of the panel, as reported in the workspace snapshot
         /// (`panels[].id`).
         panel_id: PanelId,
@@ -1246,6 +1390,10 @@ pub enum AutomationSetting {
 impl AutomationSetting {
     fn validate(&self) -> Result<(), String> {
         match self {
+            Self::ShowReads {
+                track_id: Some(track_id),
+                ..
+            } => validate_track_id(*track_id),
             Self::WindowSize { width, height } => ((640..=3_840).contains(width)
                 && (400..=2_160).contains(height))
             .then_some(())
@@ -1319,10 +1467,10 @@ impl AutomationSetting {
                 validate_panel_id(*panel_id)?;
                 validate_track_selection(track_ids)
             }
-            Self::AlignmentDensity { value }
+            Self::AlignmentDensity { value, track_id }
                 if value.is_finite() && (0.25..=4.0).contains(value) =>
             {
-                Ok(())
+                track_id.map_or(Ok(()), validate_track_id)
             }
             Self::AlignmentDensity { .. } => {
                 Err("alignment density must be finite and between 0.25 and 4".to_owned())
@@ -1390,7 +1538,13 @@ impl AutomationSetting {
                 && (100.0..=1_200.0).contains(value))
             .then_some(())
             .ok_or_else(|| "read pane height must be finite and between 100 and 1200".to_owned()),
-            Self::VerticalScrollPoints { panel_id, value }
+            Self::VerticalScrollPoints {
+                track_id: Some(track_id),
+                ..
+            } if track_id.get() == 0 => Err("track_id must be positive".to_owned()),
+            Self::VerticalScrollPoints {
+                panel_id, value, ..
+            }
             | Self::AnnotationScrollPoints { panel_id, value }
             | Self::ReadStackScrollPoints { panel_id, value } => {
                 validate_panel_id(*panel_id)?;
@@ -1583,6 +1737,10 @@ pub enum AutomationHistoryNavigation {
 
 fn default_alignment_result_limit() -> usize {
     25
+}
+
+fn default_feature_result_limit() -> usize {
+    100
 }
 
 const fn default_read_browsing_buffer_percent() -> u16 {
@@ -2424,6 +2582,81 @@ pub struct AutomationAlignmentHit {
     pub modification_evidence_status: String,
 }
 
+/// One annotation feature returned by `query_features`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationFeature {
+    /// Stable ID of the track the feature was read from.
+    pub track_id: u64,
+    /// The feature's display label (gene symbol, record name, or identifier); empty when the
+    /// record carries none. At most 256 bytes.
+    pub name: String,
+    /// The source's feature type (`gene`, `exon`, ...), or `feature` when the format has none.
+    pub feature_type: String,
+    /// Contig name as the track's source spells it.
+    pub contig: String,
+    /// Zero-based inclusive start, in bases.
+    pub start: u64,
+    /// Zero-based exclusive end, in bases (half-open `[start, end)`).
+    pub end: u64,
+    /// `+`, `-`, or `.` when the feature is unstranded.
+    pub strand: String,
+    /// Gene symbol from the record's attributes, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gene_name: Option<String>,
+}
+
+/// The `data` of a successful `query_features` command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationFeatureQueryResult {
+    /// Contig the tracks were queried on, as the workspace names it.
+    pub contig: String,
+    /// Zero-based inclusive start of the interval that was read.
+    pub start: u64,
+    /// Zero-based exclusive end of the interval that was read (clamped to the contig).
+    pub end: u64,
+    /// Stable IDs of the tracks that answered, in workspace order.
+    #[serde(default)]
+    pub track_ids: Vec<u64>,
+    /// This page of features, ordered by track, `start`, `end`, then `name`.
+    pub features: Vec<AutomationFeature>,
+    /// Number of features overlapping the interval across the queried tracks, before paging.
+    pub total_matching: usize,
+    /// The paging offset this page starts at.
+    #[serde(default)]
+    pub offset: usize,
+    /// True when matching features remain beyond this page.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// The feature `goto_gene` navigated to.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationGeneHit {
+    /// Stable ID of the track the feature was found in.
+    pub track_id: u64,
+    /// The feature's display label. At most 256 bytes.
+    pub name: String,
+    /// The source's feature type (`gene`, `transcript`, ...), or `feature` when it has none.
+    pub feature_type: String,
+}
+
+/// The `data` of a successful `goto_gene` command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationGeneNavigationResult {
+    /// Stable ID of the panel that was navigated.
+    pub panel_id: u64,
+    /// Contig the panel now shows.
+    pub contig: String,
+    /// Zero-based inclusive start of the interval the panel now shows.
+    pub start: u64,
+    /// Zero-based exclusive end of the interval the panel now shows.
+    pub end: u64,
+    /// The matched feature.
+    pub hit: AutomationGeneHit,
+    /// Number of features the search returned for the query (1 when the match was unique).
+    pub candidate_count: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AutomationAlignmentSearchResult {
     pub application_instance_id: String,
@@ -2793,6 +3026,8 @@ pub enum AutomationErrorCode {
     Timeout,
     Io,
     Internal,
+    /// Several annotation features matched a `goto_gene` query and none was preferred.
+    AmbiguousMatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3609,6 +3844,243 @@ mod tests {
         ));
     }
 
+    fn single_command_batch(command: AutomationCommand) -> AutomationBatch {
+        AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![command],
+        }
+    }
+
+    #[test]
+    fn feature_query_and_gene_navigation_round_trip_with_defaults() {
+        let batch = AutomationBatch {
+            schema_version: AUTOMATION_SCHEMA_VERSION,
+            commands: vec![
+                AutomationCommand::QueryFeatures {
+                    contig: "chr17".to_owned(),
+                    start: 43_044_294,
+                    end: 43_125_483,
+                    track_ids: Some(vec![TrackId::new(3), TrackId::new(5)]),
+                    offset: 500,
+                    limit: MAXIMUM_AUTOMATION_FEATURE_RESULTS,
+                },
+                AutomationCommand::GotoGene {
+                    query: "BRCA1".to_owned(),
+                    panel_id: Some(PanelId::new(2)),
+                    flank_bases: 5_000,
+                },
+            ],
+        };
+        let json = batch.to_json().unwrap();
+        assert_eq!(AutomationBatch::from_json(&json).unwrap(), batch);
+        assert_eq!(
+            batch
+                .commands
+                .iter()
+                .map(AutomationCommand::name)
+                .collect::<Vec<_>>(),
+            ["query_features", "goto_gene"]
+        );
+
+        // Optional fields are additive: a minimal command receives the documented defaults.
+        let minimal = AutomationBatch::from_json(
+            r#"{"schema_version":6,"commands":[
+                {"command":"query_features","contig":"chr1","start":0,"end":1000},
+                {"command":"goto_gene","query":"TP53"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            minimal.commands,
+            [
+                AutomationCommand::QueryFeatures {
+                    contig: "chr1".to_owned(),
+                    start: 0,
+                    end: 1_000,
+                    track_ids: None,
+                    offset: 0,
+                    limit: 100,
+                },
+                AutomationCommand::GotoGene {
+                    query: "TP53".to_owned(),
+                    panel_id: None,
+                    flank_bases: 0,
+                },
+            ]
+        );
+
+        let result = AutomationFeatureQueryResult {
+            contig: "chr1".to_owned(),
+            start: 0,
+            end: 1_000,
+            track_ids: vec![3],
+            features: vec![AutomationFeature {
+                track_id: 3,
+                name: "TP53".to_owned(),
+                feature_type: "gene".to_owned(),
+                contig: "chr1".to_owned(),
+                start: 10,
+                end: 90,
+                strand: "-".to_owned(),
+                gene_name: None,
+            }],
+            total_matching: 4,
+            offset: 0,
+            truncated: true,
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert!(value["features"][0].get("gene_name").is_none());
+        assert_eq!(
+            serde_json::from_value::<AutomationFeatureQueryResult>(value).unwrap(),
+            result
+        );
+        let navigation = AutomationGeneNavigationResult {
+            panel_id: 2,
+            contig: "chr17".to_owned(),
+            start: 43_039_294,
+            end: 43_130_483,
+            hit: AutomationGeneHit {
+                track_id: 3,
+                name: "BRCA1".to_owned(),
+                feature_type: "gene".to_owned(),
+            },
+            candidate_count: 1,
+        };
+        // The viewer adds `application_instance_id` and `workspace_revision` to every result.
+        let mut value = serde_json::to_value(&navigation).unwrap();
+        value["workspace_revision"] = serde_json::json!(9);
+        assert_eq!(
+            serde_json::from_value::<AutomationGeneNavigationResult>(value).unwrap(),
+            navigation
+        );
+        assert_eq!(
+            serde_json::to_value(AutomationErrorCode::AmbiguousMatch).unwrap(),
+            "ambiguous_match"
+        );
+    }
+
+    #[test]
+    fn feature_queries_reject_empty_unbounded_or_inverted_requests() {
+        let query = |contig: &str, start, end, track_ids, offset, limit| {
+            single_command_batch(AutomationCommand::QueryFeatures {
+                contig: contig.to_owned(),
+                start,
+                end,
+                track_ids,
+                offset,
+                limit,
+            })
+        };
+        let widest = MAXIMUM_AUTOMATION_FEATURE_QUERY_SPAN;
+        for accepted in [
+            query("chr1", 0, 1, None, 0, 1),
+            query(
+                "chr1",
+                7,
+                7 + widest,
+                Some(vec![TrackId::new(1)]),
+                MAXIMUM_AUTOMATION_FEATURE_OFFSET,
+                MAXIMUM_AUTOMATION_FEATURE_RESULTS,
+            ),
+            query("chr1", u64::MAX - 1, u64::MAX, None, 0, 100),
+        ] {
+            accepted.validate().unwrap();
+        }
+        for rejected in [
+            query("", 0, 10, None, 0, 100),
+            query("  ", 0, 10, None, 0, 100),
+            query(
+                &"c".repeat(MAXIMUM_AUTOMATION_STRING_BYTES + 1),
+                0,
+                10,
+                None,
+                0,
+                100,
+            ),
+            query("chr1", 10, 10, None, 0, 100),
+            query("chr1", 11, 10, None, 0, 100),
+            query("chr1", 0, widest + 1, None, 0, 100),
+            query("chr1", 0, 10, Some(Vec::new()), 0, 100),
+            query("chr1", 0, 10, Some(vec![TrackId::new(0)]), 0, 100),
+            query(
+                "chr1",
+                0,
+                10,
+                Some(vec![
+                    TrackId::new(1);
+                    MAXIMUM_AUTOMATION_TRACK_SELECTION + 1
+                ]),
+                0,
+                100,
+            ),
+            query(
+                "chr1",
+                0,
+                10,
+                None,
+                MAXIMUM_AUTOMATION_FEATURE_OFFSET + 1,
+                100,
+            ),
+            query("chr1", 0, 10, None, 0, 0),
+            query(
+                "chr1",
+                0,
+                10,
+                None,
+                0,
+                MAXIMUM_AUTOMATION_FEATURE_RESULTS + 1,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    rejected.validate(),
+                    Err(AutomationError::InvalidCommand { index: 0, .. })
+                ),
+                "{rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gene_navigation_rejects_empty_or_unbounded_requests() {
+        let goto = |query: &str, panel_id, flank_bases| {
+            single_command_batch(AutomationCommand::GotoGene {
+                query: query.to_owned(),
+                panel_id,
+                flank_bases,
+            })
+        };
+        for accepted in [
+            goto("BRCA1", None, 0),
+            goto(
+                &"g".repeat(MAXIMUM_AUTOMATION_GENE_QUERY_BYTES),
+                Some(PanelId::new(1)),
+                MAXIMUM_AUTOMATION_GENE_FLANK_BASES,
+            ),
+        ] {
+            accepted.validate().unwrap();
+        }
+        for rejected in [
+            goto("", None, 0),
+            goto(" \t", None, 0),
+            goto(
+                &"g".repeat(MAXIMUM_AUTOMATION_GENE_QUERY_BYTES + 1),
+                None,
+                0,
+            ),
+            goto("BRCA1", Some(PanelId::new(0)), 0),
+            goto("BRCA1", None, MAXIMUM_AUTOMATION_GENE_FLANK_BASES + 1),
+        ] {
+            assert!(
+                matches!(
+                    rejected.validate(),
+                    Err(AutomationError::InvalidCommand { index: 0, .. })
+                ),
+                "{rejected:?}"
+            );
+        }
+    }
+
     #[test]
     fn typed_alignment_color_tags_enforce_sam_tag_syntax() {
         let invalid = AutomationBatch {
@@ -4189,5 +4661,49 @@ mod tests {
             scale: 2.0,
         };
         assert!(native.validate().is_err());
+    }
+
+    #[test]
+    fn per_track_settings_accept_an_optional_track_and_keep_the_unnamed_wire_form() {
+        let unnamed = serde_json::json!({ "setting": "show_reads", "value": false });
+        let setting: AutomationSetting = serde_json::from_value(unnamed.clone()).unwrap();
+        assert_eq!(
+            setting,
+            AutomationSetting::ShowReads {
+                value: false,
+                track_id: None
+            }
+        );
+        assert_eq!(serde_json::to_value(&setting).unwrap(), unnamed);
+
+        let named: AutomationSetting = serde_json::from_value(serde_json::json!({
+            "setting": "vertical_scroll_points", "panel_id": 2, "track_id": 5, "value": 40.0
+        }))
+        .unwrap();
+        assert_eq!(
+            named,
+            AutomationSetting::VerticalScrollPoints {
+                panel_id: PanelId::new(2),
+                track_id: Some(TrackId::new(5)),
+                value: 40.0,
+            }
+        );
+        assert!(named.validate().is_ok());
+
+        let density: AutomationSetting = serde_json::from_value(serde_json::json!({
+            "setting": "alignment_density", "track_id": 3, "value": 1.5
+        }))
+        .unwrap();
+        assert!(density.validate().is_ok());
+        for zero in [
+            serde_json::json!({ "setting": "show_reads", "track_id": 0, "value": true }),
+            serde_json::json!({ "setting": "alignment_density", "track_id": 0, "value": 1.0 }),
+            serde_json::json!({
+                "setting": "vertical_scroll_points", "panel_id": 1, "track_id": 0, "value": 0.0
+            }),
+        ] {
+            let setting: AutomationSetting = serde_json::from_value(zero).unwrap();
+            assert!(setting.validate().is_err());
+        }
     }
 }

@@ -695,6 +695,28 @@ impl PanelWorkspace {
         self.panels.iter_mut().find(|panel| panel.id == id)
     }
 
+    /// The panel `id` names. Callers resolve the id at the UI or automation boundary and pass
+    /// it down; an id that has left the workspace falls back to the focused panel so a late
+    /// call can never index out of bounds.
+    pub(crate) fn panel(&self, id: PanelId) -> &ViewPanelController {
+        self.get(id).unwrap_or_else(|| &self.panels[self.active])
+    }
+
+    /// Mutable counterpart of [`Self::panel`].
+    pub(crate) fn panel_mut(&mut self, id: PanelId) -> &mut ViewPanelController {
+        let index = self
+            .panels
+            .iter()
+            .position(|panel| panel.id == id)
+            .unwrap_or(self.active);
+        &mut self.panels[index]
+    }
+
+    /// Whether `id` is the focused panel: the one keyboard and locus-box input address.
+    pub(crate) fn is_active(&self, id: PanelId) -> bool {
+        self.panels[self.active].id == id
+    }
+
     pub(crate) fn maximum_annotation_scroll_points(&self) -> f32 {
         if self
             .panels

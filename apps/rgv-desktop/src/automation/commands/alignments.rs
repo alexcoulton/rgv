@@ -340,8 +340,9 @@ impl Viewer {
                 .map(|panel| panel.contig_name.as_str())
                 .unwrap_or_default(),
         )?;
+        // Selecting a read focuses its panel: the inspector shows the focused panel's selection.
         anyhow::ensure!(
-            self.panels.activate(target.panel_id),
+            self.activate_view_panel(target.panel_id),
             "alignment panel is unavailable"
         );
         self.panels.active_mut().clear_selection();
@@ -363,7 +364,7 @@ impl Viewer {
         self.retain_active_selection(None);
         self.synchronize_alignment_scene_interactions(target.panel_id);
         self.prepare_alignment_scene_frame();
-        self.rebuild_genomic_display();
+        self.rebuild_genomic_display(self.panels.active().id);
         let mut navigated = false;
         if reveal != AutomationAlignmentReveal::None {
             let operation = match reveal {
@@ -742,7 +743,11 @@ impl Viewer {
         match *selection {
             AutomationSelection::Panel { panel_id } => {
                 anyhow::ensure!(
-                    self.activate_view_panel(panel_id),
+                    self.apply_command_translation(&rgv_automation::AutomationCommand::Select {
+                        selection: selection.clone(),
+                    })?
+                    .panel_id
+                    .is_some(),
                     "panel {} was not found",
                     panel_id.get()
                 );
@@ -792,9 +797,9 @@ impl Viewer {
                         .viewport
                         .centered_on(position, self.panels.active().contig_length)?;
                     self.panels.active().generation_clock.advance();
-                    self.request_alignment_query();
-                    self.request_reference_query();
-                    self.request_track_query();
+                    self.request_alignment_query(self.panels.active().id);
+                    self.request_reference_query(self.panels.active().id);
+                    self.request_track_query(self.panels.active().id);
                 }
                 let auxiliary_selection = if matches!(key, TrackFrameKey::Auxiliary(_)) {
                     self.panels
@@ -869,7 +874,7 @@ impl Viewer {
                             position,
                         });
                 }
-                self.rebuild_genomic_display();
+                self.rebuild_genomic_display(self.panels.active().id);
                 self.mark_display_dirty("explicit display invalidation");
                 self.bump_workspace_revision();
                 self.retain_active_selection(Some(granularity));

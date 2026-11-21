@@ -181,7 +181,7 @@ impl Viewer {
                 let previous = self.automation_selection_snapshot();
                 self.panels.active_mut().clear_selection();
                 self.bump_workspace_revision();
-                self.rebuild_genomic_display();
+                self.rebuild_genomic_display(self.panels.active().id);
                 AutomationExecution::Complete {
                     message: "Cleared the active panel selection".to_owned(),
                     data: serde_json::json!({
@@ -470,8 +470,10 @@ impl Viewer {
                 }
             }
             AutomationCommand::RemoveTrack { track_id } => {
-                let selected = BTreeSet::from([track_id]);
-                match self.remove_metadata_selected_tracks(&selected) {
+                match self
+                    .apply_command_translation(&AutomationCommand::RemoveTrack { track_id })
+                    .map(|outcome| outcome.removed_tracks)
+                {
                     Ok(1) => {
                         self.bump_workspace_revision();
                         self.automation_alignment_handles.clear();
@@ -488,8 +490,10 @@ impl Viewer {
                     Err(error) => automation_failure(AutomationErrorCode::InvalidState, error),
                 }
             }
-            AutomationCommand::Goto { loci } => match self.navigate_to_loci(&loci.join(" ")) {
-                Ok(()) => {
+            AutomationCommand::Goto { loci } => match self
+                .apply_command_translation(&AutomationCommand::Goto { loci: loci.clone() })
+            {
+                Ok(_) => {
                     self.bump_workspace_revision();
                     AutomationExecution::Complete {
                         message: format!("Navigated to {} ordered loci", loci.len()),
@@ -508,7 +512,15 @@ impl Viewer {
                 },
                 Err(error) => automation_failure(AutomationErrorCode::InvalidCommand, error),
             },
-            AutomationCommand::AddPanel { locus } => match self.add_view_panel(&locus) {
+            AutomationCommand::AddPanel { locus } => match self
+                .apply_command_translation(&AutomationCommand::AddPanel {
+                    locus: locus.clone(),
+                })
+                .and_then(|outcome| {
+                    outcome
+                        .panel_id
+                        .ok_or_else(|| anyhow::anyhow!("the panel was not created"))
+                }) {
                 Ok(panel_id) => {
                     self.bump_workspace_revision();
                     AutomationExecution::Complete {
@@ -519,7 +531,10 @@ impl Viewer {
                 Err(error) => automation_failure(AutomationErrorCode::InvalidCommand, error),
             },
             AutomationCommand::ClosePanel { panel_id } => {
-                if self.close_view_panel(panel_id) {
+                if self
+                    .apply_command_translation(&AutomationCommand::ClosePanel { panel_id })
+                    .is_ok_and(|outcome| outcome.changed)
+                {
                     self.bump_workspace_revision();
                     AutomationExecution::Complete {
                         message: format!("Closed panel {}", panel_id.get()),
@@ -809,6 +824,30 @@ impl Viewer {
                     },
                     Err(error) => automation_failure(AutomationErrorCode::HistoryBoundary, error),
                 }
+            }
+            AutomationCommand::QueryFeatures {
+                contig,
+                start,
+                end,
+                track_ids,
+                offset,
+                limit,
+            } => self.start_automation_feature_query(
+                command_index,
+                &contig,
+                start,
+                end,
+                track_ids.as_deref(),
+                offset,
+                limit,
+                now,
+            ),
+            AutomationCommand::GotoGene {
+                query,
+                panel_id,
+                flank_bases,
+            } => {
+                self.start_automation_gene_search(command_index, &query, panel_id, flank_bases, now)
             }
             AutomationCommand::WaitUntilSettled { timeout_millis } => {
                 if self.automation_is_settled() {

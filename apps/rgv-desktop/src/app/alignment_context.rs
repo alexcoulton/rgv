@@ -247,7 +247,7 @@ impl Viewer {
             return self.reject_alignment_context_menu_open(invocation, "no_alignment_lane");
         };
         let hit = self
-            .alignment_scene_hit_at_cursor()
+            .alignment_scene_hit_at_cursor(self.panels.active().id)
             .filter(|hit| hit.track == track_id);
         let Some(presented) = self.presented_alignment_lane(panel_id, track_id) else {
             return self
@@ -396,13 +396,11 @@ impl Viewer {
     }
 
     fn refresh_alignment_context_track(&mut self, track_id: TrackId, reason: &'static str) {
-        self.remember_current_locus();
+        self.remember_current_locus(self.panels.active().id);
         self.bump_workspace_revision();
         self.invalidate_navigation_contract(reason);
-        let active = self.panels.active().id;
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for panel_id in panel_ids {
-            self.panels.activate(panel_id);
             if let Some(track) = self
                 .alignment_tracks
                 .iter_mut()
@@ -410,9 +408,8 @@ impl Viewer {
             {
                 track.projection_mut(panel_id).advance_scene_generation();
             }
-            self.request_alignment_scene_camera_update(track_id);
+            self.request_alignment_scene_camera_update(panel_id, track_id);
         }
-        self.panels.activate(active);
         self.rebuild_all_panel_displays();
         self.mark_display_dirty("explicit display invalidation");
     }
@@ -780,7 +777,7 @@ impl Viewer {
                     self.refresh_alignment_highlight_interactions(&[target.track_id]);
                 }
                 if interaction_only_highlight {
-                    self.remember_current_locus();
+                    self.remember_current_locus(self.panels.active().id);
                     self.bump_workspace_revision();
                     let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
                     for panel_id in panel_ids {

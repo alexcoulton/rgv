@@ -146,10 +146,11 @@ impl Viewer {
 
     pub(crate) fn finish_manual_diagnostic_frame(&mut self, _total: Duration) {}
 
-    pub(crate) fn record_manual_navigation_intent(&mut self, _kind: &str) {}
+    pub(crate) fn record_manual_navigation_intent(&mut self, _panel_id: PanelId, _kind: &str) {}
 
     pub(crate) fn record_manual_vertical_scroll_intent(
         &mut self,
+        _panel_id: PanelId,
         _track_id: TrackId,
         _requested: f32,
         _previous: f32,
@@ -193,7 +194,10 @@ impl Viewer {
         serde_json::Value::Null
     }
 
-    pub(crate) fn manual_active_scroll_cache_diagnostic_state(&self) -> serde_json::Value {
+    pub(crate) fn manual_scroll_cache_diagnostic_state(
+        &self,
+        _panel_id: PanelId,
+    ) -> serde_json::Value {
         serde_json::Value::Null
     }
 

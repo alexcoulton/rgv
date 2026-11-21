@@ -10,6 +10,7 @@ use crate::workspace::alignments::{
 use crate::workspace::panels::{ReadPanelDisplayCache, ReadRowCoordinateAuthority};
 use crate::{MAX_ALIGNMENT_ROW_HEIGHT, PresentedAlignmentLane, Viewer, ui};
 use rgv_alignment_scene::AlignmentRowActivityProfile;
+use rgv_core::PanelId;
 use rgv_core::{AlignmentViewPredicate, DetailLevel, TrackKind};
 use rgv_engine::AlignmentIndividualReadCapability;
 use rgv_layout::DisplayList;
@@ -20,6 +21,7 @@ impl Viewer {
     /// alignment track.
     pub(super) fn push_primary_alignment_annotation_frame(
         &mut self,
+        panel_id: PanelId,
         pass: &mut GenomicDisplayPass,
         primary_alignment_name: String,
         primary_source_label: Option<String>,
@@ -35,24 +37,27 @@ impl Viewer {
             .copied()
         {
             let bottom = top + 26.0;
-            self.panels.active_mut().track_frames.push(TrackFrame {
-                key: TrackFrameKey::Group {
+            self.panels
+                .panel_mut(panel_id)
+                .track_frames
+                .push(TrackFrame {
+                    key: TrackFrameKey::Group {
+                        channel: ui::TrackPane::Annotation,
+                        id: group,
+                    },
                     channel: ui::TrackPane::Annotation,
-                    id: group,
-                },
-                channel: ui::TrackPane::Annotation,
-                name: format!("Group {group} · {members} tracks"),
-                kind: TrackKind::Alignment,
-                source_label: None,
-                top,
-                bottom,
-                visible: true,
-                // Group headers are fixed-height controls, not resizable data
-                // tracks. Their eye state comes from TrackGroupChrome.
-                collapsed: true,
-                frozen_bottom: None,
-                subtracks: Vec::new(),
-            });
+                    name: format!("Group {group} · {members} tracks"),
+                    kind: TrackKind::Alignment,
+                    source_label: None,
+                    top,
+                    bottom,
+                    visible: true,
+                    // Group headers are fixed-height controls, not resizable data
+                    // tracks. Their eye state comes from TrackGroupChrome.
+                    collapsed: true,
+                    frozen_bottom: None,
+                    subtracks: Vec::new(),
+                });
             top = bottom;
             debug_assert_eq!(
                 collapsed,
@@ -63,7 +68,7 @@ impl Viewer {
             && !collapsed_annotation_group_members.contains(&primary_alignment_id)
         {
             let index_only_overview =
-                self.panels.active().viewport.detail_level() == DetailLevel::Overview;
+                self.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview;
             let mut frame = if index_only_overview {
                 let bottom = top + 48.0;
                 TrackFrame {
@@ -92,7 +97,7 @@ impl Viewer {
             } else if let Some(config) = self.alignment_tracks.first().map(|track| &track.config) {
                 alignment::alignment_scene_annotation_frame(
                     config,
-                    self.panels.active().viewport,
+                    self.panels.panel(panel_id).viewport,
                     top,
                     self.track_presentation
                         .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
@@ -107,7 +112,7 @@ impl Viewer {
                 frame.collapsed = !primary_annotation_desired;
             }
             top = frame.bottom;
-            self.panels.active_mut().track_frames.push(frame);
+            self.panels.panel_mut(panel_id).track_frames.push(frame);
         }
         pass.top = top;
     }
@@ -117,6 +122,7 @@ impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(super) fn push_secondary_alignment_annotation_frames(
         &mut self,
+        panel_id: PanelId,
         pass: &mut GenomicDisplayPass,
     ) {
         let collapsed_annotation_group_members = &pass.collapsed_annotation_group_members;
@@ -149,29 +155,33 @@ impl Viewer {
                 annotation_group_headers_by_anchor.get(&track_id).copied()
             {
                 let bottom = top + 26.0;
-                self.panels.active_mut().track_frames.push(TrackFrame {
-                    key: TrackFrameKey::Group {
+                self.panels
+                    .panel_mut(panel_id)
+                    .track_frames
+                    .push(TrackFrame {
+                        key: TrackFrameKey::Group {
+                            channel: ui::TrackPane::Annotation,
+                            id: group,
+                        },
                         channel: ui::TrackPane::Annotation,
-                        id: group,
-                    },
-                    channel: ui::TrackPane::Annotation,
-                    name: format!("Group {group} · {members} tracks"),
-                    kind: TrackKind::Alignment,
-                    source_label: None,
-                    top,
-                    bottom,
-                    visible: true,
-                    collapsed: true,
-                    frozen_bottom: None,
-                    subtracks: Vec::new(),
-                });
+                        name: format!("Group {group} · {members} tracks"),
+                        kind: TrackKind::Alignment,
+                        source_label: None,
+                        top,
+                        bottom,
+                        visible: true,
+                        collapsed: true,
+                        frozen_bottom: None,
+                        subtracks: Vec::new(),
+                    });
                 top = bottom;
             }
             if annotation_group_collapsed {
                 continue;
             }
 
-            let overview = self.panels.active().viewport.detail_level() == DetailLevel::Overview;
+            let overview =
+                self.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview;
             let mut frame = if overview {
                 let bottom = top + 48.0;
                 TrackFrame {
@@ -200,7 +210,7 @@ impl Viewer {
             } else if scene_backed {
                 alignment::alignment_scene_annotation_frame(
                     &config,
-                    self.panels.active().viewport,
+                    self.panels.panel(panel_id).viewport,
                     top,
                     self.track_presentation
                         .pane_track_state(ui::TrackPane::Annotation, track_id)
@@ -243,7 +253,7 @@ impl Viewer {
                 frame.collapsed = !annotation_desired;
             }
             top = frame.bottom;
-            self.panels.active_mut().track_frames.push(frame);
+            self.panels.panel_mut(panel_id).track_frames.push(frame);
         }
         pass.top = top;
     }
@@ -251,7 +261,11 @@ impl Viewer {
     /// Read-pane frame and scroll display cache entry for every read panel
     /// that the read-pane layout exposes.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn push_read_panel_frames(&mut self, pass: &mut GenomicDisplayPass) {
+    pub(super) fn push_read_panel_frames(
+        &mut self,
+        panel_id: PanelId,
+        pass: &mut GenomicDisplayPass,
+    ) {
         let read_clip_top = pass.read_clip_top;
         let scroll_clip_bottom = pass.scroll_clip_bottom;
         let read_panel_bounds = &pass.read_panel_bounds;
@@ -264,10 +278,16 @@ impl Viewer {
             let alignment::ReadPanelKey::Track(track_id) = bounds.key else {
                 continue;
             };
-            if self.panels.active().track_frames.iter().any(|frame| {
-                frame.channel == ui::TrackPane::Reads
-                    && frame.key == TrackFrameKey::Alignment(track_id)
-            }) {
+            if self
+                .panels
+                .panel(panel_id)
+                .track_frames
+                .iter()
+                .any(|frame| {
+                    frame.channel == ui::TrackPane::Reads
+                        && frame.key == TrackFrameKey::Alignment(track_id)
+                })
+            {
                 continue;
             }
             let Some(track) = self
@@ -282,34 +302,33 @@ impl Viewer {
                 .pane_track_state(ui::TrackPane::Reads, track_id)
                 .is_some_and(|node| node.content_visible);
             let index_only_overview = track
-                .projection(self.panels.active().id)
+                .projection(panel_id)
                 .is_some_and(|projection| projection.index_only_overview)
-                || self.panels.active().viewport.detail_level() == DetailLevel::Overview;
+                || self.panels.panel(panel_id).viewport.detail_level() == DetailLevel::Overview;
             let mapped_record_count = track
                 .dictionary
                 .as_ref()
-                .and_then(|dictionary| dictionary.id_by_name(&self.panels.active().contig_name))
+                .and_then(|dictionary| {
+                    dictionary.id_by_name(&self.panels.panel(panel_id).contig_name)
+                })
                 .and_then(|contig| {
                     track
                         .index_overview
                         .as_ref()
                         .and_then(|overview| overview.contig_mapped_record_count(contig))
                 });
-            let projection = track.projection(self.panels.active().id);
+            let projection = track.projection(panel_id);
             let unified_lane_desired = !index_only_overview
                 && projection.is_some_and(|projection| {
                     projection.scene_owner.is_some()
                         && projection.navigation.desired_camera().is_some()
                 });
             let presented = (!index_only_overview)
-                .then(|| self.presented_alignment_lane(self.panels.active().id, track_id))
+                .then(|| self.presented_alignment_lane(panel_id, track_id))
                 .flatten();
             let committed_row_activity = (!index_only_overview)
                 .then(|| {
-                    self.committed_alignment_row_activity_for_desired_target(
-                        self.panels.active().id,
-                        track_id,
-                    )
+                    self.committed_alignment_row_activity_for_desired_target(panel_id, track_id)
                 })
                 .flatten();
             let row_activity = presented
@@ -362,7 +381,7 @@ impl Viewer {
                 .flatten();
             let bottom = bounds.bottom.max(bounds.top + READ_PANE_HEADER_HEIGHT);
             let content_top = bounds.top + READ_PANE_HEADER_HEIGHT;
-            let density = self.alignment_density_for_panel_track(self.panels.active().id, track_id);
+            let density = self.alignment_density_for_panel_track(panel_id, track_id);
             let row_height = (7.0 * density).clamp(2.5, MAX_ALIGNMENT_ROW_HEIGHT);
             let (total_rows, scene_content_bottom) =
                 row_activity.as_deref().map_or((None, bottom), |profile| {
@@ -381,7 +400,7 @@ impl Viewer {
             {
                 let scrollable = if index_only_overview {
                     alignment::index_only_read_display(
-                        self.active_panel_rect().width(),
+                        self.panel_rect(panel_id).width(),
                         content_top,
                         bottom,
                         mapped_record_count,
@@ -391,7 +410,7 @@ impl Viewer {
                         .clone()
                         .map_or_else(DisplayList::default, |message| {
                             alignment::read_state_display(
-                                self.active_panel_rect().width(),
+                                self.panel_rect(panel_id).width(),
                                 content_top,
                                 bottom,
                                 message,
@@ -402,7 +421,7 @@ impl Viewer {
                     .is_pending()
                     .then(|| {
                         self.panels
-                            .active()
+                            .panel(panel_id)
                             .scroll_display_cache
                             .as_ref()
                             .and_then(|cache| {
@@ -438,35 +457,38 @@ impl Viewer {
                     clip_bottom: bottom.min(scroll_clip_bottom),
                 });
             }
-            let read_frame_name = self.read_panel_frame_name(track, presented);
-            self.panels.active_mut().track_frames.push(TrackFrame {
-                key: TrackFrameKey::Alignment(track_id),
-                channel: ui::TrackPane::Reads,
-                name: read_frame_name,
-                kind: TrackKind::Alignment,
-                source_label: Some(track.config.source.redacted_label()),
-                top: bounds.top,
-                bottom,
-                visible: true,
-                collapsed: !desired,
-                frozen_bottom: Some(if desired { content_top } else { bottom }),
-                subtracks: if desired {
-                    vec![TrackSubtrack {
-                        alignment_subtrack: Some(AlignmentSubtrack::Reads),
-                        label: "Reads".to_owned(),
-                        detail: read_state_message,
-                        top: content_top,
-                        bottom,
-                        collapsed: false,
-                        composite_member: None,
-                    }]
-                } else {
-                    vec![collapsed_alignment_subtrack(
-                        AlignmentSubtrack::Reads,
-                        bounds.top,
-                    )]
-                },
-            });
+            let read_frame_name = self.read_panel_frame_name(panel_id, track, presented);
+            self.panels
+                .panel_mut(panel_id)
+                .track_frames
+                .push(TrackFrame {
+                    key: TrackFrameKey::Alignment(track_id),
+                    channel: ui::TrackPane::Reads,
+                    name: read_frame_name,
+                    kind: TrackKind::Alignment,
+                    source_label: Some(track.config.source.redacted_label()),
+                    top: bounds.top,
+                    bottom,
+                    visible: true,
+                    collapsed: !desired,
+                    frozen_bottom: Some(if desired { content_top } else { bottom }),
+                    subtracks: if desired {
+                        vec![TrackSubtrack {
+                            alignment_subtrack: Some(AlignmentSubtrack::Reads),
+                            label: "Reads".to_owned(),
+                            detail: read_state_message,
+                            top: content_top,
+                            bottom,
+                            collapsed: false,
+                            composite_member: None,
+                        }]
+                    } else {
+                        vec![collapsed_alignment_subtrack(
+                            AlignmentSubtrack::Reads,
+                            bounds.top,
+                        )]
+                    },
+                });
         }
     }
 
@@ -474,6 +496,7 @@ impl Viewer {
     /// downsampling status.
     fn read_panel_frame_name(
         &self,
+        panel_id: PanelId,
         track: &AlignmentTrackController,
         presented: Option<PresentedAlignmentLane<'_>>,
     ) -> String {
@@ -511,12 +534,12 @@ impl Viewer {
         let highlight_status = if highlight_count == 0 {
             String::new()
         } else if let Some(status) = track
-            .projection(self.panels.active().id)
+            .projection(panel_id)
             .and_then(|projection| projection.scene_highlight_status.as_deref())
         {
             format!(" · {status}")
         } else if let Some(projection) = track
-            .projection(self.panels.active().id)
+            .projection(panel_id)
             .filter(|projection| projection.scene_highlight_key.is_some())
         {
             format!(

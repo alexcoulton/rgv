@@ -55,17 +55,16 @@ impl Viewer {
     /// Sends the UI's current camera to the unified source actor and changes no pixels itself.
     /// Existing immutable scene pages are captured against this camera immediately by
     /// `prepare_alignment_scene_frame`; source acquisition remains asynchronous and latest-wins.
-    pub(crate) fn dispatch_alignment_query(&mut self) {
-        if !self.panels.active().pending_queries.alignment {
+    pub(crate) fn dispatch_alignment_query(&mut self, panel_id: PanelId) {
+        if !self.panels.panel(panel_id).pending_queries.alignment {
             return;
         }
         if self.alignment_tracks.is_empty() {
-            self.panels.active_mut().pending_queries.alignment = false;
+            self.panels.panel_mut(panel_id).pending_queries.alignment = false;
             return;
         }
-        let viewport = self.panels.active().viewport;
+        let viewport = self.panels.panel(panel_id).viewport;
         let resolution = AlignmentSceneResolution::for_viewport(viewport);
-        let panel_id = self.panels.active().id;
         if !resolution.requires_alignment_records() {
             let mut settled = 0_usize;
             let mut retired_tracks = Vec::new();
@@ -95,7 +94,7 @@ impl Viewer {
             }
             let primary_track_id = self.primary_alignment_track_id();
             for track_id in retired_tracks {
-                let panel = self.panels.active_mut();
+                let panel = self.panels.panel_mut(panel_id);
                 panel
                     .read_panel_scrolls
                     .entry(track_id)
@@ -114,7 +113,7 @@ impl Viewer {
                     panel.content_bottom_points = 0.0;
                 }
             }
-            self.panels.active_mut().pending_queries.alignment =
+            self.panels.panel_mut(panel_id).pending_queries.alignment =
                 self.alignment_tracks.iter().any(|track| {
                     track
                         .projection(panel_id)
@@ -128,7 +127,7 @@ impl Viewer {
             self.prepare_alignment_scene_frame();
             return;
         }
-        let contig_name = self.panels.active().contig_name.clone();
+        let contig_name = self.panels.panel(panel_id).contig_name.clone();
         let mut sent = 0_usize;
         for track_index in 0..self.alignment_tracks.len() {
             if matches!(
@@ -169,7 +168,7 @@ impl Viewer {
             else {
                 let message = format!(
                     "{} is not available in this alignment",
-                    self.panels.active().contig_name
+                    self.panels.panel(panel_id).contig_name
                 );
                 self.alignment_tracks[track_index].mark_unavailable(panel_id, message);
                 continue;
@@ -204,7 +203,7 @@ impl Viewer {
             let authority_discontinuity = contig_changed || atlas_disjoint;
             let primary_track_id = self.primary_alignment_track_id();
             let scroll_reset = {
-                let panel = self.panels.active_mut();
+                let panel = self.panels.panel_mut(panel_id);
                 let reset = panel
                     .read_panel_scrolls
                     .entry(track_id)
@@ -483,7 +482,7 @@ impl Viewer {
                 }
             }
         }
-        self.panels.active_mut().pending_queries.alignment =
+        self.panels.panel_mut(panel_id).pending_queries.alignment =
             self.alignment_tracks.iter().any(|track| {
                 track
                     .projection(panel_id)
@@ -491,7 +490,7 @@ impl Viewer {
             });
         if sent > 0 {
             self.data_status = format!("Updating {sent} alignment scene(s)…");
-        } else if self.panels.active().pending_queries.alignment {
+        } else if self.panels.panel(panel_id).pending_queries.alignment {
             "Alignment queues busy; retrying the latest locus…".clone_into(&mut self.data_status);
         }
         // Camera-only movement is visible before the worker produces another event. The capture

@@ -17,6 +17,7 @@ use crate::{
     SYNTHETIC_ALIGNMENT_TRACK_ID, Viewer, alignment_gpu_bundle_is_current, app, ui,
 };
 use rgv_alignment_scene::{AlignmentComponent, AlignmentRowActivityProfile};
+use rgv_core::PanelId;
 use rgv_core::{
     JunctionDisplayMode, PresentationNodeId, SessionFilters, TrackConfig, TrackId, TrackKind,
     TrackSource, WorkspacePresentation,
@@ -631,45 +632,54 @@ pub(crate) fn pane_layout_snapshot(
 }
 
 impl Viewer {
-    pub(crate) fn rebuild_genomic_display(&mut self) {
+    pub(crate) fn rebuild_genomic_display(&mut self, panel_id: PanelId) {
         let annotation_auto_fit = self.track_presentation.annotation_pane_auto_fit;
         let annotation_content_height = annotation_auto_fit
-            .then(|| annotation_frame_content_height(&self.panels.active().track_frames))
+            .then(|| annotation_frame_content_height(&self.panels.panel(panel_id).track_frames))
             .flatten();
-        let measured_content_height = self.rebuild_genomic_display_pass(annotation_content_height);
+        let measured_content_height =
+            self.rebuild_genomic_display_pass(panel_id, annotation_content_height);
         if annotation_auto_fit
             && self.track_presentation.annotation_section_expanded
             && self.track_presentation.read_section_expanded
             && annotation_content_height
                 .is_none_or(|previous| (previous - measured_content_height).abs() >= 0.5)
         {
-            self.rebuild_genomic_display_pass(Some(measured_content_height));
+            self.rebuild_genomic_display_pass(panel_id, Some(measured_content_height));
         }
     }
 
-    fn rebuild_genomic_display_pass(&mut self, annotation_content_height: Option<f32>) -> f32 {
+    fn rebuild_genomic_display_pass(
+        &mut self,
+        panel_id: PanelId,
+        annotation_content_height: Option<f32>,
+    ) -> f32 {
         let primary_alignment_name = self.alignment_track_name();
         let primary_source_label = self
             .primary_alignment_source()
             .map(TrackSource::redacted_label);
         let alignment_track_groups = self.alignment_track_group_chrome();
-        let mut pass =
-            self.begin_genomic_display_pass(annotation_content_height, &alignment_track_groups);
-        self.push_reference_lane(&mut pass);
-        self.push_pinned_gene_lanes(&mut pass);
+        let mut pass = self.begin_genomic_display_pass(
+            panel_id,
+            annotation_content_height,
+            &alignment_track_groups,
+        );
+        self.push_reference_lane(panel_id, &mut pass);
+        self.push_pinned_gene_lanes(panel_id, &mut pass);
         self.push_primary_alignment_annotation_frame(
+            panel_id,
             &mut pass,
             primary_alignment_name,
             primary_source_label,
         );
-        self.push_secondary_alignment_annotation_frames(&mut pass);
-        self.push_read_panel_frames(&mut pass);
-        self.push_auxiliary_lanes(&mut pass);
-        self.settle_annotation_frames(&mut pass, &alignment_track_groups);
-        self.commit_genomic_display_pass(pass)
+        self.push_secondary_alignment_annotation_frames(panel_id, &mut pass);
+        self.push_read_panel_frames(panel_id, &mut pass);
+        self.push_auxiliary_lanes(panel_id, &mut pass);
+        self.settle_annotation_frames(panel_id, &mut pass, &alignment_track_groups);
+        self.commit_genomic_display_pass(panel_id, pass)
     }
 
-    fn rebuild_active_panel_from_scroll_cache(&mut self) -> bool {
+    fn rebuild_panel_from_scroll_cache(&mut self, panel_id: PanelId) -> bool {
         let trace_started = self.diagnostics.latency_active().then(Instant::now);
         if trace_started.is_some() {
             self.diagnostics.latency(LatencyEvent::Stage(
@@ -678,7 +688,7 @@ impl Viewer {
         }
         let Some((annotation_content_bottom, annotation_clip_top, annotation_clip_bottom)) = self
             .panels
-            .active()
+            .panel(panel_id)
             .scroll_display_cache
             .as_ref()
             .map(|cache| {
@@ -691,7 +701,7 @@ impl Viewer {
         else {
             return false;
         };
-        let active_panel_id = self.panels.active().id;
+        let active_panel_id = panel_id;
         let native_junction_labels = self
             .alignment_presented_epoch
             .as_ref()
@@ -730,7 +740,7 @@ impl Viewer {
             .desired_target_revision();
         let read_panel_metrics = self
             .panels
-            .active()
+            .panel(panel_id)
             .scroll_display_cache
             .as_ref()
             .expect("scroll display cache was observed above")
@@ -755,34 +765,31 @@ impl Viewer {
                             ),
                         read_panel.row_coordinate_authority,
                     ),
-                    self.alignment_density_for_panel_track(
-                        self.panels.active().id,
-                        read_panel.track_id,
-                    ),
+                    self.alignment_density_for_panel_track(panel_id, read_panel.track_id),
                 )
             })
             .collect::<Vec<_>>();
         let primary_track_id = self.primary_alignment_track_id();
-        let pending_alignment_reveal =
-            self.panels
-                .active()
-                .pending_alignment_reveal
-                .and_then(|(track_id, handle)| {
-                    let presented = self.presented_alignment_lane(active_panel_id, track_id)?;
-                    let row = usize::try_from(
-                        presented
-                            .lane
-                            .snapshot
-                            .as_ref()?
-                            .reads()
-                            .atlas()
-                            .record(handle)?
-                            .record
-                            .row(),
-                    )
-                    .ok()?;
-                    Some((track_id, row))
-                });
+        let pending_alignment_reveal = self
+            .panels
+            .panel(panel_id)
+            .pending_alignment_reveal
+            .and_then(|(track_id, handle)| {
+                let presented = self.presented_alignment_lane(active_panel_id, track_id)?;
+                let row = usize::try_from(
+                    presented
+                        .lane
+                        .snapshot
+                        .as_ref()?
+                        .reads()
+                        .atlas()
+                        .record(handle)?
+                        .record
+                        .row(),
+                )
+                .ok()?;
+                Some((track_id, row))
+            });
         let annotation_scroll = if self.track_presentation.annotation_section_expanded {
             self.panels.annotation_scroll_points.clamp(
                 0.0,
@@ -796,7 +803,7 @@ impl Viewer {
         if self.track_presentation.annotation_section_expanded {
             self.panels.annotation_scroll_points = annotation_scroll;
         }
-        let panel = self.panels.active_mut();
+        let panel = self.panels.panel_mut(panel_id);
         panel
             .pane_layout
             .annotation
@@ -891,12 +898,12 @@ impl Viewer {
             panel.latent_vertical_scroll_fraction = primary.latent_scroll_fraction;
             panel.content_bottom_points = primary.content_bottom_points;
         }
-        let mut display = std::mem::take(&mut self.panels.active_mut().display_list);
+        let mut display = std::mem::take(&mut self.panels.panel_mut(panel_id).display_list);
         let rectangle_capacity = display.rectangles.capacity();
         let text_capacity = display.texts.capacity();
         display.rectangles.clear();
         display.texts.clear();
-        let panel_rect = self.active_panel_rect();
+        let panel_rect = self.panel_rect(panel_id);
         append_annotation_pane_background(
             &mut display,
             panel_rect.width(),
@@ -906,14 +913,14 @@ impl Viewer {
         {
             let cache = self
                 .panels
-                .active()
+                .panel(panel_id)
                 .scroll_display_cache
                 .as_ref()
                 .expect("scroll display cache was observed above");
             for read_panel in &cache.read_panels {
                 let scroll = self
                     .panels
-                    .active()
+                    .panel(panel_id)
                     .read_panel_scroll_state(read_panel.track_id)
                     .effective_scroll_points();
                 read_panel.scrollable.append_scrolled_and_clipped_vertical(
@@ -955,13 +962,13 @@ impl Viewer {
         );
         display.texts.extend(native_read_labels);
         let (interaction_enabled, content_revision) = {
-            let presentation = &self.panels.active().navigation_presentation;
+            let presentation = &self.panels.panel(panel_id).navigation_presentation;
             (
                 presentation.is_interactive(),
                 presentation.committed_content_revision,
             )
         };
-        let previous_hover = self.panels.active().hovered_junction_arc;
+        let previous_hover = self.panels.panel(panel_id).hovered_junction_arc;
         let native_hover_authority = previous_hover.is_some_and(|hover| {
             self.native_junction_lane_is_present(active_panel_id, hover.key.track_id)
         });
@@ -973,7 +980,7 @@ impl Viewer {
                 ..hover
             });
         if valid_hover != previous_hover {
-            self.panels.active_mut().hovered_junction_arc = valid_hover;
+            self.panels.panel_mut(panel_id).hovered_junction_arc = valid_hover;
             self.window.set_cursor(if valid_hover.is_some() {
                 CursorIcon::Pointer
             } else {
@@ -981,20 +988,20 @@ impl Viewer {
             });
             if valid_hover.is_none()
                 && matches!(
-                    self.panels.active().hover_inspector_target,
+                    self.panels.panel(panel_id).hover_inspector_target,
                     Some(HoverInspectorTarget::Junction(..))
                 )
             {
-                self.panels.active_mut().hover_inspector_target = None;
+                self.panels.panel_mut(panel_id).hover_inspector_target = None;
             }
         }
         self.sashimi_interaction_diagnostics
             .latest_hover_overlay_count = usize::from(valid_hover.is_some());
-        self.add_region_overlays(&mut display);
+        self.add_region_overlays(panel_id, &mut display);
         let generic_display = display.clone();
         let mut contextual_display = DisplayList::default();
         self.panels
-            .active()
+            .panel(panel_id)
             .context_scene
             .projected
             .append_scrolled_and_clipped_vertical(
@@ -1020,32 +1027,32 @@ impl Viewer {
                 capacity_grew,
             });
         }
-        let panel = self.panels.active_mut();
+        let panel = self.panels.panel_mut(panel_id);
         panel.generic_display_list = generic_display;
         panel.display_list = display;
         true
     }
 
-    pub(crate) fn refresh_active_panel_scroll_display(&mut self) -> bool {
+    pub(crate) fn refresh_panel_scroll_display(&mut self, panel_id: PanelId) -> bool {
         let refusal = if self.display_dirty {
             Some("display derivative is already dirty")
         } else if !self
             .panels
-            .active()
+            .panel(panel_id)
             .scroll_display_cache
             .as_ref()
             .is_some_and(|cache| cache.supports_fast_scroll)
         {
             Some("active panel has no fast-scroll display cache")
-        } else if !self.active_panel_materialization_covers_scroll() {
+        } else if !self.panel_materialization_covers_scroll(panel_id) {
             Some("requested rows fall outside the materialized scroll cache")
         } else {
             None
         };
         if let Some(reason) = refusal {
             if self.diagnostics.recording() {
-                let panel_id = self.panels.active().id.get();
-                let authorities = self.manual_active_scroll_cache_diagnostic_state();
+                let authorities = self.manual_scroll_cache_diagnostic_state(panel_id);
+                let panel_id = panel_id.get();
                 self.diagnostics.event(
                     "vertical_navigation",
                     "fast_scroll_refresh_refused",
@@ -1058,10 +1065,10 @@ impl Viewer {
             }
             return false;
         }
-        if !self.rebuild_active_panel_from_scroll_cache() {
+        if !self.rebuild_panel_from_scroll_cache(panel_id) {
             if self.diagnostics.recording() {
-                let panel_id = self.panels.active().id.get();
-                let authorities = self.manual_active_scroll_cache_diagnostic_state();
+                let authorities = self.manual_scroll_cache_diagnostic_state(panel_id);
+                let panel_id = panel_id.get();
                 self.diagnostics.event(
                     "vertical_navigation",
                     "fast_scroll_refresh_refused",
@@ -1083,18 +1090,18 @@ impl Viewer {
     /// horizontal-navigation hot path: it performs no source query, parsing, feature packing, or
     /// label measurement. Each lane retains independent readiness and contributes only its own
     /// geometry.
-    pub(crate) fn reproject_active_context_lanes(&mut self) -> bool {
-        if self.synthetic || self.panels.active().scroll_display_cache.is_none() {
+    pub(crate) fn reproject_panel_context_lanes(&mut self, panel_id: PanelId) -> bool {
+        if self.synthetic || self.panels.panel(panel_id).scroll_display_cache.is_none() {
             return false;
         }
-        let target = self.panels.active().viewport;
-        let frames = self.panels.active().track_frames.clone();
+        let target = self.panels.panel(panel_id).viewport;
+        let frames = self.panels.panel(panel_id).track_frames.clone();
         {
-            let panel = self.panels.active_mut();
+            let panel = self.panels.panel_mut(panel_id);
             panel.context_scene.update_target_readiness(target);
             panel.context_scene.project_camera_text(target, &frames);
         }
-        if !self.rebuild_active_panel_from_scroll_cache() {
+        if !self.rebuild_panel_from_scroll_cache(panel_id) {
             return false;
         }
         self.composite_display_list = composite_panel_display_lists(&self.panels);
@@ -1105,11 +1112,12 @@ impl Viewer {
         true
     }
 
-    pub(crate) fn active_read_panel_materialization_coverage(
+    pub(crate) fn read_panel_materialization_coverage_for(
         &self,
+        panel_id: PanelId,
         track_id: TrackId,
     ) -> ReadPanelMaterializationCoverage {
-        let panel = self.panels.active();
+        let panel = self.panels.panel(panel_id);
         let Some(cache) = panel.scroll_display_cache.as_ref() else {
             return ReadPanelMaterializationCoverage::Unknown;
         };
@@ -1140,9 +1148,9 @@ impl Viewer {
         read_panel_materialization_coverage(read_panel.materialized_row_ranges.as_deref(), required)
     }
 
-    fn active_panel_materialization_covers_scroll(&self) -> bool {
+    fn panel_materialization_covers_scroll(&self, panel_id: PanelId) -> bool {
         self.panels
-            .active()
+            .panel(panel_id)
             .scroll_display_cache
             .as_ref()
             .is_some_and(|cache| {
@@ -1151,7 +1159,7 @@ impl Viewer {
                     .iter()
                     .filter(|read_panel| read_panel.density_camera)
                     .all(|read_panel| {
-                        self.active_read_panel_materialization_coverage(read_panel.track_id)
+                        self.read_panel_materialization_coverage_for(panel_id, read_panel.track_id)
                             .is_covered()
                     })
             })
@@ -1180,16 +1188,12 @@ impl Viewer {
             return false;
         }
 
-        let active_id = self.panels.active().id;
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for panel_id in panel_ids {
-            self.panels.activate(panel_id);
-            if !self.rebuild_active_panel_from_scroll_cache() {
-                self.panels.activate(active_id);
+            if !self.rebuild_panel_from_scroll_cache(panel_id) {
                 return false;
             }
         }
-        self.panels.activate(active_id);
         self.composite_display_list = composite_panel_display_lists(&self.panels);
         self.prepare_rectangle_renderer();
         true
@@ -1199,17 +1203,17 @@ impl Viewer {
         self.primary_alignment_name().to_owned()
     }
 
-    pub(crate) fn add_region_overlays(&self, display: &mut DisplayList) {
-        let viewport = self.panels.active().viewport.interval();
-        let panel = self.active_panel_rect();
-        let bases_per_pixel = self.panels.active().viewport.bases_per_pixel();
+    pub(crate) fn add_region_overlays(&self, panel_id: PanelId, display: &mut DisplayList) {
+        let viewport = self.panels.panel(panel_id).viewport.interval();
+        let panel = self.panel_rect(panel_id);
+        let bases_per_pixel = self.panels.panel(panel_id).viewport.bases_per_pixel();
         for (region, x, right) in self
             .regions_of_interest
             .iter()
             .filter_map(|region| {
                 region_overlay_horizontal_span(
                     region,
-                    &self.panels.active().contig_name,
+                    &self.panels.panel(panel_id).contig_name,
                     viewport,
                     bases_per_pixel,
                     panel.left(),
@@ -1320,7 +1324,6 @@ impl Viewer {
     }
 
     pub(crate) fn rebuild_all_panel_displays(&mut self) {
-        let active_id = self.panels.active().id;
         let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         // Alignment and contextual lanes publish independently. No panel-wide transaction may
         // prevent a ready lane from rebuilding its own presentation.
@@ -1329,15 +1332,13 @@ impl Viewer {
         self.shared_annotation_frame_heights.clear();
         for panel_id in &rebuildable_panel_ids {
             self.panels.annotation_scroll_points = requested_annotation_scroll;
-            self.panels.activate(*panel_id);
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(*panel_id);
         }
         if self.panels.len() > 1 {
             self.shared_annotation_frame_heights = maximum_annotation_frame_heights(&self.panels);
             for panel_id in &rebuildable_panel_ids {
                 self.panels.annotation_scroll_points = requested_annotation_scroll;
-                self.panels.activate(*panel_id);
-                self.rebuild_genomic_display();
+                self.rebuild_genomic_display(*panel_id);
             }
         }
 
@@ -1356,11 +1357,9 @@ impl Viewer {
         self.panels.annotation_scroll_points = shared_annotation_scroll;
         if needs_scroll_reprojection {
             for panel_id in &rebuildable_panel_ids {
-                self.panels.activate(*panel_id);
-                let _ = self.rebuild_active_panel_from_scroll_cache();
+                let _ = self.rebuild_panel_from_scroll_cache(*panel_id);
             }
         }
-        self.panels.activate(active_id);
 
         self.composite_display_list = composite_panel_display_lists(&self.panels);
     }
@@ -1740,19 +1739,16 @@ impl Viewer {
         }
         self.context_scene_gpu_frame = report.frame;
         if semantic_projection_changed {
-            let active_id = self.panels.active().id;
             let panel_ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
             for panel_id in panel_ids {
-                self.panels.activate(panel_id);
-                let target = self.panels.active().viewport;
-                let frames = self.panels.active().track_frames.clone();
+                let target = self.panels.panel(panel_id).viewport;
+                let frames = self.panels.panel(panel_id).track_frames.clone();
                 self.panels
-                    .active_mut()
+                    .panel_mut(panel_id)
                     .context_scene
                     .project_content(target, &frames);
-                let _ = self.rebuild_active_panel_from_scroll_cache();
+                let _ = self.rebuild_panel_from_scroll_cache(panel_id);
             }
-            self.panels.activate(active_id);
             self.composite_display_list = composite_panel_display_lists(&self.panels);
         }
     }

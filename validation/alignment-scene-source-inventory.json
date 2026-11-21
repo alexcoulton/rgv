@@ -65,7 +65,7 @@
   "forbidden_call_edges": [
     {
       "path": "apps/rgv-desktop/src/display/mod.rs",
-      "caller": "reproject_active_context_lanes",
+      "caller": "reproject_panel_context_lanes",
       "callee": "prepare_rectangle_renderer",
       "purpose": "horizontal genomic camera movement cannot rebuild or rehash generic screen-space slabs"
     },

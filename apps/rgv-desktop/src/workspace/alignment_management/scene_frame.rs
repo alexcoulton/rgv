@@ -146,7 +146,7 @@ impl Viewer {
                     "desired_target_revision": self.alignment_scene_publication_authority.desired_target_revision(),
                     "committed_target_revision": self.alignment_scene_publication_authority.target_revision,
                     "candidate_lanes": lane_diagnostics,
-                    "scroll_cache_authorities": self.manual_active_scroll_cache_diagnostic_state(),
+                    "scroll_cache_authorities": self.manual_scroll_cache_diagnostic_state(self.panels.active().id),
                 }),
             );
             return;

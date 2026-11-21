@@ -11,12 +11,19 @@ pub mod palette;
 mod readback_tests;
 mod semantic_export;
 mod shaders;
+mod track_tile_renderer;
 pub use device_health::{GpuDeviceHealth, GpuDeviceLoss};
 pub use gpu_export::{
     GpuExportError, GpuExportLayout, GpuExportTarget, GpuExportTile, PngExportBackend,
     export_png_scaled_prefer_gpu, render_display_list_gpu, render_gpu_export,
 };
 pub use semantic_export::{SemanticAlignmentExport, project_semantic_alignment_export};
+pub use track_tile_renderer::{
+    ProjectedTrackInstance, TRACK_LANE_UNIFORM_BYTES, TRACK_TILE_INSTANCE_BYTES, TrackBinStyle,
+    TrackLaneDraw, TrackLanePage, TrackLaneProjection, TrackPalette, TrackTileFrame,
+    TrackTilePageAdmission, TrackTilePageKey, TrackTilePrepareReport, TrackTileRenderError,
+    TrackTileRenderer, project_track_instance, track_fragment_color, track_fragment_coverage,
+};
 
 /// Constant-size policy view accepted by replacement planners. Desktop code supplies
 /// `LedgerProgress`; explicit inventory tests may supply `LedgerSnapshot`. Planning never needs
@@ -49,6 +56,15 @@ pub use alignment_scene::{
     AlignmentGpuRetirement, AlignmentGpuSceneRequest, AlignmentGpuScissor, AlignmentGpuShape,
     AlignmentGpuStagedReplacement, AlignmentGpuVisibleAdmission, MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET,
     MAXIMUM_ALIGNMENT_GPU_PAGE_ROWS, PackedAlignmentPage, project_alignment_gpu_instance,
+};
+pub use alignment_summary::{
+    ALIGNMENT_DEPTH_PYRAMID_DEFAULT_GPU_BYTES, ALIGNMENT_DEPTH_PYRAMID_ENVELOPE_BAND_ALPHA,
+    ALIGNMENT_DEPTH_PYRAMID_MEAN_BAND_ALPHA, AlignmentDepthPyramidBand,
+    AlignmentDepthPyramidGpuError, AlignmentDepthPyramidGpuFrame, AlignmentDepthPyramidGpuInstance,
+    AlignmentDepthPyramidGpuPrepareStats, AlignmentDepthPyramidGpuRenderer,
+    AlignmentDepthPyramidGpuRequest, AlignmentDepthPyramidProjectedBand,
+    pack_alignment_depth_pyramid_tile, project_alignment_depth_pyramid_bin,
+    project_alignment_depth_pyramid_lane,
 };
 pub use alignment_summary::{
     AlignmentSummaryAlleleToken, AlignmentSummaryDepthRangeIndex, AlignmentSummaryFrameOverlays,

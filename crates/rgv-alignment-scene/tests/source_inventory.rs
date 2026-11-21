@@ -40,10 +40,10 @@ fn function_source<'a>(source: &'a str, function: &str) -> &'a str {
         "\n    pub(crate) fn ",
         "\n    pub(super) fn ",
     ]
-        .into_iter()
-        .filter_map(|prefix| remainder.find(prefix))
-        .min()
-        .unwrap_or(remainder.len());
+    .into_iter()
+    .filter_map(|prefix| remainder.find(prefix))
+    .min()
+    .unwrap_or(remainder.len());
     &source[start..start + signature.len() + end]
 }
 

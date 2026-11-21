@@ -11,6 +11,7 @@ use crate::workspace::context_lanes::{
 };
 use crate::workspace::panels::{PanelScrollDisplayCache, ReadPanelDisplayCache};
 use crate::{Viewer, ui};
+use rgv_core::PanelId;
 use rgv_core::{GenomicInterval, TrackConfig, TrackId, TrackKind, Viewport};
 use rgv_layout::{DisplayList, ObjectIdAllocator};
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,6 +61,7 @@ impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(super) fn begin_genomic_display_pass(
         &mut self,
+        panel_id: PanelId,
         annotation_content_height: Option<f32>,
         alignment_track_groups: &[ui::TrackGroupChrome],
     ) -> GenomicDisplayPass {
@@ -128,7 +130,7 @@ impl Viewer {
                 .unwrap_or(false);
         let previous_read_heights = self
             .panels
-            .active()
+            .panel(panel_id)
             .track_frames
             .iter()
             .filter(|frame| frame.channel == ui::TrackPane::Reads)
@@ -186,14 +188,14 @@ impl Viewer {
         let read_stack_maximum = (read_pane_layout.content_bottom - scroll_clip_bottom).max(0.0);
         let read_stack_scroll = if read_section_expanded {
             self.panels
-                .active()
+                .panel(panel_id)
                 .read_stack_scroll_points
                 .clamp(0.0, read_stack_maximum)
         } else {
-            self.panels.active().read_stack_scroll_points
+            self.panels.panel(panel_id).read_stack_scroll_points
         };
         {
-            let panel = self.panels.active_mut();
+            let panel = self.panels.panel_mut(panel_id);
             panel.read_stack_scroll_points = read_stack_scroll;
             if read_section_expanded {
                 panel.read_stack_content_bottom_points = read_pane_layout.content_bottom;
@@ -208,38 +210,41 @@ impl Viewer {
                 bottom: bounds.bottom - read_stack_scroll,
             })
             .collect::<Vec<_>>();
-        self.panels.active_mut().track_frames.clear();
+        self.panels.panel_mut(panel_id).track_frames.clear();
         for group in &read_track_groups {
             let Some(bounds) = alignment::read_panel_bounds_for_group(&read_panel_bounds, group.id)
             else {
                 continue;
             };
-            self.panels.active_mut().track_frames.push(TrackFrame {
-                key: TrackFrameKey::Group {
+            self.panels
+                .panel_mut(panel_id)
+                .track_frames
+                .push(TrackFrame {
+                    key: TrackFrameKey::Group {
+                        channel: ui::TrackPane::Reads,
+                        id: group.id,
+                    },
                     channel: ui::TrackPane::Reads,
-                    id: group.id,
-                },
-                channel: ui::TrackPane::Reads,
-                name: format!("Read group {} · {} tracks", group.id, group.members.len()),
-                kind: TrackKind::Alignment,
-                source_label: None,
-                top: bounds.top,
-                bottom: bounds.bottom.max(bounds.top + READ_PANE_HEADER_HEIGHT),
-                visible: true,
-                collapsed: true,
-                frozen_bottom: Some(
-                    (bounds.top + READ_PANE_HEADER_HEIGHT)
-                        .min(bounds.bottom.max(bounds.top + READ_PANE_HEADER_HEIGHT)),
-                ),
-                subtracks: Vec::new(),
-            });
+                    name: format!("Read group {} · {} tracks", group.id, group.members.len()),
+                    kind: TrackKind::Alignment,
+                    source_label: None,
+                    top: bounds.top,
+                    bottom: bounds.bottom.max(bounds.top + READ_PANE_HEADER_HEIGHT),
+                    visible: true,
+                    collapsed: true,
+                    frozen_bottom: Some(
+                        (bounds.top + READ_PANE_HEADER_HEIGHT)
+                            .min(bounds.bottom.max(bounds.top + READ_PANE_HEADER_HEIGHT)),
+                    ),
+                    subtracks: Vec::new(),
+                });
         }
-        let viewport_interval = self.panels.active().viewport.interval();
-        let target_viewport = self.panels.active().viewport;
-        let generation = self.panels.active().generation_clock.current().get();
+        let viewport_interval = self.panels.panel(panel_id).viewport.interval();
+        let target_viewport = self.panels.panel(panel_id).viewport;
+        let generation = self.panels.panel(panel_id).generation_clock.current().get();
         let desired_context_interval = buffered_context_interval(
             target_viewport,
-            self.panels.active().contig_length,
+            self.panels.panel(panel_id).contig_length,
             self.settings.read_browsing_buffer_percent,
             None,
         );
@@ -287,6 +292,7 @@ impl Viewer {
     #[allow(clippy::too_many_lines)]
     pub(super) fn settle_annotation_frames(
         &mut self,
+        panel_id: PanelId,
         pass: &mut GenomicDisplayPass,
         alignment_track_groups: &[ui::TrackGroupChrome],
     ) {
@@ -311,26 +317,29 @@ impl Viewer {
             };
             if self
                 .panels
-                .active()
+                .panel(panel_id)
                 .track_frames
                 .iter()
                 .any(|frame| frame.key == key)
             {
                 continue;
             }
-            self.panels.active_mut().track_frames.push(TrackFrame {
-                key,
-                channel: ui::TrackPane::Annotation,
-                name: format!("Group {} · {} tracks", group.id, group.members.len()),
-                kind: TrackKind::Feature,
-                source_label: None,
-                top,
-                bottom: top + 26.0,
-                visible: true,
-                collapsed: true,
-                frozen_bottom: None,
-                subtracks: Vec::new(),
-            });
+            self.panels
+                .panel_mut(panel_id)
+                .track_frames
+                .push(TrackFrame {
+                    key,
+                    channel: ui::TrackPane::Annotation,
+                    name: format!("Group {} · {} tracks", group.id, group.members.len()),
+                    kind: TrackKind::Feature,
+                    source_label: None,
+                    top,
+                    bottom: top + 26.0,
+                    visible: true,
+                    collapsed: true,
+                    frozen_bottom: None,
+                    subtracks: Vec::new(),
+                });
             top += 26.0;
         }
         let mut annotation_fallback_frames = self
@@ -379,14 +388,14 @@ impl Viewer {
         if annotation_section_expanded {
             let _fallback_bottom = ensure_annotation_presentation_frames(
                 &self.track_presentation,
-                &mut self.panels.active_mut().track_frames,
+                &mut self.panels.panel_mut(panel_id).track_frames,
                 &annotation_fallback_frames,
                 top,
             );
             let shared_annotation_frame_heights = self.shared_annotation_frame_heights.clone();
             top = reflow_annotation_presentation_with_heights(
                 &self.track_presentation,
-                &mut self.panels.active_mut().track_frames,
+                &mut self.panels.panel_mut(panel_id).track_frames,
                 &mut pass.annotation_display,
                 annotation_clip_top,
                 &shared_annotation_frame_heights,
@@ -396,7 +405,7 @@ impl Viewer {
             // child rows. Remove only this render revision's annotation
             // frames and primitives; their state and shared camera survive.
             self.panels
-                .active_mut()
+                .panel_mut(panel_id)
                 .track_frames
                 .retain(|frame| frame.channel != ui::TrackPane::Annotation);
             pass.annotation_display = DisplayList::default();
@@ -408,7 +417,7 @@ impl Viewer {
             top = annotation_clip_top;
         }
         self.panels
-            .active_mut()
+            .panel_mut(panel_id)
             .track_frames
             .sort_by(|left, right| {
                 left.channel
@@ -423,7 +432,11 @@ impl Viewer {
     /// display cache, and rebuilds the active panel from that cache. Returns
     /// the measured annotation content height.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn commit_genomic_display_pass(&mut self, pass: GenomicDisplayPass) -> f32 {
+    pub(super) fn commit_genomic_display_pass(
+        &mut self,
+        panel_id: PanelId,
+        pass: GenomicDisplayPass,
+    ) -> f32 {
         let GenomicDisplayPass {
             annotation_clip_top,
             annotation_clip_bottom,
@@ -446,10 +459,10 @@ impl Viewer {
             ..
         } = pass;
         {
-            let frames = self.panels.active().track_frames.clone();
+            let frames = self.panels.panel(panel_id).track_frames.clone();
             let coherence_groups =
                 context_lane_coherence_groups(&effective_auxiliary_configs, &visible_context_lanes);
-            let panel = self.panels.active_mut();
+            let panel = self.panels.panel_mut(panel_id);
             panel.context_scene.reconcile(
                 generation,
                 target_viewport,
@@ -466,7 +479,7 @@ impl Viewer {
         let mut annotation_semantic_display = annotation_display.clone();
         annotation_semantic_display.rectangles.extend(
             self.panels
-                .active()
+                .panel(panel_id)
                 .context_scene
                 .projected
                 .rectangles
@@ -475,7 +488,7 @@ impl Viewer {
         );
         annotation_semantic_display.texts.extend(
             self.panels
-                .active()
+                .panel(panel_id)
                 .context_scene
                 .projected
                 .texts
@@ -490,7 +503,7 @@ impl Viewer {
             .fold(top, f32::max)
             .max(annotation_clip_bottom);
         let pane_layout = {
-            let frames = &self.panels.active().track_frames;
+            let frames = &self.panels.panel(panel_id).track_frames;
             ui::WorkspacePaneLayout {
                 annotation: pane_layout_snapshot(
                     &self.track_presentation,
@@ -501,7 +514,7 @@ impl Viewer {
                     annotation_content_bottom,
                     self.panels.annotation_scroll_points,
                     0.0,
-                    self.active_panel_rect().width(),
+                    self.panel_rect(panel_id).width(),
                 ),
                 reads: pane_layout_snapshot(
                     &self.track_presentation,
@@ -512,14 +525,14 @@ impl Viewer {
                     read_pane_layout.content_bottom,
                     0.0,
                     read_stack_scroll,
-                    self.active_panel_rect().width(),
+                    self.panel_rect(panel_id).width(),
                 ),
             }
         };
-        self.panels.active_mut().pane_layout = pane_layout;
+        self.panels.panel_mut(panel_id).pane_layout = pane_layout;
         let read_frames = self
             .panels
-            .active()
+            .panel(panel_id)
             .track_frames
             .iter()
             .filter(|frame| frame.channel == ui::TrackPane::Reads)
@@ -527,15 +540,14 @@ impl Viewer {
             .collect::<Vec<_>>();
         let annotation_frames = self
             .panels
-            .active()
+            .panel(panel_id)
             .track_frames
             .iter()
             .filter(|frame| frame.channel == ui::TrackPane::Annotation)
             .cloned()
             .collect::<Vec<_>>();
         for read_panel in &mut read_panel_displays {
-            let density = self
-                .alignment_density_for_panel_track(self.panels.active().id, read_panel.track_id);
+            let density = self.alignment_density_for_panel_track(panel_id, read_panel.track_id);
             let padding = if read_panel.density_camera {
                 vertical_density_camera_padding(
                     (read_panel.clip_bottom - read_panel.clip_top).max(1.0),
@@ -547,7 +559,7 @@ impl Viewer {
             let content_bottom = read_panel.actual_content_bottom + padding;
             let state = self
                 .panels
-                .active()
+                .panel(panel_id)
                 .read_panel_scroll_state(read_panel.track_id);
             let frame = read_frames
                 .iter()
@@ -563,7 +575,7 @@ impl Viewer {
                         content_bottom,
                         read_panel.clip_top,
                         state.content_origin_points,
-                        self.active_panel_rect().width(),
+                        self.panel_rect(panel_id).width(),
                         128,
                     )
                 });
@@ -581,10 +593,10 @@ impl Viewer {
             annotation_content_bottom,
             annotation_clip_top,
             0.0,
-            self.active_panel_rect().width(),
+            self.panel_rect(panel_id).width(),
             128,
         );
-        self.panels.active_mut().scroll_display_cache = Some(PanelScrollDisplayCache {
+        self.panels.panel_mut(panel_id).scroll_display_cache = Some(PanelScrollDisplayCache {
             annotations: annotation_display,
             pinned: pinned_display,
             annotation_overview,
@@ -594,7 +606,7 @@ impl Viewer {
             supports_fast_scroll,
             read_panels: read_panel_displays,
         });
-        let rebuilt = self.rebuild_active_panel_from_scroll_cache();
+        let rebuilt = self.rebuild_panel_from_scroll_cache(panel_id);
         debug_assert!(rebuilt);
         measured_annotation_content_height
     }

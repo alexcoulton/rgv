@@ -7,6 +7,7 @@ mod object_id;
 mod reference_layout;
 mod sashimi_layout;
 mod track_layout;
+mod track_world_layout;
 
 pub use alignment_style::{
     MAX_HIDDEN_MODIFICATION_CODES, alignment_read_name_hash, modification_code_color,
@@ -47,4 +48,10 @@ pub use track_layout::{
     gwas_point_color, gwas_point_y, layout_copy_number, layout_features,
     layout_features_with_label_widths, layout_gwas, layout_interactions, layout_mutations,
     layout_quantitative, layout_variants, mutation_track_height, quantitative_data_range,
+};
+pub use track_world_layout::{
+    MAXIMUM_WORLD_LABEL_CHARACTERS, PlacedTrackLabel, TrackLabelView, TrackSceneHit,
+    TrackScenePoint, WORLD_FEATURE_ROW_PADDING_POINTS, WorldRowItem, cluster_closure_extent,
+    hit_test_track_scene, lay_out_bin_tile, lay_out_feature_tile, lay_out_interaction_tile,
+    lay_out_variant_tile, pack_seam_stable_rows, place_track_labels, world_feature_row_padding,
 };

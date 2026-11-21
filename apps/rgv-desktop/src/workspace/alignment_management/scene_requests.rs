@@ -31,8 +31,7 @@ use rgv_core::{ContigId, DetailLevel, PanelId, TrackId};
 use std::sync::Arc;
 
 impl Viewer {
-    pub(crate) fn request_alignment_query(&mut self) {
-        let panel_id = self.panels.active().id;
+    pub(crate) fn request_alignment_query(&mut self, panel_id: PanelId) {
         for track_index in 0..self.alignment_tracks.len() {
             self.queue_alignment_navigation_for_track(
                 track_index,
@@ -41,17 +40,20 @@ impl Viewer {
                 "alignment refresh requested",
             );
         }
-        self.panels.active_mut().pending_queries.alignment =
+        self.panels.panel_mut(panel_id).pending_queries.alignment =
             self.alignment_tracks.iter().any(|track| {
                 track
                     .projection(panel_id)
                     .is_some_and(|projection| projection.navigation.is_queued())
             });
-        self.dispatch_alignment_query();
+        self.dispatch_alignment_query(panel_id);
     }
 
-    pub(crate) fn request_alignment_scene_camera_update(&mut self, track_id: TrackId) {
-        let panel_id = self.panels.active().id;
+    pub(crate) fn request_alignment_scene_camera_update(
+        &mut self,
+        panel_id: PanelId,
+        track_id: TrackId,
+    ) {
         let Some(track_index) = self
             .alignment_tracks
             .iter()
@@ -71,8 +73,8 @@ impl Viewer {
             false,
             "alignment row camera changed",
         );
-        self.panels.active_mut().pending_queries.alignment = true;
-        self.dispatch_alignment_query();
+        self.panels.panel_mut(panel_id).pending_queries.alignment = true;
+        self.dispatch_alignment_query(panel_id);
     }
 
     /// Resolves the complete live presentation demand for one track from the final pane layout.
@@ -237,7 +239,6 @@ impl Viewer {
             return;
         }
 
-        let active_id = self.panels.active().id;
         for (panel_id, track_ids) in changed_by_panel {
             for track_id in track_ids {
                 let Some(track_index) = self
@@ -254,11 +255,9 @@ impl Viewer {
                     "alignment pane geometry changed",
                 );
             }
-            self.panels.activate(panel_id);
-            self.panels.active_mut().pending_queries.alignment = true;
-            self.dispatch_alignment_query();
+            self.panels.panel_mut(panel_id).pending_queries.alignment = true;
+            self.dispatch_alignment_query(panel_id);
         }
-        self.panels.activate(active_id);
     }
 
     /// Captures every visible alignment lane from one immutable panel-scene epoch and prepares

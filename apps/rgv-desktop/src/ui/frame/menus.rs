@@ -11,6 +11,7 @@ impl Viewer {
             .show(ui, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.menu_button("File", |ui| Self::file_menu_ui(ui, st));
+                    ui.menu_button("Edit", |ui| Self::edit_menu_ui(ui, st));
                     ui.menu_button("Genomes", |ui| self.genomes_menu_ui(ui, st));
                     ui.menu_button("View", |ui| Self::view_menu_ui(ui, st));
                     ui.menu_button("Tracks", |ui| self.tracks_menu_ui(ui, st));
@@ -57,6 +58,34 @@ impl Viewer {
         ui.label("Enter opens settings for the selected track");
         ui.label("V/C toggles a focused track's visibility/collapse");
         ui.label("Alt+Up/Down reorders a focused track; Shift+Delete removes it");
+    }
+
+    /// Undo and redo of edits made through the action path (panels and tracks). Navigation is
+    /// not here: each panel has Back and Forward for that.
+    pub(super) fn edit_menu_ui(ui: &mut egui::Ui, st: &mut ShellFrame) {
+        let command_key = st.commands.command_key;
+        let undo = st.commands.undo_label.map_or_else(
+            || format!("Undo  {command_key}+Z"),
+            |label| format!("Undo {label}  {command_key}+Z"),
+        );
+        if ui
+            .add_enabled(st.commands.undo_label.is_some(), egui::Button::new(undo))
+            .clicked()
+        {
+            st.commands.undo_requested = true;
+            ui.close();
+        }
+        let redo = st.commands.redo_label.map_or_else(
+            || format!("Redo  Shift+{command_key}+Z"),
+            |label| format!("Redo {label}  Shift+{command_key}+Z"),
+        );
+        if ui
+            .add_enabled(st.commands.redo_label.is_some(), egui::Button::new(redo))
+            .clicked()
+        {
+            st.commands.redo_requested = true;
+            ui.close();
+        }
     }
 
     pub(super) fn file_menu_ui(ui: &mut egui::Ui, st: &mut ShellFrame) {

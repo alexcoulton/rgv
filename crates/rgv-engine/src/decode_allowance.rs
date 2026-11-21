@@ -224,6 +224,19 @@ impl Drop for DecodePermit<'_> {
     }
 }
 
+/// A [`DecodePermit`] that owns its allowance; dropping it gives the permit back.
+#[derive(Debug)]
+pub(crate) struct OwnedDecodePermit {
+    allowance: Arc<DecodeAllowance>,
+}
+
+impl Drop for OwnedDecodePermit {
+    fn drop(&mut self) {
+        self.allowance.lock().release();
+        self.allowance.changed.notify_all();
+    }
+}
+
 impl DecodeAllowance {
     pub(crate) fn new(limit: NonZeroUsize) -> Self {
         Self {
@@ -277,6 +290,29 @@ impl DecodeAllowance {
                 .wait(queue)
                 .unwrap_or_else(PoisonError::into_inner);
         }
+    }
+
+    /// [`Self::acquire`] for a holder that must be able to give the permit up and take it
+    /// again from inside a callback (the coverage worker's cancellation probe), where a
+    /// borrowed permit cannot live.
+    pub(crate) fn acquire_owned(
+        self: &Arc<Self>,
+        class: DecodeClass,
+        still_wanted: &dyn Fn() -> bool,
+    ) -> Option<OwnedDecodePermit> {
+        // The borrowed permit's release is taken over by the owned one.
+        std::mem::forget(self.acquire(class, still_wanted)?);
+        Some(OwnedDecodePermit {
+            allowance: Arc::clone(self),
+        })
+    }
+
+    /// Whether a unit serving a visible camera is waiting for a permit right now.
+    pub(crate) fn foreground_waiting(&self) -> bool {
+        self.lock()
+            .waiters
+            .iter()
+            .any(|waiter| waiter.class == DecodeClass::Foreground)
     }
 
     /// Makes every waiter look at its cancellation state again.

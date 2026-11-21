@@ -1,6 +1,9 @@
 //! Alignment and reference I/O boundary.
 
 mod backend_record;
+mod coverage_sidecar;
+mod coverage_stream;
+mod htslib_guard;
 mod igv_genome;
 mod index_overview;
 mod local;
@@ -31,6 +34,11 @@ pub use bisulfite::{
     BisulfiteObservation, BisulfiteSummary, bisulfite_context_matches, bisulfite_strand_is_reverse,
     classify_bisulfite_observation, summarize_bisulfite_record,
 };
+pub use coverage_sidecar::{
+    COVERAGE_SIDECAR_DEFAULT_MAXIMUM_BYTES, CoverageSidecarCache, CoverageSidecarKey,
+    CoverageSidecarStats, default_coverage_cache_directory,
+};
+pub use coverage_stream::{CoverageTileOutcome, CoverageTileProduction, CoverageTileRequest};
 pub use exact_depth::{ExactDepthRun, ExactDepthTile, ExactDepthTileBuilder};
 pub use filter::{AlignmentFilter, AuxComparison, AuxPredicate, FilterParseError, FilterValue};
 pub use igv_genome::{
@@ -86,6 +94,13 @@ pub use remote_alignment::{
     LocalBamAlignmentSource, LocalCramAlignmentSource, MAX_IN_MEMORY_ALIGNMENT_BYTES,
     ProductionAlignmentSource, RemoteBamAlignmentSource, RemoteCramAlignmentSource,
 };
+pub use rgv_model::coverage_pyramid::{
+    COVERAGE_PYRAMID_BASE_BIN_BASES, COVERAGE_PYRAMID_LEVEL_FACTOR, COVERAGE_PYRAMID_MAX_LEVELS,
+    COVERAGE_PYRAMID_TILE_BINS, CoverageAccumulation, CoverageAccumulator,
+    CoverageAccumulatorTelemetry, CoverageBin, CoverageEligibility, CoveragePyramidError,
+    CoveragePyramidParameters, CoverageTile, CoverageTileId, add_counted_depth_segments,
+    derive_coarser_tiles,
+};
 pub use sbx::{
     SbxEvidenceError, SbxInsertionState, SbxSummary, SbxTailBounds, classify_sbx_insertion,
     sbx_tail_bounds, summarize_sbx_record,
@@ -116,10 +131,11 @@ pub use tracks::{
     MAX_FEATURE_SEARCH_RESULTS, MAX_FEATURE_SOURCE_RECORDS, MAX_GWAS_ANNOTATION_BYTES_PER_RECORD,
     MAX_GWAS_COLUMNS, MAX_GWAS_FIELD_BYTES, MAX_GWAS_LINE_BYTES, MAX_GWAS_RECORDS_PER_QUERY,
     MAX_GWAS_SEARCH_ASSOCIATIONS, MAX_GWAS_SEARCH_RESULTS, MAX_GWAS_SOURCE_ANNOTATION_BYTES,
-    MAX_GWAS_SOURCE_RECORDS, MAX_INTERACTION_RECORDS_PER_QUERY,
-    MAX_MUTATION_ANNOTATION_BYTES_PER_RECORD, MAX_MUTATION_COLUMNS, MAX_MUTATION_FIELD_BYTES,
-    MAX_MUTATION_LINE_BYTES, MAX_MUTATION_RECORDS_PER_QUERY, MAX_MUTATION_SAMPLE_NAME_BYTES,
-    MAX_MUTATION_SAMPLES, MAX_MUTATION_SOURCE_ANNOTATION_BYTES, MAX_MUTATION_SOURCE_RECORDS,
+    MAX_GWAS_SOURCE_RECORDS, MAX_IN_MEMORY_VARIANT_BYTES, MAX_IN_MEMORY_VARIANT_RECORDS,
+    MAX_INTERACTION_RECORDS_PER_QUERY, MAX_MUTATION_ANNOTATION_BYTES_PER_RECORD,
+    MAX_MUTATION_COLUMNS, MAX_MUTATION_FIELD_BYTES, MAX_MUTATION_LINE_BYTES,
+    MAX_MUTATION_RECORDS_PER_QUERY, MAX_MUTATION_SAMPLE_NAME_BYTES, MAX_MUTATION_SAMPLES,
+    MAX_MUTATION_SOURCE_ANNOTATION_BYTES, MAX_MUTATION_SOURCE_RECORDS,
     MAX_QUANTITATIVE_RECORDS_PER_QUERY, MAX_REMOTE_VARIANT_ID_SCAN_BYTES,
     MAX_VARIANT_ID_ASSOCIATIONS, MAX_VARIANT_ID_INDEX_RECORDS, MAX_VARIANT_ID_SEARCH_RESULTS,
     MutationAnnotation, MutationQuery, MutationQueryProvenance, MutationRecord, PeakMetrics,

@@ -593,7 +593,7 @@ impl OverlapCollapser {
         self.collapsed_mate_bases
     }
 
-    #[cfg(test)]
+    /// Earlier mates currently remembered for the count-once rule.
     #[doc(hidden)]
     pub fn pending_len(&self) -> usize {
         self.pending.len()

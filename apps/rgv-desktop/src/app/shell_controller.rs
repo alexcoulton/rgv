@@ -188,8 +188,7 @@ impl Viewer {
     }
 
     /// One step of a continuous navigation gesture happened in the active panel.
-    pub(crate) fn note_navigation_gesture(&mut self) {
-        let panel = self.panels.active().id;
+    pub(crate) fn note_navigation_gesture(&mut self, panel: PanelId) {
         if let Some(previous) = self.shell.navigation_gesture.touch(panel, Instant::now()) {
             self.record_panel_navigation(previous);
         }
@@ -268,8 +267,11 @@ impl Viewer {
                     .viewport
                     .pan_pixels(points, self.panels.active().contig_length)
                 {
-                    self.panels.active_mut().viewport = viewport;
-                    self.viewport_gesture_changed();
+                    self.set_panel_viewport(
+                        self.panels.active().id,
+                        viewport,
+                        crate::action::ViewportCommit::Gesture,
+                    );
                 }
                 true
             }

@@ -35,11 +35,31 @@ pub(crate) const ALIGNMENT_SUMMARY: ComposedShader = ComposedShader {
     label: "RGV alignment summary semantic page shader",
     chunks: &[COMMON, PALETTE, include_str!("alignment_summary.wgsl")],
 };
+/// Coverage-pyramid depth bins (minimum, mean and maximum per bin).
+pub(crate) const ALIGNMENT_DEPTH_PYRAMID: ComposedShader = ComposedShader {
+    label: "RGV alignment depth pyramid shader",
+    chunks: &[
+        COMMON,
+        PALETTE,
+        include_str!("alignment_depth_pyramid.wgsl"),
+    ],
+};
+/// The world-space track tile pipeline (features, bins, variants, interactions).
+pub(crate) const TRACK_TILE: ComposedShader = ComposedShader {
+    label: "RGV track tile shader",
+    chunks: &[COMMON, include_str!("track_tile.wgsl")],
+};
 
 /// Every shader this crate compiles, for validation tests.
 #[cfg(test)]
-pub(crate) const ALL: [ComposedShader; 4] =
-    [RECTANGLE, CONTEXT_SCENE, ALIGNMENT_SCENE, ALIGNMENT_SUMMARY];
+pub(crate) const ALL: [ComposedShader; 6] = [
+    RECTANGLE,
+    CONTEXT_SCENE,
+    ALIGNMENT_SCENE,
+    ALIGNMENT_SUMMARY,
+    TRACK_TILE,
+    ALIGNMENT_DEPTH_PYRAMID,
+];
 
 impl ComposedShader {
     /// The complete WGSL source.

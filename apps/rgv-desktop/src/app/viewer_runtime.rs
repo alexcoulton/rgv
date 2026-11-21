@@ -1549,7 +1549,7 @@ impl Viewer {
                 "error": failure.message,
                 "committed_target_revision": self.alignment_scene_publication_authority.target_revision,
                 "desired_target_revision": self.alignment_scene_publication_authority.desired_target_revision(),
-                "scroll_cache_authority": self.manual_active_scroll_cache_diagnostic_state(),
+                "scroll_cache_authority": self.manual_scroll_cache_diagnostic_state(self.panels.active().id),
             }));
             self.queue_manual_diagnostic_trace_failure(
                 "alignment_renderer",
@@ -1605,7 +1605,7 @@ impl Viewer {
             // display cache now that the frame is authoritative. Without this
             // handoff, visible sashimi curves remain non-interactive until an
             // unrelated layout or scroll rebuild happens.
-            if !self.refresh_active_panel_scroll_display() {
+            if !self.refresh_panel_scroll_display(self.panels.active().id) {
                 self.mark_display_dirty("explicit display invalidation");
                 self.window.request_redraw();
             }

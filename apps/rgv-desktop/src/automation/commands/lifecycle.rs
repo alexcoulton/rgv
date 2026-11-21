@@ -481,6 +481,14 @@ impl Viewer {
                 }
                 return;
             }
+            Some(AutomationWait::TrackReply {
+                command_index,
+                deadline,
+                pending,
+            }) => {
+                self.poll_automation_track_reply(command_index, deadline, &pending, now);
+                return;
+            }
             None => {}
         }
 
@@ -582,7 +590,8 @@ impl Viewer {
                 | AutomationWait::Reference { command_index, .. }
                 | AutomationWait::AlignmentTrack { command_index, .. }
                 | AutomationWait::AuxiliaryTrack { command_index, .. }
-                | AutomationWait::ExactBaseSelection { command_index, .. } => *command_index,
+                | AutomationWait::ExactBaseSelection { command_index, .. }
+                | AutomationWait::TrackReply { command_index, .. } => *command_index,
             });
             tracing::warn!(
                 command_index,
@@ -684,7 +693,8 @@ impl Viewer {
             | AutomationWait::Reference { command_index, .. }
             | AutomationWait::AlignmentTrack { command_index, .. }
             | AutomationWait::AuxiliaryTrack { command_index, .. }
-            | AutomationWait::ExactBaseSelection { command_index, .. } => *command_index,
+            | AutomationWait::ExactBaseSelection { command_index, .. }
+            | AutomationWait::TrackReply { command_index, .. } => *command_index,
         });
         if let Some(command_index) = active {
             let _ = runner.finish_command(

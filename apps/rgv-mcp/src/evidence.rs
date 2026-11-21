@@ -182,7 +182,7 @@ fn wanted(track_ids: Option<&Vec<u64>>, track_id: u64) -> bool {
 }
 
 /// Shared paging fields. `truncated` is true whenever matching rows exist beyond this page.
-fn page(total: usize, offset: usize, returned: usize) -> Value {
+pub(crate) fn page(total: usize, offset: usize, returned: usize) -> Value {
     let next = offset.saturating_add(returned);
     json!({
         "total_matching": total,
@@ -193,7 +193,7 @@ fn page(total: usize, offset: usize, returned: usize) -> Value {
     })
 }
 
-fn bounded(text: &str) -> (String, bool) {
+pub(crate) fn bounded(text: &str) -> (String, bool) {
     if text.len() <= MAXIMUM_FIELD_BYTES {
         return (text.to_owned(), false);
     }

@@ -213,6 +213,11 @@ pub(super) struct CommandDraft {
     pub(super) user_exit_requested: bool,
     pub(super) command_search: String,
     pub(super) palette_command: Option<UiCommand>,
+    pub(super) undo_requested: bool,
+    pub(super) redo_requested: bool,
+    /// What Undo / Redo would act on; `None` disables the menu item.
+    pub(super) undo_label: Option<&'static str>,
+    pub(super) redo_label: Option<&'static str>,
     pub(super) remote_source_open: bool,
     pub(super) remote_source_editor: RemoteSourceEditor,
     pub(super) remote_source_request: Option<RemoteSourceRequest>,

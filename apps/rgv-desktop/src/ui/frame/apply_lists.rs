@@ -159,18 +159,18 @@ impl Viewer {
             )
             .map(|locus| session_locus_text(&locus));
         }
-        let regions_changed = st.lists.regions != self.regions_of_interest;
-        let review_changed = st.lists.review_items != self.review_items;
-        self.regions_of_interest = std::mem::take(&mut st.lists.regions);
-        self.review_items = std::mem::take(&mut st.lists.review_items);
-        self.review_status_filter = st.lists.review_status_filter;
-        if regions_changed {
-            self.invalidate_navigation_contract("region overlays changed");
-            self.rebuild_all_panel_displays();
-            self.mark_display_dirty("explicit display invalidation");
-        } else if review_changed {
-            self.mark_display_dirty("explicit display invalidation");
+        // The edited drafts are committed whole, through the action path, so a region or
+        // review edit is one undoable step.
+        if (st.lists.regions != self.regions_of_interest
+            || st.lists.review_items != self.review_items)
+            && let Err(error) = self.apply_action(crate::action::Action::SetWorkspaceLists {
+                regions: std::mem::take(&mut st.lists.regions),
+                review_items: std::mem::take(&mut st.lists.review_items),
+            })
+        {
+            self.report_error(error.to_string());
         }
+        self.review_status_filter = st.lists.review_status_filter;
     }
 
     /// Commits the sample-metadata filter and selection; returns whether the selection changed.
@@ -305,7 +305,7 @@ impl Viewer {
             self.start_export(path, review_tsv_export(&self.review_items));
         }
         if let Some(locus) = st.lists.managed_locus_requested.take()
-            && let Err(error) = self.navigate_to_locus(&locus)
+            && let Err(error) = self.navigate_to_locus(self.panels.active().id, &locus)
         {
             self.report_error(error.to_string());
         }

@@ -11,6 +11,7 @@ use crate::workspace::context_lanes::{
     ContextLaneDraft, ContextLaneKey, prepared_context_viewport,
 };
 use crate::{Viewer, ui};
+use rgv_core::PanelId;
 use rgv_core::{
     CopyNumberTrackSettings, MutationTrackSettings, QuantitativeScaleMode, TrackConfig, TrackId,
     TrackKind, Viewport,
@@ -43,7 +44,11 @@ impl Viewer {
     /// Every auxiliary track except the pinned gene model, with quantitative
     /// overlay groups drawn once at their first member.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn push_auxiliary_lanes(&mut self, pass: &mut GenomicDisplayPass) {
+    pub(super) fn push_auxiliary_lanes(
+        &mut self,
+        panel_id: PanelId,
+        pass: &mut GenomicDisplayPass,
+    ) {
         let annotation_clip_bottom = pass.annotation_clip_bottom;
         let desired_context_interval = pass.desired_context_interval;
         let effective_auxiliary_configs = &pass.effective_auxiliary_configs;
@@ -112,14 +117,14 @@ impl Viewer {
                             Some(desired_context_interval),
                         ),
                     );
-                    if self.panels.active().pending_queries.tracks
-                        || self.panels.active().track_settled_generation != Some(generation)
+                    if self.panels.panel(panel_id).pending_queries.tracks
+                        || self.panels.panel(panel_id).track_settled_generation != Some(generation)
                     {
                         pending_context_lanes.insert(key);
                     }
                     if self
                         .panels
-                        .active()
+                        .panel(panel_id)
                         .track_query_error_generations
                         .get(&member.id)
                         == Some(&generation)
@@ -135,7 +140,7 @@ impl Viewer {
                 {
                     let Some(snapshot) = self
                         .panels
-                        .active()
+                        .panel(panel_id)
                         .track_snapshots
                         .iter()
                         .find(|snapshot| snapshot.id == member.id)
@@ -144,7 +149,7 @@ impl Viewer {
                     };
                     let Some(loaded_interval) = self
                         .panels
-                        .active()
+                        .panel(panel_id)
                         .track_snapshot_intervals
                         .get(&member.id)
                         .copied()
@@ -157,11 +162,12 @@ impl Viewer {
                     let options = TrackLayoutOptions {
                         top,
                         height,
-                        selected_record: self.selected_auxiliary_record(member.id),
+                        selected_record: self.selected_auxiliary_record(panel_id, member.id),
                         feature_display_mode: member.feature.display_mode,
                         ..TrackLayoutOptions::default()
                     };
                     let track_display = self.layout_auxiliary_member(
+                        panel_id,
                         AuxiliaryMemberLane {
                             member,
                             data: &snapshot.data,
@@ -181,7 +187,7 @@ impl Viewer {
                         key: ContextLaneKey::Auxiliary(member.id),
                         generation: self
                             .panels
-                            .active()
+                            .panel(panel_id)
                             .track_snapshot_generations
                             .get(&member.id)
                             .copied()
@@ -195,28 +201,31 @@ impl Viewer {
                     });
                 }
             }
-            self.panels.active_mut().track_frames.push(TrackFrame {
-                key: TrackFrameKey::Auxiliary(config.id),
-                channel: ui::TrackPane::Annotation,
-                name: overlay_group.map_or_else(
-                    || config.name.clone(),
-                    |group| format!("Overlay {group} · {} tracks", members.len()),
-                ),
-                kind: config.kind,
-                source_label: Some(
-                    members
-                        .iter()
-                        .map(|member| member.source.redacted_label())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                top,
-                bottom,
-                visible: overlay_group.map_or(member_content_visible, |_| composite_visible),
-                collapsed,
-                frozen_bottom: None,
-                subtracks,
-            });
+            self.panels
+                .panel_mut(panel_id)
+                .track_frames
+                .push(TrackFrame {
+                    key: TrackFrameKey::Auxiliary(config.id),
+                    channel: ui::TrackPane::Annotation,
+                    name: overlay_group.map_or_else(
+                        || config.name.clone(),
+                        |group| format!("Overlay {group} · {} tracks", members.len()),
+                    ),
+                    kind: config.kind,
+                    source_label: Some(
+                        members
+                            .iter()
+                            .map(|member| member.source.redacted_label())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    top,
+                    bottom,
+                    visible: overlay_group.map_or(member_content_visible, |_| composite_visible),
+                    collapsed,
+                    frozen_bottom: None,
+                    subtracks,
+                });
             top = bottom;
         }
         pass.top = top;
@@ -224,50 +233,50 @@ impl Viewer {
 
     /// Index of the record selected on `track_id` in the active panel,
     /// whichever kind of auxiliary selection holds it.
-    fn selected_auxiliary_record(&self, track_id: TrackId) -> Option<usize> {
+    fn selected_auxiliary_record(&self, panel_id: PanelId, track_id: TrackId) -> Option<usize> {
         self.panels
-            .active()
+            .panel(panel_id)
             .selected_feature
             .filter(|selection| selection.track_id == track_id)
             .map(|selection| selection.record_index)
             .or_else(|| {
                 self.panels
-                    .active()
+                    .panel(panel_id)
                     .selected_variant
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.record_index)
             })
             .or_else(|| {
                 self.panels
-                    .active()
+                    .panel(panel_id)
                     .selected_gwas
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.record_index)
             })
             .or_else(|| {
                 self.panels
-                    .active()
+                    .panel(panel_id)
                     .selected_quantitative
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.record_index)
             })
             .or_else(|| {
                 self.panels
-                    .active()
+                    .panel(panel_id)
                     .selected_interaction
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.record_index)
             })
             .or_else(|| {
                 self.panels
-                    .active()
+                    .panel(panel_id)
                     .selected_copy_number
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.segment_index)
             })
             .or_else(|| {
                 self.panels
-                    .active()
+                    .panel(panel_id)
                     .selected_mutation
                     .filter(|selection| selection.track_id == track_id)
                     .map(|selection| selection.record_index)
@@ -280,6 +289,7 @@ impl Viewer {
     #[allow(clippy::needless_pass_by_value)]
     fn layout_auxiliary_member(
         &self,
+        panel_id: PanelId,
         lane: AuxiliaryMemberLane<'_>,
         subtracks: &mut Vec<TrackSubtrack>,
         object_ids: &mut ObjectIdAllocator,
@@ -300,7 +310,7 @@ impl Viewer {
             .then(|| {
                 quantitative_display_records(
                     member,
-                    &self.panels.active().track_snapshots,
+                    &self.panels.panel(panel_id).track_snapshots,
                     source_viewport,
                 )
             })
@@ -360,7 +370,7 @@ impl Viewer {
                     .then(|| {
                         shared_quantitative_range(
                             effective_auxiliary_configs,
-                            &self.panels.active().track_snapshots,
+                            &self.panels.panel(panel_id).track_snapshots,
                             source_viewport,
                             member.quantitative.scale_transform,
                             member.quantitative.scale_group,
@@ -385,7 +395,7 @@ impl Viewer {
                         shared_copy_number_range(
                             member,
                             effective_auxiliary_configs,
-                            &self.panels.active().track_snapshots,
+                            &self.panels.panel(panel_id).track_snapshots,
                         )
                     })
                     .flatten();
@@ -452,7 +462,7 @@ impl Viewer {
             TrackSnapshotData::Interactions(query) => {
                 layout_interactions(
                     &query.records,
-                    &self.panels.active().contig_name,
+                    &self.panels.panel(panel_id).contig_name,
                     source_viewport,
                     options,
                     &member.interaction,

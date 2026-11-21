@@ -16,7 +16,7 @@ pub fn set_ui_waker(waker: impl Fn() + Send + Sync + 'static) -> bool {
     UI_WAKER.set(Arc::new(waker)).is_ok()
 }
 
-fn wake_ui() {
+pub(crate) fn wake_ui() {
     if let Some(waker) = UI_WAKER.get() {
         waker();
     }

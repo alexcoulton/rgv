@@ -447,6 +447,31 @@ impl LocalBamAlignmentSource {
     }
 }
 
+impl LocalBamAlignmentSource {
+    /// Builds coverage-pyramid tiles from the region's record stream; see
+    /// [`super::ProductionAlignmentSource::coverage_tiles`].
+    pub fn coverage_tiles(
+        &mut self,
+        request: &crate::CoverageTileRequest,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<crate::CoverageTileOutcome, AlignmentError> {
+        if !self.source_guard.validate()? {
+            return Err(AlignmentError::SourceChanged);
+        }
+        if !keep_going() {
+            return Ok(crate::CoverageTileOutcome::Cancelled);
+        }
+        let stream = crate::coverage_stream::CoverageStream::new(request, &self.dictionary)?;
+        let interval = stream.interval()?;
+        let region = remote_bam_region(&self.dictionary, interval)?;
+        positioned_bam_records(&mut self.reader, &self.index, interval, &region)?.coverage(
+            &self.header,
+            stream,
+            keep_going,
+        )
+    }
+}
+
 impl AlignmentSource for LocalBamAlignmentSource {
     fn reference_dictionary(&self) -> &ReferenceDictionary {
         &self.dictionary

@@ -96,6 +96,9 @@ fn adjacent_text_index(path: &Path) -> Option<PathBuf> {
 
 impl IndexedTextFeatures {
     fn open(path: &Path, format: FeatureFormat) -> Result<Self, TrackError> {
+        // `tbx::Reader` dereferences the null handle `HTSlib` returns for a path it cannot
+        // read (a directory, a file without read permission).
+        crate::htslib_guard::ensure_readable_file(path)?;
         let reader = rust_htslib::tbx::Reader::from_path(path)
             .map_err(|error| TrackError::Backend(error.to_string()))?;
         let contigs = reader.seqnames();

@@ -2,10 +2,12 @@
 use super::*;
 
 mod filtering;
+mod local;
 mod remote;
 #[cfg(test)]
 mod remote_tests;
 
+pub use local::{MAX_IN_MEMORY_VARIANT_BYTES, MAX_IN_MEMORY_VARIANT_RECORDS};
 pub use remote::MAX_REMOTE_VARIANT_ID_SCAN_BYTES;
 pub(super) use remote::{
     MAX_REMOTE_TEXT_INDEX_BYTES, RemoteVariantIndex as RemoteTabixIndex, TABIX_FLAG_ZERO_BASED,
@@ -14,9 +16,12 @@ pub(super) use remote::{
 };
 pub(crate) use remote::{fuzz_variant_index, fuzz_variant_line_interval};
 
-/// Indexed VCF/BCF source. A local file is read by `HTSlib`; a remote bgzipped VCF or BCF is
-/// read over [`crate::HttpRangeReader`] (see [`Self::open_with_remote_config`]) and only
-/// decoded by `HTSlib`.
+/// VCF/BCF source. A local BGZF-compressed file with an index is queried through `HTSlib`; any
+/// other local VCF/BCF (plain or gzip-compressed text, or a file without a usable index) is
+/// loaded into memory, up to [`MAX_IN_MEMORY_VARIANT_BYTES`] and
+/// [`MAX_IN_MEMORY_VARIANT_RECORDS`]. A remote bgzipped VCF or BCF is read over
+/// [`crate::HttpRangeReader`] (see [`Self::open_with_remote_config`]) and only decoded by
+/// `HTSlib`.
 pub struct LocalVariantSource {
     path: PathBuf,
     backend: VariantBackend,
@@ -25,11 +30,35 @@ pub struct LocalVariantSource {
     omitted_format_schemas: usize,
     total_samples: usize,
     omitted_header_samples: usize,
+    /// Names of the FILTER ids the header of an index-backed local file declares. See
+    /// [`FilterNames::Declared`].
+    declared_filters: HashMap<u32, String>,
     id_index: Option<VariantIdIndex>,
+}
+
+/// Largest 0-based start `HTSlib` can seek an indexed VCF/BCF to (`MAX_CSI_COOR` of its synced
+/// reader). Beyond it the iterator it builds is null and `_reader_seek` aborts the process.
+const MAX_INDEXED_VARIANT_START: u64 = (1 << 44) - 2;
+
+/// Placeholder for a FILTER value the header of an index-backed local file does not declare.
+const UNDECLARED_FILTER: &str = "(undeclared filter)";
+
+/// How the FILTER ids of a record are turned into names.
+#[derive(Clone, Copy)]
+enum FilterNames<'a> {
+    /// The record carries the header it was parsed with (`bcf::Reader`), so every id it
+    /// holds, including one `HTSlib` invented for an undeclared FILTER, is in that header.
+    RecordHeader,
+    /// `bcf::IndexedReader` attaches a copy of the header taken when the file was opened,
+    /// while `HTSlib` parses with (and adds undeclared FILTER values to) its own. An invented
+    /// id is past the end of the copy's dictionary, where `HeaderView::id_to_name` reads
+    /// without a bounds check; only ids resolved by name at open are looked up.
+    Declared(&'a HashMap<u32, String>),
 }
 
 enum VariantBackend {
     Htslib(bcf::IndexedReader),
+    Memory(Box<local::InMemoryVariantFile>),
     Remote(Box<remote::RemoteVariantFile>),
 }
 
@@ -44,7 +73,11 @@ impl LocalVariantSource {
         Self::open_with_remote_config(path, HttpRangeConfig::default())
     }
 
-    /// Opens an indexed VCF/BCF. An `http(s)` URL (bgzipped VCF with an adjacent `.csi` or
+    /// Opens a VCF/BCF. A local file needs no index, and need not be sorted, while it is
+    /// within [`MAX_IN_MEMORY_VARIANT_BYTES`] (on disk and decompressed) and
+    /// [`MAX_IN_MEMORY_VARIANT_RECORDS`]; a larger one without a usable index fails with
+    /// [`std::io::ErrorKind::FileTooLarge`] and a message telling the user to bgzip and index
+    /// it. An `http(s)` URL (bgzipped VCF with an adjacent `.csi` or
     /// `.tbi`, or BCF with an adjacent `.csi`) is read with `remote` (authentication, timeouts,
     /// retries and cache geometry) through RGV's range reader; nothing is written outside the
     /// system temporary directory. `remote` is unused for a local file.
@@ -78,17 +111,29 @@ impl LocalVariantSource {
                 remote,
             )?))
         } else {
-            VariantBackend::Htslib(
-                bcf::IndexedReader::from_path(path)
-                    .map_err(|error| TrackError::Backend(error.to_string()))?,
-            )
+            match local::open(path)? {
+                local::LocalVariantFile::Indexed(reader) => VariantBackend::Htslib(reader),
+                local::LocalVariantFile::Memory(file) => VariantBackend::Memory(file),
+            }
         };
         let (header, omitted_info_schemas, omitted_format_schemas, omitted_header_samples) =
             decode_variant_header(match &backend {
                 VariantBackend::Htslib(reader) => reader.header(),
+                VariantBackend::Memory(file) => file.header(),
                 VariantBackend::Remote(remote) => remote.raw_header(),
             });
         let total_samples = header.samples.len().saturating_add(omitted_header_samples);
+        let declared_filters = match &backend {
+            VariantBackend::Htslib(reader) => std::iter::once("PASS")
+                .chain(header.filters.iter().map(|filter| filter.id.as_str()))
+                .filter(|name| !name.contains('\0'))
+                .filter_map(|name| {
+                    let id = reader.header().name_to_id(name.as_bytes()).ok()?;
+                    Some((*id, name.to_owned()))
+                })
+                .collect(),
+            VariantBackend::Memory(_) | VariantBackend::Remote(_) => HashMap::new(),
+        };
         Ok(Self {
             path: path.to_path_buf(),
             backend,
@@ -97,6 +142,7 @@ impl LocalVariantSource {
             omitted_format_schemas,
             total_samples,
             omitted_header_samples,
+            declared_filters,
             id_index: None,
         })
     }
@@ -120,7 +166,7 @@ impl LocalVariantSource {
     /// Transfer statistics (index and data) of a remote source; `None` for a local file.
     pub fn remote_io_stats(&self) -> Option<RemoteIoStats> {
         match &self.backend {
-            VariantBackend::Htslib(_) => None,
+            VariantBackend::Htslib(_) | VariantBackend::Memory(_) => None,
             VariantBackend::Remote(remote) => Some(remote.stats()),
         }
     }
@@ -151,6 +197,10 @@ impl LocalVariantSource {
     ) -> Result<VariantQuery, TrackError> {
         let mut collector = VariantQueryCollector {
             header: &self.header,
+            filter_names: match &self.backend {
+                VariantBackend::Htslib(_) => FilterNames::Declared(&self.declared_filters),
+                VariantBackend::Memory(_) | VariantBackend::Remote(_) => FilterNames::RecordHeader,
+            },
             contig,
             settings,
             maximum_records,
@@ -165,12 +215,14 @@ impl LocalVariantSource {
         };
         match &mut self.backend {
             VariantBackend::Htslib(reader) => {
+                if contig.contains('\0') {
+                    return Err(TrackError::Backend(
+                        "a contig name cannot contain a NUL byte".to_owned(),
+                    ));
+                }
                 let rid = reader
                     .header()
                     .name2rid(contig.as_bytes())
-                    .map_err(|error| TrackError::Backend(error.to_string()))?;
-                reader
-                    .fetch(rid, start, Some(end.saturating_sub(1)))
                     .map_err(|error| TrackError::Backend(error.to_string()))?;
                 filtering::validate_filter_authority(
                     reader.header(),
@@ -178,9 +230,30 @@ impl LocalVariantSource {
                     self.omitted_header_samples,
                     settings,
                 )?;
-                for result in reader.records() {
-                    let record = result.map_err(|error| TrackError::Backend(error.to_string()))?;
-                    if !collector.push(&record)? {
+                // A window `HTSlib` cannot address holds no record, and must not reach it: see
+                // `MAX_INDEXED_VARIANT_START`.
+                if start <= MAX_INDEXED_VARIANT_START {
+                    reader
+                        .fetch(rid, start, Some(end.saturating_sub(1)))
+                        .map_err(|error| TrackError::Backend(error.to_string()))?;
+                    for result in reader.records() {
+                        let record =
+                            result.map_err(|error| TrackError::Backend(error.to_string()))?;
+                        if !collector.push(&record)? {
+                            break;
+                        }
+                    }
+                }
+            }
+            VariantBackend::Memory(file) => {
+                filtering::validate_filter_authority(
+                    file.header(),
+                    &self.header,
+                    self.omitted_header_samples,
+                    settings,
+                )?;
+                for record in file.overlapping(contig, start, end) {
+                    if !collector.push(record)? {
                         break;
                     }
                 }
@@ -260,6 +333,15 @@ impl LocalVariantSource {
         if self.id_index.is_none() {
             self.id_index = Some(match &mut self.backend {
                 VariantBackend::Htslib(_) => build_variant_id_index(&self.path)?,
+                VariantBackend::Memory(file) => {
+                    let mut builder = VariantIdIndexBuilder::default();
+                    for record in file.records() {
+                        if !builder.push(record)? {
+                            break;
+                        }
+                    }
+                    builder.index
+                }
                 VariantBackend::Remote(remote) => build_remote_variant_id_index(remote)?,
             });
         }
@@ -322,6 +404,7 @@ impl LocalVariantSource {
 /// limit, filters and genotype-cell budget behave identically.
 struct VariantQueryCollector<'a> {
     header: &'a VariantHeader,
+    filter_names: FilterNames<'a>,
     contig: &'a str,
     settings: &'a VariantTrackSettings,
     maximum_records: usize,
@@ -339,12 +422,13 @@ impl VariantQueryCollector<'_> {
     /// Returns `false` once the record limit is reached and reading should stop.
     fn push(&mut self, record: &bcf::Record) -> Result<bool, TrackError> {
         self.records_examined = self.records_examined.saturating_add(1);
-        let (mut decoded, _, _) = decode_variant_record(
+        let (mut decoded, _, _) = decode_variant_record_with(
             record,
             self.header,
             self.contig,
             0,
             &self.selected_sample_indices,
+            self.filter_names,
         )?;
         if !filtering::source_record_matches(
             record,
@@ -376,8 +460,7 @@ impl VariantQueryCollector<'_> {
 }
 
 fn build_variant_id_index(path: &Path) -> Result<VariantIdIndex, TrackError> {
-    let mut reader =
-        bcf::Reader::from_path(path).map_err(|error| TrackError::Backend(error.to_string()))?;
+    let mut reader = local::open_reader(path)?;
     let mut builder = VariantIdIndexBuilder::default();
     builder.extend(&mut reader)?;
     Ok(builder.index)
@@ -421,63 +504,75 @@ struct VariantIdIndexBuilder {
 impl VariantIdIndexBuilder {
     /// Indexes every record `reader` yields until a limit truncates the index.
     fn extend(&mut self, reader: &mut bcf::Reader) -> Result<(), TrackError> {
-        let header = reader.header().clone();
         for result in reader.records() {
-            if self.records == MAX_VARIANT_ID_INDEX_RECORDS
-                || self.associations == MAX_VARIANT_ID_ASSOCIATIONS
-            {
+            if self.is_full() {
                 self.index.truncated = true;
                 break;
             }
-            self.records = self.records.saturating_add(1);
             let record = result.map_err(|error| TrackError::Backend(error.to_string()))?;
-            let Some(rid) = record.rid() else {
-                continue;
-            };
-            let contig = String::from_utf8_lossy(
-                header
-                    .rid2name(rid)
-                    .map_err(|error| TrackError::Backend(error.to_string()))?,
-            )
-            .into_owned();
-            let start = u64::try_from(record.pos()).map_err(|_| TrackError::Coordinate)?;
-            let end = start.saturating_add(u64::try_from(record.rlen()).unwrap_or(1).max(1));
-            let raw_ids = record.id();
-            let ids = String::from_utf8_lossy(&raw_ids);
-            let mut record_ids = ids
-                .split(';')
-                .map(str::trim)
-                .filter(|id| !id.is_empty() && *id != ".")
-                .map(|id| (id.to_lowercase(), id.to_owned()))
-                .collect::<Vec<_>>();
-            record_ids
-                .sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-            record_ids.dedup_by(|left, right| left.0 == right.0);
-            for (normalized_id, id) in record_ids {
-                if self.associations == MAX_VARIANT_ID_ASSOCIATIONS {
-                    self.index.truncated = true;
-                    break;
-                }
-                self.index
-                    .ids
-                    .entry(normalized_id.clone())
-                    .or_default()
-                    .push(VariantIdSearchHit {
-                        matched_id: normalized_id,
-                        id,
-                        contig: contig.clone(),
-                        start,
-                        end,
-                    });
-                self.associations = self.associations.saturating_add(1);
-            }
+            self.push(&record)?;
         }
         Ok(())
+    }
+
+    fn is_full(&self) -> bool {
+        self.records == MAX_VARIANT_ID_INDEX_RECORDS
+            || self.associations == MAX_VARIANT_ID_ASSOCIATIONS
+    }
+
+    /// Indexes one record; returns `false`, marking the index truncated, once a limit is
+    /// reached.
+    fn push(&mut self, record: &bcf::Record) -> Result<bool, TrackError> {
+        if self.is_full() {
+            self.index.truncated = true;
+            return Ok(false);
+        }
+        self.records = self.records.saturating_add(1);
+        // The record's own header: `HTSlib` adds an undeclared contig to it on the fly.
+        let Some(contig) = local::record_contig(record) else {
+            return Ok(true);
+        };
+        let start = u64::try_from(record.pos()).map_err(|_| TrackError::Coordinate)?;
+        let end = start.saturating_add(u64::try_from(record.rlen()).unwrap_or(1).max(1));
+        let raw_ids = record.id();
+        let ids = String::from_utf8_lossy(&raw_ids);
+        let mut record_ids = ids
+            .split(';')
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && *id != ".")
+            .map(|id| (id.to_lowercase(), id.to_owned()))
+            .collect::<Vec<_>>();
+        record_ids.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        record_ids.dedup_by(|left, right| left.0 == right.0);
+        for (normalized_id, id) in record_ids {
+            if self.associations == MAX_VARIANT_ID_ASSOCIATIONS {
+                self.index.truncated = true;
+                break;
+            }
+            self.index
+                .ids
+                .entry(normalized_id.clone())
+                .or_default()
+                .push(VariantIdSearchHit {
+                    matched_id: normalized_id,
+                    id,
+                    contig: contig.clone(),
+                    start,
+                    end,
+                });
+            self.associations = self.associations.saturating_add(1);
+        }
+        Ok(true)
     }
 }
 
 fn decode_variant_header(header: &bcf::header::HeaderView) -> (VariantHeader, usize, usize, usize) {
-    let raw_samples = header.samples();
+    // `HeaderView::samples` builds a slice from a null pointer for a header without samples.
+    let raw_samples = if header.sample_count() == 0 {
+        Vec::new()
+    } else {
+        header.samples()
+    };
     let omitted_samples = raw_samples.len().saturating_sub(MAX_VARIANT_HEADER_SAMPLES);
     let samples = raw_samples
         .into_iter()
@@ -602,12 +697,32 @@ fn clean_header_value(value: &str) -> String {
     value.trim_matches('"').to_owned()
 }
 
+/// Decodes a record that carries the header it was parsed with.
+#[cfg(test)]
 fn decode_variant_record(
     record: &bcf::Record,
     header: &VariantHeader,
     contig: &str,
     remaining_genotype_cells: usize,
     selected_sample_indices: &[usize],
+) -> Result<(VariantRecord, usize, usize), TrackError> {
+    decode_variant_record_with(
+        record,
+        header,
+        contig,
+        remaining_genotype_cells,
+        selected_sample_indices,
+        FilterNames::RecordHeader,
+    )
+}
+
+fn decode_variant_record_with(
+    record: &bcf::Record,
+    header: &VariantHeader,
+    contig: &str,
+    remaining_genotype_cells: usize,
+    selected_sample_indices: &[usize],
+    filter_names: FilterNames<'_>,
 ) -> Result<(VariantRecord, usize, usize), TrackError> {
     let start = u64::try_from(record.pos()).map_err(|_| TrackError::Coordinate)?;
     let alleles = record.alleles();
@@ -629,7 +744,14 @@ fn decode_variant_record(
         .max(start.saturating_add(1));
     let filters = record
         .filters()
-        .map(|id| String::from_utf8_lossy(&record.header().id_to_name(id)).into_owned())
+        .map(|id| match filter_names {
+            FilterNames::RecordHeader => {
+                String::from_utf8_lossy(&record.header().id_to_name(id)).into_owned()
+            }
+            FilterNames::Declared(names) => names
+                .get(&*id)
+                .map_or_else(|| UNDECLARED_FILTER.to_owned(), Clone::clone),
+        })
         .collect();
     let (genotypes, loaded, omitted) = decode_genotypes(
         record,

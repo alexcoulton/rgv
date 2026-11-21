@@ -154,12 +154,14 @@ impl ApplicationHandler for Application {
                 viewer.cursor_moved(position, egui_response.consumed);
             }
             WindowEvent::CursorLeft { .. } => {
-                if viewer
-                    .panels
-                    .active_mut()
-                    .hovered_alignment_hit
-                    .take()
-                    .is_some()
+                // Read hover may sit in any panel, so leaving the window clears every panel's.
+                let focused = viewer.panels.active().id;
+                if !crate::ui::interaction::retarget_alignment_hover(
+                    &mut viewer.panels,
+                    focused,
+                    None,
+                )
+                .is_empty()
                 {
                     viewer.mark_display_dirty("runtime window invalidation");
                     viewer.window.request_redraw();
@@ -173,7 +175,9 @@ impl ApplicationHandler for Application {
                     .is_some()
                 {
                     viewer.window.set_cursor(CursorIcon::Default);
-                    if viewer.synthetic || !viewer.refresh_active_panel_scroll_display() {
+                    if viewer.synthetic
+                        || !viewer.refresh_panel_scroll_display(viewer.panels.active().id)
+                    {
                         viewer.mark_display_dirty("runtime window invalidation");
                     }
                     viewer.window.request_redraw();
@@ -204,7 +208,9 @@ impl ApplicationHandler for Application {
                         .sashimi_interaction_diagnostics
                         .hover_redraws
                         .saturating_add(1);
-                    if viewer.synthetic || !viewer.refresh_active_panel_scroll_display() {
+                    if viewer.synthetic
+                        || !viewer.refresh_panel_scroll_display(viewer.panels.active().id)
+                    {
                         viewer.mark_display_dirty("runtime window invalidation");
                     }
                     viewer.window.request_redraw();
@@ -212,7 +218,7 @@ impl ApplicationHandler for Application {
                 viewer.drag_origin_interval = None;
                 viewer.end_navigation_gesture();
                 if was_canvas_dragging {
-                    viewer.finish_navigation_gesture();
+                    viewer.finish_navigation_gesture(viewer.panels.active().id);
                 }
             }
             WindowEvent::Focused(true) => {
@@ -269,7 +275,7 @@ impl ApplicationHandler for Application {
                     if viewer.drag_origin_interval.take().is_some() {
                         // One history entry and one recent locus for the whole drag.
                         viewer.end_navigation_gesture();
-                        viewer.finish_navigation_gesture();
+                        viewer.finish_navigation_gesture(viewer.panels.active().id);
                     }
                     // `press_cursor` is only recorded for the unobstructed GPU canvas.
                     // The surrounding egui panel reports ordinary canvas presses as
@@ -318,7 +324,7 @@ impl ApplicationHandler for Application {
                         winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
                     )
                 {
-                    viewer.finish_navigation_gesture();
+                    viewer.finish_navigation_gesture(viewer.panels.active().id);
                 }
             }
             WindowEvent::PinchGesture { delta, phase, .. }
@@ -333,7 +339,7 @@ impl ApplicationHandler for Application {
                     phase,
                     winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
                 ) {
-                    viewer.finish_navigation_gesture();
+                    viewer.finish_navigation_gesture(viewer.panels.active().id);
                 }
             }
             WindowEvent::DroppedFile(path) => viewer.handle_dropped_file(&path),

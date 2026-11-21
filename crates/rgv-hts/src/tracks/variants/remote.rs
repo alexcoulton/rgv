@@ -691,7 +691,8 @@ fn parse_batch(
         }
     }
     file.flush()?;
-    let reader = bcf::Reader::from_path(file.path()).map_err(backend)?;
+    // Refuses a header `HTSlib` rejects, which `rust-htslib` would return as a null view.
+    let reader = super::local::open_reader(file.path())?;
     Ok(ParsedVariantBatch {
         reader,
         _file: file,

@@ -117,7 +117,7 @@ host configuration details. This example passes only the protected file's path; 
 - `rgv_navigate` with one locus retargets only the active panel; with two or more loci it
   replaces the whole panel arrangement, one panel per locus. `chr1:12345` shows that base with
   20 bases of flank on each side and a bare contig name shows the whole contig. Gene symbols are
-  not resolved.
+  not resolved by `rgv_navigate`; use `rgv_goto_gene`.
 
 ## Tools
 
@@ -153,6 +153,8 @@ host configuration details. This example passes only the protected file's path; 
 | `rgv_open_workspace` | Explicitly replaces the window with a root-confined saved project. |
 | `rgv_query_pileup` | Reads per-base depth and A/C/G/T/N, insertion and deletion counts in the active panel's current view, as paginated JSON. Never navigates. |
 | `rgv_query_variants` | Lists variant records overlapping an interval of the active panel's current view, as paginated JSON. Never navigates. |
+| `rgv_query_features` | Lists the annotation features (genes, transcripts, intervals, peaks) overlapping any interval of up to 10 Mb, as paginated JSON. Independent of the view; never navigates or selects. |
+| `rgv_goto_gene` | Finds a gene or named feature in the loaded annotation tracks and navigates one panel to it, with optional flank. Fails rather than guess when the name is ambiguous. |
 | `rgv_execute_batch` | Advanced ordered escape hatch, limited to 100 validated commands; its argument schema is the full automation command schema. |
 
 `rgv_execute_batch` always rejects `exit`. It rejects `new_workspace` unless
@@ -204,7 +206,8 @@ Some settings are narrower than their names suggest. `show_reference`, `show_cov
 `coverage_scale_transform`, `read_base_display_mode`, `shade_read_bases_by_quality`,
 `show_modified_bases`, `modified_base_color_mode` and `overlapping_mate_policy` are stored in the
 first (primary) alignment track's settings. `show_reads`, `alignment_density` and
-`vertical_scroll_points` act on the primary alignment track only. `track_height`,
+`vertical_scroll_points` take an optional `track_id` naming the alignment track to change; when it
+is omitted they act on the primary alignment track, as before. `track_height`,
 `track_collapsed` and `track_visible` address a track's annotation-channel row, and
 `track_collapsed: true` is the same operation as `track_visible: false`. `alignment_density`
 passes batch validation from 0.25 but the viewer rejects values below 0.35;
@@ -247,10 +250,61 @@ limit, in which case later rows are missing.
   `include_sample_names: true`; `sample_names` reports `pseudonymized`, `included` or
   `not_requested`.
 
-Two queries are **not** available because the control protocol has no command that can answer
-them without changing the window: annotation features or genes overlapping an interval, and
-navigation to a gene symbol. `rgv_select` can inspect the single feature under one position, but
-it replaces the selection and can move the view.
+### Annotation features and genes
+
+`rgv_query_features` and `rgv_goto_gene` use the control commands `query_features` and
+`goto_gene` (also available in `rgv_execute_batch`).
+
+`rgv_query_features` reads the loaded feature and gene-model tracks directly from their sources
+for the interval asked about. It is **independent of the view**: no panel has to show the
+interval or even the contig, and the call does not navigate, select, wait for settlement, or
+change the workspace revision.
+
+- Arguments: `contig` (as the workspace reports it; spellings a locus accepts, such as `1` for
+  `chr1`, are resolved when a reference dictionary is loaded), `start` (zero-based inclusive,
+  bases), `end` (zero-based exclusive, bases; greater than `start`, at most `start` + 10,000,000,
+  clamped to the contig length), optional `track_ids` (1 to 1,024 positive feature or gene-model
+  track IDs; omitted means every such track), `offset` (0 to 1,000,000, default 0) and `limit`
+  (1 to 500, default 50).
+- Result: `contig`, zero-based half-open `query_start`/`query_end`, `track_ids` (the tracks that
+  answered, in workspace order), `features`, and `page` with `total_matching`, `offset`,
+  `returned`, `limit`, `truncated` and `next_offset`. Each feature has `track_id`, `name` (the
+  display label; empty when the record has none), `feature_type` (`gene`, `exon`, ...; `feature`
+  when the format has none), `contig`, zero-based half-open `start`/`end`, `strand` (`+`, `-` or
+  `.`) and, when the record carries a gene symbol, `gene_name`. Text values are cut at 256 bytes
+  (`name_truncated`).
+- Features are ordered by track (workspace order), then `start`, `end` and `name`, so paging
+  with `page.next_offset` is stable while the tracks do not change. A feature overlaps the
+  interval when any of its bases lies inside it; a feature that merely abuts it does not.
+- Failures: `resource_not_found` (no feature or gene-model track is loaded or open, a named
+  track does not exist, or the contig is not in the reference dictionary), `invalid_command` (a
+  named track is of another kind, or `start` lies beyond the contig), `too_dense` (a track holds
+  more than 250,000 records in the interval; ask for a narrower one), `io` (a track's source
+  could not be read), `invalid_state` (the track engine's queue is full; retry) and `timeout`
+  (no answer within 30 seconds). A failing track fails the whole call; no partial answer is
+  returned.
+
+`rgv_goto_gene` searches every loaded searchable annotation track, case-insensitively, exactly
+as the window's own search box does, and navigates only when the answer is unambiguous: exactly
+one feature matches the whole query, or nothing matches it exactly and exactly one feature
+matches it by prefix.
+
+- Arguments: `query` (gene symbol, feature name or identifier; 1 to 256 bytes), optional
+  `panel_id` (the panel to navigate; omitted means the focused panel), `flank_bases` (0 to
+  10,000,000, default 0; bases added on each side of the feature, clamped to the contig),
+  `wait_until_settled` and `timeout_millis`.
+- Result: `panel_id`, `contig`, the zero-based half-open `start`/`end` the panel now shows, the
+  same interval as a one-based `locus` string, `hit` (`track_id`, `name`, `feature_type`),
+  `candidate_count` (how many features the search returned) and `settled`.
+- Only the addressed panel moves; the focused panel and the selection do not change. The move is
+  recorded in that panel's navigation history like any other navigation.
+- Failures: `resource_not_found` (nothing matches, no annotation track is open, or the panel
+  does not exist), `ambiguous_match` (several features match and none is preferred; the message
+  lists up to five candidates with their one-based loci and the view does not move — repeat with
+  a more specific name, or call `rgv_navigate` with the candidate's locus) and `timeout` (no
+  search answer within 30 seconds).
+- The viewer runs one annotation search at a time, so a search the user started in the window
+  that is still running when this command arrives is superseded and its result is not shown.
 
 ### Schema compatibility
 
@@ -264,6 +318,10 @@ their response shapes are unknown to it. `rgv_status` returns the range as
 `supported_schema_versions`; a viewer outside it fails with `unsupported_version` and a message
 naming both the reported version and the supported range. Generated batches are stamped with the
 minimum supported version, which every supported viewer accepts.
+
+The `query_features` and `goto_gene` commands were added to schema 6 without a version change. A
+schema-6 viewer built before them does not know the commands and rejects `rgv_query_features`
+and `rgv_goto_gene` with `invalid_batch`; every other tool is unaffected.
 
 The automation schema exposes the normalized presentation model and committed workspace
 geometry structurally. The `workspace_layout` field reports one revision for the shared workspace,
@@ -352,6 +410,9 @@ coordinates.
 - `rgv_query_pileup` returns aggregate counts only. `rgv_query_variants` returns no INFO fields or
   genotypes unless asked, and pseudonymizes sample names unless `include_sample_names: true`.
   Neither tool leaves an export file behind.
+- `rgv_query_features` returns at most 500 features per call from an interval of at most 10 Mb,
+  with names, feature types and gene symbols cut at 256 bytes. It returns annotation only: no
+  read, sample or source-path data, and it writes no file.
 - `rgv_export` is the one tool whose purpose is to write record-level evidence. The file it writes
   under the control root always contains the original read names (the `read_name` column of
   `alignments`, `filtered_alignments`, and `eligible_alignments`, and the `Read` row of
@@ -391,7 +452,8 @@ include `unavailable`, `unauthorized`, `unsupported_version`, `invalid_input`, `
 Viewer failures preserve the lower-case shared error codes, including `invalid_setting_scope`,
 `setting_out_of_range`, `effective_state_unavailable`, `no_selection`, `selection_stale`, `stale_handle`, `ambiguous_alignment_match`,
 `related_alignment_unavailable`, `review_item_not_found`, `history_boundary`, `unsaved_changes`,
-`workspace_replacement_not_confirmed`, and `workspace_revision_conflict`.
+`workspace_replacement_not_confirmed`, `workspace_revision_conflict`, `too_dense`, and
+`ambiguous_match`.
 Selection, setting, history, review, relationship, and persistence failures additionally preserve
 `no_selection`, `selection_stale`, `stale_handle`, `setting_out_of_range`,
 `effective_state_unavailable`, `review_item_not_found`, `history_boundary`,
@@ -411,7 +473,13 @@ Selection, setting, history, review, relationship, and persistence failures addi
   the resulting workspace; restore connectivity before retrying.
 - `artifact_error`: verify root permissions and ensure no path component is a symbolic link.
 - `interval_not_in_view`: an evidence query asked about a contig or interval outside the active
-  panel's current view; navigate there with `rgv_navigate` and retry.
+  panel's current view; navigate there with `rgv_navigate` and retry. `rgv_query_features` never
+  returns this code: it does not depend on the view.
+- `ambiguous_match`: `rgv_goto_gene` found several features and none was a unique exact match.
+  Nothing moved. Choose one of the candidates listed in the message and retry with its exact
+  name, or navigate to its locus with `rgv_navigate`.
+- `too_dense` from `rgv_query_features`: a track holds more records in the interval than one
+  query may read; ask for a narrower interval.
 
 Calls are mutually exclusive in the adapter and again in the viewer, but concurrently submitted
 JSON-RPC requests have no guaranteed admission order. Await a response before issuing a dependent

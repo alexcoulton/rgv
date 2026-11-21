@@ -11,6 +11,7 @@ use crate::workspace::context_lanes::{
     ContextLaneDraft, ContextLaneKey, buffered_context_interval, prepared_context_viewport,
 };
 use crate::{Viewer, ui};
+use rgv_core::PanelId;
 use rgv_core::{
     GeneticCode, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, ReferenceTranslationFrame, TrackKind,
     TrackSource, Viewport,
@@ -51,7 +52,7 @@ pub(crate) fn append_reference_translation_lanes(
 impl Viewer {
     /// Reference sequence lane: bases, translation frames, and its frame.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn push_reference_lane(&mut self, pass: &mut GenomicDisplayPass) {
+    pub(super) fn push_reference_lane(&mut self, panel_id: PanelId, pass: &mut GenomicDisplayPass) {
         let viewport_interval = pass.viewport_interval;
         let target_viewport = pass.target_viewport;
         let generation = pass.generation;
@@ -81,7 +82,7 @@ impl Viewer {
             };
             let reference_context_interval = buffered_context_interval(
                 target_viewport,
-                self.panels.active().contig_length,
+                self.panels.panel(panel_id).contig_length,
                 self.settings.read_browsing_buffer_percent,
                 Some(MAX_REFERENCE_QUERY_BASES),
             );
@@ -90,23 +91,25 @@ impl Viewer {
                     ContextLaneKey::Reference,
                     (TrackFrameKey::Reference, Some(reference_context_interval)),
                 );
-                if self.panels.active().pending_queries.reference
-                    || self.panels.active().reference_settled_generation != Some(generation)
+                if self.panels.panel(panel_id).pending_queries.reference
+                    || self.panels.panel(panel_id).reference_settled_generation != Some(generation)
                 {
                     pending_context_lanes.insert(ContextLaneKey::Reference);
                 }
-                if self.panels.active().reference_query_error_generation == Some(generation) {
+                if self.panels.panel(panel_id).reference_query_error_generation == Some(generation)
+                {
                     unavailable_context_lanes.insert(ContextLaneKey::Reference);
                 }
             }
             if reference_expanded
                 && let Some(reference) = self
                     .panels
-                    .active()
+                    .panel(panel_id)
                     .reference_slice
                     .as_deref()
                     .filter(|_| {
-                        self.panels.active().reference_slice_revision == self.reference_revision
+                        self.panels.panel(panel_id).reference_slice_revision
+                            == self.reference_revision
                     })
                     .filter(|slice| retained_data_overlaps(slice.interval, viewport_interval))
             {
@@ -126,13 +129,13 @@ impl Viewer {
                     translation_top,
                     &self.reference_translation_frames,
                     self.reference_genetic_code,
-                    self.panels.active().contig_length,
+                    self.panels.panel(panel_id).contig_length,
                 );
                 context_lane_drafts.push(ContextLaneDraft {
                     key: ContextLaneKey::Reference,
                     generation: self
                         .panels
-                        .active()
+                        .panel(panel_id)
                         .reference_slice_generation
                         .expect("every installed reference slice carries its source generation"),
                     source_viewport,
@@ -143,7 +146,7 @@ impl Viewer {
             }
             let mut subtracks = Vec::new();
             if reference_expanded {
-                let bases_per_pixel = self.panels.active().viewport.bases_per_pixel();
+                let bases_per_pixel = self.panels.panel(panel_id).viewport.bases_per_pixel();
                 let reference_detail = if bases_per_pixel > MAXIMUM_BASE_MARK_BASES_PER_PIXEL {
                     Some("zoom in to see sequence".to_owned())
                 } else if 1.0 / bases_per_pixel < f64::from(MINIMUM_BASE_GLYPH_PIXEL_WIDTH) {
@@ -192,7 +195,7 @@ impl Viewer {
                 frozen_bottom: None,
                 subtracks,
             };
-            self.panels.active_mut().track_frames.push(frame);
+            self.panels.panel_mut(panel_id).track_frames.push(frame);
             top = bottom;
         }
         pass.top = top;
@@ -200,7 +203,11 @@ impl Viewer {
 
     /// The primary gene-model track, pinned directly below the reference.
     #[allow(clippy::too_many_lines)]
-    pub(super) fn push_pinned_gene_lanes(&mut self, pass: &mut GenomicDisplayPass) {
+    pub(super) fn push_pinned_gene_lanes(
+        &mut self,
+        panel_id: PanelId,
+        pass: &mut GenomicDisplayPass,
+    ) {
         let desired_context_interval = pass.desired_context_interval;
         let effective_auxiliary_configs = &pass.effective_auxiliary_configs;
         let viewport_interval = pass.viewport_interval;
@@ -240,14 +247,14 @@ impl Viewer {
                         Some(desired_context_interval),
                     ),
                 );
-                if self.panels.active().pending_queries.tracks
-                    || self.panels.active().track_settled_generation != Some(generation)
+                if self.panels.panel(panel_id).pending_queries.tracks
+                    || self.panels.panel(panel_id).track_settled_generation != Some(generation)
                 {
                     pending_context_lanes.insert(key);
                 }
                 if self
                     .panels
-                    .active()
+                    .panel(panel_id)
                     .track_query_error_generations
                     .get(&config.id)
                     == Some(&generation)
@@ -258,7 +265,7 @@ impl Viewer {
             if !config.collapsed
                 && let Some(loaded_interval) = self
                     .panels
-                    .active()
+                    .panel(panel_id)
                     .track_snapshot_intervals
                     .get(&config.id)
                     .copied()
@@ -268,7 +275,7 @@ impl Viewer {
                     ..
                 }) = self
                     .panels
-                    .active()
+                    .panel(panel_id)
                     .track_snapshots
                     .iter()
                     .find(|snapshot| snapshot.id == config.id)
@@ -280,7 +287,7 @@ impl Viewer {
                     maximum_rows: pinned_gene_layout_maximum_rows(height),
                     selected_record: self
                         .panels
-                        .active()
+                        .panel(panel_id)
                         .selected_feature
                         .filter(|selection| selection.track_id == config.id)
                         .map(|selection| selection.record_index),
@@ -304,7 +311,7 @@ impl Viewer {
                     key: ContextLaneKey::Auxiliary(config.id),
                     generation: self
                         .panels
-                        .active()
+                        .panel(panel_id)
                         .track_snapshot_generations
                         .get(&config.id)
                         .copied()
@@ -317,19 +324,22 @@ impl Viewer {
                     display: gene_display,
                 });
             }
-            self.panels.active_mut().track_frames.push(TrackFrame {
-                key: TrackFrameKey::Auxiliary(config.id),
-                channel: ui::TrackPane::Annotation,
-                name: config.name,
-                kind: config.kind,
-                source_label: Some(config.source.redacted_label()),
-                top: frame_top,
-                bottom,
-                visible: true,
-                collapsed: config.collapsed,
-                frozen_bottom: None,
-                subtracks: Vec::new(),
-            });
+            self.panels
+                .panel_mut(panel_id)
+                .track_frames
+                .push(TrackFrame {
+                    key: TrackFrameKey::Auxiliary(config.id),
+                    channel: ui::TrackPane::Annotation,
+                    name: config.name,
+                    kind: config.kind,
+                    source_label: Some(config.source.redacted_label()),
+                    top: frame_top,
+                    bottom,
+                    visible: true,
+                    collapsed: config.collapsed,
+                    frozen_bottom: None,
+                    subtracks: Vec::new(),
+                });
             top = bottom;
         }
         pass.top = top;

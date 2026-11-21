@@ -86,7 +86,7 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn select_at_cursor(&mut self) {
-        let scene_selection = self.alignment_scene_hit_at_cursor();
+        let scene_selection = self.alignment_scene_hit_at_cursor(self.panels.active().id);
         let scene_selected_chain = scene_selection.and_then(|hit| {
             let record = self.alignment_scene_record_for_hit(self.panels.active().id, hit)?;
             selected_supplementary_chain(&record, &self.panels.active().contig_name)
@@ -1068,7 +1068,7 @@ impl Viewer {
         self.panels.active_mut().selected_chain = None;
         self.panels.active_mut().selected_pileup_position = (!modification).then_some(position);
         self.panels.active_mut().selected_modification_position = modification.then_some(position);
-        self.rebuild_genomic_display();
+        self.rebuild_genomic_display(self.panels.active().id);
         self.mark_display_dirty("explicit display invalidation");
     }
 
@@ -1309,11 +1309,10 @@ impl Viewer {
             && summaries.has_junction_lane(panel_id.get(), track_id.get())
     }
 
-    pub(crate) fn alignment_scene_hit_at_cursor(&self) -> Option<AlignmentHit> {
+    pub(crate) fn alignment_scene_hit_at_cursor(&self, panel_id: PanelId) -> Option<AlignmentHit> {
         let scale = self.window.scale_factor().max(f64::EPSILON);
         let x = self.cursor.x / scale;
         let y = self.cursor.y / scale;
-        let panel_id = self.panels.active().id;
         let epoch = self.alignment_presented_epoch.as_ref()?;
         let frame = epoch.panel_frames.get(&panel_id)?;
         let bundle = epoch.gpu_bundle.as_ref()?;

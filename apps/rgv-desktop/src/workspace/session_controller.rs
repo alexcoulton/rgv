@@ -11,12 +11,12 @@ use crate::sources::{
 };
 use crate::workspace::alignments::filter_state_from_session;
 use crate::workspace::navigation::{ImportedLocusRequest, RequestedLocus, resolve_requested_locus};
-use crate::workspace::panels::PanelWorkspace;
+use crate::workspace::panels::{PanelWorkspace, ViewPanelController};
 use anyhow::Result;
 use rgv_core::{
-    ReferenceDictionary, SessionAlignmentTrack, SessionDocument, SessionFilters, SessionLocus,
-    SessionReadPanelState, SessionViewPanel, TrackConfig, TrackFormat, TrackId, TrackKind,
-    TrackSource, WorkspacePresentation,
+    PanelId, ReferenceDictionary, SessionAlignmentTrack, SessionDocument, SessionFilters,
+    SessionLocus, SessionReadPanelState, SessionViewPanel, TrackConfig, TrackFormat, TrackId,
+    TrackKind, TrackSource, WorkspacePresentation,
 };
 use rgv_engine::{ReferenceEngine, TrackSpec, TrackSpecKind};
 use rgv_layout::DisplayList;
@@ -45,6 +45,48 @@ fn prepare_session_geometry(
         PanelWorkspace::from_session(session, width, top)?,
         cytobands,
     ))
+}
+
+/// The panel part of a session document: the focused panel's locus, every panel in order, and
+/// which one has focus. This is the persisted projection of the panel workspace, so the action
+/// tests compare it to decide whether two front ends left the same document.
+pub(crate) fn session_panel_documents(
+    panels: &PanelWorkspace,
+) -> (SessionLocus, Vec<SessionViewPanel>, PanelId) {
+    let locus_of = |panel: &ViewPanelController| {
+        let interval = panel.viewport.interval();
+        SessionLocus {
+            contig: panel.contig_name.clone(),
+            start: interval.start(),
+            end: interval.end(),
+        }
+    };
+    let saved = panels
+        .iter()
+        .map(|panel| {
+            let mut saved = SessionViewPanel::new(panel.id, locus_of(panel));
+            saved.vertical_scroll_points = panel.vertical_scroll_points;
+            // Keep the existing per-panel session field as a compatibility
+            // projection of the single workspace annotation camera.
+            saved.annotation_scroll_points = panels.annotation_scroll_points;
+            saved.vertical_content_origin_points = panel.vertical_content_origin_points;
+            saved.read_stack_scroll_points = panel.read_stack_scroll_points;
+            saved.read_panel_states = panel
+                .read_panel_scrolls
+                .iter()
+                .map(|(track_id, state)| SessionReadPanelState {
+                    track_id: *track_id,
+                    scroll_points: state.scroll_points,
+                    content_origin_points: state.content_origin_points,
+                    latent_scroll_fraction: state.latent_scroll_fraction,
+                    content_bottom_points: state.content_bottom_points,
+                    density: state.density,
+                })
+                .collect();
+            saved
+        })
+        .collect();
+    (locus_of(panels.active()), saved, panels.active().id)
 }
 
 impl Viewer {
@@ -118,7 +160,7 @@ impl Viewer {
     }
 
     pub(crate) fn persist_settings(&mut self) {
-        self.remember_current_locus();
+        self.remember_current_locus(self.panels.active().id);
         // Serialising, fsyncing and renaming happen on the settings worker;
         // rapid saves collapse into one write of the newest snapshot.
         self.settings_writer.submit(&self.settings);
@@ -503,46 +545,7 @@ impl Viewer {
     }
 
     pub(crate) fn session_document(&self) -> SessionDocument {
-        let interval = self.panels.active().viewport.interval();
-        let locus = SessionLocus {
-            contig: self.panels.active().contig_name.clone(),
-            start: interval.start(),
-            end: interval.end(),
-        };
-        let panels = self
-            .panels
-            .iter()
-            .map(|panel| {
-                let interval = panel.viewport.interval();
-                let mut saved = SessionViewPanel::new(
-                    panel.id,
-                    SessionLocus {
-                        contig: panel.contig_name.clone(),
-                        start: interval.start(),
-                        end: interval.end(),
-                    },
-                );
-                saved.vertical_scroll_points = panel.vertical_scroll_points;
-                // Keep the existing per-panel session field as a compatibility
-                // projection of the single workspace annotation camera.
-                saved.annotation_scroll_points = self.panels.annotation_scroll_points;
-                saved.vertical_content_origin_points = panel.vertical_content_origin_points;
-                saved.read_stack_scroll_points = panel.read_stack_scroll_points;
-                saved.read_panel_states = panel
-                    .read_panel_scrolls
-                    .iter()
-                    .map(|(track_id, state)| SessionReadPanelState {
-                        track_id: *track_id,
-                        scroll_points: state.scroll_points,
-                        content_origin_points: state.content_origin_points,
-                        latent_scroll_fraction: state.latent_scroll_fraction,
-                        content_bottom_points: state.content_bottom_points,
-                        density: state.density,
-                    })
-                    .collect();
-                saved
-            })
-            .collect();
+        let (locus, panels, active_panel) = session_panel_documents(&self.panels);
         let mut alignment_tracks = self
             .alignment_tracks
             .iter()
@@ -556,7 +559,7 @@ impl Viewer {
             migration_notices: Vec::new(),
             locus,
             panels,
-            active_panel: self.panels.active().id,
+            active_panel,
             alignment_tracks,
             presentation: self.workspace_presentation_snapshot(),
             reference: self.reference_source.clone(),

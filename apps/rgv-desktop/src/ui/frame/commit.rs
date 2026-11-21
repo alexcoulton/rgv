@@ -93,6 +93,14 @@ impl Viewer {
             alignment_track_to_remove,
             metadata_selection_changed,
         );
+        // Last, so nothing this frame drafted is committed on top of the restored state.
+        if st.commands.undo_requested {
+            if !self.undo_action() {
+                "Nothing to undo".clone_into(&mut self.data_status);
+            }
+        } else if st.commands.redo_requested && !self.redo_action() {
+            "Nothing to redo".clone_into(&mut self.data_status);
+        }
         self.capture_status_notification();
         self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellPostProcess,
@@ -259,7 +267,7 @@ impl Viewer {
                 }
                 self.activate_view_panel(workspace.panel_id);
                 self.panels.active_mut().read_stack_scroll_points = workspace.read_stack_offset;
-                self.rebuild_genomic_display();
+                self.rebuild_genomic_display(self.panels.active().id);
                 self.mark_display_dirty("read-track stack scrollbar changed");
                 self.window.request_redraw();
             }
@@ -362,6 +370,8 @@ impl Viewer {
                 UiCommand::Metadata => st.lists.metadata_open = true,
                 UiCommand::Regions => st.lists.regions_open = true,
                 UiCommand::ReviewQueue => st.lists.review_open = true,
+                UiCommand::Undo => st.commands.undo_requested = true,
+                UiCommand::Redo => st.commands.redo_requested = true,
             }
         }
     }
@@ -461,21 +471,21 @@ impl Viewer {
         }
         if alignment_configuration_changed {
             self.invalidate_navigation_contract("alignment track layout changed");
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(self.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if self.alignment_tracks.is_empty()
             && st.align.alignment_visible != self.primary_alignment_visible()
         {
             self.set_primary_alignment_visible(st.align.alignment_visible);
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(self.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if self.alignment_tracks.is_empty()
             && st.align.alignment_collapsed != self.primary_alignment_collapsed()
         {
             self.set_primary_alignment_collapsed(st.align.alignment_collapsed);
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(self.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         if self.alignment_tracks.is_empty()
@@ -483,7 +493,7 @@ impl Viewer {
             && st.align.alignment_name != self.primary_alignment_name()
         {
             self.set_primary_alignment_name(std::mem::take(&mut st.align.alignment_name));
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(self.panels.active().id);
             self.mark_display_dirty("explicit display invalidation");
         }
         (alignment_track_to_remove, alignment_subtracks_to_toggle)
@@ -554,7 +564,7 @@ impl Viewer {
             }
         }
         if st.inspect.selected_to_top_requested && self.promote_selected_read_to_top() {
-            self.rebuild_genomic_display();
+            self.rebuild_genomic_display(self.panels.active().id);
         }
         if st.inspect.clear_selection {
             self.clear_promoted_read();

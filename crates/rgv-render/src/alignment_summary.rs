@@ -41,11 +41,13 @@ use crate::{
 
 mod alleles;
 mod depth;
+mod depth_pyramid;
 mod junctions;
 mod modifications;
 
 pub use alleles::*;
 pub use depth::*;
+pub use depth_pyramid::*;
 pub use junctions::*;
 pub use modifications::*;
 

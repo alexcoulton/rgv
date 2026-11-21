@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod action;
 mod app;
 mod automation;
 mod control_service;

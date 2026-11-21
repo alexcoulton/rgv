@@ -26,13 +26,13 @@ impl Viewer {
             let query = self.locus_editor.clone();
             self.request_annotation_search(&query, false, false);
         }
-        if let Some((id, index)) = st.nav.panel_to_move {
-            self.move_view_panel(id, index);
-        }
-        if let Some(id) = st.nav.panel_to_close {
-            self.close_view_panel(id);
-        } else if let Some(id) = st.nav.panel_to_activate {
-            self.activate_view_panel(id);
+        for action in crate::action::translate::panel_strip_requests(
+            st.nav.panel_to_move,
+            st.nav.panel_to_close,
+            st.nav.panel_to_activate,
+        ) {
+            // A panel that vanished between the frame and its commit is not an error.
+            let _ = self.apply_action(action);
         }
     }
 
@@ -200,8 +200,11 @@ impl Viewer {
                 self.panels.active_mut().contig_length,
             ) {
                 // A slider drag reports a new span every frame; it is one history entry.
-                self.panels.active_mut().viewport = viewport;
-                self.viewport_step_changed();
+                self.set_panel_viewport(
+                    self.panels.active().id,
+                    viewport,
+                    crate::action::ViewportCommit::Step,
+                );
             }
         }
         if let Some(hit) = st.nav.annotation_hit_requested.take() {
@@ -300,7 +303,7 @@ impl Viewer {
             self.handle_dropped_file(Path::new(&path));
         }
         if let Some(locus) = st.commands.recent_locus_requested.take()
-            && let Err(error) = self.navigate_to_locus(&locus)
+            && let Err(error) = self.navigate_to_locus(self.panels.active().id, &locus)
         {
             self.report_error(error.to_string());
         }

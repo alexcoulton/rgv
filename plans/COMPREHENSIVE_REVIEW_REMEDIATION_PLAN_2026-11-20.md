@@ -215,19 +215,32 @@ Run after Wave 1 is green. Each item is one reviewable change.
 
 ## Wave 3 — architecture
 
-- [ ] ARCH-1 decode-time summary tiles and a streamed/persisted coverage pyramid
-- [ ] ARCH-2 / ARCH-7 headless `rgv-session` crate (workspace state, `Action` reducer, engines,
+Status at 2026-11-22: the lower-crate halves of ARCH-1 and ARCH-5 are built and tested but not
+yet wired into the desktop, so neither is visible in the running application.
+
+- [~] ARCH-1 decode-time summary tiles and a streamed/persisted coverage pyramid
+      — pyramid type, streaming producer, sidecar cache, coverage engine and renderer done
+        and tested (all decoder paths agree with exact depth); desktop still shows the
+        index-density overview until wired
+- [~] ARCH-2 / ARCH-7 headless `rgv-session` crate (workspace state, `Action` reducer, engines,
       scene publication); desktop, CLI snapshot, MCP and automation drive it
-- [ ] ARCH-4 explicit `(PanelId, TrackId)` throughout
-- [ ] ARCH-5 public track contract `query(region, bp_per_px, cancel) → world-coordinate tiles`;
+      — `Action` model and reducer in the desktop for navigation, panels, track arrangement
+        and region/review edits, shared by UI and automation, with undo/redo; track load,
+        display settings, session open/save and preferences not converted; no separate crate
+- [~] ARCH-4 explicit `(PanelId, TrackId)` throughout
+      — all 37 activate-swaps removed; ~55 functions take a panel; `inspection/selection.rs`
+        and wheel/junction hover still use the focused panel
+- [~] ARCH-5 public track contract `query(region, bp_per_px, cancel) → world-coordinate tiles`;
       one paged world-space renderer
-- [ ] ARCH-6 shared I/O and decode pool keyed by visibility; lift the 64-track cap (PROD-9)
+      — contract, tile engine, seam-stable world layout and renderer done and tested
+        (GPU readback); desktop still uses the old pipeline until wired
+- [~] ARCH-6 shared I/O and decode pool keyed by visibility; lift the 64-track cap (PROD-9)
+      — process-wide decode allowance with foreground priority; cap not lifted
 - [x] ARCH-8 `rgv-model` crate split from `rgv-hts`; automation/stress out of `rgv-core`
-      — ADR 0008; layout/scene/render no longer link htslib, reqwest, noodles or bigtools
-        (guarded by `dependency_boundary.rs`); `AlignmentSource`, `AlignmentError` and
-        `derive_alignment_query` stay in `rgv-hts` until the model has its own error type;
-        `rgv-core` keeps `tempfile`, `quick-xml` and `sha2` (session save, IGV import, landmarks)
-- [ ] ARCH-9 reference bases delivered engine-to-engine
+      — `AlignmentError` and the `BackendRecord` logic stay in rgv-hts; rgv-core keeps
+        tempfile, quick-xml and sha2 (all still used)
+- [~] ARCH-9 reference bases delivered engine-to-engine
+      — direct sink connected; the UI relay is kept alongside it
 
 ## Wave 4 — product reach
 

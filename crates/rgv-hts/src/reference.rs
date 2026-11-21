@@ -148,6 +148,16 @@ impl FastaReference {
             })
         } else {
             let reader = faidx::Reader::from_path(path)?;
+            // `fai_load` returns null for a file it cannot index (not FASTA, lines of uneven
+            // length, plain gzip) and for a `.fai` it cannot read or write; `rust-htslib`
+            // wraps that null as a usable reader.
+            if crate::htslib_guard::wraps_null_pointer(&reader) {
+                return Err(AlignmentError::InvalidFastaIndex(format!(
+                    "{} is not a FASTA file that can be indexed, or its .fai index is \
+                     unusable or cannot be written",
+                    path.display()
+                )));
+            }
             let dictionary = crate::local::header_reference_dictionary(
                 reader
                     .seq_names()?
@@ -293,11 +303,33 @@ impl FastaReference {
     ) -> Result<Vec<u8>, AlignmentError> {
         match &self.reader {
             FastaReader::Local(reader) => {
+                // Only a non-empty window inside a known contig is asked of `HTSlib`.
+                let length = self
+                    .dictionary
+                    .id_by_name(contig_name)
+                    .and_then(|id| self.dictionary.get(id))
+                    .map_or(0, rgv_core::Contig::length);
+                let end = end.min(length);
+                if start >= end || contig_name.contains('\0') {
+                    return Ok(Vec::new());
+                }
+                let requested =
+                    usize::try_from(end - start).map_err(|_| AlignmentError::CoordinateOverflow)?;
                 let start =
                     usize::try_from(start).map_err(|_| AlignmentError::CoordinateOverflow)?;
                 let inclusive_end = usize::try_from(end.saturating_sub(1))
                     .map_err(|_| AlignmentError::CoordinateOverflow)?;
-                Ok(reader.fetch_seq(contig_name, start, inclusive_end)?)
+                let bases = reader.fetch_seq(contig_name, start, inclusive_end)?;
+                if bases.len() > requested {
+                    // `faidx_fetch_seq64` failed: it returned null with a negative length,
+                    // which `rust-htslib` turned into a vector that owns nothing and claims
+                    // nearly the whole address space. It must be neither read nor freed.
+                    std::mem::forget(bases);
+                    return Err(AlignmentError::InvalidFastaIndex(format!(
+                        "{contig_name}:{start}-{end} could not be read from the FASTA file"
+                    )));
+                }
+                Ok(bases)
             }
             FastaReader::Remote(remote) => remote.fetch(contig_name, start, end),
             FastaReader::TwoBit(two_bit) => two_bit.fetch(contig_name, start, end),

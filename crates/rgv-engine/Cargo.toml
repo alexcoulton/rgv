@@ -11,6 +11,8 @@ crossbeam-channel.workspace = true
 rgv-core = { version = "0.1.0", path = "../rgv-core" }
 rgv-alignment-scene = { version = "0.1.0", path = "../rgv-alignment-scene" }
 rgv-hts = { version = "0.1.0", path = "../rgv-hts" }
+rgv-layout = { version = "0.1.0", path = "../rgv-layout" }
+rgv-model = { version = "0.1.0", path = "../rgv-model" }
 thiserror.workspace = true
 tracing.workspace = true
 

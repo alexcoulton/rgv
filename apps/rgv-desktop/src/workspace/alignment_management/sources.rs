@@ -58,7 +58,7 @@ impl Viewer {
                 self.synthetic = false;
                 self.data_status =
                     format!("Opening {opened_name} and rebalancing alignment-track caches…");
-                self.rebuild_genomic_display();
+                self.rebuild_genomic_display(self.panels.active().id);
                 self.mark_display_dirty("explicit display invalidation");
             }
             Err(error) => self.report_error(error.to_string()),

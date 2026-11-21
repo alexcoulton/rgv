@@ -11,6 +11,7 @@ mod contract;
 mod coverage;
 mod cpu_projector;
 mod cpu_summary_projector;
+mod depth_pyramid;
 mod evidence;
 mod filter_summary;
 mod fingerprint;
@@ -68,6 +69,12 @@ pub use cpu_summary_projector::{
     CpuSummaryCamera, CpuSummaryFrame, CpuSummaryPrimitiveShape, CpuSummaryProjectedComponent,
     CpuSummaryProjectedPrimitive, CpuSummaryProjectionError, CpuSummaryProjectionOptions,
     CpuSummaryProjector,
+};
+pub use depth_pyramid::{
+    DEPTH_PYRAMID_MAXIMUM_DERIVATION_DEPTH, DEPTH_PYRAMID_MINIMUM_RESIDENT_BYTES,
+    DEPTH_PYRAMID_PRODUCTION_UNIT_BASES, DEPTH_PYRAMID_SUMMARY_SHARE_DIVISOR, DepthLaneAuthority,
+    DepthPyramidColumn, DepthPyramidError, DepthPyramidLane, DepthPyramidPlan, DepthPyramidSegment,
+    DepthPyramidStore, DepthPyramidTile, DepthPyramidView,
 };
 pub use evidence::{
     EvidenceBuildError, EvidenceChunk, EvidenceChunkError, EvidenceChunkFootprint, EvidencePins,

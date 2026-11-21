@@ -41,6 +41,12 @@ pub use automation::{
     check_session_sources_within,
 };
 pub use automation::{
+    AutomationFeature, AutomationFeatureQueryResult, AutomationGeneHit,
+    AutomationGeneNavigationResult, MAXIMUM_AUTOMATION_FEATURE_OFFSET,
+    MAXIMUM_AUTOMATION_FEATURE_QUERY_SPAN, MAXIMUM_AUTOMATION_FEATURE_RESULTS,
+    MAXIMUM_AUTOMATION_GENE_FLANK_BASES, MAXIMUM_AUTOMATION_GENE_QUERY_BYTES,
+};
+pub use automation::{
     MAXIMUM_AUTOMATION_SNAPSHOT_SCALE, MINIMUM_AUTOMATION_SNAPSHOT_SCALE, default_snapshot_scale,
 };
 pub use interaction_stress::{

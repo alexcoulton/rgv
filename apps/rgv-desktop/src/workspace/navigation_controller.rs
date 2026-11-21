@@ -1,12 +1,14 @@
+use crate::action::Action;
 use crate::ui::TrackFrameKey;
 use crate::workspace::navigation::{
     annotation_search_hit_locus, annotation_search_hit_primary_label,
-    locus_expression_is_navigable, preferred_annotation_search_hit, resolve_initial_locus,
-    split_locus_expression, standalone_locus,
+    locus_expression_is_navigable, preferred_annotation_search_hit,
 };
 use crate::workspace::tracks::replace_panel_track_selection;
 use crate::{Viewer, ui};
 use anyhow::{Context as _, Result};
+use rgv_automation::AutomationHistoryNavigation;
+use rgv_core::PanelId;
 use rgv_core::{
     ContigAliases, ContigId, GenomicInterval, NavigationEntry, ReferenceDictionary, Viewport,
 };
@@ -80,20 +82,22 @@ pub(crate) fn resolve_history_entry(
 }
 
 impl Viewer {
+    /// Moves the focused panel to an explicit viewport, possibly on another contig.
     pub(crate) fn navigate_to_viewport(
         &mut self,
         viewport: Viewport,
         contig_name: String,
         contig_length: u64,
     ) {
-        self.commit_navigation_gesture();
-        let interval = viewport.interval();
-        let panel = self.panels.active_mut();
-        panel.viewport = viewport;
-        panel.contig_name = contig_name;
-        panel.contig_length = contig_length;
-        panel.visit_history(interval);
-        self.viewport_changed();
+        let panel_id = self.panels.active().id;
+        if let Err(error) = self.apply_action(Action::RetargetPanel {
+            panel_id,
+            viewport,
+            contig_name,
+            contig_length,
+        }) {
+            self.report_error(error.to_string());
+        }
     }
 
     /// Whether the expression should navigate directly and not be sent to
@@ -109,27 +113,12 @@ impl Viewer {
         locus_expression_is_navigable(expression, dictionary, &self.contig_aliases)
     }
 
-    pub(crate) fn navigate_to_locus(&mut self, locus: &str) -> Result<()> {
-        let (interval, contig_name, contig_length) = if let Some(dictionary) = self
-            .panels
-            .active()
-            .selected_alignment_track
-            .and_then(|id| self.alignment_dictionary_for_track(id))
-            .or_else(|| self.primary_alignment_dictionary())
-            .or(self.reference_dictionary.as_ref())
-        {
-            resolve_initial_locus(dictionary, &self.contig_aliases, Some(locus))?
-        } else {
-            standalone_locus(locus)?
-        };
-        self.commit_navigation_gesture();
-        self.panels.active_mut().viewport =
-            Viewport::new(interval, self.panels.active().viewport.pixel_width())?;
-        self.panels.active_mut().contig_name = contig_name;
-        self.panels.active_mut().contig_length = contig_length;
-        self.panels.active_mut().visit_history(interval);
-        self.viewport_changed();
-        Ok(())
+    pub(crate) fn navigate_to_locus(&mut self, panel_id: PanelId, locus: &str) -> Result<()> {
+        self.apply_action(Action::GoToLocus {
+            panel_id,
+            locus: locus.to_owned(),
+        })
+        .map(|_| ())
     }
 
     pub(crate) fn request_annotation_search(
@@ -204,7 +193,7 @@ impl Viewer {
 
     pub(crate) fn navigate_to_annotation_hit(&mut self, hit: &TrackSearchHit) {
         let locus = annotation_search_hit_locus(hit);
-        match self.navigate_to_locus(&locus) {
+        match self.navigate_to_locus(self.panels.active().id, &locus) {
             Ok(()) => {
                 replace_panel_track_selection(
                     self.panels.active_mut(),
@@ -223,53 +212,11 @@ impl Viewer {
         }
     }
 
+    /// The locus box and `goto`: one locus retargets the focused panel; several redefine the
+    /// workspace as exactly those loci.
     pub(crate) fn navigate_to_loci(&mut self, expression: &str) -> Result<()> {
-        let loci = split_locus_expression(expression)?;
-        if loci_navigation_plan(loci.len()) == LociNavigationPlan::RetargetActivePanel {
-            // One locus is a navigation of the panel being looked at; the other panels and
-            // their loci are left alone.
-            return self.navigate_to_locus(loci[0]);
-        }
-        anyhow::ensure!(
-            self.workspace_layout.projected_canvas_width(loci.len()) >= 140.0,
-            "the window is too narrow to display {} readable panels",
-            loci.len()
-        );
-
-        // Validate the complete expression before replacing any current panel.
-        let dictionary = self
-            .panels
-            .active()
-            .selected_alignment_track
-            .and_then(|id| self.alignment_dictionary_for_track(id))
-            .or_else(|| self.primary_alignment_dictionary())
-            .or(self.reference_dictionary.as_ref());
-        for locus in &loci {
-            if let Some(dictionary) = dictionary {
-                resolve_initial_locus(dictionary, &self.contig_aliases, Some(locus))?;
-            } else {
-                standalone_locus(locus)?;
-            }
-        }
-
-        let first_panel_id = self.panels.active().id;
-        self.navigate_to_locus(loci[0])?;
-        let obsolete = self
-            .panels
-            .iter()
-            .map(|panel| panel.id)
-            .filter(|id| *id != first_panel_id)
-            .collect::<Vec<_>>();
-        for id in obsolete {
-            self.close_view_panel(id);
-        }
-        for locus in loci.iter().skip(1) {
-            self.add_view_panel(locus)?;
-        }
-        self.activate_view_panel(first_panel_id);
-        self.synchronize_panel_widths();
-        self.request_all_panel_queries();
-        Ok(())
+        let action = crate::action::translate::locus_box(self.panels.active().id, expression)?;
+        self.apply_action(action).map(|_| ())
     }
 
     pub(crate) fn navigate_to_chain_segment(&mut self, index: usize) -> Result<()> {
@@ -286,96 +233,46 @@ impl Viewer {
             segment.start + 1,
             segment.end
         );
-        self.navigate_to_locus(&locus)?;
+        self.navigate_to_locus(self.panels.active().id, &locus)?;
         if let Some(chain) = &mut self.panels.active_mut().selected_chain {
             chain.active_segment = index;
         }
         Ok(())
     }
 
-    /// The dictionary panel viewports are expressed in: the selected (else
-    /// primary) alignment header, else the reference. `None` for a workspace
-    /// of standalone tracks.
-    pub(crate) fn navigation_dictionary(&self) -> Option<&ReferenceDictionary> {
-        self.panels
-            .active()
-            .selected_alignment_track
-            .and_then(|id| self.alignment_dictionary_for_track(id))
-            .or_else(|| self.primary_alignment_dictionary())
-            .or(self.reference_dictionary.as_ref())
-    }
-
     pub(crate) fn navigate_history_back(&mut self) {
-        // Record an unsettled gesture first, so Back returns to where it started.
-        self.commit_navigation_gesture();
-        if let Some(entry) = self.panels.active_mut().navigation_history.back().cloned() {
-            self.navigate_to_history_entry_reporting(&entry);
-        }
+        self.navigate_focused_history(AutomationHistoryNavigation::Back);
     }
 
     pub(crate) fn navigate_history_forward(&mut self) {
-        self.commit_navigation_gesture();
-        if let Some(entry) = self
-            .panels
-            .active_mut()
-            .navigation_history
-            .forward()
-            .cloned()
-        {
-            self.navigate_to_history_entry_reporting(&entry);
-        }
+        self.navigate_focused_history(AutomationHistoryNavigation::Forward);
     }
 
-    pub(crate) fn navigate_home(&mut self) {
-        self.commit_navigation_gesture();
-        let home = self.panels.active().home.clone();
-        self.panels
-            .active_mut()
-            .navigation_history
-            .visit(home.clone());
-        self.navigate_to_history_entry_reporting(&home);
-    }
-
-    fn navigate_to_history_entry_reporting(&mut self, entry: &NavigationEntry) {
-        if let Err(error) = self.navigate_to_history_entry(entry) {
+    /// Back/Forward from the window. Reaching the end of history is silent; an entry that no
+    /// longer resolves is reported.
+    fn navigate_focused_history(&mut self, step: AutomationHistoryNavigation) {
+        let panel_id = self.panels.active().id;
+        if let Err(error) = self.apply_action(Action::NavigateHistory { panel_id, step }) {
             self.report_error(error.to_string());
         }
     }
 
-    /// Moves the active panel to a history entry without recording a visit,
-    /// re-resolving the entry's contig by name.
-    pub(crate) fn navigate_to_history_entry(
-        &mut self,
-        entry: &NavigationEntry,
-    ) -> Result<GenomicInterval> {
-        let panel = self.panels.active();
-        let (interval, contig_name, contig_length) = resolve_history_entry(
-            entry,
-            self.navigation_dictionary(),
-            &self.contig_aliases,
-            HistoryPanelContig {
-                id: panel.viewport.interval().contig(),
-                name: &panel.contig_name,
-                length: panel.contig_length,
-            },
-        )?;
-        let viewport = Viewport::new(interval, panel.viewport.pixel_width())?;
-        let panel = self.panels.active_mut();
-        panel.contig_name = contig_name;
-        panel.contig_length = contig_length;
-        panel.viewport = viewport;
-        self.viewport_changed();
-        Ok(interval)
+    pub(crate) fn navigate_home(&mut self) {
+        let panel_id = self.panels.active().id;
+        if let Err(error) = self.apply_action(Action::NavigateHome { panel_id }) {
+            self.report_error(error.to_string());
+        }
     }
 
     /// Opens the first 100 kb of a contig chosen from the assembly's list.
     pub(crate) fn navigate_to_contig(&mut self, contig_id: ContigId) {
-        self.commit_navigation_gesture();
         let Some(contig) = self.assembly.dictionary.get(contig_id) else {
+            self.commit_navigation_gesture();
             return;
         };
         let length = contig.length();
         if length == 0 {
+            self.commit_navigation_gesture();
             return;
         }
         // The assembly numbers contigs independently of the navigation
@@ -385,21 +282,28 @@ impl Viewer {
             start: 0,
             end: length.min(100_000),
         };
-        match self.navigate_to_history_entry(&entry) {
-            Ok(interval) => self.panels.active_mut().visit_history(interval),
-            Err(error) => self.report_error(error.to_string()),
+        let panel_id = self.panels.active().id;
+        if let Err(error) = self.apply_action(Action::NavigateToEntry {
+            panel_id,
+            entry,
+            record: true,
+        }) {
+            self.report_error(error.to_string());
         }
     }
 
-    pub(crate) fn remember_current_locus(&mut self) {
-        let interval = self.panels.active().viewport.interval();
+    pub(crate) fn remember_current_locus(&mut self, panel_id: PanelId) {
+        let interval = self.panels.panel(panel_id).viewport.interval();
         let locus = format!(
             "{}:{}-{}",
-            self.panels.active().contig_name,
+            self.panels.panel(panel_id).contig_name,
             interval.start() + 1,
             interval.end()
         );
-        self.locus_editor.clone_from(&locus);
+        // The locus box is a focused-panel control; another panel's move must not overwrite it.
+        if self.panels.is_active(panel_id) {
+            self.locus_editor.clone_from(&locus);
+        }
         self.settings.remember_locus(locus);
     }
 }
@@ -407,6 +311,7 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::navigation::{resolve_initial_locus, standalone_locus};
     use crate::workspace::panels::ViewPanelController;
     use rgv_core::PanelId;
 

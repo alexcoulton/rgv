@@ -796,6 +796,8 @@ pub(crate) struct ShellState {
     pub(crate) newer_writer_guard: NewerWriterGuard,
     pub(crate) dropped_rectangles: DroppedRectangleReporter,
     pub(crate) skipped_lines: SkippedLineReporter,
+    /// Undo and redo steps of the edits applied through `Viewer::apply_action`.
+    pub(crate) undo: crate::action::history::UndoHistory,
 }
 
 #[cfg(test)]

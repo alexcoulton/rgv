@@ -4,10 +4,11 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rgv_automation::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
     AutomationAlignmentSelector, AutomationBatch, AutomationCommand, AutomationCommandStatus,
-    AutomationExportKind, AutomationHistoryNavigation, AutomationInteractionTrace,
-    AutomationNavigationDestination, AutomationReviewNavigation, AutomationRunReport,
-    AutomationSelection, AutomationSetting, AutomationSnapshotFormat, AutomationSnapshotScope,
-    AutomationUnsavedChangesPolicy, AutomationViewportOperation, AutomationWorkspaceSnapshot,
+    AutomationExportKind, AutomationFeatureQueryResult, AutomationGeneNavigationResult,
+    AutomationHistoryNavigation, AutomationInteractionTrace, AutomationNavigationDestination,
+    AutomationReviewNavigation, AutomationRunReport, AutomationSelection, AutomationSetting,
+    AutomationSnapshotFormat, AutomationSnapshotScope, AutomationUnsavedChangesPolicy,
+    AutomationViewportOperation, AutomationWorkspaceSnapshot,
 };
 use rgv_control_client::{ControlClient, ControlClientError};
 use rgv_core::{
@@ -34,6 +35,10 @@ use crate::{
     evidence::{
         DEFAULT_PILEUP_LIMIT, DEFAULT_VARIANT_LIMIT, EvidenceError, EvidenceQuery, VariantDetail,
         pileup_result, variants_result,
+    },
+    features::{
+        DEFAULT_FEATURE_LIMIT, FeatureError, FeatureQuery, feature_query_command, features_result,
+        gene_navigation_result, goto_gene_command,
     },
     redaction::{inline_export_read_names, redact_message},
 };
@@ -1298,6 +1303,89 @@ impl RgvMcpServer {
         )
     }
 
+    /// List the annotation features (genes, transcripts, BED intervals, peaks) of the loaded
+    /// feature and gene-model tracks that overlap a genomic interval. Read-only and independent
+    /// of the view: it never navigates, selects, or changes the window, and the interval need
+    /// not be shown by any panel. Coordinates are zero-based and half-open; the interval may
+    /// span at most 10 Mb. Results are ordered by track, start, end, then name, so paging with
+    /// `page.next_offset` is stable.
+    #[tool(
+        name = "rgv_query_features",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn query_features(
+        &self,
+        Parameters(args): Parameters<QueryFeaturesArgs>,
+    ) -> CallToolResult {
+        let query = FeatureQuery {
+            contig: args.contig,
+            start: args.start,
+            end: args.end,
+            track_ids: args.track_ids,
+            offset: args.offset,
+            limit: args.limit,
+        };
+        let command = match feature_query_command(&query) {
+            Ok(command) => command,
+            Err(error) => return feature_failure(&error),
+        };
+        match self
+            .execute_with_data::<AutomationFeatureQueryResult>(vec![command], 0, "feature query")
+            .await
+        {
+            Ok((result, _)) => match features_result(&result, &query) {
+                Ok(value) => success_result(
+                    "Listed annotation features overlapping the requested interval",
+                    value,
+                ),
+                Err(error) => feature_failure(&error),
+            },
+            Err(failure) => failure,
+        }
+    }
+
+    /// Find a gene or other named annotation feature by name or identifier in the loaded
+    /// annotation tracks and navigate one panel of the visible live RGV window to it. Navigates
+    /// only when the match is unambiguous; otherwise it fails with `ambiguous_match` (the
+    /// message lists candidates) or `resource_not_found` and the view does not move. Returns
+    /// the zero-based half-open interval the panel now shows.
+    #[tool(
+        name = "rgv_goto_gene",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn goto_gene(&self, Parameters(args): Parameters<GotoGeneArgs>) -> CallToolResult {
+        let command = match goto_gene_command(&args.query, args.panel_id, args.flank_bases) {
+            Ok(command) => command,
+            Err(error) => return feature_failure(&error),
+        };
+        let commands =
+            with_optional_settle(vec![command], args.wait_until_settled, args.timeout_millis);
+        match self
+            .execute_with_data::<AutomationGeneNavigationResult>(commands, 0, "gene navigation")
+            .await
+        {
+            Ok((result, _)) => {
+                let mut value = gene_navigation_result(&result);
+                merge_object(&mut value, json!({"settled": args.wait_until_settled}));
+                success_result(
+                    "Navigated the live RGV window to the matched feature",
+                    value,
+                )
+            }
+            Err(failure) => failure,
+        }
+    }
+
     /// Execute an advanced bounded sequence that may visibly mutate the live RGV window.
     #[tool(
         name = "rgv_execute_batch",
@@ -1378,6 +1466,10 @@ fn evidence_result(
             "the evidence export could not be interpreted",
         ),
     }
+}
+
+fn feature_failure(error: &FeatureError) -> CallToolResult {
+    adapter_failure(error.code(), &redact_message(&error.to_string()))
 }
 
 fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
@@ -2705,6 +2797,67 @@ pub struct QueryVariantsArgs {
     pub timeout_millis: u64,
 }
 
+fn default_feature_limit() -> usize {
+    DEFAULT_FEATURE_LIMIT
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct QueryFeaturesArgs {
+    /// Contig (reference sequence) name exactly as the workspace reports it, e.g. `chr1`. Any
+    /// contig may be queried; no panel has to show it.
+    pub contig: String,
+    /// Zero-based inclusive start of the interval, in bases (one less than the one-based
+    /// coordinate in a locus string).
+    #[schemars(range(min = 0))]
+    pub start: u64,
+    /// Zero-based exclusive end of the interval, in bases (half-open `[start, end)`), which
+    /// equals the one-based inclusive end. Must be greater than `start` and at most `start` +
+    /// 10000000 (a 10 Mb span); it is clamped to the contig length.
+    #[schemars(range(min = 1))]
+    pub end: u64,
+    /// Positive stable IDs of the feature or gene-model tracks to read (`tracks[].id` from
+    /// `rgv_get_workspace`), 1 to 1024 entries. Omit to read every loaded feature and gene-model
+    /// track.
+    #[schemars(length(min = 1, max = 1024))]
+    pub track_ids: Option<Vec<u64>>,
+    /// Number of matching features to skip, for paging, 0 to 1000000 (default 0). Use the
+    /// previous result's `page.next_offset`.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 1_000_000))]
+    pub offset: usize,
+    /// Maximum number of features to return, 1 to 500 (default 50). `page.truncated` is true
+    /// when more features match.
+    #[serde(default = "default_feature_limit")]
+    #[schemars(range(min = 1, max = 500))]
+    pub limit: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GotoGeneArgs {
+    /// Gene symbol, feature name, or feature identifier to find, e.g. `BRCA1`; non-empty, at
+    /// most 256 bytes. Matching ignores case. Only loaded annotation tracks are searched.
+    #[schemars(length(min = 1, max = 256))]
+    pub query: String,
+    /// Positive stable ID of the panel to navigate (`panels[].id` from `rgv_get_workspace`).
+    /// Omit to navigate the focused panel. No other panel moves and focus does not change.
+    #[schemars(range(min = 1))]
+    pub panel_id: Option<u64>,
+    /// Bases (base pairs) of context to show on each side of the matched feature, 0 to 10000000
+    /// (default 0). The padded interval is clamped to the contig.
+    #[serde(default)]
+    #[schemars(range(min = 0, max = 10_000_000))]
+    pub flank_bases: u64,
+    /// When true (the default), wait after navigating until every query it triggered has
+    /// settled. Set false only to observe intermediate state.
+    #[serde(default = "default_true")]
+    pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true.
+    #[serde(default = "default_timeout")]
+    #[schemars(range(min = 100, max = 600_000))]
+    pub timeout_millis: u64,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SaveArgs {
     /// Destination project file path relative to the control root, e.g. `sessions/review.rgv.json`.
@@ -3525,6 +3678,245 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// One command result as the viewer reports it.
+    fn batch_response(results: &[Value]) -> (u16, Value) {
+        let succeeded = results.iter().all(|result| result["status"] == "succeeded");
+        (
+            200,
+            json!({
+                "schema_version": AUTOMATION_SCHEMA_VERSION,
+                "succeeded": succeeded,
+                "results": results,
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn feature_query_sends_one_read_only_command_and_pages_the_viewers_answer() {
+        let mut call = 0;
+        let (address, worker) = fake_viewer(2, move |url, body| {
+            assert_eq!(url, "/v1/batches");
+            call += 1;
+            // The tool sends exactly one command: no navigation, selection or settlement.
+            let commands = body["commands"].as_array().unwrap();
+            assert_eq!(commands.len(), 1);
+            match call {
+                1 => {
+                    assert_eq!(
+                        commands[0],
+                        json!({
+                            "command": "query_features", "contig": "chr17", "start": 100,
+                            "end": 900, "track_ids": [3], "offset": 0, "limit": 2,
+                        })
+                    );
+                    batch_response(&[json!({
+                        "command_index": 0, "command": "query_features",
+                        "status": "succeeded", "message": "ok",
+                        "data": {
+                            "application_instance_id": "instance", "workspace_revision": 4,
+                            "contig": "chr17", "start": 100, "end": 900, "track_ids": [3],
+                            "features": [
+                                {"track_id": 3, "name": "BRCA1", "feature_type": "gene",
+                                 "contig": "chr17", "start": 100, "end": 400, "strand": "-",
+                                 "gene_name": "BRCA1"},
+                                {"track_id": 3, "name": "", "feature_type": "feature",
+                                 "contig": "chr17", "start": 380, "end": 500, "strand": "."},
+                            ],
+                            "total_matching": 3, "offset": 0, "truncated": true,
+                        }
+                    })])
+                }
+                _ => batch_response(&[json!({
+                    "command_index": 0, "command": "query_features", "status": "failed",
+                    "error_code": "too_dense",
+                    "message": "feature track 3 could not answer: /Users/alice/genes.gtf exceeds the 250000-record limit"
+                })]),
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let server = test_server(address, root.path());
+        let args = |limit| QueryFeaturesArgs {
+            contig: "chr17".to_owned(),
+            start: 100,
+            end: 900,
+            track_ids: Some(vec![3]),
+            offset: 0,
+            limit,
+        };
+
+        let result = server.query_features(Parameters(args(2))).await;
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["contig"], "chr17");
+        assert_eq!(structured["query_start"], 100);
+        assert_eq!(structured["query_end"], 900);
+        assert_eq!(structured["features"].as_array().unwrap().len(), 2);
+        assert_eq!(structured["features"][0]["name"], "BRCA1");
+        assert_eq!(structured["features"][0]["gene_name"], "BRCA1");
+        assert_eq!(structured["features"][0]["start"], 100);
+        assert_eq!(structured["features"][0]["end"], 400);
+        assert_eq!(structured["features"][0]["strand"], "-");
+        assert!(structured["features"][1].get("gene_name").is_none());
+        assert_eq!(structured["page"]["total_matching"], 3);
+        assert_eq!(structured["page"]["truncated"], true);
+        assert_eq!(structured["page"]["next_offset"], 2);
+        // Viewer bookkeeping is not part of the answer.
+        assert!(structured.get("application_instance_id").is_none());
+
+        // An out-of-range argument fails before anything reaches the viewer.
+        for invalid in [
+            QueryFeaturesArgs {
+                limit: 501,
+                ..args(2)
+            },
+            QueryFeaturesArgs {
+                end: 100,
+                ..args(2)
+            },
+            QueryFeaturesArgs {
+                end: 20_000_000,
+                ..args(2)
+            },
+            QueryFeaturesArgs {
+                track_ids: Some(vec![0]),
+                ..args(2)
+            },
+        ] {
+            let result = server.query_features(Parameters(invalid)).await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result.structured_content.unwrap()["error"]["code"],
+                "invalid_input"
+            );
+        }
+
+        // A viewer refusal keeps its code and its diagnostic, with the path redacted.
+        let result = server.query_features(Parameters(args(50))).await;
+        assert_eq!(result.is_error, Some(true));
+        let error = &result.structured_content.unwrap()["error"];
+        assert_eq!(error["code"], "too_dense");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("250000-record limit"), "{message}");
+        assert!(!message.contains("alice"));
+        worker.join().unwrap();
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn goto_gene_navigates_one_panel_and_reports_ambiguity_without_guessing() {
+        let mut call = 0;
+        let (address, worker) = fake_viewer(3, move |url, body| {
+            assert_eq!(url, "/v1/batches");
+            call += 1;
+            let commands = body["commands"].as_array().unwrap();
+            match call {
+                1 => {
+                    assert_eq!(
+                        commands[0],
+                        json!({
+                            "command": "goto_gene", "query": "BRCA1", "panel_id": 2,
+                            "flank_bases": 5000,
+                        })
+                    );
+                    assert_eq!(commands[1]["command"], "wait_until_settled");
+                    assert_eq!(commands.len(), 2);
+                    batch_response(&[
+                        json!({
+                            "command_index": 0, "command": "goto_gene",
+                            "status": "succeeded", "message": "ok",
+                            "data": {
+                                "application_instance_id": "instance", "workspace_revision": 5,
+                                "panel_id": 2, "contig": "chr17", "start": 43_039_294_u64,
+                                "end": 43_130_483_u64,
+                                "hit": {"track_id": 3, "name": "BRCA1", "feature_type": "gene"},
+                                "candidate_count": 4,
+                            }
+                        }),
+                        json!({
+                            "command_index": 1, "command": "wait_until_settled",
+                            "status": "succeeded", "message": "ok"
+                        }),
+                    ])
+                }
+                2 => {
+                    // Omitted optional arguments stay omitted or at their documented defaults.
+                    assert_eq!(commands.len(), 1);
+                    assert_eq!(commands[0]["panel_id"], Value::Null);
+                    assert_eq!(commands[0]["flank_bases"], 0);
+                    batch_response(&[json!({
+                        "command_index": 0, "command": "goto_gene", "status": "failed",
+                        "error_code": "ambiguous_match",
+                        "message": "2 annotation features match BRCA; none is a unique exact match: BRCA1 (chr17:43044295-43125483, gene, track 3); BRCA2 (chr13:32315508-32400268, gene, track 3)"
+                    })])
+                }
+                _ => batch_response(&[json!({
+                    "command_index": 0, "command": "goto_gene", "status": "failed",
+                    "error_code": "resource_not_found",
+                    "message": "no annotation feature matches NOTAGENE"
+                })]),
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let server = test_server(address, root.path());
+        let args = |query: &str, panel_id, flank_bases, wait_until_settled| GotoGeneArgs {
+            query: query.to_owned(),
+            panel_id,
+            flank_bases,
+            wait_until_settled,
+            timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
+        };
+
+        let result = server
+            .goto_gene(Parameters(args("BRCA1", Some(2), 5_000, true)))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["panel_id"], 2);
+        assert_eq!(structured["contig"], "chr17");
+        assert_eq!(structured["start"], 43_039_294_u64);
+        assert_eq!(structured["end"], 43_130_483_u64);
+        assert_eq!(structured["locus"], "chr17:43039295-43130483");
+        assert_eq!(structured["hit"]["name"], "BRCA1");
+        assert_eq!(structured["hit"]["track_id"], 3);
+        assert_eq!(structured["candidate_count"], 4);
+        assert_eq!(structured["settled"], true);
+
+        let result = server
+            .goto_gene(Parameters(args("BRCA", None, 0, false)))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let error = &result.structured_content.unwrap()["error"];
+        assert_eq!(error["code"], "ambiguous_match");
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains("BRCA2 (chr13:32315508-32400268"),
+            "{message}"
+        );
+
+        // Invalid arguments never reach the viewer.
+        for invalid in [
+            args("  ", None, 0, false),
+            args("BRCA1", Some(0), 0, false),
+            args("BRCA1", None, 10_000_001, false),
+        ] {
+            let result = server.goto_gene(Parameters(invalid)).await;
+            assert_eq!(
+                result.structured_content.unwrap()["error"]["code"],
+                "invalid_input"
+            );
+        }
+
+        let result = server
+            .goto_gene(Parameters(args("NOTAGENE", None, 0, false)))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "resource_not_found"
+        );
+        worker.join().unwrap();
+    }
+
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn batch_and_workspace_guards_fail_before_anything_reaches_the_viewer() {
@@ -4018,6 +4410,7 @@ mod tests {
                 "rgv_get_review_queue",
                 "rgv_get_selection",
                 "rgv_get_workspace",
+                "rgv_goto_gene",
                 "rgv_group_alignments",
                 "rgv_load_track",
                 "rgv_navigate",
@@ -4025,6 +4418,7 @@ mod tests {
                 "rgv_navigate_related_alignment",
                 "rgv_navigate_review_item",
                 "rgv_open_workspace",
+                "rgv_query_features",
                 "rgv_query_pileup",
                 "rgv_query_variants",
                 "rgv_refresh_selection",
@@ -4120,7 +4514,32 @@ mod tests {
         assert!(batch_schema.contains("#/$defs/AutomationSetting"));
         assert!(schema_of("rgv_query_pileup").contains("Zero-based position"));
         assert!(schema_of("rgv_query_variants").contains("include_sample_names"));
-        for read_only_tool in ["rgv_query_pileup", "rgv_query_variants"] {
+        let features_schema = schema_of("rgv_query_features");
+        assert!(features_schema.contains("Zero-based exclusive end"));
+        assert!(features_schema.contains("\"maximum\":500"));
+        assert!(features_schema.contains("\"maxItems\":1024"));
+        let gene_schema = schema_of("rgv_goto_gene");
+        assert!(gene_schema.contains("flank_bases"));
+        assert!(gene_schema.contains("\"maxLength\":256"));
+        for command in ["query_features", "goto_gene"] {
+            assert!(
+                batch_schema.contains(&format!("\"const\":\"{command}\"")),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            tools
+                .iter()
+                .find(|tool| tool.name == "rgv_goto_gene")
+                .and_then(|tool| tool.annotations.as_ref())
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(false)
+        );
+        for read_only_tool in [
+            "rgv_query_pileup",
+            "rgv_query_variants",
+            "rgv_query_features",
+        ] {
             assert_eq!(
                 tools
                     .iter()
