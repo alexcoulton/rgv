@@ -20,7 +20,7 @@
 //! harness checks it against freshly built pages.
 
 use rgv_core::{AlignmentColorMode, GenomicInterval};
-use rgv_hts::{AlignmentSourcePosition, ReferenceSlice};
+use rgv_model::{AlignmentSourcePosition, ReferenceSlice};
 
 use crate::{
     AlignmentHandle, AlignmentPageFamily, AlignmentPageKey, AlignmentRowAtlas,

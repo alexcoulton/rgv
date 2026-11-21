@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use rgv_core::{
+use rgv_automation::{
     AutomationRectSnapshot, INTERACTION_RECORDING_SCHEMA_NAME,
     INTERACTION_RECORDING_SCHEMA_VERSION, INTERACTION_STRESS_SCHEMA_NAME,
     INTERACTION_STRESS_SCHEMA_VERSION, InteractionLifecycle, InteractionRecordingEntry,
@@ -171,8 +171,8 @@ pub fn convert_recording(
                         if matches!(
                             observation.event,
                             StressNativeEvent::Scroll {
-                                phase: rgv_core::StressTouchPhase::Ended
-                                    | rgv_core::StressTouchPhase::Cancelled,
+                                phase: rgv_automation::StressTouchPhase::Ended
+                                    | rgv_automation::StressTouchPhase::Cancelled,
                                 ..
                             }
                         ) {
@@ -217,7 +217,8 @@ pub fn convert_recording(
                         }
                         StressNativeEvent::Scroll {
                             phase:
-                                rgv_core::StressTouchPhase::None | rgv_core::StressTouchPhase::MayBegin,
+                                rgv_automation::StressTouchPhase::None
+                                | rgv_automation::StressTouchPhase::MayBegin,
                             ..
                         } => {
                             let target = observation
@@ -545,7 +546,7 @@ fn shift_event(mut event: StressNativeEvent, base_micros: u64) -> StressNativeEv
 mod tests {
     use std::io::Write as _;
 
-    use rgv_core::{
+    use rgv_automation::{
         InteractionRecordingFooter, InteractionRecordingState, StressModifiers, StressPoint,
     };
 
@@ -722,9 +723,9 @@ mod tests {
                     at_micros: elapsed_micros,
                     delta_x: 0.0,
                     delta_y,
-                    unit: rgv_core::StressScrollUnit::Line,
-                    phase: rgv_core::StressTouchPhase::None,
-                    momentum_phase: rgv_core::StressTouchPhase::None,
+                    unit: rgv_automation::StressScrollUnit::Line,
+                    phase: rgv_automation::StressTouchPhase::None,
+                    momentum_phase: rgv_automation::StressTouchPhase::None,
                     continuous: false,
                     modifiers: StressModifiers::default(),
                 },
@@ -776,7 +777,7 @@ mod tests {
         assert!(events.iter().all(|event| matches!(
             event,
             StressNativeEvent::Scroll {
-                phase: rgv_core::StressTouchPhase::None,
+                phase: rgv_automation::StressTouchPhase::None,
                 ..
             }
         )));

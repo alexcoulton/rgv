@@ -216,7 +216,8 @@ impl AlignmentHeaderMetadata {
     }
 }
 
-pub(crate) fn alignment_header_metadata_from_sam(bytes: &[u8]) -> AlignmentHeaderMetadata {
+#[doc(hidden)]
+pub fn alignment_header_metadata_from_sam(bytes: &[u8]) -> AlignmentHeaderMetadata {
     let mut metadata = AlignmentHeaderMetadata::default();
     for line in bytes.split(|byte| *byte == b'\n') {
         if line.starts_with(b"@SQ\t") {
@@ -559,7 +560,8 @@ impl AlignmentOverlapIndex {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum FilteredRecordReason {
+#[doc(hidden)]
+pub enum FilteredRecordReason {
     Unmapped,
     Secondary,
     Supplementary,
@@ -1204,19 +1206,16 @@ impl AlignmentBatch {
         (0..self.len()).map(|index| AlignmentRecordView { batch: self, index })
     }
 
-    pub(crate) fn push_filtered_record(
-        &mut self,
-        start: u64,
-        end: u64,
-        reason: FilteredRecordReason,
-    ) {
+    #[doc(hidden)]
+    pub fn push_filtered_record(&mut self, start: u64, end: u64, reason: FilteredRecordReason) {
         if start < end {
             self.filtered_record_spans
                 .push(FilteredRecordSpan { start, end, reason });
         }
     }
 
-    pub(crate) fn mark_filtered_record_spans_incomplete(&mut self) {
+    #[doc(hidden)]
+    pub fn mark_filtered_record_spans_incomplete(&mut self) {
         self.filtered_record_spans_complete = false;
     }
 
@@ -1224,12 +1223,14 @@ impl AlignmentBatch {
         self.filtered_record_spans_complete
     }
 
-    pub(crate) fn sort_filtered_records(&mut self) {
+    #[doc(hidden)]
+    pub fn sort_filtered_records(&mut self) {
         self.filtered_record_spans
             .sort_unstable_by_key(|record| record.start);
     }
 
-    pub(crate) fn absorb_filtered_records(&mut self, mut source: Self) {
+    #[doc(hidden)]
+    pub fn absorb_filtered_records(&mut self, mut source: Self) {
         self.filtered_record_spans
             .append(&mut source.filtered_record_spans);
         self.filtered_record_spans_complete &= source.filtered_record_spans_complete;
@@ -1483,7 +1484,8 @@ impl AlignmentBatch {
             && self.auxiliary_bytes(left) == other.auxiliary_bytes(right)
     }
 
-    pub(crate) fn copy_filtered_records_within(
+    #[doc(hidden)]
+    pub fn copy_filtered_records_within(
         &self,
         interval: rgv_core::GenomicInterval,
         target: &mut Self,

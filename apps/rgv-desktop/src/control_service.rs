@@ -11,7 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rgv_core::{AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationError, AutomationRunReport};
+use rgv_automation::{
+    AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationError, AutomationRunReport,
+};
 use tiny_http::{Header, Method, Request, Response, StatusCode};
 
 use crate::diagnostics::HealthHandle;
@@ -686,7 +688,7 @@ mod tests {
         time::Duration,
     };
 
-    use rgv_core::{
+    use rgv_automation::{
         AutomationCommand, AutomationCommandResult, AutomationCommandStatus, AutomationRunTelemetry,
     };
 

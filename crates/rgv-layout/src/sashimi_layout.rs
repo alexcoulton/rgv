@@ -9,7 +9,7 @@ use crate::{
     DisplayList, RectPrimitive, RectShape, Rgba, TextPrimitive, junction_arc_stroke_width,
 };
 use rgv_core::{JunctionDisplayMode, SashimiCountMode, Viewport};
-use rgv_hts::{JunctionEvidence, JunctionSummary};
+use rgv_model::{JunctionEvidence, JunctionSummary};
 
 pub const MAX_ANNOTATED_JUNCTIONS: usize = 100_000;
 pub const MAX_RENDERED_JUNCTIONS: usize = 4_096;

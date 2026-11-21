@@ -3,10 +3,10 @@ use crate::inspection::model::SelectedSupplementaryChain;
 use crate::inspection::rna::selected_supplementary_chain;
 use anyhow::Result;
 use rgv_alignment_scene::{AlignmentHandle, AlignmentPresentationScene};
-use rgv_core::{
+use rgv_automation::{
     AutomationReadPresentationState, AutomationSelectionSnapshot, AutomationViewportOperation,
-    GenomicInterval, TrackSource, Viewport,
 };
+use rgv_core::{GenomicInterval, TrackSource, Viewport};
 use rgv_engine::AlignmentIndividualReadCapability;
 use rgv_hts::{AlignmentRecord, AuxValue, SupplementarySegment};
 use sha2::{Digest as _, Sha256};

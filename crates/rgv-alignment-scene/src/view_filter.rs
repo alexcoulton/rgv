@@ -4,7 +4,7 @@ use rgv_core::{
     AlignmentAuxComparison, AlignmentAuxFilterValue, AlignmentCigarEventPredicate,
     AlignmentFlagPredicate, ContigId, GenomicInterval,
 };
-use rgv_hts::{
+use rgv_model::{
     AlignedBaseClassification, AlignmentFlags, AlignmentRecordView, AuxValue, CigarOpKind,
     PackedRecordError, ReferenceSlice, SequenceView, classify_aligned_base,
 };
@@ -729,7 +729,7 @@ pub enum AlignmentFilterEvaluationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rgv_hts::{AlignmentBatch, AlignmentRecord, CigarOp, SequenceData};
+    use rgv_model::{AlignmentBatch, AlignmentRecord, CigarOp, SequenceData};
 
     fn packed_record(cigar: Vec<CigarOp>, bases: &[u8]) -> AlignmentBatch {
         let reference_bases = cigar.iter().fold(0_u64, |total, operation| {

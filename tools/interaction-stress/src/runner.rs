@@ -11,7 +11,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use rgv_core::{
+use rgv_automation::{
     AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationCommand, AutomationRectSnapshot,
     AutomationRunReport, AutomationSnapshotFormat, AutomationSnapshotScope,
     AutomationWorkspaceSnapshot, InteractionStressRunManifest, InteractionStressScenario,
@@ -772,8 +772,8 @@ impl StressRunner {
         &mut self,
         step_id: &str,
         target: &StressTarget,
-        timing: rgv_core::StressTiming,
-        events: &[rgv_core::StressNativeEvent],
+        timing: rgv_automation::StressTiming,
+        events: &[rgv_automation::StressNativeEvent],
         run_id: &str,
         artifacts: &mut RunArtifacts,
     ) -> Result<(), StressFailureSignature> {
@@ -921,9 +921,12 @@ impl StressRunner {
             .describe_workspace(artifacts)
             .await
             .map_err(infrastructure_failure)?;
-        let resized = events
-            .iter()
-            .any(|event| matches!(event, rgv_core::StressNativeEvent::ResizeWindow { .. }));
+        let resized = events.iter().any(|event| {
+            matches!(
+                event,
+                rgv_automation::StressNativeEvent::ResizeWindow { .. }
+            )
+        });
         let after_revision = after
             .workspace_layout
             .as_ref()
@@ -1051,7 +1054,7 @@ impl StressRunner {
                     path: output.display().to_string(),
                     scope: AutomationSnapshotScope::NativeWindow,
                     format: AutomationSnapshotFormat::Png,
-                    scale: rgv_core::default_snapshot_scale(),
+                    scale: rgv_automation::default_snapshot_scale(),
                 }],
                 Duration::from_secs(60),
                 artifacts,
@@ -1135,7 +1138,7 @@ impl StressRunner {
             let detail = report
                 .results
                 .iter()
-                .find(|result| result.status == rgv_core::AutomationCommandStatus::Failed)
+                .find(|result| result.status == rgv_automation::AutomationCommandStatus::Failed)
                 .map_or_else(
                     || "RGV control batch failed".to_owned(),
                     |result| format!("{}: {}", result.command, result.message),
@@ -1436,7 +1439,7 @@ impl StressRunner {
             }
         };
         Self::update_recording_counts(artifacts, &status);
-        if status.state == rgv_core::InteractionRecordingState::Recording {
+        if status.state == rgv_automation::InteractionRecordingState::Recording {
             let _ = self
                 .run_control(
                     vec![AutomationCommand::EndNativeObservation],
@@ -1459,25 +1462,27 @@ impl StressRunner {
                 }
             };
             let stopped_status = report.results.first().and_then(|result| {
-                serde_json::from_value::<rgv_core::InteractionRecordingStatus>(result.data.clone())
-                    .ok()
+                serde_json::from_value::<rgv_automation::InteractionRecordingStatus>(
+                    result.data.clone(),
+                )
+                .ok()
             });
             if let Some(status) = &stopped_status {
                 Self::update_recording_counts(artifacts, status);
             }
             let complete = stopped_status.is_some_and(|status| {
-                status.state == rgv_core::InteractionRecordingState::Complete
+                status.state == rgv_automation::InteractionRecordingState::Complete
             });
             Self::register_known_app_recording(artifacts, complete)?;
             if !complete {
                 bail!("RGV did not finalise the application input recording");
             }
-        } else if status.state == rgv_core::InteractionRecordingState::Complete {
+        } else if status.state == rgv_automation::InteractionRecordingState::Complete {
             Self::register_known_app_recording(artifacts, true)?;
         } else if matches!(
             status.state,
-            rgv_core::InteractionRecordingState::Incomplete
-                | rgv_core::InteractionRecordingState::Failed
+            rgv_automation::InteractionRecordingState::Incomplete
+                | rgv_automation::InteractionRecordingState::Failed
         ) {
             Self::register_known_app_recording(artifacts, false)?;
             bail!("RGV reported {:?} application input evidence", status.state);
@@ -1487,7 +1492,7 @@ impl StressRunner {
 
     fn update_recording_counts(
         artifacts: &mut RunArtifacts,
-        status: &rgv_core::InteractionRecordingStatus,
+        status: &rgv_automation::InteractionRecordingStatus,
     ) {
         artifacts.manifest_mut().coalesced_events = status.coalesced_events;
         artifacts.manifest_mut().rejected_events = status.rejected_events;
@@ -1560,7 +1565,7 @@ impl StressRunner {
                     path: capture.display().to_string(),
                     scope: AutomationSnapshotScope::NativeWindow,
                     format: AutomationSnapshotFormat::Png,
-                    scale: rgv_core::default_snapshot_scale(),
+                    scale: rgv_automation::default_snapshot_scale(),
                 }],
                 Duration::from_secs(10),
                 artifacts,
@@ -1781,7 +1786,7 @@ fn resolve_target_rect(
 #[allow(clippy::too_many_lines)]
 fn validate_native_shape(
     step_id: &str,
-    events: &[rgv_core::StressNativeEvent],
+    events: &[rgv_automation::StressNativeEvent],
     summary: &NativeObservationSummary,
 ) -> Result<(), StressFailureSignature> {
     if summary.extraneous_events > 0 {
@@ -1937,41 +1942,43 @@ fn validate_native_shape(
     Ok(())
 }
 
-fn required_lifecycle_shape(events: &[rgv_core::StressNativeEvent]) -> (bool, bool, bool) {
+fn required_lifecycle_shape(events: &[rgv_automation::StressNativeEvent]) -> (bool, bool, bool) {
     let mut requires_begin = false;
     let mut requires_advance = false;
     let mut requires_termination = false;
     let mut interaction_active = false;
     for event in events {
         match event {
-            rgv_core::StressNativeEvent::PrimaryDown { .. }
-            | rgv_core::StressNativeEvent::SecondaryDown { .. }
-            | rgv_core::StressNativeEvent::Scroll {
-                phase: rgv_core::StressTouchPhase::Began,
+            rgv_automation::StressNativeEvent::PrimaryDown { .. }
+            | rgv_automation::StressNativeEvent::SecondaryDown { .. }
+            | rgv_automation::StressNativeEvent::Scroll {
+                phase: rgv_automation::StressTouchPhase::Began,
                 ..
             } => {
                 requires_begin = true;
                 interaction_active = true;
             }
-            rgv_core::StressNativeEvent::PrimaryDrag { .. }
-            | rgv_core::StressNativeEvent::SecondaryDrag { .. }
-            | rgv_core::StressNativeEvent::Scroll {
-                phase: rgv_core::StressTouchPhase::Changed,
+            rgv_automation::StressNativeEvent::PrimaryDrag { .. }
+            | rgv_automation::StressNativeEvent::SecondaryDrag { .. }
+            | rgv_automation::StressNativeEvent::Scroll {
+                phase: rgv_automation::StressTouchPhase::Changed,
                 ..
             } => {
                 requires_advance = true;
                 interaction_active = true;
             }
-            rgv_core::StressNativeEvent::PrimaryUp { .. }
-            | rgv_core::StressNativeEvent::SecondaryUp { .. }
-            | rgv_core::StressNativeEvent::Scroll {
-                phase: rgv_core::StressTouchPhase::Ended | rgv_core::StressTouchPhase::Cancelled,
+            rgv_automation::StressNativeEvent::PrimaryUp { .. }
+            | rgv_automation::StressNativeEvent::SecondaryUp { .. }
+            | rgv_automation::StressNativeEvent::Scroll {
+                phase:
+                    rgv_automation::StressTouchPhase::Ended
+                    | rgv_automation::StressTouchPhase::Cancelled,
                 ..
             } => {
                 requires_termination = true;
                 interaction_active = false;
             }
-            rgv_core::StressNativeEvent::Focus { focused: false, .. } => {
+            rgv_automation::StressNativeEvent::Focus { focused: false, .. } => {
                 requires_termination |= interaction_active;
                 interaction_active = false;
             }
@@ -1982,7 +1989,7 @@ fn required_lifecycle_shape(events: &[rgv_core::StressNativeEvent]) -> (bool, bo
 }
 
 #[allow(clippy::too_many_lines)]
-fn expected_event_shape(events: &[rgv_core::StressNativeEvent]) -> NativeEventShape {
+fn expected_event_shape(events: &[rgv_automation::StressNativeEvent]) -> NativeEventShape {
     let mut shape = NativeEventShape::default();
     let mut last_motion = None;
     let mut motion_direction = [0_i8; 2];
@@ -1992,7 +1999,7 @@ fn expected_event_shape(events: &[rgv_core::StressNativeEvent]) -> NativeEventSh
     let mut keys_held = std::collections::BTreeSet::new();
     for event in events {
         match event {
-            rgv_core::StressNativeEvent::Move { position, .. } => {
+            rgv_automation::StressNativeEvent::Move { position, .. } => {
                 shape.move_events = shape.move_events.saturating_add(1);
                 observe_expected_motion(
                     &mut shape,
@@ -2001,11 +2008,11 @@ fn expected_event_shape(events: &[rgv_core::StressNativeEvent]) -> NativeEventSh
                     [position.x, position.y],
                 );
             }
-            rgv_core::StressNativeEvent::PrimaryDown { .. } => {
+            rgv_automation::StressNativeEvent::PrimaryDown { .. } => {
                 shape.primary_down_events = shape.primary_down_events.saturating_add(1);
                 primary_held = true;
             }
-            rgv_core::StressNativeEvent::PrimaryDrag { position, .. } => {
+            rgv_automation::StressNativeEvent::PrimaryDrag { position, .. } => {
                 shape.primary_drag_events = shape.primary_drag_events.saturating_add(1);
                 observe_expected_motion(
                     &mut shape,
@@ -2014,15 +2021,15 @@ fn expected_event_shape(events: &[rgv_core::StressNativeEvent]) -> NativeEventSh
                     [position.x, position.y],
                 );
             }
-            rgv_core::StressNativeEvent::PrimaryUp { .. } => {
+            rgv_automation::StressNativeEvent::PrimaryUp { .. } => {
                 shape.primary_up_events = shape.primary_up_events.saturating_add(1);
                 primary_held = false;
             }
-            rgv_core::StressNativeEvent::SecondaryDown { .. } => {
+            rgv_automation::StressNativeEvent::SecondaryDown { .. } => {
                 shape.secondary_down_events = shape.secondary_down_events.saturating_add(1);
                 secondary_held = true;
             }
-            rgv_core::StressNativeEvent::SecondaryDrag { position, .. } => {
+            rgv_automation::StressNativeEvent::SecondaryDrag { position, .. } => {
                 shape.secondary_drag_events = shape.secondary_drag_events.saturating_add(1);
                 observe_expected_motion(
                     &mut shape,
@@ -2031,23 +2038,27 @@ fn expected_event_shape(events: &[rgv_core::StressNativeEvent]) -> NativeEventSh
                     [position.x, position.y],
                 );
             }
-            rgv_core::StressNativeEvent::SecondaryUp { .. } => {
+            rgv_automation::StressNativeEvent::SecondaryUp { .. } => {
                 shape.secondary_up_events = shape.secondary_up_events.saturating_add(1);
                 secondary_held = false;
             }
-            rgv_core::StressNativeEvent::Scroll {
+            rgv_automation::StressNativeEvent::Scroll {
                 delta_x,
                 delta_y,
                 phase,
                 ..
             } => {
                 let counter = match phase {
-                    rgv_core::StressTouchPhase::None => &mut shape.scroll_none_events,
-                    rgv_core::StressTouchPhase::Began => &mut shape.scroll_began_events,
-                    rgv_core::StressTouchPhase::Changed => &mut shape.scroll_changed_events,
-                    rgv_core::StressTouchPhase::Ended => &mut shape.scroll_ended_events,
-                    rgv_core::StressTouchPhase::Cancelled => &mut shape.scroll_cancelled_events,
-                    rgv_core::StressTouchPhase::MayBegin => &mut shape.scroll_may_begin_events,
+                    rgv_automation::StressTouchPhase::None => &mut shape.scroll_none_events,
+                    rgv_automation::StressTouchPhase::Began => &mut shape.scroll_began_events,
+                    rgv_automation::StressTouchPhase::Changed => &mut shape.scroll_changed_events,
+                    rgv_automation::StressTouchPhase::Ended => &mut shape.scroll_ended_events,
+                    rgv_automation::StressTouchPhase::Cancelled => {
+                        &mut shape.scroll_cancelled_events
+                    }
+                    rgv_automation::StressTouchPhase::MayBegin => {
+                        &mut shape.scroll_may_begin_events
+                    }
                 };
                 *counter = counter.saturating_add(1);
                 shape.direction_reversals = shape
@@ -2055,15 +2066,15 @@ fn expected_event_shape(events: &[rgv_core::StressNativeEvent]) -> NativeEventSh
                     .saturating_add(observe_direction(&mut scroll_direction[0], *delta_x))
                     .saturating_add(observe_direction(&mut scroll_direction[1], *delta_y));
             }
-            rgv_core::StressNativeEvent::KeyDown { key_code, .. } => {
+            rgv_automation::StressNativeEvent::KeyDown { key_code, .. } => {
                 shape.key_down_events = shape.key_down_events.saturating_add(1);
                 keys_held.insert(*key_code);
             }
-            rgv_core::StressNativeEvent::KeyUp { key_code, .. } => {
+            rgv_automation::StressNativeEvent::KeyUp { key_code, .. } => {
                 shape.key_up_events = shape.key_up_events.saturating_add(1);
                 keys_held.remove(key_code);
             }
-            rgv_core::StressNativeEvent::Focus { focused, .. } => {
+            rgv_automation::StressNativeEvent::Focus { focused, .. } => {
                 shape.focus_events = shape.focus_events.saturating_add(1);
                 if !focused {
                     shape.primary_up_events = shape
@@ -2079,10 +2090,10 @@ fn expected_event_shape(events: &[rgv_core::StressNativeEvent]) -> NativeEventSh
                     keys_held.clear();
                 }
             }
-            rgv_core::StressNativeEvent::ResizeWindow { .. } => {
+            rgv_automation::StressNativeEvent::ResizeWindow { .. } => {
                 shape.resize_events = shape.resize_events.saturating_add(1);
             }
-            rgv_core::StressNativeEvent::Unsupported { .. } => {}
+            rgv_automation::StressNativeEvent::Unsupported { .. } => {}
         }
     }
     shape
@@ -2280,7 +2291,7 @@ impl<T> Pipe for T {}
 
 #[cfg(test)]
 mod tests {
-    use rgv_core::{
+    use rgv_automation::{
         InteractionStressStep, StressModifiers, StressNativeEvent, StressPoint, StressTarget,
         StressTiming,
     };

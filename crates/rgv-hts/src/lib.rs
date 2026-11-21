@@ -1,32 +1,23 @@
 //! Alignment and reference I/O boundary.
 
-mod alignment;
 mod backend_record;
-mod bisulfite;
-mod exact_depth;
-mod filter;
 mod igv_genome;
 mod index_overview;
-mod junction;
 mod local;
-mod modification_summary;
-mod modified_bases;
-mod pair;
-mod pileup;
 mod positioned_resume;
 mod reference;
 mod remote;
 mod remote_alignment;
-mod sbx;
-mod smrt_kinetics;
-mod source_position;
 mod source_revision;
 mod summary_index;
-mod supplementary;
 mod tdf;
 mod tracks;
 mod two_bit;
-mod ultima;
+
+use rgv_model::{
+    alignment, bisulfite, exact_depth, filter, junction, modification_summary, modified_bases,
+    pair, pileup, sbx, smrt_kinetics, source_position, supplementary, ultima,
+};
 
 pub use alignment::{
     AlignedBaseClassification, AlignmentBatch, AlignmentFlags, AlignmentHeaderMetadata,

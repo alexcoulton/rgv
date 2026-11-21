@@ -960,7 +960,7 @@ pub enum CpuInteractionError {
 #[cfg(test)]
 mod tests {
     use rgv_core::ContigId;
-    use rgv_hts::AlignmentSourcePosition;
+    use rgv_model::AlignmentSourcePosition;
 
     use super::*;
     use crate::{

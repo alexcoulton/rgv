@@ -5,7 +5,7 @@ use rgv_core::{
     BisulfiteContext, ModifiedBaseColorMode, OverlappingMatePolicy, ReadBaseDisplayMode,
     ReadStackingMode, SbxSimplexTailMode, SmrtKineticsMode, UltimaQualityMode,
 };
-use rgv_hts::{ModificationCode, TemplateLengthBounds};
+use rgv_model::{ModificationCode, TemplateLengthBounds};
 
 use crate::fingerprint::StableHasher;
 use crate::{AnnotationRevision, ContractFingerprint, ReferenceRevision, RevisionFingerprint};

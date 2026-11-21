@@ -53,7 +53,7 @@ impl ReadSampling {
 /// Stable, well-mixed sampling priority for one template name. Lower values are retained first.
 #[must_use]
 pub(crate) fn sampling_priority(read_name: &[u8]) -> u64 {
-    let mut value = rgv_hts::template_id(read_name).get();
+    let mut value = rgv_model::template_id(read_name).get();
     // SplitMix64 finaliser: FNV alone leaves trailing name characters weakly mixed.
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
@@ -166,7 +166,7 @@ pub(crate) fn sampling_window_starts(
 
 #[cfg(test)]
 mod tests {
-    use rgv_hts::AlignmentSourcePosition;
+    use rgv_model::AlignmentSourcePosition;
 
     use super::*;
     use crate::{AlignmentSourceRevision, RevisionFingerprint, SourceFingerprint};

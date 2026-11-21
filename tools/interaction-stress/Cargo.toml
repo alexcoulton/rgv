@@ -10,6 +10,7 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 rgv-control-client = { version = "0.1.0", path = "../../crates/rgv-control-client" }
+rgv-automation = { version = "0.1.0", path = "../../crates/rgv-automation" }
 rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
 serde.workspace = true
 serde_json.workspace = true

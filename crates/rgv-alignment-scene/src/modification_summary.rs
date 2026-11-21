@@ -1,6 +1,6 @@
 use std::{mem::size_of, sync::Arc};
 
-use rgv_hts::{
+use rgv_model::{
     AuxField, AuxValue, MAX_MODIFICATION_SERIES, ModificationBin, ModificationSeries,
     ModificationSummary, ModificationSummaryBuilder, SequenceView,
 };
@@ -299,7 +299,7 @@ pub enum ExactModificationSummaryError {
     #[error(transparent)]
     Evidence(#[from] EvidenceSelectionError),
     #[error(transparent)]
-    Packed(#[from] rgv_hts::PackedRecordError),
+    Packed(#[from] rgv_model::PackedRecordError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     #[error("exact modification summary requires complete sequence payload")]
@@ -317,7 +317,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use rgv_core::{ContigId, GenomicInterval};
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
         AlignmentSourcePosition, CigarOp, CigarOpKind, ImplicitModificationMode, ModificationCode,
         SequenceData,

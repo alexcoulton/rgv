@@ -9,11 +9,13 @@ use crate::inspection::model::{InspectorSnapshot, RetainedEvidenceSnapshot};
 use crate::workspace::alignments::expanded_workspace_alignment_limit;
 use crate::{MAX_VERTICAL_DENSITY, MIN_VERTICAL_DENSITY, Viewer, ui};
 use anyhow::Result;
+use rgv_automation::{
+    AutomationEvidenceField, AutomationOptionScope, AutomationSelectionGranularity,
+    AutomationSelectionKind, AutomationSetting, AutomationViewportOperation,
+};
 use rgv_core::{
-    AlignmentViewPredicate, AutomationEvidenceField, AutomationOptionScope,
-    AutomationSelectionGranularity, AutomationSelectionKind, AutomationSetting,
-    AutomationViewportOperation, CoverageScaleTransform, PanelId, PresentationNodeId,
-    ReadStackingMode, TrackIntent,
+    AlignmentViewPredicate, CoverageScaleTransform, PanelId, PresentationNodeId, ReadStackingMode,
+    TrackIntent,
 };
 use std::time::Instant;
 

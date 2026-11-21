@@ -1,5 +1,5 @@
 use crate::Rgba;
-use rgv_hts::ModificationCode;
+use rgv_model::ModificationCode;
 
 pub const MAX_HIDDEN_MODIFICATION_CODES: usize = 8;
 

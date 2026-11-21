@@ -1,12 +1,13 @@
 use crate::MAX_AUTOMATION_FRAME_SAMPLES;
 use crate::control_service::ControlRequest;
 use anyhow::{Context as _, Result};
-use rgv_core::{
+use rgv_automation::{
     AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationCommand, AutomationCommandResult,
     AutomationCommandStatus, AutomationEnvironmentTelemetry, AutomationErrorCode,
     AutomationFrameTelemetry, AutomationGpuTelemetry, AutomationNavigationTelemetry,
-    AutomationRunReport, AutomationRunTelemetry, GenomicInterval, PanelId, TrackId,
+    AutomationRunReport, AutomationRunTelemetry,
 };
+use rgv_core::{GenomicInterval, PanelId, TrackId};
 use rgv_render::PrepareStats;
 use std::collections::VecDeque;
 use std::path::PathBuf;

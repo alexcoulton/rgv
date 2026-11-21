@@ -3,9 +3,10 @@ use crate::sources::{primary_alignment_track, source_path, track_source};
 use crate::workspace::navigation::{ImportedLocusRequest, imported_locus_request};
 use anyhow::{Context as _, Result};
 use clap::Parser;
+use rgv_automation::AutomationBatch;
 use rgv_core::{
-    AutomationBatch, DesktopSettings, GenomeConfiguration, GenomeLandmarkCatalogue,
-    IgvImportReport, LandmarkAssetRole, SessionDocument, TrackSource,
+    DesktopSettings, GenomeConfiguration, GenomeLandmarkCatalogue, IgvImportReport,
+    LandmarkAssetRole, SessionDocument, TrackSource,
 };
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

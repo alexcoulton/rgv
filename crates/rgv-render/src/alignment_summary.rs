@@ -26,11 +26,11 @@ use rgv_core::{
     BisulfiteContext, CoverageScaleTransform, GenomicInterval, JunctionDisplayMode,
     ModifiedBaseColorMode, SashimiCountMode,
 };
-use rgv_hts::{JunctionEvidence, ModificationBin, ModificationCode, ModificationSeriesKey};
 use rgv_layout::{
     MAX_RENDERED_JUNCTION_LABELS, RectPrimitive, RectShape, Rgba, junction_arc_distance_to_point,
     modification_code_color,
 };
+use rgv_model::{JunctionEvidence, ModificationBin, ModificationCode, ModificationSeriesKey};
 use thiserror::Error;
 
 use crate::paged_cache::{self, CachedFrameSlot, CachedGpuPage, PageTableError, PagedGpuCache};

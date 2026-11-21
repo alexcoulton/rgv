@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use rgv_hts::{
+use rgv_model::{
     AlignmentPayloadBatch, AlignmentRecord, AuxField, PackedRecordError, SequenceData, SequenceView,
 };
 use thiserror::Error;
@@ -180,7 +180,7 @@ pub enum PayloadSidecarError {
 #[cfg(test)]
 mod tests {
     use rgv_core::{ContigId, GenomicInterval};
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
         AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, SequenceData,
     };

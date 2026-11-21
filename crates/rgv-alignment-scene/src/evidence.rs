@@ -1,7 +1,7 @@
 use std::{collections::HashSet, mem::size_of, sync::Arc};
 
 use rgv_core::GenomicInterval;
-use rgv_hts::{AlignmentRecordView, AuxField, PackedRecordError, SequenceView};
+use rgv_model::{AlignmentRecordView, AuxField, PackedRecordError, SequenceView};
 use thiserror::Error;
 
 use crate::{
@@ -917,7 +917,7 @@ impl EvidenceSelection {
     pub fn materialize_retained_record(
         &self,
         index: usize,
-    ) -> Result<rgv_hts::AlignmentRecord, PackedRecordError> {
+    ) -> Result<rgv_model::AlignmentRecord, PackedRecordError> {
         let record = self
             .records
             .get(index)
@@ -994,7 +994,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use rgv_core::{ContigId, GenomicInterval};
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentRecord, AlignmentSourcePosition, SequenceData,
     };
 

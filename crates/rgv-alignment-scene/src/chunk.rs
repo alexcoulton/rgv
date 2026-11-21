@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use rgv_hts::{AlignmentBatch, AlignmentOverlapIndex, AlignmentSourcePosition};
+use rgv_model::{AlignmentBatch, AlignmentOverlapIndex, AlignmentSourcePosition};
 use thiserror::Error;
 
 use crate::{AlignmentHandle, AlignmentSourceRevision, ContractFingerprint};
@@ -202,7 +202,7 @@ pub enum ChunkError {
 #[cfg(test)]
 mod tests {
     use rgv_core::ContigId;
-    use rgv_hts::{AlignmentFlags, AlignmentRecord, SequenceData};
+    use rgv_model::{AlignmentFlags, AlignmentRecord, SequenceData};
 
     use super::*;
     use crate::{ContractFingerprint, RevisionFingerprint, SourceFingerprint};

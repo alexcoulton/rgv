@@ -1,10 +1,10 @@
 use crate::Viewer;
 use crate::automation::commands::evidence::bounded_automation_text;
 use anyhow::{Context as _, Result};
-use rgv_core::{
+use rgv_automation::{
     AutomationHistoryNavigation, AutomationReviewNavigation, MAXIMUM_AUTOMATION_HISTORY_ENTRIES,
-    MAXIMUM_REVIEW_ITEMS, PanelId, ReviewStatus,
 };
+use rgv_core::{MAXIMUM_REVIEW_ITEMS, PanelId, ReviewStatus};
 
 impl Viewer {
     pub(crate) fn automation_review_queue_snapshot(&self) -> serde_json::Value {

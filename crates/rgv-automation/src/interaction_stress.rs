@@ -6,9 +6,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use rgv_core::{PanelId, PresentationNodeId, TrackChannel, TrackId};
+
 use crate::{
     AutomationBatch, AutomationCommand, AutomationError, AutomationRectSnapshot,
-    AutomationWorkspaceSnapshot, PanelId, PresentationNodeId, TrackChannel, TrackId,
+    AutomationWorkspaceSnapshot,
 };
 
 pub const INTERACTION_STRESS_SCHEMA_NAME: &str = "rgv.interaction_stress";
@@ -1587,7 +1589,7 @@ mod tests {
             0,
             InteractionStressStep::Control {
                 commands: vec![AutomationCommand::LoadTrack {
-                    source: crate::TrackSource::Remote {
+                    source: rgv_core::TrackSource::Remote {
                         url: "https://user:secret@example.org/reads.bam?token=x".to_owned(),
                     },
                     kind: None,

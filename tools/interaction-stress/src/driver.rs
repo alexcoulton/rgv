@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context as _, bail};
-use rgv_core::{
+use rgv_automation::{
     AutomationRectSnapshot, MAXIMUM_STRESS_NATIVE_EVENTS, StressModifiers, StressNativeEvent,
     StressScrollUnit, StressTiming, StressTouchPhase,
 };
@@ -611,7 +611,7 @@ impl DriverResponse {
     }
 }
 
-fn resolve_point(rect: AutomationRectSnapshot, point: rgv_core::StressPoint) -> [f64; 2] {
+fn resolve_point(rect: AutomationRectSnapshot, point: rgv_automation::StressPoint) -> [f64; 2] {
     [
         f64::from(rect.left) + point.x * f64::from(rect.right - rect.left),
         f64::from(rect.top) + point.y * f64::from(rect.bottom - rect.top),
@@ -648,7 +648,7 @@ fn scheduled_micros(
 
 #[cfg(test)]
 mod tests {
-    use rgv_core::{StressPoint, StressTiming};
+    use rgv_automation::{StressPoint, StressTiming};
 
     use super::*;
 

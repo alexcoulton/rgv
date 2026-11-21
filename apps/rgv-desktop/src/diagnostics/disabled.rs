@@ -6,10 +6,11 @@
 
 use super::{HealthSignal, LatencyEvent, ManualDiagnosticFramePhase, ManualDiagnosticTraceFields};
 use crate::{Viewer, ui};
-use rgv_core::{
+use rgv_automation::{
     AutomationInteractionTrace, AutomationWorkspaceSnapshot, InteractionRecordingStatus,
-    NativeObservationSummary, PanelId, StressHealthSnapshot, StressTarget, TrackId,
+    NativeObservationSummary, StressHealthSnapshot, StressTarget,
 };
+use rgv_core::{PanelId, TrackId};
 use std::path::PathBuf;
 use std::time::Duration;
 use winit::event::{DeviceEvent, WindowEvent};

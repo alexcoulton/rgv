@@ -1,11 +1,9 @@
 //! Domain types shared by the RGV application, data engine, and renderer.
 
-mod automation;
 mod coordinates;
 mod generation;
 mod genome;
 mod igv_genome;
-mod interaction_stress;
 mod landmarks;
 mod locus;
 mod lod;
@@ -18,42 +16,6 @@ mod source;
 mod track;
 mod viewport;
 
-pub use automation::{
-    AUTOMATION_SCHEMA_VERSION, AutomationAlignmentHit, AutomationAlignmentRelationship,
-    AutomationAlignmentReveal, AutomationAlignmentSceneDiagnostics,
-    AutomationAlignmentSearchResult, AutomationAlignmentSelector, AutomationAlignmentState,
-    AutomationAlignmentTrackSnapshot, AutomationBatch, AutomationCommand, AutomationCommandResult,
-    AutomationCommandStatus, AutomationContextLaneSnapshot, AutomationCytobandAvailability,
-    AutomationEnvironmentTelemetry, AutomationError, AutomationErrorCode, AutomationEvidenceField,
-    AutomationExportKind, AutomationFrameTelemetry, AutomationGenomeSnapshot,
-    AutomationGpuTelemetry, AutomationHistoryEntrySnapshot, AutomationHistoryNavigation,
-    AutomationInteractionTrace, AutomationInteractionTraceEvent, AutomationLandmarkIntegrityState,
-    AutomationLandmarkSnapshot, AutomationLandmarkTrackState, AutomationNavigationDestination,
-    AutomationNavigationHistorySnapshot, AutomationNavigationTelemetry, AutomationOptionScope,
-    AutomationPaneItemLayoutSnapshot, AutomationPaneLayoutSnapshot, AutomationPanelSnapshot,
-    AutomationPresentationCompositeSnapshot, AutomationPresentationGroupSnapshot,
-    AutomationPresentationNodeSnapshot, AutomationReadPanelStateSnapshot,
-    AutomationReadPresentationState, AutomationRectSnapshot, AutomationRenderLaneSnapshot,
-    AutomationRenderOmissionReason, AutomationReviewItemSnapshot, AutomationReviewNavigation,
-    AutomationReviewQueueSnapshot, AutomationRunReport, AutomationRunTelemetry,
-    AutomationSelection, AutomationSelectionGranularity, AutomationSelectionKind,
-    AutomationSelectionSnapshot, AutomationSetting, AutomationSnapshotFormat,
-    AutomationSnapshotScope, AutomationTrackGestureKind, AutomationTrackGestureSnapshot,
-    AutomationTrackLifecycle, AutomationTrackSnapshot, AutomationUnsavedChangesPolicy,
-    AutomationViewportOperation, AutomationWorkspaceLayoutSnapshot,
-    AutomationWorkspacePanelLayoutSnapshot, AutomationWorkspaceSnapshot,
-    MAXIMUM_AUTOMATION_ALIGNMENT_RESULTS, MAXIMUM_AUTOMATION_COMMANDS,
-    MAXIMUM_AUTOMATION_EVIDENCE_FIELDS, MAXIMUM_AUTOMATION_HISTORY_ENTRIES,
-    MAXIMUM_AUTOMATION_LOCI, MAXIMUM_AUTOMATION_OPTION_BYTES,
-    MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS, MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS,
-    MAXIMUM_AUTOMATION_STRING_BYTES, MAXIMUM_AUTOMATION_TRACK_SELECTION,
-    MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT, MINIMUM_AUTOMATION_SCHEMA_VERSION,
-    MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS, check_automation_remote_url,
-    check_session_sources_within,
-};
-pub use automation::{
-    MAXIMUM_AUTOMATION_SNAPSHOT_SCALE, MINIMUM_AUTOMATION_SNAPSHOT_SCALE, default_snapshot_scale,
-};
 pub use coordinates::{
     Contig, ContigAliasError, ContigAliases, ContigId, DuplicateContigError, GenomicInterval,
     IntervalError, ReferenceDictionary, resolve_contig_alias,
@@ -69,23 +31,6 @@ pub use genome::{
 pub use igv_genome::{
     IGV_HOSTED_GENOME_LIST_URL, IgvGenomeDescription, IgvGenomeError, IgvGenomeListEntry,
     IgvGenomeTrack, parse_igv_alias_table, parse_igv_genome_list,
-};
-pub use interaction_stress::{
-    INTERACTION_RECORDING_SCHEMA_NAME, INTERACTION_RECORDING_SCHEMA_VERSION,
-    INTERACTION_STRESS_SCHEMA_NAME, INTERACTION_STRESS_SCHEMA_VERSION, InteractionLifecycle,
-    InteractionRecordingCheckpoint, InteractionRecordingEntry, InteractionRecordingFooter,
-    InteractionRecordingHeader, InteractionRecordingState, InteractionRecordingStatus,
-    InteractionStressError, InteractionStressRunManifest, InteractionStressScenario,
-    InteractionStressStep, MAXIMUM_INTERACTION_STRESS_DOCUMENT_BYTES,
-    MAXIMUM_STRESS_COORDINATE_FRACTION, MAXIMUM_STRESS_NATIVE_EVENTS, MAXIMUM_STRESS_NESTING,
-    MAXIMUM_STRESS_REPEAT_COUNT, MAXIMUM_STRESS_RUN_MILLIS, MAXIMUM_STRESS_STEPS,
-    MAXIMUM_STRESS_STRING_BYTES, MAXIMUM_STRESS_TIMING_SCALE, NativeEventShape,
-    NativeInputObservation, NativeObservationSummary, RecordedReadScroll,
-    STRESS_HEALTH_SCHEMA_VERSION, StressActionKind, StressArtifactReference, StressFailureClass,
-    StressFailureSignature, StressGeneratorProfile, StressGeneratorSpecification,
-    StressHealthSnapshot, StressInteractionState, StressModifiers, StressNativeEvent, StressPoint,
-    StressPredicate, StressRequirements, StressRunEnvironment, StressRunLimits, StressRunState,
-    StressScrollUnit, StressStepResult, StressTarget, StressTiming, StressTouchPhase,
 };
 pub use landmarks::{
     AssemblyMatchEvidence, AssemblyResolution, AssemblyResolutionInput, AssemblyResolutionStatus,
@@ -106,23 +51,26 @@ pub use sample_metadata::{
     MAXIMUM_SAMPLE_METADATA_ROWS, SampleMetadataError, SampleMetadataRow, SampleMetadataTable,
 };
 pub use session::newer_writer_notice;
+/// Validation shared with the automation protocol in `rgv-automation`. Not a supported API.
+#[doc(hidden)]
+pub use session::validate_alignment_predicate_expression;
 pub use session::{
     AlignmentAuxComparison, AlignmentAuxFilterValue, AlignmentCigarEventPredicate,
     AlignmentColorMode, AlignmentFlagPredicate, AlignmentGroupMode, AlignmentOrderDirection,
     AlignmentPredicateExpression, AlignmentPredicateScope, AlignmentReadSampling,
     AlignmentSortMode, AlignmentViewPredicate, BisulfiteContext, CoverageScaleTransform,
     IgvImportReport, IgvLocusResolution, IgvSessionImport, InspectorActivation,
-    JunctionDisplayMode, MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_CONTIG_ALIASES,
-    MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS, MAXIMUM_REVIEW_NOTE_BYTES,
-    MAXIMUM_SESSION_TRACKS, MAXIMUM_VIEW_PANELS, ModifiedBaseColorMode, OverlappingMatePolicy,
-    PresentationNodeId, ReadBaseDisplayMode, ReadStackingMode, ReadStackingTransitionReason,
-    RegionOfInterest, ReviewItem, ReviewStatus, SESSION_SCHEMA_MINOR_VERSION,
-    SESSION_SCHEMA_VERSION, SashimiCountMode, SashimiScaleMode, SbxDisplayOptions,
-    SbxSimplexTailMode, SessionAlignmentTrack, SessionDocument, SessionError, SessionFilters,
-    SessionLocus, SessionPaneTrackState, SessionPresentationComposite, SessionPresentationGroup,
-    SessionReadPanelState, SessionViewPanel, SmrtKineticsMode, TrackChangeSet, TrackChannel,
-    TrackIntent, TrackIntentError, UltimaDisplayOptions, UltimaQualityMode,
-    UnresolvedSessionSource, WorkspacePresentation,
+    JunctionDisplayMode, MAXIMUM_ALIGNMENT_TRACKS, MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT,
+    MAXIMUM_CONTIG_ALIASES, MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS,
+    MAXIMUM_REVIEW_NOTE_BYTES, MAXIMUM_SESSION_TRACKS, MAXIMUM_VIEW_PANELS, ModifiedBaseColorMode,
+    OverlappingMatePolicy, PresentationNodeId, ReadBaseDisplayMode, ReadStackingMode,
+    ReadStackingTransitionReason, RegionOfInterest, ReviewItem, ReviewStatus,
+    SESSION_SCHEMA_MINOR_VERSION, SESSION_SCHEMA_VERSION, SashimiCountMode, SashimiScaleMode,
+    SbxDisplayOptions, SbxSimplexTailMode, SessionAlignmentTrack, SessionDocument, SessionError,
+    SessionFilters, SessionLocus, SessionPaneTrackState, SessionPresentationComposite,
+    SessionPresentationGroup, SessionReadPanelState, SessionViewPanel, SmrtKineticsMode,
+    TrackChangeSet, TrackChannel, TrackIntent, TrackIntentError, UltimaDisplayOptions,
+    UltimaQualityMode, UnresolvedSessionSource, WorkspacePresentation,
 };
 pub use settings::{
     AlignmentMemoryPolicy, DEFAULT_AUTOSAVE_INTERVAL_SECONDS, DEFAULT_AUTOSAVE_RETENTION,

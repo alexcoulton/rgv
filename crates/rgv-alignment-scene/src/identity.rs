@@ -1,4 +1,4 @@
-use rgv_hts::AlignmentSourcePosition;
+use rgv_model::AlignmentSourcePosition;
 
 use crate::AlignmentSourceRevision;
 

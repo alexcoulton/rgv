@@ -18,7 +18,7 @@ use crate::workspace::alignments::{
 use crate::workspace::context_lanes::ContextLaneKey;
 use crate::{Viewer, ui};
 use rgv_alignment_scene::AlignmentComponent;
-use rgv_core::{
+use rgv_automation::{
     AUTOMATION_SCHEMA_VERSION, AutomationAlignmentSceneDiagnostics,
     AutomationAlignmentTrackSnapshot, AutomationContextLaneSnapshot,
     AutomationCytobandAvailability, AutomationEvidenceField, AutomationGenomeSnapshot,
@@ -28,10 +28,11 @@ use rgv_core::{
     AutomationRenderLaneSnapshot, AutomationRenderOmissionReason, AutomationSelectionKind,
     AutomationSelectionSnapshot, AutomationTrackGestureKind, AutomationTrackGestureSnapshot,
     AutomationTrackLifecycle, AutomationTrackSnapshot, AutomationWorkspaceLayoutSnapshot,
-    AutomationWorkspacePanelLayoutSnapshot, AutomationWorkspaceSnapshot, DetailLevel,
-    GenomicInterval, MAXIMUM_AUTOMATION_EVIDENCE_FIELDS, MAXIMUM_AUTOMATION_LOCI,
-    MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS, PresentationNodeId, TrackId, TrackKind,
+    AutomationWorkspacePanelLayoutSnapshot, AutomationWorkspaceSnapshot,
+    MAXIMUM_AUTOMATION_EVIDENCE_FIELDS, MAXIMUM_AUTOMATION_LOCI,
+    MAXIMUM_AUTOMATION_SNAPSHOT_TRACKS,
 };
+use rgv_core::{DetailLevel, GenomicInterval, PresentationNodeId, TrackId, TrackKind};
 use rgv_engine::{AlignmentIndividualReadCapability, AlignmentSceneCoordinatorTelemetry};
 use rgv_render::GpuBudgetPressure;
 use std::time::Instant;

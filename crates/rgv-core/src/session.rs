@@ -24,6 +24,8 @@ pub const MAXIMUM_ALIGNMENT_TRACKS: usize = 64;
 /// Bound on non-alignment tracks in one session document.
 pub const MAXIMUM_SESSION_TRACKS: usize = 4_096;
 pub const MAXIMUM_VIEW_PANELS: usize = 16;
+/// Largest complete-read admission limit a session or an automation setting may request.
+pub const MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT: usize = 10_000_000;
 pub const MAXIMUM_CONTIG_ALIASES: usize = 10_000;
 pub const MAXIMUM_REGIONS_OF_INTEREST: usize = 100_000;
 pub const MAXIMUM_REVIEW_ITEMS: usize = 100_000;
@@ -3287,7 +3289,7 @@ fn validate_filters(filters: &SessionFilters) -> Result<(), SessionError> {
     Ok(())
 }
 
-pub(crate) fn validate_alignment_predicate_expression(
+pub fn validate_alignment_predicate_expression(
     expression: &AlignmentPredicateExpression,
 ) -> Result<(), SessionError> {
     const MAXIMUM_PREDICATES: usize = 64;

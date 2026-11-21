@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
+use rgv_automation::AUTOMATION_SCHEMA_VERSION;
 use rgv_control_client::{ControlClient, ControlStatus};
-use rgv_core::AUTOMATION_SCHEMA_VERSION;
 use serde::{Deserialize, Serialize};
 use url::Url;
 

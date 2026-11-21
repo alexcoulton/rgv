@@ -373,7 +373,7 @@ mod tests {
         CoverageScaleTransform, GenomicInterval, JunctionDisplayMode, ModifiedBaseColorMode,
         OverlappingMatePolicy, ReadStackingMode,
     };
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
         AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, ReferenceSlice,
         SequenceData, TemplateLengthBounds,
@@ -1041,7 +1041,7 @@ mod tests {
         assert!(!bins.is_empty());
         assert!(
             bins.values()
-                .all(|series| series.code == rgv_hts::ModificationCode::Letter(b'm'))
+                .all(|series| series.code == rgv_model::ModificationCode::Letter(b'm'))
         );
     }
 

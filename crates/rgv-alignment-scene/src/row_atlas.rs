@@ -11,7 +11,7 @@ use rgv_core::{
     AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, GenomicInterval,
     ReadStackingMode,
 };
-use rgv_hts::AlignmentSourcePosition;
+use rgv_model::AlignmentSourcePosition;
 use thiserror::Error;
 
 use crate::{
@@ -2319,7 +2319,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use rgv_core::{ContigId, ReadStackingMode};
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
         AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, SequenceData,
         TemplateLengthBounds,
@@ -3300,7 +3300,7 @@ mod tests {
         assert_eq!(connector_profile.bins()[0].connector_count(), 1);
         assert_eq!(connector_profile.bins()[0].occupied_rows(), 1);
 
-        layout.promoted_template = Some(rgv_hts::template_id(b"supp").get());
+        layout.promoted_template = Some(rgv_model::template_id(b"supp").get());
         let promoted = AlignmentRowAtlas::build(
             revision(401),
             &evidence,

@@ -4,7 +4,7 @@ use rgv_core::{
     BisulfiteContext, CoverageScaleTransform, GenomicInterval, JunctionDisplayMode,
     SashimiCountMode, Viewport,
 };
-use rgv_hts::{
+use rgv_model::{
     JunctionEvidence, ModificationBin, ModificationCode, ModificationSeriesKey, PairSummary,
     PileupBin,
 };
@@ -1517,7 +1517,7 @@ pub enum CpuSummaryProjectionError {
 #[cfg(test)]
 mod tests {
     use rgv_core::ContigId;
-    use rgv_hts::{AlleleSupport, QualityWeightedAlleleSupport, ReferenceSlice};
+    use rgv_model::{AlleleSupport, QualityWeightedAlleleSupport, ReferenceSlice};
 
     use super::*;
     use crate::SummarySemanticPrimitive;

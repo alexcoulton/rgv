@@ -27,7 +27,7 @@ use rgv_core::{
     CoverageScaleTransform, GenomicInterval, JunctionDisplayMode, ModifiedBaseColorMode,
     OverlappingMatePolicy, ReadStackingMode, SashimiCountMode,
 };
-use rgv_hts::{
+use rgv_model::{
     AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
     AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, ReferenceSlice,
     SequenceData, TemplateLengthBounds,

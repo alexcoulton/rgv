@@ -9,9 +9,9 @@ use crate::workspace::navigation::{ImportedLocusRequest, imported_locus_request}
 use crate::workspace_lists::{WorkspaceListImport, WorkspaceListKind, import_workspace_list};
 use crate::{UiPanel, Viewer};
 use anyhow::Result;
+use rgv_automation::AutomationErrorCode;
 use rgv_core::{
-    AutomationErrorCode, IgvImportReport, MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS,
-    SessionDocument,
+    IgvImportReport, MAXIMUM_REGIONS_OF_INTEREST, MAXIMUM_REVIEW_ITEMS, SessionDocument,
 };
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
@@ -153,7 +153,7 @@ pub(crate) fn control_project_refusal(
     opened_by_automation: bool,
 ) -> Option<String> {
     let policy = policy.filter(|_| opened_by_automation)?;
-    rgv_core::check_session_sources_within(
+    rgv_automation::check_session_sources_within(
         document,
         &policy.root,
         policy.allow_private_network_urls,

@@ -9,7 +9,9 @@ use std::{
 };
 
 use reqwest::StatusCode;
-use rgv_core::{AutomationBatch, AutomationCommand, AutomationRunReport, StressHealthSnapshot};
+use rgv_automation::{
+    AutomationBatch, AutomationCommand, AutomationRunReport, StressHealthSnapshot,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -300,7 +302,7 @@ pub enum ControlClientError {
     #[error("could not encode or decode RGV control JSON: {0}")]
     Json(#[from] serde_json::Error),
     #[error("the RGV automation batch is invalid: {0}")]
-    InvalidBatch(#[from] rgv_core::AutomationError),
+    InvalidBatch(#[from] rgv_automation::AutomationError),
     #[error("RGV local control returned {status} ({code}): {message}")]
     Http {
         status: u16,
@@ -321,7 +323,7 @@ pub enum ControlClientError {
 mod tests {
     use std::thread;
 
-    use rgv_core::AUTOMATION_SCHEMA_VERSION;
+    use rgv_automation::AUTOMATION_SCHEMA_VERSION;
     use tiny_http::{Header, Response, Server};
 
     use super::*;

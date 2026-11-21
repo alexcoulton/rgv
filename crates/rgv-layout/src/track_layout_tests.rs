@@ -402,7 +402,7 @@ fn narrow_peaks_render_the_called_summit() {
         strand: Strand::Unstranded,
         blocks: Vec::new(),
         coding_interval: None,
-        peak: Some(rgv_hts::PeakMetrics {
+        peak: Some(rgv_model::PeakMetrics {
             signal_value: 12.0,
             p_value: Some(5.0),
             q_value: None,
@@ -790,7 +790,7 @@ fn copy_number_layout_only_materializes_visible_sample_rows() {
     let query = CopyNumberQuery {
         samples: (0..5).map(|index| format!("sample-{index}")).collect(),
         segments: (0..5)
-            .map(|sample_index| rgv_hts::CopyNumberSegment {
+            .map(|sample_index| rgv_model::CopyNumberSegment {
                 sample_index,
                 start: 100,
                 end: 200,
@@ -800,7 +800,7 @@ fn copy_number_layout_only_materializes_visible_sample_rows() {
             .collect(),
         sample_sort_values: vec![None; 5],
         inferred_value_semantics: CopyNumberValueSemantics::Absolute,
-        provenance: rgv_hts::CopyNumberQueryProvenance::default(),
+        provenance: rgv_model::CopyNumberQueryProvenance::default(),
     };
     let settings = CopyNumberTrackSettings {
         row_height: 10.0,
@@ -837,7 +837,7 @@ fn copy_number_layout_only_materializes_visible_sample_rows() {
 
 #[test]
 fn mutation_layout_virtualizes_samples_and_marks_repeated_calls() {
-    let mutation = |sample_index, gene: &str| rgv_hts::MutationRecord {
+    let mutation = |sample_index, gene: &str| rgv_model::MutationRecord {
         sample_index,
         start: 120,
         end: 121,
@@ -853,7 +853,7 @@ fn mutation_layout_virtualizes_samples_and_marks_repeated_calls() {
         annotations: Vec::new(),
         annotation_values_omitted: 0,
     };
-    let query = rgv_hts::MutationQuery {
+    let query = rgv_model::MutationQuery {
         headers: Vec::new(),
         samples: vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
         records: vec![
@@ -861,7 +861,7 @@ fn mutation_layout_virtualizes_samples_and_marks_repeated_calls() {
             mutation(1, "KRAS"),
             mutation(1, "KRAS"),
         ],
-        provenance: rgv_hts::MutationQueryProvenance::default(),
+        provenance: rgv_model::MutationQueryProvenance::default(),
     };
     let layout = layout_mutations(
         &query,
@@ -886,7 +886,7 @@ fn mutation_layout_virtualizes_samples_and_marks_repeated_calls() {
 
 #[test]
 fn interaction_layout_draws_intrachromosomal_arcs_and_cross_contig_markers() {
-    let endpoint = |contig: &str, start, end, name: &str| rgv_hts::InteractionEndpoint {
+    let endpoint = |contig: &str, start, end, name: &str| rgv_model::InteractionEndpoint {
         contig: contig.to_owned(),
         start,
         end,
@@ -948,7 +948,7 @@ fn interaction_layout_draws_intrachromosomal_arcs_and_cross_contig_markers() {
 
 #[test]
 fn cross_contig_undirected_interactions_use_a_neutral_join_label() {
-    let endpoint = |contig: &str, start| rgv_hts::InteractionEndpoint {
+    let endpoint = |contig: &str, start| rgv_model::InteractionEndpoint {
         contig: contig.to_owned(),
         start,
         end: start + 4,
@@ -977,7 +977,7 @@ fn cross_contig_undirected_interactions_use_a_neutral_join_label() {
 
 #[test]
 fn directed_interactions_point_to_the_semantic_target_in_either_genomic_order() {
-    let endpoint = |start, strand| rgv_hts::InteractionEndpoint {
+    let endpoint = |start, strand| rgv_model::InteractionEndpoint {
         contig: "chr1".to_owned(),
         start,
         end: start + 4,
@@ -1033,7 +1033,7 @@ fn directed_interactions_point_to_the_semantic_target_in_either_genomic_order() 
 
 #[test]
 fn directed_interactions_keep_an_outward_target_marker_when_the_target_is_clipped() {
-    let endpoint = |start, end| rgv_hts::InteractionEndpoint {
+    let endpoint = |start, end| rgv_model::InteractionEndpoint {
         contig: "chr1".to_owned(),
         start,
         end,
@@ -1084,14 +1084,14 @@ fn directed_interactions_keep_an_outward_target_marker_when_the_target_is_clippe
 #[test]
 fn undirected_interactions_use_endpoint_strands_without_inventing_source_target_direction() {
     let record = InteractionRecord {
-        source: rgv_hts::InteractionEndpoint {
+        source: rgv_model::InteractionEndpoint {
             contig: "chr1".to_owned(),
             start: 110,
             end: 114,
             name: None,
             strand: Strand::Forward,
         },
-        target: rgv_hts::InteractionEndpoint {
+        target: rgv_model::InteractionEndpoint {
             contig: "chr1".to_owned(),
             start: 180,
             end: 184,
@@ -1133,14 +1133,14 @@ fn undirected_interactions_use_endpoint_strands_without_inventing_source_target_
 fn interaction_layout_obeys_filter_fixed_scale_and_hard_record_cap() {
     let records = (0..MAX_RENDERED_INTERACTIONS + 10)
         .map(|index| InteractionRecord {
-            source: rgv_hts::InteractionEndpoint {
+            source: rgv_model::InteractionEndpoint {
                 contig: "chr1".to_owned(),
                 start: 100 + u64::try_from(index % 20).unwrap(),
                 end: 101 + u64::try_from(index % 20).unwrap(),
                 name: None,
                 strand: Strand::Unstranded,
             },
-            target: rgv_hts::InteractionEndpoint {
+            target: rgv_model::InteractionEndpoint {
                 contig: "chr1".to_owned(),
                 start: 180,
                 end: 181,
@@ -1175,14 +1175,14 @@ fn interaction_layout_obeys_filter_fixed_scale_and_hard_record_cap() {
 #[test]
 fn interaction_cap_counts_only_records_drawable_in_the_viewport() {
     let record = |contig: &str, start: u64, target: u64| InteractionRecord {
-        source: rgv_hts::InteractionEndpoint {
+        source: rgv_model::InteractionEndpoint {
             contig: contig.to_owned(),
             start,
             end: start + 1,
             name: None,
             strand: Strand::Unstranded,
         },
-        target: rgv_hts::InteractionEndpoint {
+        target: rgv_model::InteractionEndpoint {
             contig: contig.to_owned(),
             start: target,
             end: target + 1,
@@ -1228,7 +1228,7 @@ fn interaction_cap_counts_only_records_drawable_in_the_viewport() {
 
 #[test]
 fn interaction_arcs_with_distant_endpoints_stay_bounded_and_finite() {
-    let endpoint = |start: u64| rgv_hts::InteractionEndpoint {
+    let endpoint = |start: u64| rgv_model::InteractionEndpoint {
         contig: "chr1".to_owned(),
         start,
         end: start + 1,
@@ -1485,7 +1485,7 @@ fn variants_extending_beyond_the_viewport_use_clipped_geometry() {
         filters: Vec::new(),
         info: Vec::new(),
         genotypes: Vec::new(),
-        variant_types: vec![rgv_hts::VariantType::Complex],
+        variant_types: vec![rgv_model::VariantType::Complex],
         breakends: Vec::new(),
         breakpoint_orientations: Vec::new(),
     };
@@ -1555,21 +1555,21 @@ fn genotype_colour_uses_selected_cohort_calls_instead_of_variant_type() {
         quality: Some(50.0),
         filters: Vec::new(),
         info: Vec::new(),
-        genotypes: vec![rgv_hts::VariantGenotype {
+        genotypes: vec![rgv_model::VariantGenotype {
             sample_index: 0,
             alleles: vec![
-                rgv_hts::VariantGenotypeAllele {
+                rgv_model::VariantGenotypeAllele {
                     index: Some(0),
                     phased: false,
                 },
-                rgv_hts::VariantGenotypeAllele {
+                rgv_model::VariantGenotypeAllele {
                     index: Some(1),
                     phased: false,
                 },
             ],
             fields: Vec::new(),
         }],
-        variant_types: vec![rgv_hts::VariantType::Snv],
+        variant_types: vec![rgv_model::VariantType::Snv],
         breakends: Vec::new(),
         breakpoint_orientations: Vec::new(),
     };
@@ -1604,8 +1604,8 @@ fn breakend_and_symbolic_sv_orientation_reaches_layout_shapes() {
         filters: Vec::new(),
         info: Vec::new(),
         genotypes: Vec::new(),
-        variant_types: vec![rgv_hts::VariantType::Breakend],
-        breakends: vec![rgv_hts::BreakendPartner {
+        variant_types: vec![rgv_model::VariantType::Breakend],
+        breakends: vec![rgv_model::BreakendPartner {
             alternate_index: 0,
             contig: "chr1".to_owned(),
             position: 180,
@@ -1619,9 +1619,9 @@ fn breakend_and_symbolic_sv_orientation_reaches_layout_shapes() {
         end: 170,
         id: Some("inv".to_owned()),
         alternates: vec![b"<INV>".to_vec()],
-        variant_types: vec![rgv_hts::VariantType::Inversion],
+        variant_types: vec![rgv_model::VariantType::Inversion],
         breakends: Vec::new(),
-        breakpoint_orientations: vec![rgv_hts::BreakpointOrientation {
+        breakpoint_orientations: vec![rgv_model::BreakpointOrientation {
             local_join_after_position: false,
             partner_join_after_position: true,
             support: Some(8),
@@ -1669,8 +1669,8 @@ fn every_breakend_join_side_combination_reaches_both_display_endpoints() {
                     filters: Vec::new(),
                     info: Vec::new(),
                     genotypes: Vec::new(),
-                    variant_types: vec![rgv_hts::VariantType::Breakend],
-                    breakends: vec![rgv_hts::BreakendPartner {
+                    variant_types: vec![rgv_model::VariantType::Breakend],
+                    breakends: vec![rgv_model::BreakendPartner {
                         alternate_index: 0,
                         contig: "chr1".to_owned(),
                         position: partner_position,
@@ -1729,8 +1729,8 @@ fn offscreen_breakend_label_keeps_both_join_sides_inside_the_viewport() {
         filters: Vec::new(),
         info: Vec::new(),
         genotypes: Vec::new(),
-        variant_types: vec![rgv_hts::VariantType::Breakend],
-        breakends: vec![rgv_hts::BreakendPartner {
+        variant_types: vec![rgv_model::VariantType::Breakend],
+        breakends: vec![rgv_model::BreakendPartner {
             alternate_index: 0,
             contig: "chr1".to_owned(),
             position: 300,
@@ -1773,23 +1773,23 @@ fn multiple_offscreen_and_cross_contig_breakend_partners_get_bounded_edge_marker
         filters: Vec::new(),
         info: Vec::new(),
         genotypes: Vec::new(),
-        variant_types: vec![rgv_hts::VariantType::Breakend],
+        variant_types: vec![rgv_model::VariantType::Breakend],
         breakends: vec![
-            rgv_hts::BreakendPartner {
+            rgv_model::BreakendPartner {
                 alternate_index: 0,
                 contig: "chr1".to_owned(),
                 position: 50,
                 local_join_after_position: false,
                 partner_join_after_position: true,
             },
-            rgv_hts::BreakendPartner {
+            rgv_model::BreakendPartner {
                 alternate_index: 1,
                 contig: "chr1".to_owned(),
                 position: 250,
                 local_join_after_position: true,
                 partner_join_after_position: false,
             },
-            rgv_hts::BreakendPartner {
+            rgv_model::BreakendPartner {
                 alternate_index: 2,
                 contig: "chr2".to_owned(),
                 position: 400,
@@ -1825,7 +1825,7 @@ fn multiple_offscreen_and_cross_contig_breakend_partners_get_bounded_edge_marker
 #[test]
 fn gwas_layout_transforms_p_values_and_preserves_selectable_point_identity() {
     let records = vec![
-        rgv_hts::GwasRecord {
+        rgv_model::GwasRecord {
             contig: "chr1".to_owned(),
             position: 125,
             identifier: "rs-low".to_owned(),
@@ -1833,7 +1833,7 @@ fn gwas_layout_transforms_p_values_and_preserves_selectable_point_identity() {
             minus_log10_p: 1.0,
             fields: Vec::new(),
         },
-        rgv_hts::GwasRecord {
+        rgv_model::GwasRecord {
             contig: "chr1".to_owned(),
             position: 175,
             identifier: "rs-high".to_owned(),

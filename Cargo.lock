@@ -4004,8 +4004,22 @@ version = "0.1.0"
 dependencies = [
  "rgv-core",
  "rgv-hts",
+ "rgv-model",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rgv-automation"
+version = "0.1.0"
+dependencies = [
+ "rgv-core",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "url",
 ]
 
 [[package]]
@@ -4013,6 +4027,7 @@ name = "rgv-control-client"
 version = "0.1.0"
 dependencies = [
  "reqwest",
+ "rgv-automation",
  "rgv-core",
  "serde",
  "serde_json",
@@ -4050,6 +4065,7 @@ dependencies = [
  "pollster",
  "rfd",
  "rgv-alignment-scene",
+ "rgv-automation",
  "rgv-core",
  "rgv-engine",
  "rgv-hts",
@@ -4092,6 +4108,7 @@ dependencies = [
  "noodles-bgzf 0.51.0",
  "reqwest",
  "rgv-core",
+ "rgv-model",
  "rust-htslib",
  "sha2",
  "tempfile",
@@ -4132,6 +4149,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rgv-automation",
  "rgv-control-client",
  "rgv-core",
  "serde",
@@ -4149,7 +4167,7 @@ name = "rgv-layout"
 version = "0.1.0"
 dependencies = [
  "rgv-core",
- "rgv-hts",
+ "rgv-model",
 ]
 
 [[package]]
@@ -4161,6 +4179,7 @@ dependencies = [
  "clap",
  "image",
  "reqwest",
+ "rgv-automation",
  "rgv-control-client",
  "rgv-core",
  "rmcp",
@@ -4173,6 +4192,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "rgv-model"
+version = "0.1.0"
+dependencies = [
+ "rgv-core",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4199,8 +4226,8 @@ dependencies = [
  "pollster",
  "rgv-alignment-scene",
  "rgv-core",
- "rgv-hts",
  "rgv-layout",
+ "rgv-model",
  "tempfile",
  "thiserror 2.0.20",
  "wgpu",
@@ -4214,6 +4241,7 @@ dependencies = [
  "bigtools",
  "clap",
  "flate2",
+ "rgv-automation",
  "rgv-core",
  "rgv-engine",
  "rgv-hts",

@@ -6,7 +6,7 @@ use std::{
 };
 
 use rgv_core::GenomicInterval;
-use rgv_hts::ReferenceSlice;
+use rgv_model::ReferenceSlice;
 use thiserror::Error;
 
 use crate::page_identity::{page_reads_reference, reference_slice_stamp};

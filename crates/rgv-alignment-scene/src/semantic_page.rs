@@ -9,7 +9,7 @@ use rgv_core::{
     AlignmentColorMode, GenomicInterval, ModifiedBaseColorMode, ReadBaseDisplayMode,
     SbxSimplexTailMode,
 };
-use rgv_hts::{
+use rgv_model::{
     AlignedBaseClassification, AuxValue, CigarOpKind, ImplicitModificationMode, PairClassification,
     PairOrientation, ReferenceSlice, SbxInsertionState, SbxTailBounds, SequenceView,
     TemplateLengthBounds, UltimaEventUnavailable, UltimaIndelKind, UltimaQualitySource,
@@ -254,7 +254,7 @@ pub enum AlignmentComponent {
         /// the mate's source revision is the primitive's own and is not repeated here; storing
         /// a whole [`AlignmentHandle`] made this the widest variant and every primitive 32
         /// bytes larger. Use [`AlignmentComponent::pair_connector_mate`] for the handle.
-        mate: Option<rgv_hts::AlignmentSourcePosition>,
+        mate: Option<rgv_model::AlignmentSourcePosition>,
     },
     Label {
         kind: AlignmentLabelKind,
@@ -263,7 +263,7 @@ pub enum AlignmentComponent {
     ModifiedBase {
         read_index: u32,
         canonical_base: u8,
-        code: rgv_hts::ModificationCode,
+        code: rgv_model::ModificationCode,
         probability: Option<u8>,
         state: ModificationState,
     },
@@ -1161,7 +1161,7 @@ impl AlignmentSemanticPage {
 fn body_color_token(
     selection: &crate::EvidenceSelection,
     index: usize,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     mode: AlignmentColorMode,
     visible_interval: GenomicInterval,
     pair_bounds: TemplateLengthBounds,
@@ -1276,7 +1276,7 @@ fn auxiliary_category(
     Ok(supported.then(|| hash.finish()))
 }
 
-fn first_of_pair_reverse(flags: rgv_hts::AlignmentFlags) -> Option<bool> {
+fn first_of_pair_reverse(flags: rgv_model::AlignmentFlags) -> Option<bool> {
     if flags.is_first_in_template() {
         Some(flags.is_reverse())
     } else if flags.is_last_in_template() {
@@ -1313,7 +1313,7 @@ const fn classification_rank(value: PairClassification) -> u8 {
 fn prepare_specialist_overlays(
     selection: &crate::EvidenceSelection,
     index: usize,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     style: AlignmentStyleContract,
     reference: Option<&ReferenceSlice>,
     tile: GenomicInterval,
@@ -1360,7 +1360,7 @@ fn prepare_specialist_overlays(
 fn prepare_modified_base_overlays(
     selection: &crate::EvidenceSelection,
     index: usize,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     style: AlignmentStyleContract,
     tile: GenomicInterval,
     output: &mut Vec<PreparedOverlay>,
@@ -1412,7 +1412,7 @@ fn prepare_modified_base_overlays(
         );
         return Ok(());
     };
-    let mut canonical_groups = Vec::<(u8, rgv_hts::ModificationCode, BTreeSet<usize>)>::new();
+    let mut canonical_groups = Vec::<(u8, rgv_model::ModificationCode, BTreeSet<usize>)>::new();
     for call in &calls {
         if style.hidden_modification_codes.contains(&Some(call.code))
             || (style.minimum_modification_probability > 0
@@ -1515,7 +1515,7 @@ fn prepare_modified_base_overlays(
 fn prepare_bisulfite_overlays(
     selection: &crate::EvidenceSelection,
     index: usize,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     reference: Option<&ReferenceSlice>,
     context: rgv_core::BisulfiteContext,
     tile: GenomicInterval,
@@ -1542,10 +1542,10 @@ fn prepare_bisulfite_overlays(
         let observation =
             classify_bisulfite_observation(reference, position, reverse, context, base);
         let observation = match observation {
-            Some(rgv_hts::BisulfiteObservation::Protected) => {
+            Some(rgv_model::BisulfiteObservation::Protected) => {
                 Some(BisulfiteObservationToken::Protected)
             }
-            Some(rgv_hts::BisulfiteObservation::Converted) => {
+            Some(rgv_model::BisulfiteObservation::Converted) => {
                 Some(BisulfiteObservationToken::Converted)
             }
             None => None,
@@ -1569,7 +1569,7 @@ fn prepare_bisulfite_overlays(
 fn prepare_smrt_overlays(
     selection: &crate::EvidenceSelection,
     index: usize,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     mode: rgv_core::SmrtKineticsMode,
     tile: GenomicInterval,
     output: &mut Vec<PreparedOverlay>,
@@ -1619,7 +1619,7 @@ fn prepare_smrt_overlays(
 fn prepare_ultima_overlays(
     selection: &crate::EvidenceSelection,
     index: usize,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     reference: Option<&ReferenceSlice>,
     options: rgv_core::UltimaDisplayOptions,
     tile: GenomicInterval,
@@ -1676,7 +1676,7 @@ fn prepare_ultima_overlays(
 fn prepare_sbx_overlays(
     selection: &crate::EvidenceSelection,
     index: usize,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     options: rgv_core::SbxDisplayOptions,
     tile: GenomicInterval,
     output: &mut Vec<PreparedOverlay>,
@@ -1776,7 +1776,7 @@ fn prepare_sbx_overlays(
 fn hidden_sbx_tail_bounds(
     selection: &crate::EvidenceSelection,
     index: usize,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     color_mode: AlignmentColorMode,
 ) -> Option<SbxTailBounds> {
     let AlignmentColorMode::Sbx(options) = color_mode else {
@@ -1800,7 +1800,7 @@ fn hidden_sbx_tail_bounds(
 
 fn push_unavailable(
     output: &mut Vec<PreparedOverlay>,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     tile: GenomicInterval,
     mode: SpecialistMode,
     reason: SpecialistUnavailableReason,
@@ -1817,7 +1817,7 @@ fn push_unavailable(
 }
 
 fn for_each_aligned_base(
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     mut visit: impl FnMut(usize, u64, usize),
 ) {
     let mut reference_position = record.start();
@@ -1848,7 +1848,7 @@ fn for_each_aligned_base(
 
 fn reference_position_for_read_position(
     alignment_start: u64,
-    cigar: &[rgv_hts::CigarOp],
+    cigar: &[rgv_model::CigarOp],
     target: usize,
 ) -> Option<u64> {
     let mut reference_position = alignment_start;
@@ -1913,7 +1913,7 @@ fn emit_record_primitives(
     labels: &mut Vec<PendingLabel>,
     handle: AlignmentHandle,
     row_offset: u32,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     sequence: Option<SequenceView<'_>>,
     body: AlignmentBodyColorToken,
     lod: GeometryLod,
@@ -2312,7 +2312,7 @@ fn mark_directional_read_geometry(
     output: &mut [AlignmentSemanticPrimitive],
     handle: AlignmentHandle,
     row_offset: u32,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     tile: GenomicInterval,
     tile_start: u64,
 ) {
@@ -2484,7 +2484,7 @@ fn visible_read_range(
 }
 
 fn visible_reference_bounds(
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     hidden_sbx_tail: Option<SbxTailBounds>,
 ) -> Option<(u64, u64)> {
     let Some(tail) = hidden_sbx_tail else {
@@ -2505,7 +2505,7 @@ fn visible_reference_bounds(
 fn read_label_for_record(
     selection: &crate::EvidenceSelection,
     index: usize,
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     mode: AlignmentReadLabelMode,
 ) -> Result<Option<(AlignmentLabelKind, String)>, SemanticPageError> {
     Ok(match mode {
@@ -2737,7 +2737,7 @@ fn geometry_for(
         | AlignmentComponent::UltimaIndel { .. }
         | AlignmentComponent::SbxInsertion { .. } => AlignmentGeometryToken::PointMarker,
         AlignmentComponent::DirectionTerminal => {
-            if rgv_hts::AlignmentFlags::from_bits(style.flags).is_reverse() {
+            if rgv_model::AlignmentFlags::from_bits(style.flags).is_reverse() {
                 AlignmentGeometryToken::DirectionalTerminalLeft
             } else {
                 AlignmentGeometryToken::DirectionalTerminalRight
@@ -3029,7 +3029,7 @@ fn semantic_page_dynamic_scratch_bytes(
         // vector, hence twice) and at most one canonical-position set entry per call.
         .saturating_add(
             modification_call_slots.saturating_mul(
-                size_of::<rgv_hts::ModifiedBaseCall>()
+                size_of::<rgv_model::ModifiedBaseCall>()
                     .saturating_mul(2)
                     .saturating_add(64),
             ),
@@ -3087,7 +3087,7 @@ fn modified_base_call_bound(mm: &AuxValue) -> ModifiedBaseCallBound {
 
 /// Aligned (`M`/`=`/`X`) bases of the whole record and of its part inside `tile`.
 fn aligned_base_counts(
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     tile: GenomicInterval,
 ) -> (usize, usize) {
     let mut total = 0_usize;
@@ -3130,7 +3130,7 @@ struct RecordPrimitiveBound {
 /// clipping `push_span`, `push_point` and `emit_bases` apply. Display filters (minimum indel
 /// size, hidden tails, base display mode) can only emit fewer primitives than counted here.
 fn record_primitive_bound(
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     tile: GenomicInterval,
     lod: GeometryLod,
     minimum_event_label_size: u32,
@@ -3270,7 +3270,7 @@ pub enum SemanticPageError {
     #[error("semantic-page preparation for handle {0:?} was lost")]
     MissingPreparedSemantics(AlignmentHandle),
     #[error(transparent)]
-    PackedRecord(#[from] rgv_hts::PackedRecordError),
+    PackedRecord(#[from] rgv_model::PackedRecordError),
 }
 
 #[cfg(test)]
@@ -3282,7 +3282,7 @@ mod tests {
         ReadBaseDisplayMode, ReadStackingMode, SbxDisplayOptions, SmrtKineticsMode,
         UltimaDisplayOptions,
     };
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
         AlignmentSourcePosition, AuxField, AuxValue, CigarOp, SequenceData, TemplateLengthBounds,
     };
@@ -4485,7 +4485,7 @@ mod tests {
         let sequence = b"CCACCACCCCAAACCC";
         let mm = AuxValue::String("C+mh,0,1,2;A+a?,3;".to_owned());
         let decoded =
-            rgv_hts::decode_modified_bases_parts(sequence, AlignmentFlags::from_bits(0), &mm, None)
+            rgv_model::decode_modified_bases_parts(sequence, AlignmentFlags::from_bits(0), &mm, None)
                 .unwrap();
         let bound = modified_base_call_bound(&mm);
         assert_eq!(decoded.len(), 7);
@@ -4839,7 +4839,7 @@ mod tests {
         assert_eq!(identities.len(), exported.len());
         assert_eq!(
             scene.modification_codes(10, 10).unwrap(),
-            vec![rgv_hts::ModificationCode::Letter(b'm')]
+            vec![rgv_model::ModificationCode::Letter(b'm')]
         );
         assert_eq!(
             scene.inspect_retained(hit.handle).unwrap().unwrap(),
@@ -5343,7 +5343,7 @@ mod tests {
     #[test]
     fn semantic_primitive_size_is_pinned() {
         assert_eq!(size_of::<AlignmentHandle>(), 56);
-        assert_eq!(size_of::<rgv_hts::AlignmentSourcePosition>(), 24);
+        assert_eq!(size_of::<rgv_model::AlignmentSourcePosition>(), 24);
         assert_eq!(size_of::<AlignmentStyleToken>(), 32);
         assert_eq!(size_of::<AlignmentComponent>(), 32);
         assert_eq!(size_of::<AlignmentSemanticPrimitive>(), 152);

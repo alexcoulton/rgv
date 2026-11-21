@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rgv_core::{
+use rgv_automation::{
     AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationCommand, AutomationWorkspaceSnapshot,
     INTERACTION_STRESS_SCHEMA_NAME, INTERACTION_STRESS_SCHEMA_VERSION, InteractionRecordingStatus,
     InteractionStressRunManifest, InteractionStressScenario, InteractionStressStep,
@@ -497,7 +497,7 @@ async fn record(
             .data
             .clone(),
     )?;
-    if status.state != rgv_core::InteractionRecordingState::Complete {
+    if status.state != rgv_automation::InteractionRecordingState::Complete {
         bail!(
             "recording stopped as {:?}: {}",
             status.state,
@@ -713,12 +713,15 @@ async fn describe_workspace(
     .context("workspace response was malformed")
 }
 
-fn require_success(report: &rgv_core::AutomationRunReport, operation: &str) -> anyhow::Result<()> {
+fn require_success(
+    report: &rgv_automation::AutomationRunReport,
+    operation: &str,
+) -> anyhow::Result<()> {
     if report.succeeded {
         Ok(())
     } else {
         let reason = report.results.iter().find_map(|result| {
-            (result.status == rgv_core::AutomationCommandStatus::Failed)
+            (result.status == rgv_automation::AutomationCommandStatus::Failed)
                 .then_some(result.message.as_str())
         });
         bail!(

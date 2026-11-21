@@ -6,10 +6,10 @@ use crate::automation::{
 use crate::control_service::ControlService;
 use crate::workspace::alignments::AlignmentTrackLifecycle;
 use crate::workspace::queries::reference_dependency_is_settled;
-use rgv_core::{
+use rgv_automation::{
     AutomationCommand, AutomationErrorCode, AutomationSelection, AutomationSelectionGranularity,
-    MAXIMUM_BASE_MARK_BASES_PER_PIXEL, PanelId,
 };
+use rgv_core::{MAXIMUM_BASE_MARK_BASES_PER_PIXEL, PanelId};
 use std::time::{Duration, Instant};
 
 /// Longest a batch waits for a snapshot, export or save worker before failing the command.

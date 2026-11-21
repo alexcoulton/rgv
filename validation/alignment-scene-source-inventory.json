@@ -6,6 +6,7 @@
     "crates/rgv-alignment-scene/src",
     "crates/rgv-engine/src",
     "crates/rgv-layout/src",
+    "crates/rgv-model/src",
     "crates/rgv-render/src"
   ],
   "deleted_files": [

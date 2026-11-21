@@ -74,8 +74,8 @@ impl AlignmentSourceRevision {
     }
 }
 
-impl From<rgv_hts::AlignmentSourceStamp> for AlignmentSourceRevision {
-    fn from(value: rgv_hts::AlignmentSourceStamp) -> Self {
+impl From<rgv_model::AlignmentSourceStamp> for AlignmentSourceRevision {
+    fn from(value: rgv_model::AlignmentSourceStamp) -> Self {
         Self::new(
             SourceFingerprint::new(fingerprint_from_bytes(value.source())),
             fingerprint_from_bytes(value.revision()),
@@ -97,7 +97,7 @@ mod tests {
 
     #[test]
     fn hts_stamp_conversion_preserves_all_bits() {
-        let stamp = rgv_hts::AlignmentSourceStamp::new(
+        let stamp = rgv_model::AlignmentSourceStamp::new(
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             [
                 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,

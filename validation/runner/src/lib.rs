@@ -7,12 +7,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use rgv_automation::{
+    AutomationBatch, AutomationCommand, AutomationExportKind, AutomationSnapshotFormat,
+};
 use rgv_core::{
-    AlignmentColorMode, AutomationBatch, AutomationCommand, AutomationExportKind,
-    AutomationSnapshotFormat, BisulfiteContext, GenerationClock, GenomeConfiguration,
-    GenomicInterval, PanelGeneration, PanelId, QuantitativeArithmetic, ReferenceTranslationFrame,
-    SashimiScaleMode, SbxSimplexTailMode, SessionDocument, SmrtKineticsMode, TrackFormat,
-    TrackKind, TrackSource, UltimaQualityMode,
+    AlignmentColorMode, BisulfiteContext, GenerationClock, GenomeConfiguration, GenomicInterval,
+    PanelGeneration, PanelId, QuantitativeArithmetic, ReferenceTranslationFrame, SashimiScaleMode,
+    SbxSimplexTailMode, SessionDocument, SmrtKineticsMode, TrackFormat, TrackKind, TrackSource,
+    UltimaQualityMode,
 };
 use rgv_engine::{TrackEngine, TrackEngineEvent, TrackSnapshotData, TrackSpec, TrackSpecKind};
 use rgv_hts::{

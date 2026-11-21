@@ -1,5 +1,5 @@
 use anyhow::bail;
-use rgv_core::{
+use rgv_automation::{
     InteractionStressScenario, InteractionStressStep, StressFailureSignature, StressNativeEvent,
     StressPredicate,
 };
@@ -356,11 +356,12 @@ fn event_count(steps: &[InteractionStressStep]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use rgv_core::{
+    use rgv_automation::{
         INTERACTION_STRESS_SCHEMA_NAME, INTERACTION_STRESS_SCHEMA_VERSION,
-        InteractionStressScenario, PanelId, StressFailureClass, StressModifiers, StressPoint,
+        InteractionStressScenario, StressFailureClass, StressModifiers, StressPoint,
         StressRequirements, StressRunLimits, StressTarget, StressTiming,
     };
+    use rgv_core::PanelId;
 
     use super::*;
 
@@ -410,7 +411,7 @@ mod tests {
             requirements: StressRequirements::default(),
             steps: vec![
                 InteractionStressStep::Control {
-                    commands: vec![rgv_core::AutomationCommand::DescribeWorkspace],
+                    commands: vec![rgv_automation::AutomationCommand::DescribeWorkspace],
                 },
                 gesture("noise"),
                 gesture("failure"),

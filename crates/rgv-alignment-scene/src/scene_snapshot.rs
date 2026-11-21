@@ -6,7 +6,7 @@ use std::{
 };
 
 use rgv_core::GenomicInterval;
-use rgv_hts::AlignmentRecord;
+use rgv_model::AlignmentRecord;
 use thiserror::Error;
 
 use crate::summary_page::required_summary_page_keys;
@@ -516,7 +516,7 @@ impl AlignmentSceneSnapshot {
         })
     }
 
-    fn allele_semantic_at(&self, position: u64) -> Option<(rgv_hts::PileupBin, Option<u8>)> {
+    fn allele_semantic_at(&self, position: u64) -> Option<(rgv_model::PileupBin, Option<u8>)> {
         let end = position.checked_add(1)?;
         let interval =
             GenomicInterval::new(self.prepared_interval().contig(), position, end).ok()?;

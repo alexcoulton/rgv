@@ -1,5 +1,6 @@
 use crate::Viewer;
-use rgv_core::{AutomationRectSnapshot, AutomationWorkspaceSnapshot, PresentationNodeId};
+use rgv_automation::{AutomationRectSnapshot, AutomationWorkspaceSnapshot};
+use rgv_core::PresentationNodeId;
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Write as _},
@@ -14,13 +15,14 @@ use std::{
 };
 use winit::keyboard::ModifiersState;
 
-use rgv_core::{
+use rgv_automation::{
     INTERACTION_RECORDING_SCHEMA_NAME, INTERACTION_RECORDING_SCHEMA_VERSION, InteractionLifecycle,
     InteractionRecordingCheckpoint, InteractionRecordingEntry, InteractionRecordingFooter,
     InteractionRecordingHeader, InteractionRecordingState, InteractionRecordingStatus,
     NativeInputObservation, NativeObservationSummary, RecordedReadScroll, StressModifiers,
-    StressNativeEvent, StressPoint, StressScrollUnit, StressTarget, StressTouchPhase, TrackChannel,
+    StressNativeEvent, StressPoint, StressScrollUnit, StressTarget, StressTouchPhase,
 };
+use rgv_core::TrackChannel;
 use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
     keyboard::{KeyCode, PhysicalKey},

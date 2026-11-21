@@ -68,7 +68,8 @@ pub struct AuxPredicate {
 }
 
 impl AuxPredicate {
-    pub(crate) fn matches_value(&self, value: &AuxValue) -> bool {
+    #[doc(hidden)]
+    pub fn matches_value(&self, value: &AuxValue) -> bool {
         let Some(expected) = &self.value else {
             return false;
         };

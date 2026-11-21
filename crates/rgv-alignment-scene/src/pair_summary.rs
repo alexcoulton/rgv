@@ -1,6 +1,6 @@
 use std::{mem::size_of, sync::Arc};
 
-use rgv_hts::{PairSummary, PairSummaryBuilder, template_id};
+use rgv_model::{PairSummary, PairSummaryBuilder, template_id};
 use thiserror::Error;
 
 use crate::{
@@ -272,7 +272,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use rgv_core::{ContigId, GenomicInterval};
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentRecord, AlignmentSourcePosition, SequenceData,
     };
 

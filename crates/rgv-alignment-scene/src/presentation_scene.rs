@@ -7,7 +7,7 @@ use std::{
 };
 
 use rgv_core::GenomicInterval;
-use rgv_hts::{AlignmentRecord, ModificationCode, PackedRecordError, decode_modified_bases};
+use rgv_model::{AlignmentRecord, ModificationCode, PackedRecordError, decode_modified_bases};
 use thiserror::Error;
 
 use crate::{
@@ -512,7 +512,7 @@ impl AlignmentPresentationScene {
     pub fn for_each_identity(
         &self,
         interval: GenomicInterval,
-        mut visit: impl FnMut(AlignmentHandle, &[u8], rgv_hts::AlignmentFlags),
+        mut visit: impl FnMut(AlignmentHandle, &[u8], rgv_model::AlignmentFlags),
     ) -> Result<(), AlignmentExportError> {
         if !self.prepared_interval.contains_interval(interval) {
             return Err(AlignmentExportError::UnpreparedInterval(interval));
@@ -662,7 +662,7 @@ impl AlignmentPresentationScene {
     fn read_name_and_flags(
         &self,
         handle: AlignmentHandle,
-    ) -> Option<(Vec<u8>, rgv_hts::AlignmentFlags)> {
+    ) -> Option<(Vec<u8>, rgv_model::AlignmentFlags)> {
         if !self.evidence.contains_handle(handle) {
             return None;
         }
@@ -684,7 +684,7 @@ impl AlignmentPresentationScene {
     fn matching_read_name_handles(
         &self,
         read_name: &[u8],
-    ) -> Vec<(AlignmentHandle, rgv_hts::AlignmentFlags)> {
+    ) -> Vec<(AlignmentHandle, rgv_model::AlignmentFlags)> {
         let mut output = Vec::new();
         for chunk in self.evidence.chunks() {
             let batch = chunk.chunk().batch();

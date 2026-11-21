@@ -8,7 +8,7 @@ use rgv_alignment_scene::{
     CpuClipRect,
 };
 use rgv_core::{ContigId, GenomicInterval, Viewport};
-use rgv_hts::{CigarOp, CigarOpKind};
+use rgv_model::{CigarOp, CigarOpKind};
 
 use super::{
     FORMAT, Oracle, Quad, Shade, TestGpu, edge_is_decidable, first_column_at_or_after,

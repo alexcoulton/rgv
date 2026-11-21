@@ -1,6 +1,6 @@
 use std::{mem::size_of, sync::Arc};
 
-use rgv_hts::{
+use rgv_model::{
     AuxField, AuxValue, CigarOpKind, JunctionEvidence, JunctionStrand, JunctionStrandInput,
     JunctionSummary, JunctionSummaryBuilder, RecordJunctionCollector,
 };
@@ -365,7 +365,7 @@ fn entering_bytes(entering: &Vec<JunctionEvidence>) -> usize {
 
 /// Reference skips of `record` this tile retains: `(owned, entering)`.
 fn retained_skip_counts(
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     tile: rgv_core::GenomicInterval,
 ) -> (usize, usize) {
     let mut owned = 0_usize;
@@ -422,7 +422,7 @@ pub enum ExactJunctionSummaryError {
     #[error(transparent)]
     Evidence(#[from] EvidenceSelectionError),
     #[error(transparent)]
-    Packed(#[from] rgv_hts::PackedRecordError),
+    Packed(#[from] rgv_model::PackedRecordError),
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     #[error("exact junction summary requires the XS auxiliary-tag capability")]
@@ -436,7 +436,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use rgv_core::{ContigId, GenomicInterval};
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
         AlignmentSourcePosition, AuxField, CigarOp, SequenceData,
     };

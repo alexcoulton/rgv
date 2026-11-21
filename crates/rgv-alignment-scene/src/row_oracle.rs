@@ -5,7 +5,7 @@ use std::{
 };
 
 use rgv_core::{AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, GenomicInterval};
-use rgv_hts::{
+use rgv_model::{
     AlignmentFlags, AuxValue, CigarOp, CigarOpKind, PairClassification, PairEvidence,
     PairOrientation, ReadOrder, SequenceView, pair_evidence_view, template_id,
 };
@@ -1271,7 +1271,7 @@ pub enum RowOracleError {
     #[error(transparent)]
     Evidence(#[from] EvidenceSelectionError),
     #[error(transparent)]
-    PackedRecord(#[from] rgv_hts::PackedRecordError),
+    PackedRecord(#[from] rgv_model::PackedRecordError),
     #[error("row layout mode requires retained sequence payload")]
     SequencePayloadRequired,
     #[error("row layout mode requires retained auxiliary tag {0:?}")]

@@ -27,7 +27,7 @@ use rgv_core::{
     GenomicInterval, ModifiedBaseColorMode, OverlappingMatePolicy, ReadBaseDisplayMode,
     ReadStackingMode,
 };
-use rgv_hts::{
+use rgv_model::{
     AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
     AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, ReferenceSlice,
     SequenceData, TemplateLengthBounds,
@@ -1897,7 +1897,7 @@ fn random_ordered_layout(rng: &mut XorShift, world: &World) -> LayoutContract {
         pair_length_bounds: TemplateLengthBounds::default(),
         promoted_template: rng.chance(1, 4).then(|| {
             let record = &world.records[rng.below(world.records.len() as u64) as usize];
-            rgv_hts::template_id(&record.read_name).get()
+            rgv_model::template_id(&record.read_name).get()
         }),
         sampling: ReadSampling::Complete,
     }

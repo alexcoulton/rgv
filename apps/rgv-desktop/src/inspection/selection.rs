@@ -29,10 +29,10 @@ use rgv_alignment_scene::{
     AlignmentComponent, AlignmentHit, AlignmentTraversalDirection, CpuAlignmentProjector,
     SummaryPageFamily, SummarySemanticComponent,
 };
+use rgv_automation::AutomationSelectionGranularity;
 use rgv_core::{
-    AutomationSelectionGranularity, CopyNumberTrackSettings, GenomicInterval, GwasTrackSettings,
-    InteractionTrackSettings, PanelId, QuantitativeTrackSettings, TrackId, TrackKind,
-    VariantTrackSettings,
+    CopyNumberTrackSettings, GenomicInterval, GwasTrackSettings, InteractionTrackSettings, PanelId,
+    QuantitativeTrackSettings, TrackId, TrackKind, VariantTrackSettings,
 };
 use rgv_engine::{AlignmentIndividualReadCapability, TrackSnapshotData};
 use rgv_layout::{

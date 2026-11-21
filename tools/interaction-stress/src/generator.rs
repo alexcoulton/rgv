@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::bail;
-use rgv_core::{
+use rgv_automation::{
     AutomationWorkspaceSnapshot, INTERACTION_STRESS_SCHEMA_NAME, INTERACTION_STRESS_SCHEMA_VERSION,
-    InteractionStressScenario, InteractionStressStep, PanelId, StressActionKind,
-    StressGeneratorProfile, StressGeneratorSpecification, StressModifiers, StressNativeEvent,
-    StressPoint, StressPredicate, StressRequirements, StressRunLimits, StressTarget, StressTiming,
-    StressTouchPhase,
+    InteractionStressScenario, InteractionStressStep, StressActionKind, StressGeneratorProfile,
+    StressGeneratorSpecification, StressModifiers, StressNativeEvent, StressPoint, StressPredicate,
+    StressRequirements, StressRunLimits, StressTarget, StressTiming, StressTouchPhase,
 };
+use rgv_core::PanelId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -581,7 +581,7 @@ fn scroll_event(
         at_micros,
         delta_x: 0.0,
         delta_y,
-        unit: rgv_core::StressScrollUnit::Pixel,
+        unit: rgv_automation::StressScrollUnit::Pixel,
         phase,
         momentum_phase: StressTouchPhase::None,
         continuous: true,
@@ -690,7 +690,7 @@ impl XorShift64 {
 
 #[cfg(test)]
 mod tests {
-    use rgv_core::{StressGeneratorProfile, StressGeneratorSpecification};
+    use rgv_automation::{StressGeneratorProfile, StressGeneratorSpecification};
 
     use super::*;
 

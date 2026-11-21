@@ -11,7 +11,8 @@ use crate::ui::alignment_settings::{
 };
 use crate::{HoverInspectorTarget, Viewer};
 use rgv_alignment_scene::AlignmentComponent;
-use rgv_core::{AutomationSelectionKind, GenomicInterval, OverlappingMatePolicy, SashimiCountMode};
+use rgv_automation::AutomationSelectionKind;
+use rgv_core::{GenomicInterval, OverlappingMatePolicy, SashimiCountMode};
 use rgv_hts::{
     AlignmentRecord, AuxValue, CigarOpKind, QUALITY_WEIGHT_SCALE, SequenceData,
     UltimaTagOrientation, analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse,

@@ -1,7 +1,7 @@
 use std::{mem::size_of, sync::Arc};
 
 use rgv_core::{BisulfiteContext, ContigId, GenomicInterval};
-use rgv_hts::{
+use rgv_model::{
     JunctionEvidence, ModificationBin, ModificationSeriesKey, PairSummary, PileupBin,
     ReferenceSlice, bisulfite_context_matches,
 };
@@ -937,7 +937,7 @@ mod tests {
         AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId,
         OverlappingMatePolicy, ReadStackingMode,
     };
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
         AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, SequenceData,
         TemplateLengthBounds,

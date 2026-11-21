@@ -1,6 +1,6 @@
 use crate::{DisplayList, RectPrimitive, Rgba, TextPrimitive};
 use rgv_core::{GeneticCode, ReferenceTranslationFrame, Viewport};
-use rgv_hts::ReferenceSlice;
+use rgv_model::ReferenceSlice;
 
 pub const MINIMUM_BASE_GLYPH_PIXEL_WIDTH: f32 = 7.0;
 

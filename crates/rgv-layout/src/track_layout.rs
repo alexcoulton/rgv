@@ -8,7 +8,7 @@ use rgv_core::{
     QuantitativeTrackSettings, QuantitativeWindowFunction, VariantColorMode, VariantTrackSettings,
     Viewport,
 };
-use rgv_hts::{
+use rgv_model::{
     CopyNumberQuery, CopyNumberValueSemantics, FeatureRecord, GwasRecord, InteractionRecord,
     MutationQuery, QuantitativeRecord, Strand, VariantRecord,
 };
@@ -456,7 +456,7 @@ pub fn layout_variants(
                 variant
                     .variant_types
                     .first()
-                    .unwrap_or(&rgv_hts::VariantType::Complex),
+                    .unwrap_or(&rgv_model::VariantType::Complex),
             ),
             VariantColorMode::Genotype => genotype_color(variant),
         };
@@ -1144,8 +1144,8 @@ fn add_interaction_endpoint(
 #[allow(clippy::too_many_arguments)]
 fn add_directed_interaction_target(
     display: &mut DisplayList,
-    source: &rgv_hts::InteractionEndpoint,
-    target: &rgv_hts::InteractionEndpoint,
+    source: &rgv_model::InteractionEndpoint,
+    target: &rgv_model::InteractionEndpoint,
     viewport: Viewport,
     baseline: f32,
     color: Rgba,
@@ -1628,7 +1628,7 @@ pub fn layout_mutations(
     }
 }
 
-fn mutation_color(record: &rgv_hts::MutationRecord, mode: MutationColorMode) -> Rgba {
+fn mutation_color(record: &rgv_model::MutationRecord, mode: MutationColorMode) -> Rgba {
     let bytes = match mode {
         MutationColorMode::Uniform => [45, 48, 54, 255],
         MutationColorMode::VariantType => match record.variant_type.to_ascii_uppercase().as_str() {
@@ -2594,22 +2594,22 @@ fn clipped_geometry(start: u64, end: u64, viewport: Viewport) -> (f32, f32) {
     (x, right - x)
 }
 
-fn variant_color(variant_type: &rgv_hts::VariantType) -> Rgba {
+fn variant_color(variant_type: &rgv_model::VariantType) -> Rgba {
     match variant_type {
-        rgv_hts::VariantType::Snv => Rgba::new(0.20, 0.67, 0.42, 0.96),
-        rgv_hts::VariantType::Mnv => Rgba::new(0.15, 0.62, 0.68, 0.96),
-        rgv_hts::VariantType::Insertion | rgv_hts::VariantType::StructuralInsertion => {
+        rgv_model::VariantType::Snv => Rgba::new(0.20, 0.67, 0.42, 0.96),
+        rgv_model::VariantType::Mnv => Rgba::new(0.15, 0.62, 0.68, 0.96),
+        rgv_model::VariantType::Insertion | rgv_model::VariantType::StructuralInsertion => {
             Rgba::new(0.62, 0.34, 0.88, 0.96)
         }
-        rgv_hts::VariantType::Deletion | rgv_hts::VariantType::StructuralDeletion => {
+        rgv_model::VariantType::Deletion | rgv_model::VariantType::StructuralDeletion => {
             Rgba::new(0.90, 0.25, 0.22, 0.96)
         }
-        rgv_hts::VariantType::Inversion => Rgba::new(0.22, 0.46, 0.84, 0.96),
-        rgv_hts::VariantType::Duplication => Rgba::new(0.92, 0.52, 0.16, 0.96),
-        rgv_hts::VariantType::CopyNumber => Rgba::new(0.78, 0.62, 0.12, 0.96),
-        rgv_hts::VariantType::Breakend => Rgba::new(0.84, 0.20, 0.63, 0.96),
-        rgv_hts::VariantType::SpanningDeletion => Rgba::new(0.40, 0.42, 0.46, 0.96),
-        rgv_hts::VariantType::Complex | rgv_hts::VariantType::Symbolic(_) => {
+        rgv_model::VariantType::Inversion => Rgba::new(0.22, 0.46, 0.84, 0.96),
+        rgv_model::VariantType::Duplication => Rgba::new(0.92, 0.52, 0.16, 0.96),
+        rgv_model::VariantType::CopyNumber => Rgba::new(0.78, 0.62, 0.12, 0.96),
+        rgv_model::VariantType::Breakend => Rgba::new(0.84, 0.20, 0.63, 0.96),
+        rgv_model::VariantType::SpanningDeletion => Rgba::new(0.40, 0.42, 0.46, 0.96),
+        rgv_model::VariantType::Complex | rgv_model::VariantType::Symbolic(_) => {
             Rgba::new(0.48, 0.38, 0.72, 0.96)
         }
     }

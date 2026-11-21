@@ -626,7 +626,7 @@ impl EvidenceStore {
         target: GenomicInterval,
         contract: &AlignmentViewFilterContract,
         evaluation_fingerprint: crate::ContractFingerprint,
-        reference: Option<&rgv_hts::ReferenceSlice>,
+        reference: Option<&rgv_model::ReferenceSlice>,
         reservation_kind: ReservationKind,
     ) -> Result<EvidenceCandidate, EvidenceStoreError> {
         if contract.is_empty() {
@@ -2633,7 +2633,7 @@ mod tests {
         AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId, GenomicInterval,
         OverlappingMatePolicy, ReadStackingMode,
     };
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentRecord, AlignmentSourcePosition, SequenceData,
         TemplateLengthBounds,
     };

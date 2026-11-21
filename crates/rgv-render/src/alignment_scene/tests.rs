@@ -17,7 +17,7 @@ use rgv_core::{
     AlignmentGroupMode, AlignmentOrderDirection, AlignmentSortMode, ContigId, GenomicInterval,
     ReadStackingMode,
 };
-use rgv_hts::{
+use rgv_model::{
     AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
     AlignmentSourcePosition, CigarOp, CigarOpKind, SequenceData, TemplateLengthBounds,
 };
@@ -3556,19 +3556,19 @@ fn light_palette_reproduces_every_legacy_baked_colour() {
             read_index: 0,
             base: b'A',
             quality: None,
-            classification: rgv_hts::AlignedBaseClassification::Substitution,
+            classification: rgv_model::AlignedBaseClassification::Substitution,
         },
         AlignmentComponent::ModifiedBase {
             read_index: 0,
             canonical_base: b'C',
-            code: rgv_hts::ModificationCode::Letter(b'm'),
+            code: rgv_model::ModificationCode::Letter(b'm'),
             probability: Some(200),
             state: ModificationState::Modified,
         },
         AlignmentComponent::ModifiedBase {
             read_index: 0,
             canonical_base: b'C',
-            code: rgv_hts::ModificationCode::Letter(b'm'),
+            code: rgv_model::ModificationCode::Letter(b'm'),
             probability: None,
             state: ModificationState::Canonical,
         },
@@ -3626,7 +3626,7 @@ fn light_palette_reproduces_every_legacy_baked_colour() {
             read_index: 0,
             base,
             quality: Some(30),
-            classification: rgv_hts::AlignedBaseClassification::Substitution,
+            classification: rgv_model::AlignedBaseClassification::Substitution,
         };
         assert!(light_palette_deviation(component, style) <= 1.0e-6);
     }

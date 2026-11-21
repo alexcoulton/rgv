@@ -6,7 +6,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{
+use rgv_core::{
     AlignmentColorMode, AlignmentGroupMode, AlignmentOrderDirection, AlignmentPredicateExpression,
     AlignmentSortMode, AlignmentViewPredicate, CoverageScaleTransform, DetailLevel,
     ModifiedBaseColorMode, OverlappingMatePolicy, PanelId, ReadBaseDisplayMode, ReadStackingMode,
@@ -26,7 +26,7 @@ pub const MAXIMUM_AUTOMATION_ALIGNMENT_RESULTS: usize = 128;
 pub const MAXIMUM_AUTOMATION_HISTORY_ENTRIES: usize = 256;
 pub const MINIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS: u64 = 100;
 pub const MAXIMUM_AUTOMATION_SETTLE_TIMEOUT_MILLIS: u64 = 600_000;
-pub const MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT: usize = 10_000_000;
+pub use rgv_core::MAXIMUM_CONFIGURABLE_COMPLETE_READ_LIMIT;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationBatch {
@@ -1091,7 +1091,7 @@ pub enum AutomationSetting {
     /// visibility, grouping, or heights.
     PresentationSectionExpanded {
         /// The section to expand or collapse.
-        channel: crate::TrackChannel,
+        channel: rgv_core::TrackChannel,
         /// True expands the section, false collapses it.
         value: bool,
     },
@@ -1099,14 +1099,14 @@ pub enum AutomationSetting {
     PresentationNodeVisible {
         /// The node to show or hide: `reference` or a `track`. A `group` is rejected; use
         /// `presentation_group_visible`.
-        target: crate::PresentationNodeId,
+        target: rgv_core::PresentationNodeId,
         /// True shows the node's content, false hides it.
         value: bool,
     },
     /// Set the preferred height of the reference lane or of one track row.
     PresentationNodeHeight {
         /// The node to resize: `reference` or a `track`. A `group` is rejected.
-        target: crate::PresentationNodeId,
+        target: rgv_core::PresentationNodeId,
         /// Preferred height in logical points: 26 to 1200 for the reference lane and
         /// annotation-channel tracks, 40 to 1200 for reads-channel tracks.
         #[cfg_attr(feature = "schema", schemars(range(min = 26.0, max = 1200.0)))]
@@ -1115,14 +1115,14 @@ pub enum AutomationSetting {
     /// Expand or collapse a presentation group's member rows.
     PresentationGroupExpanded {
         /// The group to expand or collapse; must be a `group` node.
-        target: crate::PresentationNodeId,
+        target: rgv_core::PresentationNodeId,
         /// True shows the group's member rows, false collapses them.
         value: bool,
     },
     /// Show or hide the content of a presentation group.
     PresentationGroupVisible {
         /// The group to show or hide; must be a `group` node.
-        target: crate::PresentationNodeId,
+        target: rgv_core::PresentationNodeId,
         /// True shows the group's content, false hides it.
         value: bool,
     },
@@ -1131,7 +1131,7 @@ pub enum AutomationSetting {
     PresentationCompositeVisible {
         /// Channel that owns the composite. Must be `annotation`; composites do not exist in
         /// the reads channel.
-        channel: crate::TrackChannel,
+        channel: rgv_core::TrackChannel,
         /// Positive composite ID as reported in `presentation_composites` of the workspace
         /// snapshot.
         #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
@@ -1142,7 +1142,7 @@ pub enum AutomationSetting {
     /// Place tracks of one channel in a new presentation group.
     PresentationGroup {
         /// Channel in which to create the group.
-        channel: crate::TrackChannel,
+        channel: rgv_core::TrackChannel,
         /// Positive stable IDs of the tracks to group; 2 to 1024 distinct entries.
         #[cfg_attr(feature = "schema", schemars(length(min = 2, max = 1024)))]
         track_ids: Vec<TrackId>,
@@ -1150,7 +1150,7 @@ pub enum AutomationSetting {
     /// Dissolve a presentation group, returning its members to the top level.
     PresentationUngroup {
         /// The group to dissolve; must be a `group` node.
-        target: crate::PresentationNodeId,
+        target: rgv_core::PresentationNodeId,
     },
     /// Set the height of the reads pane.
     ReadPaneHeight {
@@ -1252,33 +1252,33 @@ impl AutomationSetting {
             .ok_or_else(|| {
                 "window size must be between 640x400 and 3840x2160 logical points".to_owned()
             }),
-            Self::InterfaceScalePercent { value } => (crate::MINIMUM_INTERFACE_SCALE_PERCENT
-                ..=crate::MAXIMUM_INTERFACE_SCALE_PERCENT)
+            Self::InterfaceScalePercent { value } => (rgv_core::MINIMUM_INTERFACE_SCALE_PERCENT
+                ..=rgv_core::MAXIMUM_INTERFACE_SCALE_PERCENT)
                 .contains(value)
                 .then_some(())
                 .ok_or_else(|| "interface scale must be between 75 and 200 percent".to_owned()),
             Self::ReadBrowsingBufferPercent { value } => {
-                (crate::MINIMUM_READ_BROWSING_BUFFER_PERCENT
-                    ..=crate::MAXIMUM_READ_BROWSING_BUFFER_PERCENT)
+                (rgv_core::MINIMUM_READ_BROWSING_BUFFER_PERCENT
+                    ..=rgv_core::MAXIMUM_READ_BROWSING_BUFFER_PERCENT)
                     .contains(value)
                     .then_some(())
                     .ok_or_else(|| {
                         format!(
                             "read browsing buffer must be between {} and {} percent",
-                            crate::MINIMUM_READ_BROWSING_BUFFER_PERCENT,
-                            crate::MAXIMUM_READ_BROWSING_BUFFER_PERCENT
+                            rgv_core::MINIMUM_READ_BROWSING_BUFFER_PERCENT,
+                            rgv_core::MAXIMUM_READ_BROWSING_BUFFER_PERCENT
                         )
                     })
             }
-            Self::TotalCacheBudgetMib { value } => (crate::MINIMUM_CACHE_BUDGET_MIB
-                ..=crate::MAXIMUM_CACHE_BUDGET_MIB)
+            Self::TotalCacheBudgetMib { value } => (rgv_core::MINIMUM_CACHE_BUDGET_MIB
+                ..=rgv_core::MAXIMUM_CACHE_BUDGET_MIB)
                 .contains(value)
                 .then_some(())
                 .ok_or_else(|| {
                     format!(
                         "total cache budget must be between {} and {} MiB",
-                        crate::MINIMUM_CACHE_BUDGET_MIB,
-                        crate::MAXIMUM_CACHE_BUDGET_MIB
+                        rgv_core::MINIMUM_CACHE_BUDGET_MIB,
+                        rgv_core::MAXIMUM_CACHE_BUDGET_MIB
                     )
                 }),
             Self::PropertiesPanelWidth { value } => (value.is_finite()
@@ -1297,7 +1297,7 @@ impl AutomationSetting {
             Self::AlignmentViewFilter { track_ids, value }
             | Self::AlignmentHighlightFilter { track_ids, value } => {
                 validate_track_selection(track_ids)?;
-                crate::session::validate_alignment_predicate_expression(value)
+                rgv_core::validate_alignment_predicate_expression(value)
                     .map_err(|error| error.to_string())
             }
             Self::ReadStackingMode { track_ids, .. } => validate_track_selection(track_ids),
@@ -1339,23 +1339,22 @@ impl AutomationSetting {
                 validate_track_id(*track_id)
             }
             Self::PresentationNodeVisible { target, .. } => match target {
-                crate::PresentationNodeId::Reference | crate::PresentationNodeId::Track { .. } => {
-                    Ok(())
-                }
-                crate::PresentationNodeId::Group { .. } => Err(
+                rgv_core::PresentationNodeId::Reference
+                | rgv_core::PresentationNodeId::Track { .. } => Ok(()),
+                rgv_core::PresentationNodeId::Group { .. } => Err(
                     "presentation group visibility must use presentation_group_visible".to_owned(),
                 ),
             },
             Self::PresentationNodeHeight { target, value } => {
-                if matches!(target, crate::PresentationNodeId::Group { .. }) {
+                if matches!(target, rgv_core::PresentationNodeId::Group { .. }) {
                     return Err(
                         "presentation groups do not have a resizable content row".to_owned()
                     );
                 }
                 let valid = value.is_finite()
                     && match target.channel() {
-                        crate::TrackChannel::Annotation => (26.0..=1_200.0).contains(value),
-                        crate::TrackChannel::Reads => (40.0..=1_200.0).contains(value),
+                        rgv_core::TrackChannel::Annotation => (26.0..=1_200.0).contains(value),
+                        rgv_core::TrackChannel::Reads => (40.0..=1_200.0).contains(value),
                     };
                 valid.then_some(()).ok_or_else(|| {
                     "presentation node height is outside the valid range for its channel".to_owned()
@@ -1364,7 +1363,7 @@ impl AutomationSetting {
             Self::PresentationGroupExpanded { target, .. }
             | Self::PresentationGroupVisible { target, .. }
             | Self::PresentationUngroup { target } => {
-                matches!(target, crate::PresentationNodeId::Group { .. })
+                matches!(target, rgv_core::PresentationNodeId::Group { .. })
                     .then_some(())
                     .ok_or_else(|| "the setting target must be a presentation group".to_owned())
             }
@@ -1372,7 +1371,7 @@ impl AutomationSetting {
                 channel,
                 composite_id,
                 ..
-            } => (*channel == crate::TrackChannel::Annotation && *composite_id > 0)
+            } => (*channel == rgv_core::TrackChannel::Annotation && *composite_id > 0)
                 .then_some(())
                 .ok_or_else(|| {
                     "presentation composite must be a positive Annotation composite ID".to_owned()
@@ -1587,7 +1586,7 @@ fn default_alignment_result_limit() -> usize {
 }
 
 const fn default_read_browsing_buffer_percent() -> u16 {
-    crate::DEFAULT_READ_BROWSING_BUFFER_PERCENT
+    rgv_core::DEFAULT_READ_BROWSING_BUFFER_PERCENT
 }
 
 /// Constant-size alignment-scene diagnostics carried by `describe_workspace`. Collecting these
@@ -1742,7 +1741,7 @@ pub struct AutomationWorkspaceSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AutomationPresentationGroupSnapshot {
-    pub channel: crate::TrackChannel,
+    pub channel: rgv_core::TrackChannel,
     pub id: u32,
     pub label: String,
     pub members: Vec<TrackId>,
@@ -1752,14 +1751,14 @@ pub struct AutomationPresentationGroupSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AutomationPresentationCompositeSnapshot {
-    pub channel: crate::TrackChannel,
+    pub channel: rgv_core::TrackChannel,
     pub id: u32,
     pub content_visible: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationPresentationNodeSnapshot {
-    pub id: crate::PresentationNodeId,
+    pub id: rgv_core::PresentationNodeId,
     pub order_index: usize,
     pub desired_content_visible: bool,
     pub effective_content_visible: bool,
@@ -1840,7 +1839,7 @@ const fn default_automation_scale() -> f32 {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationPaneItemLayoutSnapshot {
-    pub id: crate::PresentationNodeId,
+    pub id: rgv_core::PresentationNodeId,
     pub row: AutomationRectSnapshot,
     pub header: AutomationRectSnapshot,
     #[serde(default)]
@@ -1855,7 +1854,7 @@ pub struct AutomationPaneItemLayoutSnapshot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationPaneLayoutSnapshot {
     pub panel_id: PanelId,
-    pub channel: crate::TrackChannel,
+    pub channel: rgv_core::TrackChannel,
     pub pane: AutomationRectSnapshot,
     pub content_bottom: f32,
     pub scroll_points: f32,
@@ -1878,7 +1877,7 @@ pub struct AutomationTrackGestureSnapshot {
     pub kind: AutomationTrackGestureKind,
     pub panel_id: PanelId,
     #[serde(default)]
-    pub target: Option<crate::PresentationNodeId>,
+    pub target: Option<rgv_core::PresentationNodeId>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1911,9 +1910,9 @@ pub struct AutomationLandmarkSnapshot {
     #[serde(default)]
     pub resource_configured: bool,
     #[serde(default)]
-    pub resolution_status: Option<crate::AssemblyResolutionStatus>,
+    pub resolution_status: Option<rgv_core::AssemblyResolutionStatus>,
     #[serde(default)]
-    pub evidence: Option<crate::AssemblyMatchEvidence>,
+    pub evidence: Option<rgv_core::AssemblyMatchEvidence>,
     #[serde(default)]
     pub subset: bool,
     #[serde(default)]
@@ -1931,7 +1930,7 @@ pub struct AutomationLandmarkSnapshot {
     #[serde(default)]
     pub suppressed: bool,
     #[serde(default)]
-    pub gene_asset_format: Option<crate::LandmarkAssetFormat>,
+    pub gene_asset_format: Option<rgv_core::LandmarkAssetFormat>,
     #[serde(default)]
     pub gene_asset_sha256: Option<String>,
     #[serde(default)]
@@ -1944,9 +1943,9 @@ pub struct AutomationGenomeSnapshot {
     #[serde(default)]
     pub context_label: String,
     #[serde(default)]
-    pub assembly_identity: Option<crate::GenomeAssemblyIdentity>,
+    pub assembly_identity: Option<rgv_core::GenomeAssemblyIdentity>,
     #[serde(default)]
-    pub suggested_assembly_identity: Option<crate::GenomeAssemblyIdentity>,
+    pub suggested_assembly_identity: Option<rgv_core::GenomeAssemblyIdentity>,
     pub reference_configured: bool,
     pub reference_ready: bool,
     #[serde(default)]
@@ -2013,9 +2012,9 @@ pub struct AutomationPanelSnapshot {
     #[serde(default)]
     pub read_panel_states: Vec<AutomationReadPanelStateSnapshot>,
     #[serde(default)]
-    pub selected_presentation_nodes: Vec<crate::PresentationNodeId>,
+    pub selected_presentation_nodes: Vec<rgv_core::PresentationNodeId>,
     #[serde(default)]
-    pub presentation_selection_anchor: Option<crate::PresentationNodeId>,
+    pub presentation_selection_anchor: Option<rgv_core::PresentationNodeId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2452,7 +2451,7 @@ pub fn check_automation_remote_url(
     allow_private_network: bool,
 ) -> Result<(), AutomationError> {
     let refused = |reason: &str| AutomationError::RemoteSourceRefused {
-        url: crate::TrackSource::Remote {
+        url: rgv_core::TrackSource::Remote {
             url: url.to_owned(),
         }
         .redacted_label(),
@@ -2512,7 +2511,7 @@ fn ipv4_is_private_network(address: std::net::Ipv4Addr) -> bool {
 /// been resolved against the project's directory, as `SessionDocument::read`
 /// does.
 pub fn check_session_sources_within(
-    document: &crate::SessionDocument,
+    document: &rgv_core::SessionDocument,
     root: impl AsRef<Path>,
     allow_private_network: bool,
 ) -> Result<(), AutomationError> {
@@ -3433,8 +3432,8 @@ mod tests {
                 presentation_selection_anchor: None,
             }],
             tracks: Vec::new(),
-            read_browsing_buffer_percent: crate::DEFAULT_READ_BROWSING_BUFFER_PERCENT,
-            total_cache_budget_mib: crate::DEFAULT_CACHE_BUDGET_MIB,
+            read_browsing_buffer_percent: rgv_core::DEFAULT_READ_BROWSING_BUFFER_PERCENT,
+            total_cache_budget_mib: rgv_core::DEFAULT_CACHE_BUDGET_MIB,
             alignment_scene_budget_bytes: 0,
             alignment_scene_charged_bytes: 0,
             alignment_scene_reserved_bytes: 0,
@@ -3735,7 +3734,7 @@ mod tests {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             commands: vec![AutomationCommand::Configure {
                 setting: AutomationSetting::ReadBrowsingBufferPercent {
-                    value: crate::MAXIMUM_READ_BROWSING_BUFFER_PERCENT + 1,
+                    value: rgv_core::MAXIMUM_READ_BROWSING_BUFFER_PERCENT + 1,
                 },
             }],
         };
@@ -3747,7 +3746,7 @@ mod tests {
             schema_version: AUTOMATION_SCHEMA_VERSION,
             commands: vec![AutomationCommand::Configure {
                 setting: AutomationSetting::TotalCacheBudgetMib {
-                    value: crate::MAXIMUM_CACHE_BUDGET_MIB + 1,
+                    value: rgv_core::MAXIMUM_CACHE_BUDGET_MIB + 1,
                 },
             }],
         };
@@ -4098,7 +4097,7 @@ mod tests {
         symlink(outside.join("private.bam"), root.join("linked.bam")).unwrap();
 
         let project = |source: TrackSource| {
-            let mut document = crate::SessionDocument::new(crate::SessionLocus {
+            let mut document = rgv_core::SessionDocument::new(rgv_core::SessionLocus {
                 contig: "chr1".to_owned(),
                 start: 0,
                 end: 100,
@@ -4112,7 +4111,7 @@ mod tests {
         let remote = |url: &str| TrackSource::Remote {
             url: url.to_owned(),
         };
-        let check = |document: &crate::SessionDocument| {
+        let check = |document: &rgv_core::SessionDocument| {
             check_session_sources_within(document, &root, false)
         };
 

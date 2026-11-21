@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use super::InteractionTraceStage;
-use rgv_core::{AutomationInteractionTrace, AutomationInteractionTraceEvent};
+use rgv_automation::{AutomationInteractionTrace, AutomationInteractionTraceEvent};
 
 const MAXIMUM_TRACE_EVENTS: usize = 128;
 const MAXIMUM_TRACE_DURATION: Duration = Duration::from_millis(500);

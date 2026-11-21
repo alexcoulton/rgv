@@ -222,7 +222,11 @@ Run after Wave 1 is green. Each item is one reviewable change.
 - [ ] ARCH-5 public track contract `query(region, bp_per_px, cancel) → world-coordinate tiles`;
       one paged world-space renderer
 - [ ] ARCH-6 shared I/O and decode pool keyed by visibility; lift the 64-track cap (PROD-9)
-- [ ] ARCH-8 `rgv-model` crate split from `rgv-hts`; automation/stress out of `rgv-core`
+- [x] ARCH-8 `rgv-model` crate split from `rgv-hts`; automation/stress out of `rgv-core`
+      — ADR 0008; layout/scene/render no longer link htslib, reqwest, noodles or bigtools
+        (guarded by `dependency_boundary.rs`); `AlignmentSource`, `AlignmentError` and
+        `derive_alignment_query` stay in `rgv-hts` until the model has its own error type;
+        `rgv-core` keeps `tempfile`, `quick-xml` and `sha2` (session save, IGV import, landmarks)
 - [ ] ARCH-9 reference bases delivered engine-to-engine
 
 ## Wave 4 — product reach

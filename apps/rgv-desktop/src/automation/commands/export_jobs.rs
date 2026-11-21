@@ -12,7 +12,7 @@ use crate::inspection::variant::{variant_evidence_export_tsv, variant_genotype_e
 use crate::workspace_lists::region_bed_export;
 use crate::{Viewer, ui};
 use anyhow::{Context as _, Result};
-use rgv_core::{AutomationExportKind, AutomationSnapshotFormat, AutomationSnapshotScope};
+use rgv_automation::{AutomationExportKind, AutomationSnapshotFormat, AutomationSnapshotScope};
 use rgv_engine::{AlignmentIndividualReadCapability, TrackSnapshotData};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;

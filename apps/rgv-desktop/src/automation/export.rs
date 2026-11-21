@@ -13,10 +13,8 @@ use crate::{
 };
 use anyhow::Result;
 use rgv_alignment_scene::AlleleSummaryDetail;
-use rgv_core::{
-    AutomationSnapshotFormat, AutomationSnapshotScope, GenomicInterval, PanelId, TrackCollection,
-    TrackId, WorkspacePresentation,
-};
+use rgv_automation::{AutomationSnapshotFormat, AutomationSnapshotScope};
+use rgv_core::{GenomicInterval, PanelId, TrackCollection, TrackId, WorkspacePresentation};
 use rgv_engine::{TrackSnapshot, TrackSnapshotData};
 use rgv_hts::AlignmentRecord;
 use rgv_layout::{
@@ -1405,7 +1403,7 @@ mod scale_tests {
         assert_eq!(scale(64.0), 8.0_f32.to_bits());
         // Automation snapshots stay one PNG pixel per logical point unless the command asks.
         assert_eq!(
-            rgv_core::default_snapshot_scale().to_bits(),
+            rgv_automation::default_snapshot_scale().to_bits(),
             1.0_f32.to_bits()
         );
 

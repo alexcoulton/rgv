@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use rgv_core::{
+use rgv_automation::{
     AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationCommand, AutomationCommandStatus,
     AutomationRunReport,
 };
@@ -505,7 +505,7 @@ fn verify_telemetry(
 }
 
 fn verify_environment(
-    telemetry: &rgv_core::AutomationRunTelemetry,
+    telemetry: &rgv_automation::AutomationRunTelemetry,
     expectation: &TelemetryExpectation,
 ) -> Result<EnvironmentEvidence> {
     let environment = &telemetry.environment;
@@ -573,7 +573,7 @@ fn verify_environment(
 }
 
 fn verify_frames(
-    telemetry: &rgv_core::AutomationRunTelemetry,
+    telemetry: &rgv_automation::AutomationRunTelemetry,
     expectation: &TelemetryExpectation,
 ) -> Result<FrameEvidence> {
     let frames = &telemetry.frames;
@@ -618,7 +618,7 @@ fn verify_frames(
 }
 
 fn verify_gpu(
-    gpu: &rgv_core::AutomationGpuTelemetry,
+    gpu: &rgv_automation::AutomationGpuTelemetry,
     expectation: &TelemetryExpectation,
 ) -> Result<()> {
     anyhow::ensure!(gpu.prepared_frames > 0, "no GPU frames were prepared");
@@ -727,7 +727,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use rgv_core::{
+    use rgv_automation::{
         AutomationCommandResult, AutomationEnvironmentTelemetry, AutomationFrameTelemetry,
         AutomationGpuTelemetry, AutomationRunTelemetry,
     };

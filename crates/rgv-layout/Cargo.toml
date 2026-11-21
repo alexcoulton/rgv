@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 rgv-core = { version = "0.1.0", path = "../rgv-core" }
-rgv-hts = { version = "0.1.0", path = "../rgv-hts" }
+rgv-model = { version = "0.1.0", path = "../rgv-model" }
 
 [lints]
 workspace = true

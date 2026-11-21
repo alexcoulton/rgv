@@ -2,8 +2,10 @@ use crate::automation::AutomationAuxiliaryOpenState;
 use crate::sources::track_source;
 use crate::{Viewer, ui};
 use anyhow::{Context as _, Result};
-use rgv_core::{
+use rgv_automation::{
     AutomationLandmarkIntegrityState, AutomationLandmarkSnapshot, AutomationLandmarkTrackState,
+};
+use rgv_core::{
     ContigAliases, FeatureDisplayMode, GenomeAssemblyIdentity, GenomeLandmarkCatalogue,
     LandmarkAssetRole, LandmarkSearchIndex, ReferenceDictionary, TrackConfig, TrackFormat, TrackId,
     TrackKind,

@@ -3,7 +3,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use rgv_core::{
+use rgv_automation::{
     InteractionRecordingState, InteractionRecordingStatus, STRESS_HEALTH_SCHEMA_VERSION,
     StressHealthSnapshot, StressInteractionState,
 };

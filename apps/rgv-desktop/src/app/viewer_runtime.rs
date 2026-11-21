@@ -31,11 +31,11 @@ use crate::{
 use anyhow::{Context as _, Result};
 use egui_wgpu::{RendererOptions, ScreenDescriptor};
 use rgv_alignment_scene::{AlignmentPanelSceneStore, AllocationLedger};
+use rgv_automation::{AutomationEnvironmentTelemetry, AutomationErrorCode};
 use rgv_core::{
-    AutomationEnvironmentTelemetry, AutomationErrorCode, ContigId, GeneticCode, GenomicInterval,
-    ReferenceDictionary, SessionAlignmentTrack, SessionDocument, SessionFilters,
-    SessionPaneTrackState, TrackId, TrackSource, VariantFieldScope, VariantMissingValueRule,
-    Viewport, WorkspacePresentation,
+    ContigId, GeneticCode, GenomicInterval, ReferenceDictionary, SessionAlignmentTrack,
+    SessionDocument, SessionFilters, SessionPaneTrackState, TrackId, TrackSource,
+    VariantFieldScope, VariantMissingValueRule, Viewport, WorkspacePresentation,
 };
 use rgv_engine::{ReferenceEngine, TrackSearchResults};
 use rgv_layout::DisplayList;

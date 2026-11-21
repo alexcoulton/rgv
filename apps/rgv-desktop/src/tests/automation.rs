@@ -12,12 +12,13 @@ use crate::inspection::rna::{AutomationAlignmentExportAuthority, AutomationAlign
 use crate::workspace::alignment_navigation::AlignmentNavigationPhase;
 use crate::workspace::alignments::AlignmentPanelProjection;
 use crate::workspace::panels::ViewPanelController;
-use rgv_core::{
+use rgv_automation::{
     AUTOMATION_SCHEMA_VERSION, AutomationBatch, AutomationCommand, AutomationCommandStatus,
     AutomationErrorCode, AutomationEvidenceField, AutomationRunReport,
     AutomationSelectionGranularity, AutomationSelectionKind, AutomationSelectionSnapshot,
-    AutomationViewportOperation, ContigId, GenomicInterval, PanelId, TrackId, Viewport,
+    AutomationViewportOperation,
 };
+use rgv_core::{ContigId, GenomicInterval, PanelId, TrackId, Viewport};
 use rgv_engine::{AlignmentSceneRequestToken, TrackSnapshot, TrackSnapshotData};
 use rgv_layout::{DisplayList, RectPrimitive, Rgba};
 use rgv_render::PrepareStats;

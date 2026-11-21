@@ -8,10 +8,13 @@ publish = false
 
 [dependencies]
 rgv-core = { version = "0.1.0", path = "../rgv-core" }
-rgv-hts = { version = "0.1.0", path = "../rgv-hts" }
+rgv-model = { version = "0.1.0", path = "../rgv-model" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# Only `allele_summary`'s parity test uses this: it compares scene summaries with
+# `rgv_hts::derive_alignment_query`, whose error type wraps the htslib error.
+rgv-hts = { version = "0.1.0", path = "../rgv-hts" }
 serde_json.workspace = true
 
 [lints]

@@ -25,7 +25,7 @@ use rgv_core::{
     GenomicInterval, JunctionDisplayMode, OverlappingMatePolicy, ReadStackingMode,
     SashimiCountMode, Viewport,
 };
-use rgv_hts::{
+use rgv_model::{
     AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
     AlignmentSourcePosition, AuxField, AuxValue, CigarOp, CigarOpKind, ReferenceSlice,
     SequenceData, TemplateLengthBounds,
@@ -1643,13 +1643,13 @@ fn junction_range_index_matches_exhaustive_scan_and_prunes_narrow_queries() {
             AlignmentSummaryJunctionEntry {
                 start_offset,
                 end_offset: start_offset.saturating_add(5 + index % 7),
-                evidence: rgv_hts::JunctionEvidence {
+                evidence: rgv_model::JunctionEvidence {
                     start: start_offset,
                     end: start_offset.saturating_add(5 + index % 7),
                     depth: (index % 19 + 1) as u32,
                     minimum_left_flank: (index % 11 + 1) as u32,
                     minimum_right_flank: (index % 13 + 1) as u32,
-                    ..rgv_hts::JunctionEvidence::default()
+                    ..rgv_model::JunctionEvidence::default()
                 },
                 expanded_row: (index % 23) as u32,
                 annotation: None,

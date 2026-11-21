@@ -6,7 +6,7 @@ use super::manual_diagnostic_instrumentation::ManualDiagnosticTraceRuntime;
 use super::manual_diagnostic_trace::ManualDiagnosticTraceRecorder;
 use super::stress_health::StressHealthPublisher;
 use super::{HealthSignal, LatencyEvent};
-use rgv_core::{
+use rgv_automation::{
     AutomationInteractionTrace, AutomationWorkspaceSnapshot, InteractionRecordingStatus,
     NativeObservationSummary, StressHealthSnapshot, StressTarget,
 };

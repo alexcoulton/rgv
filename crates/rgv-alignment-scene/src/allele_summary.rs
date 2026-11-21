@@ -1,6 +1,6 @@
 use std::{mem::size_of, sync::Arc};
 
-use rgv_hts::{
+use rgv_model::{
     AlignmentMateAlignment, AlignmentMateOverlapCollapser, CigarOpKind, PileupBin, PileupBuilder,
     SequenceView, aligned_observation, base_observation_is_counted, bisulfite_strand_is_reverse,
 };
@@ -425,7 +425,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use rgv_core::{ContigId, GenomicInterval, OverlappingMatePolicy};
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentPayloadBatch, AlignmentRecord,
         AlignmentSourcePosition, CigarOp, SequenceData,
     };
@@ -758,34 +758,34 @@ mod tests {
             batch.push(record).unwrap();
         }
         let whole = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
-        let resident = rgv_hts::AlignmentQuery {
+        let resident = rgv_model::AlignmentQuery {
             interval: whole,
-            header: Arc::new(rgv_hts::AlignmentHeaderMetadata::default()),
+            header: Arc::new(rgv_model::AlignmentHeaderMetadata::default()),
             batch,
-            pileup: rgv_hts::PileupSummary::default(),
-            junctions: rgv_hts::JunctionSummary::default(),
-            pairs: rgv_hts::PairSummary::default(),
+            pileup: rgv_model::PileupSummary::default(),
+            junctions: rgv_model::JunctionSummary::default(),
+            pairs: rgv_model::PairSummary::default(),
             reference: None,
-            stats: rgv_hts::QueryStats {
+            stats: rgv_model::QueryStats {
                 records_seen: 2,
                 records_eligible: 2,
                 records_emitted: 2,
                 complete_read_limit: 100,
-                ..rgv_hts::QueryStats::default()
+                ..rgv_model::QueryStats::default()
             },
         };
-        let options = rgv_hts::QueryOptions {
-            detail: rgv_hts::QueryDetail::Full,
+        let options = rgv_model::QueryOptions {
+            detail: rgv_model::QueryDetail::Full,
             max_records: std::num::NonZeroUsize::new(100).unwrap(),
             coverage_bins: std::num::NonZeroUsize::new(100).unwrap(),
             collect_alleles: true,
             overlapping_mate_policy: OverlappingMatePolicy::CountOnce,
             minimum_base_quality: 10,
-            ..rgv_hts::QueryOptions::default()
+            ..rgv_model::QueryOptions::default()
         };
         let direct = rgv_hts::derive_alignment_query(
             &resident,
-            &rgv_hts::AlignmentOverlapIndex::new(&resident.batch),
+            &rgv_model::AlignmentOverlapIndex::new(&resident.batch),
             whole,
             &options,
             None,

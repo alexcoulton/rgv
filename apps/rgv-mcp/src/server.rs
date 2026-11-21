@@ -1,18 +1,20 @@
 use std::path::Path;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use rgv_automation::{
+    AUTOMATION_SCHEMA_VERSION, AutomationAlignmentRelationship, AutomationAlignmentReveal,
+    AutomationAlignmentSelector, AutomationBatch, AutomationCommand, AutomationCommandStatus,
+    AutomationExportKind, AutomationHistoryNavigation, AutomationInteractionTrace,
+    AutomationNavigationDestination, AutomationReviewNavigation, AutomationRunReport,
+    AutomationSelection, AutomationSetting, AutomationSnapshotFormat, AutomationSnapshotScope,
+    AutomationUnsavedChangesPolicy, AutomationViewportOperation, AutomationWorkspaceSnapshot,
+};
 use rgv_control_client::{ControlClient, ControlClientError};
 use rgv_core::{
-    AUTOMATION_SCHEMA_VERSION, AlignmentAuxComparison, AlignmentAuxFilterValue,
-    AlignmentCigarEventPredicate, AlignmentColorMode, AlignmentFlagPredicate, AlignmentGroupMode,
-    AlignmentOrderDirection, AlignmentPredicateExpression, AlignmentPredicateScope,
-    AlignmentSortMode, AlignmentViewPredicate, AutomationAlignmentRelationship,
-    AutomationAlignmentReveal, AutomationAlignmentSelector, AutomationBatch, AutomationCommand,
-    AutomationCommandStatus, AutomationExportKind, AutomationHistoryNavigation,
-    AutomationInteractionTrace, AutomationNavigationDestination, AutomationReviewNavigation,
-    AutomationRunReport, AutomationSelection, AutomationSetting, AutomationSnapshotFormat,
-    AutomationSnapshotScope, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
-    AutomationWorkspaceSnapshot, PanelId, TrackId, TrackKind, TrackSource,
+    AlignmentAuxComparison, AlignmentAuxFilterValue, AlignmentCigarEventPredicate,
+    AlignmentColorMode, AlignmentFlagPredicate, AlignmentGroupMode, AlignmentOrderDirection,
+    AlignmentPredicateExpression, AlignmentPredicateScope, AlignmentSortMode,
+    AlignmentViewPredicate, PanelId, TrackId, TrackKind, TrackSource,
 };
 use rmcp::schemars;
 use rmcp::{
@@ -48,7 +50,7 @@ pub(crate) const MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION: u32 = AUTOMATION_SCHEM
 const BATCH_SCHEMA_VERSION: u32 = MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION;
 const _: () = assert!(
     MINIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION <= MAXIMUM_SUPPORTED_VIEWER_SCHEMA_VERSION
-        && rgv_core::MINIMUM_AUTOMATION_SCHEMA_VERSION <= BATCH_SCHEMA_VERSION
+        && rgv_automation::MINIMUM_AUTOMATION_SCHEMA_VERSION <= BATCH_SCHEMA_VERSION
 );
 
 const DEFAULT_SETTLE_TIMEOUT_MILLIS: u64 = 30_000;
@@ -183,7 +185,7 @@ impl RgvMcpServer {
             path: temporary.path().display().to_string(),
             scope,
             format: AutomationSnapshotFormat::Png,
-            scale: rgv_core::default_snapshot_scale(),
+            scale: rgv_automation::default_snapshot_scale(),
         });
         commands.push(AutomationCommand::DescribeWorkspace);
         match self
@@ -367,7 +369,7 @@ impl RgvMcpServer {
     )]
     async fn get_selection(&self) -> CallToolResult {
         match self
-            .execute_with_data::<Option<rgv_core::AutomationSelectionSnapshot>>(
+            .execute_with_data::<Option<rgv_automation::AutomationSelectionSnapshot>>(
                 vec![AutomationCommand::DescribeSelection],
                 0,
                 "selection",
@@ -2932,7 +2934,8 @@ mod tests {
         assert!(viewer_schema_compatibility(0, None).is_err());
         // Every supported viewer accepts the version stamped on generated batches.
         assert!(
-            (rgv_core::MINIMUM_AUTOMATION_SCHEMA_VERSION..=minimum).contains(&BATCH_SCHEMA_VERSION)
+            (rgv_automation::MINIMUM_AUTOMATION_SCHEMA_VERSION..=minimum)
+                .contains(&BATCH_SCHEMA_VERSION)
         );
     }
 
@@ -4348,7 +4351,7 @@ mod tests {
         // string spelling of the `tag` colour mode. No core setting is withheld.
         mirror!(
             ToolSetting,
-            rgv_core::AutomationSetting,
+            rgv_automation::AutomationSetting,
             [],
             adapter_only: ["alignmentcolortag"]
         );
@@ -4357,7 +4360,7 @@ mod tests {
         // `native_window` is the separate `rgv_capture_window` tool.
         mirror!(
             ToolSnapshotScope,
-            rgv_core::AutomationSnapshotScope,
+            rgv_automation::AutomationSnapshotScope,
             ["nativewindow"]
         );
         assert!(failures.is_empty(), "{failures:#?}");

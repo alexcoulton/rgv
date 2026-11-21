@@ -100,7 +100,7 @@ impl AlignmentInteractionState {
 mod tests {
     use super::*;
     use crate::{AlignmentSourceRevision, RevisionFingerprint, SourceFingerprint};
-    use rgv_hts::AlignmentSourcePosition;
+    use rgv_model::AlignmentSourcePosition;
 
     fn handle(position: u64) -> AlignmentHandle {
         AlignmentHandle::new(

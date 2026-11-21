@@ -1,7 +1,9 @@
 use std::{mem::size_of, sync::Arc};
 
 use rgv_core::GenomicInterval;
-use rgv_hts::{JunctionEvidence, JunctionProvenance, ModificationSummary, PairSummary, PileupBin};
+use rgv_model::{
+    JunctionEvidence, JunctionProvenance, ModificationSummary, PairSummary, PileupBin,
+};
 use thiserror::Error;
 
 use crate::{

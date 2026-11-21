@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rgv_core::{
+use rgv_automation::{
     AutomationWorkspaceSnapshot, NativeObservationSummary, StressFailureClass,
     StressFailureSignature, StressHealthSnapshot, StressPredicate,
 };

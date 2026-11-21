@@ -11,11 +11,12 @@ use crate::workspace::tracks::replace_panel_track_selection;
 use crate::{AutomationAlignmentHandleTarget, Viewer, ui};
 use anyhow::{Context as _, Result};
 use rgv_alignment_scene::{AlignmentComponent, AlignmentHandle, AlignmentHit};
-use rgv_core::{
+use rgv_automation::{
     AutomationAlignmentRelationship, AutomationAlignmentReveal, AutomationAlignmentSelector,
     AutomationAlignmentState, AutomationNavigationDestination, AutomationSelection,
-    AutomationViewportOperation, PanelId, TrackId,
+    AutomationViewportOperation,
 };
+use rgv_core::{PanelId, TrackId};
 use rgv_engine::{AlignmentIndividualReadCapability, TrackSnapshotData};
 use rgv_hts::{
     AlignmentRecord, AuxPredicate, SequenceData, TemplateLengthBounds, decode_modified_bases,

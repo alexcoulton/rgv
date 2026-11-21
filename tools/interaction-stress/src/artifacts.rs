@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use rgv_core::{InteractionStressRunManifest, StressArtifactReference, StressRunState};
+use rgv_automation::{InteractionStressRunManifest, StressArtifactReference, StressRunState};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
@@ -185,7 +185,7 @@ fn checksum(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use rgv_core::InteractionStressRunManifest;
+    use rgv_automation::InteractionStressRunManifest;
 
     use super::*;
 
@@ -195,12 +195,12 @@ mod tests {
             run_id: "run-1".to_owned(),
             state: StressRunState::Running,
             scenario_name: "test".to_owned(),
-            scenario_schema: rgv_core::INTERACTION_STRESS_SCHEMA_NAME.to_owned(),
-            scenario_schema_version: rgv_core::INTERACTION_STRESS_SCHEMA_VERSION,
+            scenario_schema: rgv_automation::INTERACTION_STRESS_SCHEMA_NAME.to_owned(),
+            scenario_schema_version: rgv_automation::INTERACTION_STRESS_SCHEMA_VERSION,
             seed: None,
-            requirements: rgv_core::StressRequirements::default(),
-            limits: rgv_core::StressRunLimits::default(),
-            environment: rgv_core::StressRunEnvironment::default(),
+            requirements: rgv_automation::StressRequirements::default(),
+            limits: rgv_automation::StressRunLimits::default(),
+            environment: rgv_automation::StressRunEnvironment::default(),
             application_instance_id: "instance".to_owned(),
             process_id: 4,
             started_unix_millis: 1,

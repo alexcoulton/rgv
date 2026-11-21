@@ -153,7 +153,8 @@ pub struct PileupProvenance {
 /// memory growth; incomplete results are explicitly reported in provenance.
 pub const MAX_PILEUP_DEPTH_EVENTS: usize = 2_000_000;
 
-pub(crate) const MAX_PENDING_PAIR_OVERLAPS: usize = 100_000;
+#[doc(hidden)]
+pub const MAX_PENDING_PAIR_OVERLAPS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OverlapMask {
@@ -593,7 +594,8 @@ impl OverlapCollapser {
     }
 
     #[cfg(test)]
-    pub(crate) fn pending_len(&self) -> usize {
+    #[doc(hidden)]
+    pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
 }
@@ -830,7 +832,8 @@ impl PileupBuilder {
     }
 
     #[cfg(test)]
-    pub(crate) fn add_base(&mut self, position: u64, base: u8, quality: Option<u8>, reverse: bool) {
+    #[doc(hidden)]
+    pub fn add_base(&mut self, position: u64, base: u8, quality: Option<u8>, reverse: bool) {
         self.add_base_with_bisulfite_strand(position, base, quality, reverse, reverse);
     }
 

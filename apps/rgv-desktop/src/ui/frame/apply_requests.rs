@@ -10,7 +10,8 @@ use crate::inspection::variant::{
 use crate::sources::source_path;
 use crate::ui::frame::ShellFrame;
 use crate::{Viewer, apply_accessibility_preferences};
-use rgv_core::{AutomationSnapshotFormat, AutomationSnapshotScope, MAXIMUM_VIEW_PANELS};
+use rgv_automation::{AutomationSnapshotFormat, AutomationSnapshotScope};
+use rgv_core::MAXIMUM_VIEW_PANELS;
 use rgv_render::ContextSceneGpuFrame;
 use std::path::Path;
 

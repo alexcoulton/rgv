@@ -6,11 +6,11 @@ use crate::automation::{
 };
 use crate::sources::{inferred_automation_track_kind, source_path, track_source};
 use crate::{AUTOMATION_SOURCE_OPEN_TIMEOUT, Viewer};
-use rgv_core::{
+use rgv_automation::{
     AutomationCommand, AutomationErrorCode, AutomationExportKind, AutomationSelection,
     AutomationSelectionGranularity, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
-    SessionDocument, SessionLocus, TrackKind, TrackSource,
 };
+use rgv_core::{SessionDocument, SessionLocus, TrackKind, TrackSource};
 use rgv_layout::{AlignmentGroupMode, AlignmentSortMode};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

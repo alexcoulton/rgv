@@ -1,6 +1,6 @@
 use std::{mem::size_of, sync::Arc};
 
-use rgv_hts::{
+use rgv_model::{
     AlignmentMateAlignment, AlignmentMateOverlapCollapser, CigarOpKind, ExactDepthRun,
     ExactDepthTile, ExactDepthTileBuilder,
 };
@@ -297,7 +297,7 @@ impl ExactDepthSummaryTile {
 
 /// Aligned (`M`/`=`/`X`) operations of `record` with at least one base inside `tile`.
 fn aligned_operations_in_tile(
-    record: rgv_hts::AlignmentRecordView<'_>,
+    record: rgv_model::AlignmentRecordView<'_>,
     tile: rgv_core::GenomicInterval,
 ) -> usize {
     let mut count = 0_usize;
@@ -360,7 +360,7 @@ mod tests {
     use std::num::{NonZeroU64, NonZeroUsize};
 
     use rgv_core::{ContigId, GenomicInterval, OverlappingMatePolicy};
-    use rgv_hts::{
+    use rgv_model::{
         AlignmentBatch, AlignmentFlags, AlignmentRecord, AlignmentSourcePosition, CigarOp,
         SequenceData,
     };
