@@ -1286,7 +1286,10 @@ impl Viewer {
         self.dispatch_due_resolution_query_refresh(now);
         self.poll_reference_events();
         self.poll_alignment_events();
-        let ledger_progressed = self.alignment_ledger_progress.take_pending();
+        // Both are drained every poll; under the strict policy they watch the same ledger.
+        let scene_ledger_progressed = self.alignment_ledger_progress.take_pending();
+        let gpu_ledger_progressed = self.alignment_gpu_ledger_progress.take_pending();
+        let ledger_progressed = scene_ledger_progressed || gpu_ledger_progressed;
         if ledger_progressed {
             self.diagnostics.health(HealthSignal::WorkerProgress);
         }

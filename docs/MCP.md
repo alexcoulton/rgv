@@ -108,8 +108,16 @@ host configuration details. This example passes only the protected file's path; 
   `rgv_refresh_selection` is the only operation that replaces that evidence explicitly.
 - Position selection defaults to `exact_base`; choose `visible_bin` only when the current rendered
   bin is itself the evidence under review. `anchor_position` and the evidence interval are
-  intentionally separate. A settled annotation snapshot is selected in its current viewport;
-  only alignment evidence that lacks an exact one-base pileup bin may require a one-base query.
+  intentionally separate. A settled annotation snapshot is selected in its current viewport.
+  When alignment evidence has no exact one-base pileup at the current zoom, an `exact_base`
+  selection (and `rgv_refresh_selection` of one) **fits the panel's viewport to that single base**
+  and waits up to 30 seconds for the query; the view stays there afterwards. A position outside
+  the viewport recentres the panel on it. Use `rgv_query_pileup` to read counts without moving
+  the view.
+- `rgv_navigate` with one locus retargets only the active panel; with two or more loci it
+  replaces the whole panel arrangement, one panel per locus. `chr1:12345` shows that base with
+  20 bases of flank on each side and a bare contig name shows the whole contig. Gene symbols are
+  not resolved.
 
 ## Tools
 
@@ -129,11 +137,11 @@ host configuration details. This example passes only the protected file's path; 
 | `rgv_select_alignment` | Selects one opaque alignment handle and can atomically leave it, center it, or fit it in view. |
 | `rgv_get_related_alignments` | Describes mate and supplementary-chain availability. |
 | `rgv_navigate_related_alignment` | Opens a mate or chain segment. |
-| `rgv_navigate` | Replaces the visible panel arrangement with exact locus strings. |
+| `rgv_navigate` | Retargets the active panel (one locus) or replaces the panel arrangement (two to 16 loci) with exact locus strings. |
 | `rgv_change_viewport` | Pans by bases/fraction, zooms around an optional anchor, or fits an interval. |
-| `rgv_load_track` | Loads a typed local path or HTTP/S remote source and returns the command report. |
+| `rgv_load_track` | Loads a typed local path, or for alignment tracks an HTTP/S remote source, and returns the command report. |
 | `rgv_remove_track` | Destructively removes one stable track ID. |
-| `rgv_configure` | Applies a valid-by-construction typed setting and returns effective state. |
+| `rgv_configure` | Applies any typed automation setting and returns effective state. |
 | `rgv_group_alignments` | Applies a typed grouping mode and group order to stable alignment track IDs. |
 | `rgv_sort_alignments` | Applies a typed sort mode and direction. |
 | `rgv_filter_alignments` | Applies RGV's validated alignment-filter expression. |
@@ -143,11 +151,15 @@ host configuration details. This example passes only the protected file's path; 
 | `rgv_export` | Writes a structured export under the root and inlines only small UTF-8 results, with read names pseudonymized unless `include_read_names: true`. |
 | `rgv_save_workspace` | Saves an RGV project under the root. |
 | `rgv_open_workspace` | Explicitly replaces the window with a root-confined saved project. |
-| `rgv_execute_batch` | Advanced ordered escape hatch, limited to 100 validated commands. |
+| `rgv_query_pileup` | Reads per-base depth and A/C/G/T/N, insertion and deletion counts in the active panel's current view, as paginated JSON. Never navigates. |
+| `rgv_query_variants` | Lists variant records overlapping an interval of the active panel's current view, as paginated JSON. Never navigates. |
+| `rgv_execute_batch` | Advanced ordered escape hatch, limited to 100 validated commands; its argument schema is the full automation command schema. |
 
 `rgv_execute_batch` always rejects `exit`. It rejects `new_workspace` unless
-`allow_destructive` is true. Focused tools should be preferred because their generated schemas,
-annotations, defaults, and result interpretation are more precise.
+`allow_destructive` is true. A command that does not match the published schema, or that fails
+shared validation, is returned as an `invalid_batch` tool error naming the problem. Focused tools
+should be preferred because their annotations, defaults, and result interpretation are more
+precise.
 
 Typed configuration reports `requested`, `effective`, `changed`, and `clamped`. Group, sort, and
 filter reports additionally expose `no_op`; an empty filter expression is the explicit operation
@@ -155,7 +167,90 @@ for clearing an alignment filter. This makes an applied clamp or idempotent call
 from a mutation that changed the viewer.
 
 Every argument in the generated tool schemas carries a description stating its unit and, for
-genomic coordinates, whether it is zero-based or one-based and half-open or inclusive.
+genomic coordinates, whether it is zero-based or one-based and half-open or inclusive. This holds
+for the nested schemas too: `rgv_execute_batch.commands` publishes the real `AutomationCommand`
+schema (every command, setting, selector, mode and option), generated from the same `rgv-core`
+types the viewer deserializes, so it cannot drift from the wire format. A test fails if any
+property in any tool's schema lacks a description. The cost is size: the published input schemas
+total roughly 190 KB, of which `rgv_execute_batch` is about 90 KB and `rgv_configure` about
+50 KB.
+
+### Typed arguments and their wire forms
+
+Tool arguments are the `rgv-core` wire types themselves wherever the wire format is the same
+(viewport operations, selections, selectors, review and history navigation, reveal, relationship,
+destination, export kind, unsaved-changes policy, sort/group direction, presentation nodes and
+channels, and every setting). A few arguments keep a friendlier MCP spelling:
+
+| Tool argument | MCP spelling | Core wire form (used inside `rgv_execute_batch`) |
+|---|---|---|
+| `rgv_load_track.source` | `{"kind": "local", "path": ".."}` / `{"kind": "remote", "url": ".."}` | `{"Local": {"path": ".."}}` / `{"Remote": {"url": ".."}}` |
+| `rgv_load_track.kind` | `gene_model` (snake case) | `GeneModel` (capitalised) |
+| `rgv_group_alignments.mode`, `rgv_sort_alignments.mode` | `"tag"` plus the separate `tag: "HP"` argument | the command's own `tag: "HP"` field, which overrides `mode` |
+| `rgv_configure` `alignment_color_tag` | `{"setting": "alignment_color_tag", "track_ids": [3], "tag": "HP"}` | `alignment_color_mode` with `value: {"tag": [72, 80]}` (two ASCII byte values) |
+| `rgv_configure` `alignment_view_filter` / `alignment_highlight_filter` | `predicates: [...]` with `tag: "NM"`, `observed_base: "T"`, `{"type": "float", "value": 2.5}` | `value: {"version": 1, "all": [...]}` with `tag: [78, 77]`, `observed_base: 84`, `{"type": "float_bits", "value": <IEEE-754 bits>}` |
+| `rgv_capture_view.scope` | no `native_window` (use `rgv_capture_window`) | `native_window` also exists |
+
+`rgv_configure` accepts every core setting. Besides the display, presentation and scroll
+settings it offers `complete_read_limit` (1000 to 10000000 records), `read_stacking_mode`
+(`stable` or `compact`), `rebuild_stable_read_architecture`, `read_browsing_buffer_percent`
+(0 to 400) and `total_cache_budget_mib` (128 to 4096); the last two are written to the user's
+desktop settings and outlive the workspace. `alignment_color_mode` takes every colour mode,
+including `{"bisulfite": "cg"}`, `{"smrt_kinetics": "subread_ipd"}`, `{"ultima": {}}` and
+`{"sbx": {}}`. The two filter settings also accept the core `value` form shown above.
+
+Some settings are narrower than their names suggest. `show_reference`, `show_coverage`,
+`show_junctions`, `view_as_pairs`, `include_secondary`, `include_supplementary`,
+`coverage_scale_transform`, `read_base_display_mode`, `shade_read_bases_by_quality`,
+`show_modified_bases`, `modified_base_color_mode` and `overlapping_mate_policy` are stored in the
+first (primary) alignment track's settings. `show_reads`, `alignment_density` and
+`vertical_scroll_points` act on the primary alignment track only. `track_height`,
+`track_collapsed` and `track_visible` address a track's annotation-channel row, and
+`track_collapsed: true` is the same operation as `track_visible: false`. `alignment_density`
+passes batch validation from 0.25 but the viewer rejects values below 0.35;
+`read_panel_density` raises such values to 0.35 and reports `clamped`.
+`presentation_node_visible` and `presentation_node_height` take the reference lane or a track,
+not a group, and `presentation_composite_visible` exists for the annotation channel only.
+
+### Evidence queries
+
+`rgv_query_pileup` and `rgv_query_variants` answer from the viewer's own structured `export` of
+the active panel's current interval, written to a temporary artifact that is removed on every
+outcome. They send only `wait_until_settled` and `export`, so they change neither the viewport
+nor the selection. Consequently the requested interval must lie inside the active panel's
+current view; otherwise the call fails with `interval_not_in_view` and a message giving the view.
+Navigate first with `rgv_navigate`.
+
+Shared arguments: optional `contig` (a guard: the call fails rather than answer for a different
+contig), `start` (zero-based inclusive), `end` (zero-based exclusive; omitted with `start` it
+means that one base, and omitting both means the whole view), optional `track_ids`, `offset`,
+`limit`, `wait_until_settled` and `timeout_millis`. Every result reports `genome`, `contig`,
+zero-based half-open `query_start`/`query_end` and `view_start`/`view_end`, per-track
+provenance in `tracks`, and `page` with `total_matching`, `offset`, `returned`, `truncated` and
+`next_offset`. `source_export_truncated` is true when the viewer's export itself hit its 64 MiB
+limit, in which case later rows are missing.
+
+- `rgv_query_pileup` (`limit` 1 to 500, default 50) returns `sites`, each with `track_id`,
+  zero-based `position`, `depth`, `forward_depth`, `reverse_depth`, `counts` (`A`, `C`, `G`,
+  `T`, `N`, `insertion`, `deletion`), and `mean_base_quality`/`mean_mapping_quality` (`null`
+  when unavailable). Bases with no coverage are omitted and the reference base is not reported.
+  Check each track's `alleles_available` in `tracks`: when it is false the allele counts are not
+  meaningful and only the depths should be used. The viewer refuses the export, and the tool
+  returns its error, when the committed scene cannot supply single-base depth for the whole
+  view. No read-level data is returned.
+- `rgv_query_variants` (`limit` 1 to 200, default 25) returns `variants`, each with `track_id`,
+  `contig`, zero-based half-open `start`/`end`, `id`, `ref`, `alt`, `qual`, `filters` and
+  `types`. `include_info: true` adds up to 64 INFO fields per record and
+  `include_genotypes: true` up to 64 genotypes per record; free-text values are cut at 256
+  bytes, with `*_truncated` flags. Sample names are replaced by `sample_1`, `sample_2`, ... in
+  first-appearance order (stable across pages of the same view) unless
+  `include_sample_names: true`; `sample_names` reports `pseudonymized`, `included` or
+  `not_requested`.
+
+Two queries are **not** available because the control protocol has no command that can answer
+them without changing the window: annotation features or genes overlapping an interval, and
+navigation to a gene symbol. `rgv_select` can inspect the single feature under one position, but
+it replaces the selection and can move the view.
 
 ### Schema compatibility
 
@@ -252,7 +347,11 @@ coordinates.
   read sequences, and arbitrary alignment tags.
 - Exact read names may be supplied as sensitive `rgv_find_alignments` input. They are matched only
   in the desktop process, redacted if a batch is serialized, never echoed in search or selection
-  results, and replaced by random opaque handles that expire when the backing query changes.
+  results, and replaced by random opaque handles that expire when the backing query changes or
+  `rgv_find_alignments` is called again.
+- `rgv_query_pileup` returns aggregate counts only. `rgv_query_variants` returns no INFO fields or
+  genotypes unless asked, and pseudonymizes sample names unless `include_sample_names: true`.
+  Neither tool leaves an export file behind.
 - `rgv_export` is the one tool whose purpose is to write record-level evidence. The file it writes
   under the control root always contains the original read names (the `read_name` column of
   `alignments`, `filtered_alignments`, and `eligible_alignments`, and the `Read` row of
@@ -288,9 +387,9 @@ Tool failures contain structured `error.code` and `error.message` fields. `error
 redacted as described under "Bounds and privacy" and bounded to 4 KiB. Stable adapter codes
 include `unavailable`, `unauthorized`, `unsupported_version`, `invalid_input`, `invalid_batch`,
 `forbidden_command`, `destructive_confirmation_required`, `invalid_response`,
-`response_too_large`, `state_reobservation_failed`, and `artifact_error`. Viewer failures preserve the lower-case shared error
-codes, including `invalid_setting_scope`, `setting_out_of_range`, `effective_state_unavailable`,
-`no_selection`, `selection_stale`, `stale_handle`, `ambiguous_alignment_match`,
+`response_too_large`, `state_reobservation_failed`, `interval_not_in_view`, and `artifact_error`.
+Viewer failures preserve the lower-case shared error codes, including `invalid_setting_scope`,
+`setting_out_of_range`, `effective_state_unavailable`, `no_selection`, `selection_stale`, `stale_handle`, `ambiguous_alignment_match`,
 `related_alignment_unavailable`, `review_item_not_found`, `history_boundary`, `unsaved_changes`,
 `workspace_replacement_not_confirmed`, and `workspace_revision_conflict`.
 Selection, setting, history, review, relationship, and persistence failures additionally preserve
@@ -311,6 +410,8 @@ Selection, setting, history, review, relationship, and persistence failures addi
 - `state_reobservation_failed`: the adapter detected an interrupted mutation but could not inspect
   the resulting workspace; restore connectivity before retrying.
 - `artifact_error`: verify root permissions and ensure no path component is a symbolic link.
+- `interval_not_in_view`: an evidence query asked about a contig or interval outside the active
+  panel's current view; navigate there with `rgv_navigate` and retry.
 
 Calls are mutually exclusive in the adapter and again in the viewer, but concurrently submitted
 JSON-RPC requests have no guaranteed admission order. Await a response before issuing a dependent

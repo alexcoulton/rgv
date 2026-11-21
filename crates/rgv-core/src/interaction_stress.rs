@@ -260,40 +260,67 @@ const fn default_stress_barrier_timeout_millis() -> u64 {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StressTarget {
+    /// The whole workspace rectangle of the window.
     Window,
+    /// The genomic canvas of one panel.
     GenomicCanvas {
+        /// Positive stable ID of the panel that contains the target.
         panel_id: PanelId,
     },
+    /// The reads-channel content of one alignment track in one panel.
     ReadCanvas {
+        /// Positive stable ID of the panel that contains the target.
         panel_id: PanelId,
+        /// Positive stable ID of the alignment track whose read rows are targeted.
         track_id: TrackId,
     },
+    /// The vertical read scrollbar of one alignment track in one panel.
     ReadScrollbar {
+        /// Positive stable ID of the panel that contains the target.
         panel_id: PanelId,
+        /// Positive stable ID of the alignment track whose scrollbar is targeted.
         track_id: TrackId,
     },
+    /// The header of one presentation node in one panel.
     TrackHeader {
+        /// Positive stable ID of the panel that contains the target.
         panel_id: PanelId,
+        /// The presentation node whose header is targeted.
         target: PresentationNodeId,
     },
+    /// The overview row of one panel's header.
     Overview {
+        /// Positive stable ID of the panel that contains the target.
         panel_id: PanelId,
     },
+    /// The ruler row of one panel's header.
     Ruler {
+        /// Positive stable ID of the panel that contains the target.
         panel_id: PanelId,
     },
+    /// The content rectangle of one presentation node in one panel.
     PaneContent {
+        /// Positive stable ID of the panel that contains the target.
         panel_id: PanelId,
+        /// The presentation node whose content is targeted.
         target: PresentationNodeId,
     },
+    /// The header rectangle of one presentation node in one panel's pane layout.
     PaneHeader {
+        /// Positive stable ID of the panel that contains the target.
         panel_id: PanelId,
+        /// The presentation node whose header is targeted.
         target: PresentationNodeId,
     },
+    /// A user-interface element addressed by its accessibility identifier.
     Accessibility {
+        /// Accessibility identifier of the element. The set of identifiers is unverified.
         identifier: String,
     },
+    /// Raw window coordinates, valid only at one window size.
     WindowCoordinate {
+        /// Window client-area size `[width, height]` in logical points that the coordinates
+        /// were recorded at.
         required_logical_size: [u32; 2],
     },
 }

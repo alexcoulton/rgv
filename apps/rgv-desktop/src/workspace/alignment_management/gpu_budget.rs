@@ -11,7 +11,10 @@ use crate::{
     AlignmentGpuPublicationRetry, AlignmentGpuPublicationRetryGate, AlignmentGpuSpeculationPhase,
     AlignmentScenePublicationAttempt, Viewer,
 };
-use rgv_alignment_scene::{AlignmentPageKey, LedgerError, LedgerProgressEpoch};
+use rgv_alignment_scene::{
+    AlignmentPageKey, AllocationLedger, AllocationOwner, AllocationOwnerShares, LedgerError,
+    LedgerProgressEpoch,
+};
 use rgv_core::TrackId;
 use rgv_render::{AlignmentSummaryGpuPageKey, GpuBudgetPressure, GpuReclaimGoal, GpuReclaimReport};
 use std::collections::HashSet;
@@ -41,7 +44,7 @@ impl Viewer {
         attempt: &AlignmentScenePublicationAttempt,
         blocker: AlignmentGpuPublicationBlocker,
     ) {
-        let snapshot = match self.alignment_scene_ledger.progress() {
+        let snapshot = match self.alignment_gpu_ledger.progress() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.alignment_gpu_publication_retry = None;
@@ -80,7 +83,7 @@ impl Viewer {
         self.wait_alignment_navigation_transactions_for_gpu(navigation_candidates);
         self.defer_alignment_gpu_publication(attempt, blocker);
 
-        let snapshot = match self.alignment_scene_ledger.progress() {
+        let snapshot = match self.alignment_gpu_ledger.progress() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.alignment_capacity_reclaim = None;
@@ -105,15 +108,20 @@ impl Viewer {
         // would ask source/semantic owners to evict bytes already proved to disappear atomically.
         let target_charged = alignment_gpu_pressure_target_charged(pressure, &snapshot);
         let mut pending_tracks = HashSet::new();
-        for track in &self.alignment_tracks {
-            let Some(engine) = &track.scene_engine else {
-                continue;
-            };
-            if engine
-                .try_evict_inactive_for_headroom(request_id, target_charged)
-                .is_ok()
-            {
-                pending_tracks.insert(track.config.id);
+        // Under the bounded policy GPU pages have a ledger of their own: no source engine holds
+        // capacity which could admit this candidate, so none is asked and the cycle settles at
+        // once instead of waiting on another layer.
+        if !self.alignment_gpu_ledger_is_private() {
+            for track in &self.alignment_tracks {
+                let Some(engine) = &track.scene_engine else {
+                    continue;
+                };
+                if engine
+                    .try_evict_inactive_for_headroom(request_id, target_charged)
+                    .is_ok()
+                {
+                    pending_tracks.insert(track.config.id);
+                }
             }
         }
         self.alignment_capacity_reclaim = Some(AlignmentCapacityReclaimCycle {
@@ -178,7 +186,7 @@ impl Viewer {
         {
             return;
         }
-        let snapshot = match self.alignment_scene_ledger.progress() {
+        let snapshot = match self.alignment_gpu_ledger.progress() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.alignment_gpu_publication_retry = None;
@@ -245,7 +253,7 @@ impl Viewer {
         let Some(retry) = self.alignment_gpu_publication_retry else {
             return;
         };
-        let snapshot = match self.alignment_scene_ledger.progress() {
+        let snapshot = match self.alignment_gpu_ledger.progress() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.alignment_gpu_publication_retry = None;
@@ -294,20 +302,22 @@ impl Viewer {
         self.alignment_gpu_speculation_gate
             .suppress_for_foreground_pressure();
 
-        if let Some(pressure) = alignment_source_pressure_gpu_budget(pressure) {
-            let baseline = self.alignment_scene_ledger.progress()?;
+        if !self.alignment_gpu_ledger_is_private()
+            && let Some(pressure) = alignment_source_pressure_gpu_budget(pressure)
+        {
+            let baseline = self.alignment_gpu_ledger.progress()?;
             let occupied = baseline.charged.saturating_add(baseline.reserved);
             let goal = GpuReclaimGoal::new(pressure, occupied)
                 .with_additional_headroom_above_floor(pressure.requested_bytes, baseline.pinned);
             if goal.is_feasible() && !goal.is_satisfied_at(occupied) {
                 let reads = self.alignment_gpu_renderer.reclaim_for_goal(
-                    &self.alignment_scene_ledger,
+                    &self.alignment_gpu_ledger,
                     goal,
                     &[],
                 )?;
                 if !reads.headroom_satisfied {
                     let _ = self.alignment_summary_gpu_renderer.reclaim_for_goal(
-                        &self.alignment_scene_ledger,
+                        &self.alignment_gpu_ledger,
                         goal,
                         &[],
                     )?;
@@ -329,7 +339,7 @@ impl Viewer {
         protected_read_pages: &[AlignmentPageKey],
         protected_summary_pages: &[AlignmentSummaryGpuPageKey],
     ) -> std::result::Result<AlignmentGpuReclaimOutcome, LedgerError> {
-        let baseline = self.alignment_scene_ledger.progress()?;
+        let baseline = self.alignment_gpu_ledger.progress()?;
         let baseline_occupied = baseline.charged.saturating_add(baseline.reserved);
         let goal = GpuReclaimGoal::new(pressure, baseline_occupied)
             .with_additional_headroom_above_floor(pressure.requested_bytes, baseline.pinned);
@@ -374,7 +384,7 @@ impl Viewer {
             .suppress_for_foreground_pressure();
 
         let reads = self.alignment_gpu_renderer.reclaim_for_goal(
-            &self.alignment_scene_ledger,
+            &self.alignment_gpu_ledger,
             goal,
             protected_read_pages,
         )?;
@@ -382,12 +392,12 @@ impl Viewer {
             None
         } else {
             Some(self.alignment_summary_gpu_renderer.reclaim_for_goal(
-                &self.alignment_scene_ledger,
+                &self.alignment_gpu_ledger,
                 goal,
                 protected_summary_pages,
             )?)
         };
-        let final_snapshot = self.alignment_scene_ledger.progress()?;
+        let final_snapshot = self.alignment_gpu_ledger.progress()?;
         let final_occupied = final_snapshot
             .charged
             .saturating_add(final_snapshot.reserved);
@@ -425,7 +435,7 @@ impl Viewer {
 
     pub(crate) fn apply_live_cache_budget(&mut self, cache_budget_mib: usize) {
         let previous_budget_bytes = self
-            .alignment_scene_ledger
+            .alignment_gpu_ledger
             .progress()
             .map_or(self.alignment_scene_budget.budget_bytes, |snapshot| {
                 snapshot.budget
@@ -433,7 +443,7 @@ impl Viewer {
         let total_bytes = cache_budget_mib.saturating_mul(1024 * 1024).max(1);
         self.refresh_alignment_scene_budget();
         let current_budget_bytes = self
-            .alignment_scene_ledger
+            .alignment_gpu_ledger
             .progress()
             .map_or(total_bytes, |snapshot| snapshot.budget);
         if current_budget_bytes < previous_budget_bytes {
@@ -442,7 +452,7 @@ impl Viewer {
             self.alignment_gpu_speculation_gate.budget_bytes = current_budget_bytes;
             self.alignment_gpu_speculation_gate
                 .suppress_for_foreground_pressure();
-            if let Ok(snapshot) = self.alignment_scene_ledger.progress() {
+            if let Ok(snapshot) = self.alignment_gpu_ledger.progress() {
                 let pressure = GpuBudgetPressure::from_budget_failure(
                     0,
                     snapshot.charged,
@@ -455,12 +465,12 @@ impl Viewer {
                 );
                 if goal.required_reclaim_bytes() > 0 {
                     let _ = self.alignment_gpu_renderer.reclaim_for_goal(
-                        &self.alignment_scene_ledger,
+                        &self.alignment_gpu_ledger,
                         goal,
                         &[],
                     );
                     let _ = self.alignment_summary_gpu_renderer.reclaim_for_goal(
-                        &self.alignment_scene_ledger,
+                        &self.alignment_gpu_ledger,
                         goal,
                         &[],
                     );
@@ -496,11 +506,23 @@ impl Viewer {
     }
 
     pub(crate) fn alignment_ledger_occupied_bytes(&self) -> usize {
-        self.alignment_scene_ledger
-            .progress()
-            .map_or(0, |progress| {
+        let occupied = |ledger: &AllocationLedger| {
+            ledger.progress().map_or(0, |progress| {
                 progress.charged.saturating_add(progress.reserved)
             })
+        };
+        let scene = occupied(&self.alignment_scene_ledger);
+        if self.alignment_gpu_ledger_is_private() {
+            scene.saturating_add(occupied(&self.alignment_gpu_ledger))
+        } else {
+            scene
+        }
+    }
+
+    /// Whether GPU pages are charged to their own ledger (the bounded memory policy) rather
+    /// than to the ledger shared with the source engines (the strict policy).
+    pub(crate) fn alignment_gpu_ledger_is_private(&self) -> bool {
+        self.alignment_scene_ledger.is_bounded()
     }
 
     /// Reconciles the shared alignment ledger and the two not-yet-ledger-native GPU caches under
@@ -525,6 +547,18 @@ impl Viewer {
             self.report_error(format!(
                 "Could not apply alignment resource limits: {error}"
             ));
+        }
+        if self.alignment_gpu_ledger_is_private() {
+            let gpu_budget_bytes = alignment_gpu_share_bytes(alignment_budget_bytes);
+            if let Err(error) = self.alignment_gpu_ledger.set_limits(
+                gpu_budget_bytes,
+                gpu_budget_bytes,
+                total_budget_bytes,
+            ) {
+                self.report_error(format!(
+                    "Could not apply alignment GPU resource limits: {error}"
+                ));
+            }
         }
 
         let allowance = NonZeroUsize::new(alignment_budget_bytes)
@@ -561,5 +595,27 @@ impl Viewer {
         if let Some(error) = first_error {
             self.report_error(format!("Could not apply cache budget: {error}"));
         }
+    }
+}
+
+/// The GPU owner's fixed share of the alignment cache budget under the bounded memory policy.
+pub(crate) fn alignment_gpu_share_bytes(alignment_budget_bytes: usize) -> usize {
+    AllocationOwnerShares::default()
+        .share_of(alignment_budget_bytes, AllocationOwner::Gpu)
+        .max(1)
+}
+
+/// The ledger GPU pages are charged to. The strict policy shares the scene ledger, exactly as
+/// before. The bounded policy gives the GPU caches a private strict ledger sized to their share:
+/// they evict their own least-recently-used pages and never contend with CPU scene work.
+pub(crate) fn alignment_gpu_ledger_for(
+    scene_ledger: &AllocationLedger,
+    alignment_budget_bytes: usize,
+) -> AllocationLedger {
+    if scene_ledger.is_bounded() {
+        let share = alignment_gpu_share_bytes(alignment_budget_bytes);
+        AllocationLedger::new_with_transient_budget(share, share, alignment_budget_bytes)
+    } else {
+        scene_ledger.clone()
     }
 }

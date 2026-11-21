@@ -95,6 +95,26 @@ Raw samples and digests are retained in `benchmark-results/latest.json`. Medians
 because first-pass scheduling and filesystem noise can create outliers even after the correctness
 warm-up.
 
+## Backend comparison (HTS-15)
+
+```sh
+cargo run --release -p rgv-alignment-bench -- \
+  compare-backends benchmark-data/mixed.bam --iterations 15 \
+  --output benchmark-results/backend-compare.json
+```
+
+`compare-backends` measures only the two production decoders, `rust-htslib` and `noodles`, on a
+local BAM: one inflate thread each, `HTSlib` with four decode threads, and `noodles` with its
+`bgzf::io::MultithreadedReader` and four workers. Each runs a layout-level traversal (flags,
+placement, name, CIGAR) and a full-detail one that materialises every base, quality and auxiliary
+value, over a short-read deep locus, a short-read 2 Mb region, the long-read region and the whole
+file. It reports the decode loop separately from open/header/index time, with the median and the
+fastest sample, and rejects a timing whose digest differs between backends. The results and what
+they mean for the backend decision are in `docs/architecture/0002-alignment-backend.md`.
+
+The `rust-htslib-http` workload of `run` is the only code in the workspace that lets `HTSlib` open
+a URL, which is why this crate asks for the `curl` feature itself.
+
 ## Scope limitations
 
 - The corpus is synthetic and generated through HTSlib. Digest parity reduces format-bias risk but

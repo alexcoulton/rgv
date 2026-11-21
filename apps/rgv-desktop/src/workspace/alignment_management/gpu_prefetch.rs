@@ -99,7 +99,7 @@ impl Viewer {
             self.alignment_gpu_prefetch.clear();
             return;
         }
-        let optional_pin_ceiling = match self.alignment_scene_ledger.progress() {
+        let optional_pin_ceiling = match self.alignment_gpu_ledger.progress() {
             Ok(progress) => progress.budget,
             Err(error) => {
                 tracing::debug!(%error, "could not inspect optional GPU residency ceiling");
@@ -212,7 +212,7 @@ impl Viewer {
                     &self.device,
                     &self.queue,
                     cursor,
-                    &self.alignment_scene_ledger,
+                    &self.alignment_gpu_ledger,
                     publication_attempt_sequence,
                     maximum_pages,
                 ) {
@@ -274,7 +274,7 @@ impl Viewer {
                     &self.device,
                     &self.queue,
                     cursor,
-                    &self.alignment_scene_ledger,
+                    &self.alignment_gpu_ledger,
                     publication_attempt_sequence,
                     maximum_pages,
                 ) {

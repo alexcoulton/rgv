@@ -1280,6 +1280,12 @@ struct Viewer {
     context_scene_gpu_frame: ContextSceneGpuFrame,
     alignment_scene_ledger: AllocationLedger,
     alignment_ledger_progress: LedgerProgressSubscription,
+    /// The ledger every alignment GPU page, page table and frame slot is charged to. Under the
+    /// strict memory policy it is `alignment_scene_ledger` itself. Under the bounded policy it
+    /// is a private ledger holding only the GPU share of the cache budget, so GPU occupancy can
+    /// neither refuse CPU scene work nor be relieved by it.
+    alignment_gpu_ledger: AllocationLedger,
+    alignment_gpu_ledger_progress: LedgerProgressSubscription,
     alignment_gpu_renderer: AlignmentGpuRenderer,
     alignment_summary_gpu_renderer: AlignmentSummaryGpuRenderer,
     alignment_gpu_last_prepare_stats: AlignmentGpuPrepareStats,

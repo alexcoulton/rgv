@@ -5,16 +5,17 @@ use std::{
 };
 
 use rgv_alignment_scene::{
-    AlignmentSceneSnapshot, AllocationId, AllocationLease, EvidenceStoreError, LedgerError,
+    AlignmentSceneSnapshot, AllocationId, AllocationLease, AllocationOwner, EvidenceStoreError,
+    LedgerError,
 };
 use rgv_core::GenomicInterval;
 
-use crate::{CanonicalAlignmentSourceBackend, SourceOwnerId};
+use crate::{CanonicalAlignmentSourceBackend, SourceIntentKind, SourceOwnerId};
 
 use super::{
-    AlignmentCoordinatorEviction, AlignmentCoordinatorPressure, AlignmentForegroundCapacityPlan,
-    AlignmentSceneCoordinatorError, AlignmentSceneSourceCoordinator, elapsed_nanoseconds,
-    presentation_owner,
+    AlignmentBoundedTrim, AlignmentCoordinatorEviction, AlignmentCoordinatorPressure,
+    AlignmentForegroundCapacityPlan, AlignmentSceneCoordinatorError, AlignmentSceneOwnerPressure,
+    AlignmentSceneSourceCoordinator, elapsed_nanoseconds, presentation_owner,
 };
 
 pub(crate) const MAXIMUM_FOREGROUND_WORKING_SET_ISLANDS: usize = 32;
@@ -179,6 +180,8 @@ where
             // must not permanently suppress work after the user grants more room.
             lane.vertical_residency_budget_limited = false;
             lane.vertical_residency_failed = false;
+            lane.foreground_pressure_refusal = None;
+            lane.speculation_refusal = None;
         }
         let speculation_was_pending = self.actor.schedule().desired_speculation().is_some()
             || self
@@ -307,6 +310,181 @@ where
             elapsed_nanoseconds: elapsed_nanoseconds(started),
             reclaim_complete,
         })
+    }
+
+    /// One maintenance pass of the `Bounded` memory policy; a no-op under `Complete`.
+    ///
+    /// Each owner's caches are trimmed, least recently used first, back to that owner's share.
+    /// Nothing published or prepared is released, and neither is evidence inside a live source
+    /// horizon. When what cannot be released alone exceeds an owner's hard cap, the request
+    /// still being served gives way, in this order: optional read-ahead is aborted and not
+    /// resubmitted for that horizon; then the active foreground decode, or else the staged scene
+    /// build, is abandoned, latched, and returned as `pressure` to be reported exactly once.
+    /// With no request in flight nothing is reported: content already on screen stays.
+    #[allow(clippy::result_large_err)]
+    pub fn trim_bounded_caches(
+        &mut self,
+        maximum_entries: usize,
+    ) -> Result<AlignmentBoundedTrim, AlignmentSceneCoordinatorError<B::Error>> {
+        let mut outcome = AlignmentBoundedTrim {
+            complete: true,
+            ..AlignmentBoundedTrim::default()
+        };
+        if !self.actor.store().ledger().is_bounded() {
+            return Ok(outcome);
+        }
+        let presentation = self.presentation.trim_to_owner_budget(maximum_entries)?;
+        if presentation.evicted_read_pages > 0 {
+            self.reconcile_vertical_residency_after_reclaim();
+        }
+        outcome.evicted_entries = presentation.evicted_entries;
+        outcome.complete = presentation.complete;
+        let mut pressure = presentation.pressure;
+        let mut evidence_pressure = false;
+        // The second pass runs only after read-ahead was withdrawn from the shield.
+        for _ in 0..2 {
+            let shielded = self.bounded_trim_shield();
+            let quantum = maximum_entries
+                .saturating_sub(outcome.evicted_entries)
+                .max(1);
+            let evidence = self
+                .actor
+                .store_mut()
+                .trim_to_owner_budgets(&shielded, quantum)?;
+            outcome.evicted_entries = outcome
+                .evicted_entries
+                .saturating_add(evidence.evicted_entries);
+            outcome.complete &= evidence.complete;
+            if evidence.pressure_owner != Some(AllocationOwner::Evidence) {
+                pressure = pressure.or(evidence.pressure);
+                break;
+            }
+            if !self.yield_speculation_to_bounded_pressure() {
+                pressure = evidence.pressure;
+                evidence_pressure = true;
+                break;
+            }
+            outcome.speculation_aborted = true;
+        }
+        let Some(pressure) = pressure else {
+            return Ok(outcome);
+        };
+        // Only evidence pressure is relieved by stopping a decode; derived owners give way at
+        // the scene build which is producing their content.
+        if evidence_pressure && let Some(work) = self.actor.abort_active_foreground() {
+            let owner = work.intent().owner();
+            if let Some(lane) = self.lanes.get_mut(&owner) {
+                lane.foreground_pressure_refusal =
+                    lane.desired.as_ref().map(|desired| desired.source_horizon);
+            }
+            outcome.pressure = Some(AlignmentSceneOwnerPressure {
+                owner,
+                target: work.intent().spec().target(),
+                intent: SourceIntentKind::Foreground,
+                pressure,
+            });
+            return Ok(outcome);
+        }
+        let building = self
+            .last_scene_build_owner
+            .filter(|owner| {
+                self.lanes
+                    .get(owner)
+                    .is_some_and(|lane| lane.scene_build.is_some())
+            })
+            .or_else(|| {
+                self.lanes
+                    .iter()
+                    .find_map(|(owner, lane)| lane.scene_build.is_some().then_some(*owner))
+            });
+        if let Some(owner) = building
+            && let Some(lane) = self.lanes.get_mut(&owner)
+            && let Some(target) = lane.desired.as_ref().map(|desired| desired.source_horizon)
+        {
+            let intent = if lane
+                .frame(owner, &self.presentation)
+                .is_none_or(|frame| !frame.visible_complete())
+            {
+                SourceIntentKind::Foreground
+            } else {
+                SourceIntentKind::Speculative
+            };
+            // Dropping the build returns every candidate it pinned. It is not rebuilt until a
+            // camera, contract, reference or explicit retry asks again.
+            lane.scene_build = None;
+            lane.scene_build_failed = true;
+            lane.foreground_pressure_refusal = Some(target);
+            self.actor.cancel_foreground_for(owner);
+            self.actor.cancel_speculation_for(owner);
+            outcome.pressure = Some(AlignmentSceneOwnerPressure {
+                owner,
+                target,
+                intent,
+                pressure,
+            });
+        }
+        Ok(outcome)
+    }
+
+    /// Evidence the `Bounded` trim must leave alone: every live source horizon, less a read-ahead
+    /// target which was already refused for it.
+    fn bounded_trim_shield(&self) -> Vec<GenomicInterval> {
+        let mut shielded = Vec::new();
+        for lane in self.lanes.values() {
+            let Some(horizon) = lane.desired.as_ref().map(|desired| desired.source_horizon) else {
+                continue;
+            };
+            match lane
+                .speculation_refusal
+                .filter(|refused| refused.overlaps(horizon))
+            {
+                None => shielded.push(horizon),
+                Some(refused) => {
+                    for (start, end) in [
+                        (horizon.start(), refused.start().min(horizon.end())),
+                        (refused.end().max(horizon.start()), horizon.end()),
+                    ] {
+                        if start < end
+                            && let Ok(piece) = GenomicInterval::new(horizon.contig(), start, end)
+                        {
+                            shielded.push(piece);
+                        }
+                    }
+                }
+            }
+        }
+        shielded
+    }
+
+    /// Withdraws pending and active read-ahead and latches each target as refused, so the same
+    /// margin is not requested again for its horizon. Returns whether there was any.
+    fn yield_speculation_to_bounded_pressure(&mut self) -> bool {
+        let mut yielded = false;
+        for (owner, lane) in &mut self.lanes {
+            let Some(target) = self
+                .actor
+                .schedule()
+                .desired_speculation_for(*owner)
+                .map(|intent| intent.spec().target())
+            else {
+                continue;
+            };
+            lane.speculation_refusal = Some(target);
+            lane.telemetry.resource_pressure_speculation_aborts = lane
+                .telemetry
+                .resource_pressure_speculation_aborts
+                .saturating_add(1);
+            yielded = true;
+        }
+        if let Some(work) = self.actor.abort_speculation() {
+            if let Some(lane) = self.lanes.get_mut(&work.intent().owner())
+                && lane.speculation_refusal.is_none()
+            {
+                lane.speculation_refusal = Some(work.intent().spec().target());
+            }
+            yielded = true;
+        }
+        yielded
     }
 
     pub(crate) fn reconcile_vertical_residency_after_reclaim(&mut self) {

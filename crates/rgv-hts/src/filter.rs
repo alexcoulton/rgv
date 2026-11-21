@@ -1,6 +1,5 @@
 use std::str::FromStr;
 
-use rust_htslib::bam::{self, record::Aux};
 use thiserror::Error;
 
 use crate::AuxValue;
@@ -14,36 +13,6 @@ pub struct AlignmentFilter {
 }
 
 impl AlignmentFilter {
-    pub(crate) fn matches(&self, record: &bam::Record) -> Result<bool, rust_htslib::errors::Error> {
-        let flags = record.flags();
-        if flags & self.required_flags != self.required_flags || flags & self.excluded_flags != 0 {
-            return Ok(false);
-        }
-        if let Some(minimum) = self.minimum_mapping_quality
-            && (record.mapq() == u8::MAX || record.mapq() < minimum)
-        {
-            return Ok(false);
-        }
-        for predicate in &self.auxiliary {
-            let mut matching_value = None;
-            for result in record.aux_iter() {
-                let (tag, value) = result?;
-                if tag == predicate.tag {
-                    matching_value = Some(value);
-                    break;
-                }
-            }
-            if predicate.comparison == AuxComparison::Exists {
-                if matching_value.is_none() {
-                    return Ok(false);
-                }
-            } else if !matching_value.is_some_and(|value| predicate.matches(value)) {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
     pub fn fingerprint(&self) -> u64 {
         let mut hash = Fnv64::default();
         hash.write(&[self.minimum_mapping_quality.unwrap_or(u8::MAX)]);
@@ -99,32 +68,6 @@ pub struct AuxPredicate {
 }
 
 impl AuxPredicate {
-    fn matches(&self, value: Aux<'_>) -> bool {
-        let Some(expected) = &self.value else {
-            return false;
-        };
-        let Some(actual) = FilterScalar::from_aux(value) else {
-            return false;
-        };
-        match self.comparison {
-            AuxComparison::Exists => true,
-            AuxComparison::Equal => actual.equal(expected),
-            AuxComparison::NotEqual => !actual.equal(expected),
-            AuxComparison::Greater => actual
-                .order(expected)
-                .is_some_and(std::cmp::Ordering::is_gt),
-            AuxComparison::GreaterOrEqual => actual
-                .order(expected)
-                .is_some_and(std::cmp::Ordering::is_ge),
-            AuxComparison::Less => actual
-                .order(expected)
-                .is_some_and(std::cmp::Ordering::is_lt),
-            AuxComparison::LessOrEqual => actual
-                .order(expected)
-                .is_some_and(std::cmp::Ordering::is_le),
-        }
-    }
-
     pub(crate) fn matches_value(&self, value: &AuxValue) -> bool {
         let Some(expected) = &self.value else {
             return false;
@@ -230,29 +173,6 @@ enum FilterScalar<'a> {
 }
 
 impl FilterScalar<'_> {
-    #[allow(clippy::needless_pass_by_value)]
-    fn from_aux(value: Aux<'_>) -> Option<FilterScalar<'_>> {
-        match value {
-            Aux::Char(value) => Some(FilterScalar::Character(value)),
-            Aux::I8(value) => Some(FilterScalar::Signed(i64::from(value))),
-            Aux::U8(value) => Some(FilterScalar::Unsigned(u64::from(value))),
-            Aux::I16(value) => Some(FilterScalar::Signed(i64::from(value))),
-            Aux::U16(value) => Some(FilterScalar::Unsigned(u64::from(value))),
-            Aux::I32(value) => Some(FilterScalar::Signed(i64::from(value))),
-            Aux::U32(value) => Some(FilterScalar::Unsigned(u64::from(value))),
-            Aux::Float(value) => Some(FilterScalar::Float(f64::from(value))),
-            Aux::Double(value) => Some(FilterScalar::Float(value)),
-            Aux::String(value) | Aux::HexByteArray(value) => Some(FilterScalar::String(value)),
-            Aux::ArrayI8(_)
-            | Aux::ArrayU8(_)
-            | Aux::ArrayI16(_)
-            | Aux::ArrayU16(_)
-            | Aux::ArrayI32(_)
-            | Aux::ArrayU32(_)
-            | Aux::ArrayFloat(_) => None,
-        }
-    }
-
     fn from_value(value: &AuxValue) -> Option<FilterScalar<'_>> {
         match value {
             AuxValue::Character(value) => Some(FilterScalar::Character(*value)),

@@ -228,7 +228,7 @@ impl Viewer {
                 &self.queue,
                 &authority,
                 read_requests,
-                &self.alignment_scene_ledger,
+                &self.alignment_gpu_ledger,
             ) {
                 Ok((frame, stats)) => {
                     self.alignment_gpu_last_prepare_stats = stats;
@@ -258,7 +258,7 @@ impl Viewer {
                 &self.queue,
                 &authority,
                 summary_requests,
-                &self.alignment_scene_ledger,
+                &self.alignment_gpu_ledger,
             ) {
                 Ok((frame, stats)) => {
                     self.alignment_summary_gpu_last_prepare_stats = stats;
@@ -301,7 +301,7 @@ impl Viewer {
         let panel_frames = std::mem::take(&mut epoch.panel_frames);
         let panel_scene_stores = std::mem::take(&mut self.alignment_panel_scene_stores);
         let planned = build_alignment_semantic_retirement_claim_set(
-            &self.alignment_scene_ledger,
+            &self.alignment_gpu_ledger,
             panel_frames
                 .values()
                 .flat_map(|frame| frame.lanes.iter())
@@ -371,7 +371,7 @@ impl Viewer {
         read_authorities: Vec<AlignmentNativeReadAuthority>,
     ) -> std::result::Result<AlignmentGpuFrameBundle, AlignmentGpuBundleFailure> {
         let progress = self
-            .alignment_scene_ledger
+            .alignment_gpu_ledger
             .progress()
             .map_err(|error| AlignmentGpuBundleFailure::terminal(error.to_string()))?;
         let mut next_slot = AllocationBundleSlot::new(0);
@@ -429,7 +429,7 @@ impl Viewer {
 
         let read_retirement = if let Some(plan) = &read_plan {
             match self.alignment_gpu_renderer.detach_replacement_retirement(
-                &self.alignment_scene_ledger,
+                &self.alignment_gpu_ledger,
                 plan,
                 &mut prior_reads,
             ) {
@@ -453,7 +453,7 @@ impl Viewer {
             match self
                 .alignment_summary_gpu_renderer
                 .detach_replacement_retirement(
-                    &self.alignment_scene_ledger,
+                    &self.alignment_gpu_ledger,
                     plan,
                     &mut prior_summaries,
                 ) {
@@ -485,7 +485,7 @@ impl Viewer {
                 claim_sets.push(retirement.retirement_claim_set());
             }
             match self
-                .alignment_scene_ledger
+                .alignment_gpu_ledger
                 .combine_retirement_claim_sets(claim_sets)
             {
                 Ok(claim_set) => claim_set,
@@ -504,7 +504,7 @@ impl Viewer {
         };
         let reservation =
             match self
-                .alignment_scene_ledger
+                .alignment_gpu_ledger
                 .reserve_replacement_bundle(AllocationBundleSpec::new(
                     progress.policy_revision,
                     demands,
@@ -537,7 +537,7 @@ impl Viewer {
                 read_requests,
                 plan,
                 &reservation,
-                &self.alignment_scene_ledger,
+                &self.alignment_gpu_ledger,
                 publication_attempt_sequence,
             ) {
                 Ok(staged) => Some(staged),
@@ -562,7 +562,7 @@ impl Viewer {
                 summary_requests,
                 plan,
                 &reservation,
-                &self.alignment_scene_ledger,
+                &self.alignment_gpu_ledger,
                 publication_attempt_sequence,
             ) {
                 Ok(staged) => Some(staged),

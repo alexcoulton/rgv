@@ -8,100 +8,48 @@ use noodles::{bam, bgzf::VirtualPosition, cram, sam};
 use rgv_core::GenomicInterval;
 
 use super::{
-    CramSliceSpan, Eligibility, NoodlesReader, RemoteIndex, SelectedCramSlices, eligibility,
-    noodles_record_intersects, noodles_record_starts_at_or_after_end, normalize_record,
-    record_reference_end, select_cram_containers, visit_cram_container_records,
+    CramSliceSpan, NoodlesReader, RemoteIndex, SelectedCramSlices, noodles_record_intersects,
+    noodles_record_span_on, noodles_record_starts_at_or_after_end, select_cram_containers,
+    visit_cram_container_records,
 };
 use crate::{
-    AlignmentError, AlignmentSourcePosition, PositionedAlignmentBlock, PositionedAlignmentRecord,
-    PositionedAlignmentStreamCheckpoint, PositionedAlignmentStreamCompletion, QueryDetail,
-    QueryOptions, QueryStats, local::finalize_positioned_stream_stats,
+    AlignmentError, AlignmentSourcePosition, PositionedAlignmentBlock,
+    PositionedAlignmentStreamCheckpoint, PositionedAlignmentStreamCompletion,
+    PositionedChunkReceipt, QueryOptions,
+    backend_record::{AsBackendRecord, PositionedAdmission, PositionedBlockBuilder},
+    positioned_resume::{ChunkCompletion, ChunkExtent},
 };
 
 pub(super) struct NoodlesPositionedStream {
-    interval: GenomicInterval,
-    admission_interval: GenomicInterval,
-    options: QueryOptions,
-    stats: QueryStats,
+    admission: PositionedAdmission,
     work: StreamWork,
-    ready: VecDeque<PositionedAlignmentBlock>,
+    ready: VecDeque<(PositionedAlignmentBlock, Option<PositionedChunkReceipt>)>,
+    /// Receipt of the block the last checkpoint returned.
+    receipt: Option<PositionedChunkReceipt>,
 }
 
 enum StreamWork {
     Bam {
         chunks: VecDeque<(VirtualPosition, VirtualPosition)>,
         resume: Option<VirtualPosition>,
+        /// Reading never resumes before this offset: everything up to it was skipped.
+        floor: VirtualPosition,
     },
     Cram {
         containers: VecDeque<(u64, SelectedCramSlices)>,
     },
 }
 
-#[derive(Default)]
-struct BlockBuilder {
-    records: Vec<PositionedAlignmentRecord>,
-    span: Option<(u64, u64)>,
-}
-
-impl BlockBuilder {
-    fn finish(mut self, owner_offset: u64, interval: GenomicInterval) -> PositionedAlignmentBlock {
-        self.records.sort_by(|left, right| {
-            (
-                left.record.start,
-                left.record.end,
-                &left.record.read_name,
-                left.source_position,
-            )
-                .cmp(&(
-                    right.record.start,
-                    right.record.end,
-                    &right.record.read_name,
-                    right.source_position,
-                ))
-        });
-        PositionedAlignmentBlock {
-            compressed_offset: owner_offset,
-            records: self.records,
-            genomic_span: self
-                .span
-                .and_then(|(start, end)| GenomicInterval::new(interval.contig(), start, end).ok()),
-        }
-    }
-}
-
 impl NoodlesPositionedStream {
-    fn new(
-        interval: GenomicInterval,
-        admission_interval: GenomicInterval,
-        options: QueryOptions,
-        work: StreamWork,
-    ) -> Result<Self, AlignmentError> {
-        if !interval.contains_interval(admission_interval) {
-            return Err(AlignmentError::AdmissionIntervalOutsideQuery {
-                query: interval,
-                admission: admission_interval,
-            });
-        }
-        Ok(Self {
-            interval,
-            admission_interval,
-            stats: QueryStats {
-                complete_read_limit: options.max_records.get(),
-                ..QueryStats::default()
-            },
-            options,
-            work,
-            ready: VecDeque::new(),
-        })
-    }
-
     pub(super) fn begin_bam(
         index: &RemoteIndex,
         interval: GenomicInterval,
         admission_interval: GenomicInterval,
         options: QueryOptions,
         region: &noodles::core::Region,
-    ) -> Result<Self, AlignmentError> {
+        skip: Vec<PositionedChunkReceipt>,
+    ) -> Result<(Self, usize), AlignmentError> {
+        let mut admission = PositionedAdmission::new(interval, admission_interval, options)?;
         let reference_sequence_id = usize::try_from(interval.contig().get())
             .map_err(|_| AlignmentError::CoordinateOverflow)?;
         let mut chunks = index
@@ -118,15 +66,21 @@ impl NoodlesPositionedStream {
                 _ => merged.push((start, end)),
             }
         }
-        Self::new(
-            interval,
-            admission_interval,
-            options,
-            StreamWork::Bam {
-                chunks: merged.into(),
-                resume: None,
+        // This decoder recognises a skipped chunk before reading it, by where it starts.
+        let skipped = admission.set_skipped(skip, PositionedChunkReceipt::has_bam_start);
+        Ok((
+            Self {
+                admission,
+                work: StreamWork::Bam {
+                    chunks: merged.into(),
+                    resume: None,
+                    floor: VirtualPosition::from(0),
+                },
+                ready: VecDeque::new(),
+                receipt: None,
             },
-        )
+            skipped,
+        ))
     }
 
     pub(super) fn begin_cram<R>(
@@ -134,112 +88,109 @@ impl NoodlesPositionedStream {
         interval: GenomicInterval,
         admission_interval: GenomicInterval,
         options: QueryOptions,
-    ) -> Result<Self, AlignmentError>
+        skip: Vec<PositionedChunkReceipt>,
+    ) -> Result<(Self, usize), AlignmentError>
     where
         R: std::io::Read,
     {
-        let containers = select_cram_containers(reader, interval)?;
-        Self::new(
-            interval,
-            admission_interval,
-            options,
-            StreamWork::Cram {
-                containers: containers.into_iter().collect(),
+        let mut admission = PositionedAdmission::new(interval, admission_interval, options)?;
+        let mut containers = select_cram_containers(reader, interval)?;
+        let skipped = admission.set_skipped(skip, PositionedChunkReceipt::is_cram);
+        // A skipped slice is never selected: it is neither fetched nor decoded.
+        for (container, landmark) in admission.resume().skipped_keys() {
+            let Some(landmark) = landmark else { continue };
+            if let Some(slices) = containers.get_mut(&container) {
+                slices.remove(&landmark);
+                if slices.is_empty() {
+                    containers.remove(&container);
+                }
+            }
+        }
+        Ok((
+            Self {
+                admission,
+                work: StreamWork::Cram {
+                    containers: containers.into_iter().collect(),
+                },
+                ready: VecDeque::new(),
+                receipt: None,
             },
-        )
+            skipped,
+        ))
     }
 
-    fn complete(mut self) -> PositionedAlignmentStreamCheckpoint {
-        finalize_positioned_stream_stats(&mut self.stats);
+    pub(super) const fn take_receipt(&mut self) -> Option<PositionedChunkReceipt> {
+        self.receipt.take()
+    }
+
+    fn complete(self) -> PositionedAlignmentStreamCheckpoint {
+        let (interval, stats) = self.admission.finish();
         PositionedAlignmentStreamCheckpoint::Complete(PositionedAlignmentStreamCompletion {
-            interval: self.interval,
-            stats: self.stats,
+            interval,
+            stats,
         })
     }
 
-    /// Applies the exact local-BAM eligibility, admission and retention rules to one record.
+    /// Applies the shared eligibility, admission and retention rules to one record.
     fn process<R>(
         &mut self,
         record: &R,
         header: &sam::Header,
         source_position: AlignmentSourcePosition,
-        builder: &mut BlockBuilder,
+        owner: u64,
+        builder: &mut PositionedBlockBuilder,
     ) -> Result<(), AlignmentError>
     where
-        R: sam::alignment::Record,
+        R: AsBackendRecord,
     {
-        self.stats.records_seen = self.stats.records_seen.saturating_add(1);
-        let record_span = record
-            .alignment_start()
-            .transpose()?
-            .map(|position| position.get() as u64 - 1)
-            .map(|start| record_reference_end(record, start).map(|end| (start, end)))
-            .transpose()?
-            .filter(|(start, end)| end > start);
-        if let Some((start, end)) = record_span {
-            builder.span = Some(builder.span.map_or((start, end), |(minimum, maximum)| {
-                (minimum.min(start), maximum.max(end))
-            }));
-        }
-        match eligibility(record, header, &self.options)? {
-            Eligibility::Eligible => {}
-            Eligibility::Unmapped => {
-                self.stats.records_filtered_unmapped =
-                    self.stats.records_filtered_unmapped.saturating_add(1);
-                return Ok(());
-            }
-            Eligibility::Secondary => {
-                self.stats.records_filtered_secondary =
-                    self.stats.records_filtered_secondary.saturating_add(1);
-                return Ok(());
-            }
-            Eligibility::Supplementary => {
-                self.stats.records_filtered_supplementary =
-                    self.stats.records_filtered_supplementary.saturating_add(1);
-                return Ok(());
-            }
-            Eligibility::UserFilter {
-                duplicate,
-                qc_failed,
-            } => {
-                self.stats.records_filtered_user =
-                    self.stats.records_filtered_user.saturating_add(1);
-                self.stats.records_filtered_duplicate = self
-                    .stats
-                    .records_filtered_duplicate
-                    .saturating_add(usize::from(duplicate));
-                self.stats.records_filtered_qc_failed = self
-                    .stats
-                    .records_filtered_qc_failed
-                    .saturating_add(usize::from(qc_failed));
-                return Ok(());
-            }
-        }
-        self.stats.records_eligible = self.stats.records_eligible.saturating_add(1);
-        if record_span.is_some_and(|(start, end)| {
-            start < self.admission_interval.end() && end > self.admission_interval.start()
-        }) {
-            self.stats.complete_read_records_eligible =
-                self.stats.complete_read_records_eligible.saturating_add(1);
-        }
-        if self.stats.complete_read_records_eligible > self.options.max_records.get() {
-            return Ok(());
-        }
-        let (detail, tags): (QueryDetail, &[[u8; 2]]) = if self.options.collect_modifications {
-            (QueryDetail::Full, &[])
-        } else {
-            (self.options.detail, &self.options.retained_auxiliary_tags)
-        };
-        builder.records.push(PositionedAlignmentRecord {
-            record: normalize_record(record, header, detail, tags)?,
+        self.admission.note_seen();
+        self.admission.process(
+            &record.backend_record(header),
             source_position,
-        });
-        self.stats.records_emitted = self.stats.records_emitted.saturating_add(1);
-        Ok(())
+            owner,
+            builder,
+        )
     }
 }
 
+/// The index chunks still to read, as virtual-offset ranges without the skipped extents, so
+/// the range reader plans (and fetches) only what will be decoded.
+fn bam_read_plan(
+    chunks: &VecDeque<(VirtualPosition, VirtualPosition)>,
+    resume: Option<VirtualPosition>,
+    floor: VirtualPosition,
+    skipped: impl Iterator<Item = (u64, u64)>,
+) -> Vec<(u64, u64)> {
+    let mut plan = chunks
+        .iter()
+        .enumerate()
+        .map(|(index, (start, end))| {
+            let start = resume.filter(|_| index == 0).unwrap_or(*start).max(floor);
+            (u64::from(start), u64::from(*end))
+        })
+        .filter(|(start, end)| start < end)
+        .collect::<Vec<_>>();
+    for (skip_start, skip_end) in skipped {
+        let mut remaining = Vec::with_capacity(plan.len() + 1);
+        for (start, end) in plan {
+            if skip_end <= start || end <= skip_start {
+                remaining.push((start, end));
+                continue;
+            }
+            if start < skip_start {
+                remaining.push((start, skip_start));
+            }
+            if skip_end < end {
+                remaining.push((skip_end, end));
+            }
+        }
+        plan = remaining;
+    }
+    plan
+}
+
 /// Performs at most one BGZF owner block of remote BAM work.
+#[allow(clippy::too_many_lines)]
 pub(super) fn next_bam_checkpoint(
     slot: &mut Option<NoodlesPositionedStream>,
     reader: &mut NoodlesReader,
@@ -250,50 +201,96 @@ pub(super) fn next_bam_checkpoint(
     let mut state = slot
         .take()
         .ok_or(AlignmentError::NoActivePositionedStream)?;
-    let interval = state.interval;
-    let mut builder = BlockBuilder::default();
+    state.receipt = None;
+    let interval = state.admission.interval;
+    let skipping = state.admission.resume().has_skipped();
+    let mut builder = PositionedBlockBuilder::default();
     let mut current_block = None::<u64>;
+    // Virtual offsets of the first and just past the last record processed into the block.
+    let mut block_start = None::<u64>;
+    let mut block_end = 0_u64;
+    // A record of the target beyond the block being built is known to exist.
+    let mut later_record = false;
     let bgzf_reader = reader;
-    if let StreamWork::Bam { chunks, resume } = &state.work {
+    if let StreamWork::Bam {
+        chunks,
+        resume,
+        floor,
+    } = &state.work
+    {
         // The chunks still to be read (the first from where the last checkpoint stopped) are
         // what the range reader should fetch; a narrowed plan keeps its cached bytes.
-        bgzf_reader
-            .get_mut()
-            .set_bgzf_read_plan(chunks.iter().enumerate().map(|(index, (start, end))| {
-                let start = resume.filter(|_| index == 0).unwrap_or(*start);
-                (u64::from(start), u64::from(*end))
-            }));
+        bgzf_reader.get_mut().set_bgzf_read_plan(bam_read_plan(
+            chunks,
+            *resume,
+            *floor,
+            state.admission.resume().skipped_extents(),
+        ));
     }
     let mut record = bam::Record::default();
     'chunks: loop {
-        let StreamWork::Bam { chunks, resume } = &mut state.work else {
+        let StreamWork::Bam {
+            chunks,
+            resume,
+            floor,
+        } = &mut state.work
+        else {
             return Err(AlignmentError::NoActivePositionedStream);
         };
         let Some(&(chunk_start, chunk_end)) = chunks.front() else {
             break;
         };
-        let position = resume.unwrap_or(chunk_start);
+        let position = resume.unwrap_or(chunk_start).max(*floor);
         if position >= chunk_end {
             chunks.pop_front();
             *resume = None;
             continue;
         }
+        if skipping {
+            let evidence = state
+                .admission
+                .skipped_target_record_at(u64::from(position));
+            if let Some(target) = state.admission.skip_from_position(u64::from(position)) {
+                // The caller already holds the chunks lying here: continue past them.
+                *floor = VirtualPosition::from(target);
+                *resume = Some(*floor);
+                later_record |= evidence;
+                if current_block.is_some() {
+                    break 'chunks;
+                }
+                continue;
+            }
+        }
         bgzf_reader.seek_to_virtual_position(position)?;
         let mut direct_reader = bam::io::Reader::from(&mut *bgzf_reader);
         loop {
             let before = direct_reader.get_ref().virtual_position();
+            let StreamWork::Bam {
+                chunks,
+                resume,
+                floor,
+            } = &mut state.work
+            else {
+                unreachable!("stream work kind is fixed");
+            };
             if before >= chunk_end {
-                let StreamWork::Bam { chunks, resume } = &mut state.work else {
-                    unreachable!("stream work kind is fixed");
-                };
                 chunks.pop_front();
                 *resume = None;
                 continue 'chunks;
             }
+            if skipping {
+                let evidence = state.admission.skipped_target_record_at(u64::from(before));
+                if let Some(target) = state.admission.skip_from_position(u64::from(before)) {
+                    *floor = VirtualPosition::from(target);
+                    *resume = Some(*floor);
+                    later_record |= evidence;
+                    if current_block.is_some() {
+                        break 'chunks;
+                    }
+                    continue 'chunks;
+                }
+            }
             if direct_reader.read_record(&mut record)? == 0 {
-                let StreamWork::Bam { chunks, resume } = &mut state.work else {
-                    unreachable!("stream work kind is fixed");
-                };
                 chunks.clear();
                 *resume = None;
                 break 'chunks;
@@ -302,47 +299,57 @@ pub(super) fn next_bam_checkpoint(
             let end_position = u64::from(after);
             let block = end_position >> 16;
             if current_block.is_some_and(|current| current != block) {
-                // The record belongs to the next physical owner; re-read it at the next checkpoint.
-                let StreamWork::Bam { resume, .. } = &mut state.work else {
-                    unreachable!("stream work kind is fixed");
-                };
+                // The record belongs to the next physical owner; re-read it at the next
+                // checkpoint. It lies in the target unless it starts at or beyond its end.
                 *resume = Some(before);
+                later_record |= noodles_record_span_on(&record, header, interval.contig())?
+                    .is_some_and(|(start, _)| start < interval.end());
                 break 'chunks;
             }
-            {
-                let StreamWork::Bam { resume, .. } = &mut state.work else {
-                    unreachable!("stream work kind is fixed");
-                };
-                *resume = Some(after);
-            }
+            *resume = Some(after);
             if !noodles_record_intersects(&record, header, interval)? {
                 if noodles_record_starts_at_or_after_end(&record, header, interval)? {
                     // Coordinate order: no later record can intersect; the remaining chunks
                     // are never fetched.
-                    let StreamWork::Bam { chunks, resume } = &mut state.work else {
-                        unreachable!("stream work kind is fixed");
-                    };
                     chunks.clear();
                     *resume = None;
                     break 'chunks;
                 }
                 continue;
             }
+            if current_block.is_none() {
+                later_record = false;
+                block_start = Some(u64::from(before));
+            }
             current_block = Some(block);
+            block_end = end_position;
             state.process(
                 &record,
                 header,
                 AlignmentSourcePosition::bam_virtual_offset(end_position),
+                block,
                 &mut builder,
             )?;
         }
     }
     match current_block {
         Some(block) => {
+            let finished = builder.finish(block, interval);
+            state.receipt = Some(state.admission.issue_receipt(
+                &mut builder,
+                ChunkCompletion {
+                    owner: block,
+                    cram_slice_landmark: None,
+                    extent: Some(ChunkExtent {
+                        start: block_start,
+                        end: block_end,
+                    }),
+                    left_complete: None,
+                    right_complete: later_record,
+                },
+            ));
             *slot = Some(state);
-            Ok(PositionedAlignmentStreamCheckpoint::Block(
-                builder.finish(block, interval),
-            ))
+            Ok(PositionedAlignmentStreamCheckpoint::Block(finished))
         }
         None => Ok(state.complete()),
     }
@@ -361,8 +368,10 @@ where
     let mut state = slot
         .take()
         .ok_or(AlignmentError::NoActivePositionedStream)?;
+    state.receipt = None;
     loop {
-        if let Some(block) = state.ready.pop_front() {
+        if let Some((block, receipt)) = state.ready.pop_front() {
+            state.receipt = receipt;
             *slot = Some(state);
             return Ok(PositionedAlignmentStreamCheckpoint::Block(block));
         }
@@ -372,8 +381,8 @@ where
         let Some((container_offset, landmarks)) = containers.pop_front() else {
             return Ok(state.complete());
         };
-        let interval = state.interval;
-        let mut slices = BTreeMap::<u64, BlockBuilder>::new();
+        let interval = state.admission.interval;
+        let mut slices = BTreeMap::<u64, PositionedBlockBuilder>::new();
         visit_cram_container_records(
             reader,
             header,
@@ -385,15 +394,35 @@ where
                 let AlignmentSourcePosition::CramRecord { slice_landmark, .. } = position else {
                     return Err(AlignmentError::PositionedStreamUnsupported);
                 };
+                // Skipped slices lying before this one count first, as a fresh stream would
+                // have counted them.
+                state
+                    .admission
+                    .account_skipped_before((container_offset, slice_landmark));
                 let builder = slices.entry(slice_landmark).or_default();
-                state.process(&record, header, position, builder)
+                state.process(&record, header, position, container_offset, builder)
             },
         )?;
-        state.ready.extend(
-            slices
-                .into_values()
-                .map(|builder| builder.finish(container_offset, interval)),
-        );
+        let reference_sequence_id = usize::try_from(interval.contig().get()).ok();
+        for (landmark, mut builder) in slices {
+            let block = builder.finish(container_offset, interval);
+            // A slice whose indexed span lies inside the target holds no record the target
+            // does not return, so any later target can reuse it.
+            let contained = reference_sequence_id
+                .and_then(|id| landmarks.get(&landmark)?.get(&id))
+                .is_some_and(|(start, end)| interval.start() <= *start && *end <= interval.end());
+            let receipt = state.admission.issue_receipt(
+                &mut builder,
+                ChunkCompletion {
+                    owner: container_offset,
+                    cram_slice_landmark: Some(landmark),
+                    extent: None,
+                    left_complete: Some(contained),
+                    right_complete: contained,
+                },
+            );
+            state.ready.push_back((block, Some(receipt)));
+        }
         if state.ready.is_empty() {
             // Nothing in this container intersected the target: report bounded progress.
             *slot = Some(state);

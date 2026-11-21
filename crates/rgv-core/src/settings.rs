@@ -23,6 +23,20 @@ pub const MINIMUM_INTERFACE_SCALE_PERCENT: u16 = 75;
 pub const MAXIMUM_INTERFACE_SCALE_PERCENT: u16 = 200;
 const RECENT_ITEM_LIMIT: usize = 12;
 
+/// How alignment caches treat the user's cache budget.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlignmentMemoryPolicy {
+    /// Charge what a build actually retained, keep each cache class inside its own share of the
+    /// budget by evicting least-recently-used unpinned entries, and report pressure only when
+    /// visible content alone cannot fit.
+    #[default]
+    Bounded,
+    /// Reserve a worst-case bound against one shared budget before every build and refuse the
+    /// build rather than exceed it.
+    Complete,
+}
+
 /// User-controlled desktop preferences. Diagnostics are disabled unless the
 /// user explicitly opts in.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -34,6 +48,8 @@ pub struct DesktopSettings {
     pub recent_sessions: Vec<String>,
     pub recent_loci: Vec<String>,
     pub cache_budget_mib: usize,
+    /// Whether alignment caches are bounded by eviction or by strict reserve-before-build.
+    pub alignment_memory_policy: AlignmentMemoryPolicy,
     /// Desired decoded-read margin on each side, as a percentage of the viewport span.
     pub read_browsing_buffer_percent: u16,
     pub diagnostics_opt_in: bool,
@@ -55,6 +71,7 @@ impl Default for DesktopSettings {
             recent_sessions: Vec::new(),
             recent_loci: Vec::new(),
             cache_budget_mib: DEFAULT_CACHE_BUDGET_MIB,
+            alignment_memory_policy: AlignmentMemoryPolicy::default(),
             read_browsing_buffer_percent: DEFAULT_READ_BROWSING_BUFFER_PERCENT,
             diagnostics_opt_in: false,
             autosave_enabled: false,

@@ -1,6 +1,7 @@
 # ADR 0004: remote backends and byte accountability
 
-Status: accepted for beta; amended 20 November 2026 (local CRAM backend, see Decision).
+Status: accepted for beta; amended 20 November 2026 (local CRAM backend) and 21 November 2026
+(shared derivations, extension-less URLs, see Decision).
 
 ## Context
 
@@ -24,10 +25,20 @@ seekable reader that the pure-Rust `bigtools` library can consume.
   `crates/rgv-hts/src/remote_alignment.rs` routes a local `.cram` path to
   `LocalCramAlignmentSource`, which uses the `noodles` indexed CRAM reader and the same positioned
   container/slice decoder as remote CRAM. Only local BAM (and any other local non-CRAM path) goes
-  through `rust-htslib`. The doc comment on `ProductionAlignmentSource` still says "Local files
-  and CRAM use `HTSlib`" and is stale. RGV therefore ships two production alignment decoders;
-  converging on one is tracked as HTS-15 / OPS-10 in
-  `audits/COMPREHENSIVE_REVIEW_2026-11-20.md`.
+  through `rust-htslib`. RGV therefore ships two production alignment decoders; converging on one
+  is tracked as HTS-15 / OPS-10 in `audits/COMPREHENSIVE_REVIEW_2026-11-20.md` and discussed, with
+  measurements, in ADR 0002 ("Backend convergence").
+- **Amended 21 November 2026.** The doc comment on `ProductionAlignmentSource` now states the
+  routing above. "Both formats share normalized alignment, pileup, ... code" is now true of both
+  *backends* as well: normalisation, eligibility, pileup and positioned-stream admission are
+  generic over one record view (`crates/rgv-hts/src/backend_record.rs`), and local/remote parity
+  is enforced by a differential suite rather than by keeping two copies in step. A remote URL
+  whose path does not end in `.bam` or `.cram` (an object key, a download endpoint, a signed link)
+  is identified by the object's leading bytes (`CRAM`, or a BGZF block inflating to `BAM\1`) over
+  `HttpRangeReader` and opened by the same range path with the usual index discovery;
+  `LocalAlignmentSource::open` refuses every URL, so `HTSlib` never opens one. Positioned streams
+  can resume past chunks the caller already holds (`begin_positioned_stream_resuming`); for remote
+  BAM the skipped byte ranges are left out of the range plan and are not requested.
 - Keep all callers behind RGV source traits so backend selection does not affect layout or
   rendering.
 - Use RGV's `HttpRangeReader` for BigWig and BigBed. It performs bounded chunk coalescing, maintains

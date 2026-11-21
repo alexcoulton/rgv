@@ -213,7 +213,12 @@ impl AlignmentSceneSourceLane {
             Ok(None) => AlignmentSceneCoordinatorError::<E>::MissingCamera,
             Err(error) => error,
         };
-        if let Some(pressure) = coordinator_budget_pressure(&failure) {
+        // Under `Bounded` a page build is refused only by its own per-build cap. No ledger
+        // progress can admit it, so it takes the terminal latch below instead of a pause which
+        // would resume on every release.
+        if let Some(pressure) =
+            coordinator_budget_pressure(&failure).filter(|_| !presentation.ledger().is_bounded())
+        {
             self.pause_foreground_rows_for_pressure(owner, presentation);
             return Ok(AlignmentPresentationPump {
                 owner,

@@ -13,11 +13,11 @@ use crate::{
     AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory, AlignmentFilterEvaluationError,
     AlignmentRowAtlas, AlignmentRowAtlasError, AlignmentRowAtlasPins, AlignmentSourceRevision,
     AlignmentViewFilterContract, AlleleSummaryContract, AllocationId, AllocationLease,
-    AllocationLedger, AllocationRecordSnapshot, CanonicalGenomicTile, DepthSummaryContract,
-    EvidenceAcquisition, EvidenceBuildError, EvidenceChunk, EvidencePins, EvidenceRevision,
-    EvidenceRoot, EvidenceRootBuilder, ExactAlleleSummaryError, ExactAlleleSummaryKey,
-    ExactAlleleSummaryTile, ExactDepthSummaryError, ExactDepthSummaryKey, ExactDepthSummaryTile,
-    ExactFilterSummaryError, ExactFilterSummaryKey, ExactFilterSummaryTile,
+    AllocationLedger, AllocationOwner, AllocationRecordSnapshot, CanonicalGenomicTile,
+    DepthSummaryContract, EvidenceAcquisition, EvidenceBuildError, EvidenceChunk, EvidencePins,
+    EvidenceRevision, EvidenceRoot, EvidenceRootBuilder, ExactAlleleSummaryError,
+    ExactAlleleSummaryKey, ExactAlleleSummaryTile, ExactDepthSummaryError, ExactDepthSummaryKey,
+    ExactDepthSummaryTile, ExactFilterSummaryError, ExactFilterSummaryKey, ExactFilterSummaryTile,
     ExactJunctionSummaryError, ExactJunctionSummaryKey, ExactJunctionSummaryTile,
     ExactModificationSummaryError, ExactModificationSummaryKey, ExactModificationSummaryTile,
     ExactPairSummaryError, ExactPairSummaryKey, ExactPairSummaryTile, ExactSummaryPins,
@@ -226,6 +226,21 @@ enum EvidenceCacheLocation {
     FilterSummary,
     Chunk,
     Acquisition,
+}
+
+impl EvidenceCacheLocation {
+    /// The owner whose share this family's entries are charged to.
+    const fn owner(self) -> AllocationOwner {
+        match self {
+            Self::RowAtlas | Self::Chunk | Self::Acquisition => AllocationOwner::Evidence,
+            Self::DepthSummary
+            | Self::AlleleSummary
+            | Self::JunctionSummary
+            | Self::PairSummary
+            | Self::ModificationSummary
+            | Self::FilterSummary => AllocationOwner::Summary,
+        }
+    }
 }
 
 impl EvidenceStore {
@@ -1728,7 +1743,10 @@ impl EvidenceStore {
     /// Pinned current evidence is never destroyed and remains visible as explicit pinned overage.
     pub fn reduce_budget(&mut self, budget: usize) -> Result<StorePressure, EvidenceStoreError> {
         self.ledger.set_budget(budget)?;
-        self.evict_inactive_until(budget)
+        let pressure = self.evict_inactive_until(budget)?;
+        // Under `Bounded` the new total also shrinks each owner's share.
+        self.trim_to_owner_budgets(&[], usize::MAX)?;
+        Ok(pressure)
     }
 
     /// Releases reloadable inactive source/summary/layout cache ownership without changing the
@@ -1743,12 +1761,183 @@ impl EvidenceStore {
     /// Releases a bounded number of reloadable evidence entries. Collections are ordered with
     /// their oldest entry at the tail so removal is `Vec::pop`, avoiding the repeated whole-vector
     /// shifts previously caused by `remove(0)` at dense loci.
-    #[allow(clippy::too_many_lines)]
     pub fn evict_inactive_batch(
         &mut self,
         target_charged: usize,
         maximum_entries: usize,
     ) -> Result<StorePressure, EvidenceStoreError> {
+        self.evict_scoped(None, &[], target_charged, maximum_entries)
+    }
+
+    /// Keeps this store's caches inside their owners' shares under
+    /// [`AlignmentMemoryPolicy::Bounded`](crate::AlignmentMemoryPolicy): least-recently-used
+    /// entries of every over-share owner are released, derived summaries before evidence. It is
+    /// a no-op under `Complete`.
+    ///
+    /// Never released: anything the published authority owns, and any active entry overlapping
+    /// one of `shielded`, the horizons visible work is still being prepared for. `pressure` is
+    /// set only when the content those horizons need alone exceeds an owner's hard cap; content
+    /// pinned only for a superseded locus does not count against the request replacing it.
+    pub fn trim_to_owner_budgets(
+        &mut self,
+        shielded: &[GenomicInterval],
+        maximum_entries: usize,
+    ) -> Result<BoundedCacheTrim, EvidenceStoreError> {
+        let mut trim = BoundedCacheTrim {
+            complete: true,
+            ..BoundedCacheTrim::default()
+        };
+        if !self.ledger.is_bounded() {
+            return Ok(trim);
+        }
+        for owner in [AllocationOwner::Summary, AllocationOwner::Evidence] {
+            let usage = self.ledger.owner_usage(owner)?;
+            if usage.overage() == 0 {
+                continue;
+            }
+            let quantum = maximum_entries.saturating_sub(trim.evicted_entries);
+            let pass = self.evict_scoped(Some(owner), shielded, usage.soft_budget, quantum)?;
+            trim.evicted_entries = trim
+                .evicted_entries
+                .saturating_add(pass.evicted_acquisitions)
+                .saturating_add(pass.evicted_chunks)
+                .saturating_add(pass.evicted_exact_summaries)
+                .saturating_add(pass.evicted_row_atlases);
+            if !pass.reclaim_complete {
+                trim.complete = false;
+                continue;
+            }
+            let usage = self.ledger.owner_usage(owner)?;
+            if usage.charged > usage.hard_cap {
+                // Every evictable entry of this store is gone. What counts against the cap is
+                // what a request for the shielded horizons needs: not the superseded authority,
+                // which is still pinned but retires when that request publishes. Evidence is
+                // trimmed last, so its pressure is the one reported when both owners are over.
+                let unevictable = self.unevictable_owner_bytes(owner, shielded, usage.pinned)?;
+                if let Some(pressure) = self.ledger.owner_cap_pressure(owner, unevictable)? {
+                    trim.pressure = Some(pressure);
+                    trim.pressure_owner = Some(owner);
+                }
+            }
+        }
+        Ok(trim)
+    }
+
+    /// The bytes of `owner` a request for the `shielded` horizons cannot do without: everything
+    /// pinned anywhere, less what this store pins only for content outside those horizons (the
+    /// superseded authority, which retires when the request publishes), plus whatever this
+    /// store's remaining entries hold unpinned.
+    fn unevictable_owner_bytes(
+        &self,
+        owner: AllocationOwner,
+        shielded: &[GenomicInterval],
+        owner_pinned: usize,
+    ) -> Result<usize, EvidenceStoreError> {
+        let needed = |overlaps: &dyn Fn(GenomicInterval) -> bool| {
+            shielded.iter().any(|interval| overlaps(*interval))
+        };
+        // `(inside a shielded horizon, allocation)` for every remaining entry of this owner.
+        let mut held = Vec::<(bool, &AllocationLease)>::new();
+        match owner {
+            AllocationOwner::Evidence => {
+                let chunks = self
+                    .chunks
+                    .iter()
+                    .map(|cached| (cached.interval, &cached.chunk))
+                    .chain(self.acquisitions.iter().flat_map(|cached| {
+                        let interval = Some(cached.acquisition.coverage().interval());
+                        cached
+                            .acquisition
+                            .chunks()
+                            .iter()
+                            .map(move |chunk| (interval, chunk))
+                    }));
+                for (interval, chunk) in chunks {
+                    let inside = needed(&|shield| interval.is_some_and(|own| own.overlaps(shield)));
+                    held.push((inside, chunk.core_allocation()));
+                    held.push((inside, chunk.overlap_allocation()));
+                    if let Some(payload) = chunk.payload() {
+                        held.push((inside, payload.allocation()));
+                    }
+                }
+                for cached in &self.row_atlases {
+                    let inside = needed(&|interval| cached.atlas.interval().overlaps(interval));
+                    held.extend(
+                        cached
+                            .atlas
+                            .allocation_leases()
+                            .map(|allocation| (inside, allocation)),
+                    );
+                }
+            }
+            AllocationOwner::Summary => {
+                macro_rules! observe_summaries {
+                    ($($entries:ident),+) => {
+                        $(for cached in &self.$entries {
+                            let inside =
+                                needed(&|interval| cached.summary.tile().overlaps(interval));
+                            held.push((inside, cached.summary.allocation()));
+                        })+
+                    };
+                }
+                observe_summaries!(
+                    depth_summaries,
+                    allele_summaries,
+                    junction_summaries,
+                    pair_summaries,
+                    modification_summaries,
+                    filter_summaries
+                );
+            }
+            AllocationOwner::Presentation | AllocationOwner::Gpu => {}
+        }
+        // An allocation shared by an entry inside a horizon is needed, whoever else holds it.
+        held.sort_by_key(|(inside, _)| !inside);
+        let mut seen = HashSet::<AllocationId>::new();
+        let mut unpinned = 0_usize;
+        let mut retiring = 0_usize;
+        for (inside, allocation) in held {
+            if !seen.insert(allocation.id()) {
+                continue;
+            }
+            let record = allocation.snapshot()?;
+            if record.class.owner() != owner {
+                continue;
+            }
+            if record.pins == 0 {
+                unpinned = unpinned.saturating_add(record.charged_capacity);
+            } else if !inside {
+                retiring = retiring.saturating_add(record.charged_capacity);
+            }
+        }
+        Ok(owner_pinned
+            .saturating_sub(retiring)
+            .saturating_add(unpinned))
+    }
+
+    fn scope_charged(&self, scope: Option<AllocationOwner>) -> Result<usize, EvidenceStoreError> {
+        let progress = self.ledger.progress()?;
+        Ok(scope.map_or(progress.charged, |owner| {
+            progress.retained.owner_bytes(owner)
+        }))
+    }
+
+    /// One eviction pass toward `target_charged` bytes of the whole ledger, or of one owner
+    /// when `scope` names it; then only that owner's entry families are candidates.
+    #[allow(clippy::too_many_lines)]
+    fn evict_scoped(
+        &mut self,
+        scope: Option<AllocationOwner>,
+        shielded: &[GenomicInterval],
+        target_charged: usize,
+        maximum_entries: usize,
+    ) -> Result<StorePressure, EvidenceStoreError> {
+        // An active entry inside a horizon visible work is being prepared for.
+        let shields = |residency: AlignmentCacheResidencyClass,
+                       overlaps: &dyn Fn(GenomicInterval) -> bool| {
+            residency >= AlignmentCacheResidencyClass::ActiveNearBuffer
+                && shielded.iter().any(|interval| overlaps(*interval))
+        };
         if self.eviction_order_dirty {
             self.acquisitions
                 .sort_by_key(|cached| Reverse((cached.residency, cached.admitted_revision)));
@@ -1774,7 +1963,7 @@ impl EvidenceStore {
         // Entries backing the published authority are set aside, not dropped: releasing the
         // cache's reference to them frees nothing while the published root pins them, and it
         // strips the lookup entries the next extension of the visible locus needs.
-        let under_pressure = self.ledger.progress()?.charged > target_charged;
+        let under_pressure = self.scope_charged(scope)? > target_charged;
         let protected = if under_pressure {
             self.published_allocations()
         } else {
@@ -1794,8 +1983,8 @@ impl EvidenceStore {
         let mut evicted_exact_summaries = 0;
         let mut evicted_row_atlases = 0;
         let mut removed = 0_usize;
-        while removed < maximum_entries && self.ledger.progress()?.charged > target_charged {
-            let (candidate, inspected) = self.oldest_cache_entry();
+        while removed < maximum_entries && self.scope_charged(scope)? > target_charged {
+            let (candidate, inspected) = self.oldest_cache_entry(scope);
             candidates_inspected = candidates_inspected.saturating_add(inspected);
             let Some(candidate) = candidate else {
                 break;
@@ -1818,39 +2007,66 @@ impl EvidenceStore {
             match candidate {
                 EvidenceCacheLocation::RowAtlas => {
                     relinquish!(row_atlases, evicted_row_atlases, |cached| protected
-                        .contains(&cached.atlas.metadata_allocation().id()));
+                        .contains(&cached.atlas.metadata_allocation().id())
+                        || shields(cached.residency, &|interval| cached
+                            .atlas
+                            .interval()
+                            .overlaps(interval)));
                 }
                 EvidenceCacheLocation::DepthSummary => {
                     relinquish!(depth_summaries, evicted_exact_summaries, |cached| protected
-                        .contains(&cached.summary.allocation().id()));
+                        .contains(&cached.summary.allocation().id())
+                        || shields(cached.residency, &|interval| cached
+                            .summary
+                            .tile()
+                            .overlaps(interval)));
                 }
                 EvidenceCacheLocation::AlleleSummary => {
                     relinquish!(allele_summaries, evicted_exact_summaries, |cached| {
                         protected.contains(&cached.summary.allocation().id())
+                            || shields(cached.residency, &|interval| {
+                                cached.summary.tile().overlaps(interval)
+                            })
                     });
                 }
                 EvidenceCacheLocation::JunctionSummary => {
                     relinquish!(junction_summaries, evicted_exact_summaries, |cached| {
                         protected.contains(&cached.summary.allocation().id())
+                            || shields(cached.residency, &|interval| {
+                                cached.summary.tile().overlaps(interval)
+                            })
                     });
                 }
                 EvidenceCacheLocation::PairSummary => {
                     relinquish!(pair_summaries, evicted_exact_summaries, |cached| protected
-                        .contains(&cached.summary.allocation().id()));
+                        .contains(&cached.summary.allocation().id())
+                        || shields(cached.residency, &|interval| cached
+                            .summary
+                            .tile()
+                            .overlaps(interval)));
                 }
                 EvidenceCacheLocation::ModificationSummary => {
                     relinquish!(modification_summaries, evicted_exact_summaries, |cached| {
                         protected.contains(&cached.summary.allocation().id())
+                            || shields(cached.residency, &|interval| {
+                                cached.summary.tile().overlaps(interval)
+                            })
                     });
                 }
                 EvidenceCacheLocation::FilterSummary => {
                     relinquish!(filter_summaries, evicted_exact_summaries, |cached| {
                         protected.contains(&cached.summary.allocation().id())
+                            || shields(cached.residency, &|interval| {
+                                cached.summary.tile().overlaps(interval)
+                            })
                     });
                 }
                 EvidenceCacheLocation::Chunk => {
                     relinquish!(chunks, evicted_chunks, |cached| protected
-                        .contains(&cached.chunk.core_allocation().id()));
+                        .contains(&cached.chunk.core_allocation().id())
+                        || shields(cached.residency, &|interval| cached
+                            .interval
+                            .is_some_and(|own| own.overlaps(interval))));
                 }
                 // A certificate is what lets the visible locus be extended from cache; it backs
                 // the published root as soon as any of its chunks does.
@@ -1865,7 +2081,12 @@ impl EvidenceStore {
                                 .acquisition
                                 .coverage()
                                 .interval()
-                                .overlaps(target))));
+                                .overlaps(target)))
+                        || shields(cached.residency, &|interval| cached
+                            .acquisition
+                            .coverage()
+                            .interval()
+                            .overlaps(interval)));
                 }
             }
             removed = removed.saturating_add(1);
@@ -1892,7 +2113,8 @@ impl EvidenceStore {
             self.invalidate_cache_indices();
         }
         let progress = self.ledger.progress()?;
-        let reclaim_complete = progress.charged <= target_charged || removed < maximum_entries;
+        let reclaim_complete =
+            self.scope_charged(scope)? <= target_charged || removed < maximum_entries;
         let residency = if reclaim_complete && maximum_entries == usize::MAX {
             self.residency_inventory()?
         } else {
@@ -1991,8 +2213,15 @@ impl EvidenceStore {
     /// already-ordered collection. Return-cache material yields before every active entry;
     /// within one residency tier, reproducible derived products yield before source evidence and
     /// each family remains LRU. Selection therefore stays constant-sized.
-    fn oldest_cache_entry(&self) -> (Option<EvidenceCacheLocation>, usize) {
-        let key = |residency, revision, location| (residency, location, revision);
+    fn oldest_cache_entry(
+        &self,
+        scope: Option<AllocationOwner>,
+    ) -> (Option<EvidenceCacheLocation>, usize) {
+        let key = |residency, revision, location: EvidenceCacheLocation| {
+            scope
+                .is_none_or(|owner| location.owner() == owner)
+                .then_some((residency, location, revision))
+        };
         let candidates = [
             self.row_atlases.last().map(|cached| {
                 key(
@@ -2058,10 +2287,11 @@ impl EvidenceStore {
                 )
             }),
         ];
-        let inspected = candidates.iter().flatten().count();
+        let inspected = candidates.iter().flatten().flatten().count();
         (
             candidates
                 .into_iter()
+                .flatten()
                 .flatten()
                 .min()
                 .map(|(_, location, _)| location),
@@ -2327,6 +2557,20 @@ struct PublishedRowAtlas {
     target: GenomicInterval,
     root: Arc<AlignmentRowAtlas>,
     _pins: AlignmentRowAtlasPins,
+}
+
+/// Outcome of one `Bounded` cache trim: see [`EvidenceStore::trim_to_owner_budgets`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BoundedCacheTrim {
+    pub evicted_entries: usize,
+    /// Read pages among `evicted_entries` (presentation store only).
+    pub evicted_read_pages: usize,
+    /// `false` when the entry quantum ran out with an owner still over its share.
+    pub complete: bool,
+    /// Unevictable content alone exceeds an owner's hard cap.
+    pub pressure: Option<LedgerError>,
+    /// The owner `pressure` describes.
+    pub pressure_owner: Option<AllocationOwner>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2887,6 +3131,259 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn bounded_ledger(budget: usize) -> AllocationLedger {
+        AllocationLedger::with_policy(
+            crate::AlignmentMemoryPolicy::Bounded,
+            budget,
+            budget,
+            budget,
+        )
+    }
+
+    fn locus(start: u64, end: u64) -> GenomicInterval {
+        GenomicInterval::new(ContigId::new(0), start, end).unwrap()
+    }
+
+    #[test]
+    fn bounded_trim_evicts_least_recently_used_certificates_and_stops_claiming_them() {
+        let ledger = bounded_ledger(1 << 20);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        for block in 0..4_u64 {
+            store
+                .admit(one_record_acquisition(
+                    &ledger,
+                    block * 100,
+                    block * 100 + 100,
+                    block + 1,
+                ))
+                .unwrap();
+        }
+        let one = ledger
+            .owner_usage(AllocationOwner::Evidence)
+            .unwrap()
+            .charged
+            / 4;
+        // Inside its share nothing is touched.
+        let idle = store.trim_to_owner_budgets(&[], usize::MAX).unwrap();
+        assert_eq!(
+            (idle.evicted_entries, idle.complete, idle.pressure),
+            (0, true, None)
+        );
+        // A share with room for two certificates: the two oldest go, whole.
+        ledger.set_budget(one * 2 * 1_000 / 400 + 3).unwrap();
+        let trim = store.trim_to_owner_budgets(&[], usize::MAX).unwrap();
+        assert!(trim.complete);
+        assert_eq!(trim.pressure, None);
+        assert_eq!(store.acquisition_count(), 2);
+        let usage = ledger.owner_usage(AllocationOwner::Evidence).unwrap();
+        assert!(usage.charged <= usage.soft_budget, "{usage:?}");
+        // An evicted certificate is no longer claimed; a retained one still is, and delivers.
+        assert!(!store.cached_covers(locus(0, 100), &no_payload()));
+        assert!(!store.cached_covers(locus(100, 200), &no_payload()));
+        assert!(store.cached_covers(locus(200, 400), &no_payload()));
+        let root = store
+            .prepare(locus(200, 400), no_payload(), ReservationKind::Normal)
+            .unwrap();
+        assert_eq!(root.root().select(locus(200, 400)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn bounded_trim_never_releases_published_or_shielded_content_and_reports_pressure_once_over_the_cap()
+     {
+        let ledger = bounded_ledger(1 << 20);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        for block in 0..3_u64 {
+            store
+                .admit(one_record_acquisition(
+                    &ledger,
+                    block * 100,
+                    block * 100 + 100,
+                    block + 1,
+                ))
+                .unwrap();
+        }
+        let candidate = store
+            .prepare(locus(0, 100), no_payload(), ReservationKind::Normal)
+            .unwrap();
+        let current = store.publish(candidate);
+        // No share at all: everything not published or shielded goes; nothing else does.
+        ledger.set_budget(0).unwrap();
+        let trim = store
+            .trim_to_owner_budgets(&[locus(250, 260)], usize::MAX)
+            .unwrap();
+        assert!(trim.complete);
+        assert!(store.cached_covers(locus(0, 100), &no_payload()));
+        assert!(store.cached_covers(locus(200, 300), &no_payload()));
+        assert!(!store.cached_covers(locus(100, 200), &no_payload()));
+        assert_eq!(store.acquisition_count(), 2);
+        assert_eq!(current.select(locus(1, 2)).unwrap().len(), 1);
+        // The shielded horizon's own bytes exceed a zero cap: that is the pressure, and it is
+        // intrinsic. The published locus lies outside the horizon being prepared, so the chunks
+        // it pins are about to retire and are not held against the request.
+        let usage = ledger.owner_usage(AllocationOwner::Evidence).unwrap();
+        assert!(usage.pinned > 0 && usage.charged > usage.pinned);
+        let Some(LedgerError::BudgetExceeded {
+            requested,
+            charged,
+            reserved: 0,
+            limit: 0,
+        }) = trim.pressure
+        else {
+            panic!("expected cap pressure, got {:?}", trim.pressure);
+        };
+        assert_eq!(charged, usage.charged);
+        assert!(
+            requested >= usage.charged - usage.pinned,
+            "{requested} {usage:?}"
+        );
+        assert!(requested < usage.charged, "{requested} {usage:?}");
+        assert!(trim.pressure.unwrap().intrinsically_exceeds_limit());
+        // Shielding the published locus as well makes its pinned chunks part of the request.
+        let both = store
+            .trim_to_owner_budgets(&[locus(250, 260), locus(0, 100)], usize::MAX)
+            .unwrap();
+        assert_eq!(
+            both.pressure,
+            Some(LedgerError::BudgetExceeded {
+                requested: usage.charged,
+                charged: usage.charged,
+                reserved: 0,
+                limit: 0,
+            })
+        );
+        // Without the shield the in-flight horizon is cache again; the published locus is not.
+        let trim = store.trim_to_owner_budgets(&[], usize::MAX).unwrap();
+        assert_eq!(store.acquisition_count(), 1);
+        assert!(store.cached_covers(locus(0, 100), &no_payload()));
+        let usage = ledger.owner_usage(AllocationOwner::Evidence).unwrap();
+        assert_eq!(usage.charged, usage.pinned);
+        assert_eq!(
+            trim.pressure.map(LedgerError::intrinsically_exceeds_limit),
+            Some(true)
+        );
+        // With room for the published content there is no pressure, however full the cache was.
+        ledger.set_budget(1 << 20).unwrap();
+        assert_eq!(
+            store
+                .trim_to_owner_budgets(&[], usize::MAX)
+                .unwrap()
+                .pressure,
+            None
+        );
+    }
+
+    #[test]
+    fn a_superseded_published_locus_is_not_held_against_the_request_replacing_it() {
+        let ledger = bounded_ledger(1 << 20);
+        let mut store = EvidenceStore::new(
+            source_revision(),
+            ContractFingerprint::new(9),
+            ledger.clone(),
+        );
+        store
+            .admit(one_record_acquisition(&ledger, 0, 100, 1))
+            .unwrap();
+        let candidate = store
+            .prepare(locus(0, 100), no_payload(), ReservationKind::Normal)
+            .unwrap();
+        let published = store.publish(candidate);
+        // A disjoint jump: the next locus is decoded while the old one is still on screen.
+        store
+            .admit(one_record_acquisition(&ledger, 1_000, 1_100, 2))
+            .unwrap();
+        // A hard cap just below old and new together, which holds either of them alone.
+        let charged = ledger
+            .owner_usage(AllocationOwner::Evidence)
+            .unwrap()
+            .charged;
+        ledger.set_budget((charged - 1) * 1_000 / 800).unwrap();
+        let usage = ledger.owner_usage(AllocationOwner::Evidence).unwrap();
+        assert!(usage.hard_cap < usage.charged && usage.hard_cap >= usage.pinned);
+
+        let trim = store
+            .trim_to_owner_budgets(&[locus(1_000, 1_100)], usize::MAX)
+            .unwrap();
+        assert!(trim.complete);
+        assert_eq!(
+            trim.pressure, None,
+            "the retiring locus refused its successor"
+        );
+        // Nothing was released to get there: the old locus is pinned, the new one shielded.
+        assert_eq!(store.acquisition_count(), 2);
+        assert_eq!(published.select(locus(1, 2)).unwrap().len(), 1);
+        // Two panels which both need their locus are a different request, and that one is over.
+        let both = store
+            .trim_to_owner_budgets(&[locus(1_000, 1_100), locus(0, 100)], usize::MAX)
+            .unwrap();
+        assert!(
+            both.pressure
+                .is_some_and(LedgerError::intrinsically_exceeds_limit)
+        );
+    }
+
+    #[test]
+    fn bounded_builds_never_fail_for_budget_and_complete_builds_still_refuse() {
+        for (ledger, admitted) in [
+            (
+                // No budget to speak of; the per-build sanity cap is the scratch limit.
+                AllocationLedger::with_policy(crate::AlignmentMemoryPolicy::Bounded, 1, 0, 1 << 20),
+                true,
+            ),
+            (
+                AllocationLedger::new_with_transient_budget(1 << 20, 0, 1 << 20),
+                false,
+            ),
+        ] {
+            let mut store = EvidenceStore::new(
+                source_revision(),
+                ContractFingerprint::new(9),
+                ledger.clone(),
+            );
+            store
+                .admit(one_record_acquisition(&ledger, 0, 100, 7))
+                .unwrap();
+            // Leave the strict ledger no headroom at all.
+            ledger
+                .set_budget(
+                    ledger
+                        .progress()
+                        .unwrap()
+                        .charged
+                        .min(ledger.progress().unwrap().budget),
+                )
+                .unwrap();
+            let before = ledger.progress().unwrap().charged;
+            let prepared = store.prepare(locus(0, 100), no_payload(), ReservationKind::Normal);
+            assert_eq!(prepared.is_ok(), admitted);
+            if let Err(error) = &prepared {
+                assert!(matches!(
+                    error,
+                    EvidenceStoreError::Build(crate::EvidenceBuildError::Ledger(
+                        LedgerError::BudgetExceeded { .. }
+                    ))
+                ));
+                assert_eq!(ledger.progress().unwrap().charged, before);
+            }
+            drop(prepared);
+            let progress = ledger.progress().unwrap();
+            assert_eq!((progress.charged, progress.reserved), (before, 0));
+            // The trim is a no-op under the strict policy.
+            if !admitted {
+                let trim = store.trim_to_owner_budgets(&[], usize::MAX).unwrap();
+                assert_eq!((trim.evicted_entries, trim.pressure), (0, None));
+                assert_eq!(store.acquisition_count(), 1);
+            }
+        }
     }
 
     #[test]

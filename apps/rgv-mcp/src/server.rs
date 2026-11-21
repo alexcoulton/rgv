@@ -7,15 +7,12 @@ use rgv_core::{
     AlignmentCigarEventPredicate, AlignmentColorMode, AlignmentFlagPredicate, AlignmentGroupMode,
     AlignmentOrderDirection, AlignmentPredicateExpression, AlignmentPredicateScope,
     AlignmentSortMode, AlignmentViewPredicate, AutomationAlignmentRelationship,
-    AutomationAlignmentReveal, AutomationAlignmentSelector, AutomationAlignmentState,
-    AutomationBatch, AutomationCommand, AutomationCommandStatus, AutomationExportKind,
-    AutomationHistoryNavigation, AutomationInteractionTrace, AutomationNavigationDestination,
-    AutomationReviewNavigation, AutomationRunReport, AutomationSelection,
-    AutomationSelectionGranularity, AutomationSetting, AutomationSnapshotFormat,
+    AutomationAlignmentReveal, AutomationAlignmentSelector, AutomationBatch, AutomationCommand,
+    AutomationCommandStatus, AutomationExportKind, AutomationHistoryNavigation,
+    AutomationInteractionTrace, AutomationNavigationDestination, AutomationReviewNavigation,
+    AutomationRunReport, AutomationSelection, AutomationSetting, AutomationSnapshotFormat,
     AutomationSnapshotScope, AutomationUnsavedChangesPolicy, AutomationViewportOperation,
-    AutomationWorkspaceSnapshot, CoverageScaleTransform, ModifiedBaseColorMode,
-    OverlappingMatePolicy, PanelId, PresentationNodeId, ReadBaseDisplayMode, TrackChannel, TrackId,
-    TrackKind, TrackSource,
+    AutomationWorkspaceSnapshot, PanelId, TrackId, TrackKind, TrackSource,
 };
 use rmcp::schemars;
 use rmcp::{
@@ -32,6 +29,10 @@ use crate::{
     artifacts::{ArtifactError, ArtifactStore, TemporaryArtifact},
     capture::{InlineCapture, effective_max_width, prepare_inline_png},
     config::RgvMcpArgs,
+    evidence::{
+        DEFAULT_PILEUP_LIMIT, DEFAULT_VARIANT_LIMIT, EvidenceError, EvidenceQuery, VariantDetail,
+        pileup_result, variants_result,
+    },
     redaction::{inline_export_read_names, redact_message},
 };
 
@@ -124,6 +125,44 @@ impl RgvMcpServer {
             )
         })?;
         Ok((parsed, report))
+    }
+
+    /// Exports one kind of evidence for the active panel's current interval to a temporary
+    /// artifact and returns its text. The viewer's state is not changed and the file is removed
+    /// on every exit path.
+    async fn evidence_export(
+        &self,
+        kind: AutomationExportKind,
+        wait_until_settled: bool,
+        timeout_millis: u64,
+    ) -> Result<String, CallToolResult> {
+        let temporary = self.artifacts.temporary("tsv");
+        let mut commands = Vec::new();
+        if wait_until_settled {
+            commands.push(AutomationCommand::WaitUntilSettled { timeout_millis });
+        }
+        commands.push(AutomationCommand::Export {
+            path: temporary.path().display().to_string(),
+            kind,
+        });
+        let batch = AutomationBatch {
+            schema_version: BATCH_SCHEMA_VERSION,
+            commands,
+        };
+        match self.control.run_batch(&batch).await {
+            Ok(report) if report.succeeded => {}
+            Ok(report) => return Err(report_failure(&report)),
+            Err(error) => return Err(control_failure(&error)),
+        }
+        let bytes = temporary
+            .read_capture()
+            .map_err(|error| artifact_failure(&error))?;
+        String::from_utf8(bytes).map_err(|_| {
+            adapter_failure(
+                "invalid_response",
+                "RGV wrote an evidence export that is not UTF-8",
+            )
+        })
     }
 
     /// Runs `[wait_until_settled,] snapshot, describe_workspace` and returns the successful
@@ -452,7 +491,7 @@ impl RgvMcpServer {
     ) -> CallToolResult {
         let commands = with_optional_settle(
             vec![AutomationCommand::NavigateReviewItem {
-                action: args.action.into_core(),
+                action: args.action,
             }],
             args.wait_until_settled,
             args.timeout_millis,
@@ -509,7 +548,7 @@ impl RgvMcpServer {
         let commands = with_optional_settle(
             vec![AutomationCommand::NavigateHistory {
                 panel_id: PanelId::new(args.panel_id),
-                action: args.action.into_core(),
+                action: args.action,
             }],
             args.wait_until_settled,
             args.timeout_millis,
@@ -536,7 +575,7 @@ impl RgvMcpServer {
                 vec![AutomationCommand::FindAlignments {
                     panel_id: PanelId::new(args.panel_id),
                     track_id: TrackId::new(args.track_id),
-                    selector: args.selector.into_core(),
+                    selector: args.selector,
                     maximum_results: args.maximum_results,
                 }],
                 0,
@@ -569,7 +608,7 @@ impl RgvMcpServer {
         let commands = with_optional_settle(
             vec![AutomationCommand::SelectAlignment {
                 handle: args.handle,
-                reveal: args.reveal.into_core(),
+                reveal: args.reveal,
                 expected_workspace_revision: args.expected_workspace_revision,
             }],
             args.wait_until_settled,
@@ -620,9 +659,9 @@ impl RgvMcpServer {
     ) -> CallToolResult {
         let commands = with_optional_settle(
             vec![AutomationCommand::NavigateRelatedAlignment {
-                relationship: args.relationship.into_core(),
+                relationship: args.relationship,
                 segment_index: args.segment_index,
-                destination: args.destination.into_core(),
+                destination: args.destination,
                 expected_workspace_revision: args.expected_workspace_revision,
             }],
             args.wait_until_settled,
@@ -664,11 +703,10 @@ impl RgvMcpServer {
         &self,
         Parameters(args): Parameters<ChangeViewportArgs>,
     ) -> CallToolResult {
-        let operation = args.operation.into_core();
         let commands = with_optional_settle(
             vec![AutomationCommand::ChangeViewport {
                 panel_id: PanelId::new(args.panel_id),
-                operation,
+                operation: args.operation,
             }],
             args.wait_until_settled,
             args.timeout_millis,
@@ -762,7 +800,7 @@ impl RgvMcpServer {
             vec![AutomationCommand::Group {
                 track_ids: track_ids(&args.track_ids),
                 mode,
-                direction: args.direction.into_core(),
+                direction: args.direction,
                 tag,
                 anchor_position: args.anchor_position,
             }],
@@ -793,7 +831,7 @@ impl RgvMcpServer {
             vec![AutomationCommand::Sort {
                 track_ids: track_ids(&args.track_ids),
                 mode,
-                direction: args.direction.into_core(),
+                direction: args.direction,
                 tag,
                 anchor_position: args.anchor_position,
             }],
@@ -838,7 +876,7 @@ impl RgvMcpServer {
     async fn select(&self, Parameters(args): Parameters<SelectArgs>) -> CallToolResult {
         let commands = with_optional_settle(
             vec![AutomationCommand::Select {
-                selection: args.selection.into_core(),
+                selection: args.selection,
             }],
             args.wait_until_settled,
             args.timeout_millis,
@@ -1042,7 +1080,7 @@ impl RgvMcpServer {
         }
         commands.push(AutomationCommand::Export {
             path: path.display().to_string(),
-            kind: args.kind.into_core(),
+            kind: args.kind,
         });
         let report = match self
             .control
@@ -1161,13 +1199,101 @@ impl RgvMcpServer {
             vec![AutomationCommand::OpenWorkspace {
                 path: path.display().to_string(),
                 confirm_replace: true,
-                unsaved_changes: args.unsaved_changes.into_core(),
+                unsaved_changes: args.unsaved_changes,
                 timeout_millis: args.timeout_millis,
             }],
             args.wait_until_settled,
             args.timeout_millis,
         );
         self.execute(commands).await
+    }
+
+    /// Read per-base depth and A/C/G/T/N, insertion and deletion counts from the alignment tracks
+    /// in the active panel's current view. Read-only: it never navigates, so the interval must lie
+    /// inside the current view (call `rgv_navigate` first). Positions are zero-based; bases with
+    /// no coverage are omitted and the reference base is not reported. When a track's
+    /// `alleles_available` is false, use only its depths.
+    #[tool(
+        name = "rgv_query_pileup",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn query_pileup(&self, Parameters(args): Parameters<QueryPileupArgs>) -> CallToolResult {
+        let text = match self
+            .evidence_export(
+                AutomationExportKind::Pileup,
+                args.wait_until_settled,
+                args.timeout_millis,
+            )
+            .await
+        {
+            Ok(text) => text,
+            Err(failure) => return failure,
+        };
+        let query = EvidenceQuery {
+            contig: args.contig,
+            start: args.start,
+            end: args.end,
+            track_ids: args.track_ids,
+            offset: args.offset,
+            limit: args.limit,
+        };
+        evidence_result(
+            "Read pileup counts from the active panel's current view",
+            tokio::task::spawn_blocking(move || pileup_result(&text, &query)).await,
+        )
+    }
+
+    /// List the variant records of visible variant tracks that overlap an interval of the active
+    /// panel's current view. Read-only: it never navigates, so the interval must lie inside the
+    /// current view (call `rgv_navigate` first). Coordinates are zero-based and half-open. INFO
+    /// fields and genotypes are returned only on request, and sample names are pseudonymized
+    /// unless `include_sample_names` is true.
+    #[tool(
+        name = "rgv_query_variants",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn query_variants(
+        &self,
+        Parameters(args): Parameters<QueryVariantsArgs>,
+    ) -> CallToolResult {
+        let text = match self
+            .evidence_export(
+                AutomationExportKind::Variants,
+                args.wait_until_settled,
+                args.timeout_millis,
+            )
+            .await
+        {
+            Ok(text) => text,
+            Err(failure) => return failure,
+        };
+        let query = EvidenceQuery {
+            contig: args.contig,
+            start: args.start,
+            end: args.end,
+            track_ids: args.track_ids,
+            offset: args.offset,
+            limit: args.limit,
+        };
+        let detail = VariantDetail {
+            include_info: args.include_info,
+            include_genotypes: args.include_genotypes,
+            include_sample_names: args.include_sample_names,
+        };
+        evidence_result(
+            "Listed variants overlapping the requested interval of the active panel's view",
+            tokio::task::spawn_blocking(move || variants_result(&text, &query, detail)).await,
+        )
     }
 
     /// Execute an advanced bounded sequence that may visibly mutate the live RGV window.
@@ -1235,6 +1361,20 @@ impl RgvMcpServer {
             Ok(report) => report_failure(&report),
             Err(error) => control_failure(&error),
         }
+    }
+}
+
+fn evidence_result(
+    summary: &str,
+    outcome: Result<Result<Value, EvidenceError>, tokio::task::JoinError>,
+) -> CallToolResult {
+    match outcome {
+        Ok(Ok(value)) => success_result(summary, value),
+        Ok(Err(error)) => adapter_failure(error.code(), &redact_message(&error.to_string())),
+        Err(_) => adapter_failure(
+            "invalid_response",
+            "the evidence export could not be interpreted",
+        ),
     }
 }
 
@@ -1500,9 +1640,11 @@ pub struct WorkspaceArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NavigateArgs {
-    /// One to 16 locus strings; each becomes one panel, in order, replacing the current panel
-    /// arrangement. Coordinates are one-based and inclusive at both ends, e.g.
-    /// `chr1:1,000,001-1,100,000` (thousands separators optional).
+    /// One to 16 locus strings. A single locus retargets only the active panel; two or more
+    /// replace the whole panel arrangement with one panel per locus, in order. Coordinates are
+    /// one-based and inclusive at both ends, e.g. `chr1:1,000,001-1,100,000` (thousands
+    /// separators optional); `chr1:12345` shows that base with 20 bases of flank and a bare
+    /// contig name shows the whole contig. Gene symbols are not resolved.
     #[schemars(length(min = 1, max = 16))]
     pub loci: Vec<String>,
     /// When true (the default), wait after the operation until every query it triggered has
@@ -1525,7 +1667,7 @@ pub struct ChangeViewportArgs {
     pub panel_id: u64,
     /// The pan, zoom, or fit to apply. Numeric positions are zero-based; intervals are half-open
     /// `[start, end)`.
-    pub operation: ToolViewportOperation,
+    pub operation: AutomationViewportOperation,
     /// When true (the default), wait after the operation until every query it triggered has
     /// settled, so the returned report describes the final state. Set false only to observe
     /// intermediate state.
@@ -1538,67 +1680,14 @@ pub struct ChangeViewportArgs {
     pub timeout_millis: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(tag = "operation", rename_all = "snake_case")]
-pub enum ToolViewportOperation {
-    /// Pan by a signed number of bases.
-    PanBases {
-        /// Signed pan distance in bases (base pairs). Positive moves the view toward higher
-        /// coordinates, negative toward lower. Must not be zero; the view is clamped to the contig.
-        delta: i64,
-    },
-    /// Pan by a signed fraction of the visible span.
-    PanFraction {
-        /// Signed pan distance as a fraction of the currently visible span (1.0 = one full view
-        /// width). Positive moves toward higher coordinates. Must not be zero; -100 to 100.
-        #[schemars(range(min = -100.0, max = 100.0))]
-        fraction: f64,
-    },
-    /// Zoom in or out around an anchor.
-    Zoom {
-        /// Magnification factor, 0.01 to 100: above 1 zooms in (the visible span is divided by the
-        /// factor), below 1 zooms out.
-        #[schemars(range(min = 0.01, max = 100.0))]
-        factor: f64,
-        /// Zero-based genomic position on the panel's current contig that keeps its screen position
-        /// while zooming. Omit to zoom around the viewport centre.
-        anchor_position: Option<u64>,
-    },
-    /// Show exactly one zero-based, half-open interval `[start, end)` of the panel's current
-    /// contig.
-    FitInterval {
-        /// Zero-based inclusive start of the interval, in bases, on the panel's current contig.
-        start: u64,
-        /// Zero-based exclusive end of the interval (half-open `[start, end)`); must be greater
-        /// than `start`. Equals the one-based inclusive end. Clamped to the contig length.
-        end: u64,
-    },
-}
-
-impl ToolViewportOperation {
-    fn into_core(self) -> AutomationViewportOperation {
-        match self {
-            Self::PanBases { delta } => AutomationViewportOperation::PanBases { delta },
-            Self::PanFraction { fraction } => AutomationViewportOperation::PanFraction { fraction },
-            Self::Zoom {
-                factor,
-                anchor_position,
-            } => AutomationViewportOperation::Zoom {
-                factor,
-                anchor_position,
-            },
-            Self::FitInterval { start, end } => {
-                AutomationViewportOperation::FitInterval { start, end }
-            }
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LoadTrackArgs {
-    /// Where to read the track from: a local file under the control root or an HTTP/HTTPS URL.
+    /// Where to read the track from: a local file under the control root or, for alignment tracks
+    /// only, an HTTP/HTTPS URL (remote reference and annotation sources fail with
+    /// `unsupported_command`).
     pub source: ToolSource,
-    /// Track kind. Omit to let RGV infer it from the source.
+    /// Track kind. Omit to infer it from the source's file name; an unrecognised name is loaded as
+    /// `feature`.
     pub kind: Option<ToolTrackKind>,
     /// Optional display name for the track.
     pub name: Option<String>,
@@ -1614,6 +1703,9 @@ pub struct LoadTrackArgs {
     pub timeout_millis: u64,
 }
 
+/// Adapter, not a mirror: core `TrackSource` is externally tagged with capitalised keys
+/// (`{"Local": {"path": ..}}`, the persisted session format). The tool keeps the flatter
+/// `{"kind": "local", "path": ..}` spelling its callers already use.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolSource {
@@ -1639,18 +1731,30 @@ impl ToolSource {
     }
 }
 
+/// Adapter, not a mirror: core `TrackKind` serialises its variants capitalised (`"GeneModel"`,
+/// the persisted session format); the tool spells them in snake case like every other argument.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolTrackKind {
+    /// Aligned reads (BAM or CRAM).
     Alignment,
+    /// A reference sequence (FASTA). Local sources only.
     Reference,
+    /// Interval features such as BED records.
     Feature,
+    /// Gene and transcript models.
     GeneModel,
+    /// Variant calls (VCF or BCF).
     Variant,
+    /// Mutation records (MAF).
     Mutation,
+    /// Genome-wide association results.
     Gwas,
+    /// A numeric signal along the genome (bigWig, TDF, bedGraph, or WIG).
     Quantitative,
+    /// Copy-number segments (SEG).
     CopyNumber,
+    /// Paired-interval interactions (BEDPE or interact).
     Interaction,
 }
 
@@ -1692,7 +1796,8 @@ pub struct TrackIdArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ConfigureArgs {
     /// The single typed setting to apply, selected by its `setting` discriminator. The report gives
-    /// `requested`, `effective`, `changed`, and `clamped`.
+    /// `requested`, `effective`, `changed`, and `clamped`. `read_browsing_buffer_percent` and
+    /// `total_cache_budget_mib` are saved to the user's desktop settings and outlive the workspace.
     pub change: ToolSetting,
     /// When true (the default), wait after the operation until every query it triggered has
     /// settled, so the returned report describes the final state. Set false only to observe
@@ -1706,189 +1811,173 @@ pub struct ConfigureArgs {
     pub timeout_millis: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolTrackChannel {
-    Annotation,
-    Reads,
+/// The `rgv_configure` argument: any core [`AutomationSetting`] in its own wire form, or one of
+/// the three MCP spellings in [`ToolSettingAdapter`].
+///
+/// The published schema is the core setting schema with the adapter's variants substituted for
+/// the two core filter variants, so it cannot drift from the wire type and withholds nothing.
+#[derive(Debug)]
+pub enum ToolSetting {
+    Core(AutomationSetting),
+    Adapter(ToolSettingAdapter),
 }
 
-impl ToolTrackChannel {
-    const fn into_core(self) -> TrackChannel {
+/// Settings whose core wire form is awkward to write by hand. Core carries a SAM tag as two byte
+/// values, a base as its ASCII code, and a float operand as IEEE-754 bits; these variants take
+/// strings and JSON numbers and convert.
+// The variant names are the wire identifiers of the settings, which share the prefix.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "setting", rename_all = "snake_case")]
+pub enum ToolSettingAdapter {
+    /// Colour reads on the listed alignment tracks by the value of a SAM auxiliary tag. The
+    /// string spelling of `alignment_color_mode` with `{"tag": [..]}`.
+    AlignmentColorTag {
+        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+        /// entries.
+        #[schemars(length(min = 1, max = 1024))]
+        track_ids: Vec<u64>,
+        /// Two-character SAM auxiliary tag whose value colours each read, e.g. `HP` (a letter
+        /// followed by a letter or digit; case-sensitive).
+        #[schemars(length(min = 2, max = 2))]
+        #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
+        tag: String,
+    },
+    /// Replace the view filter of the listed alignment tracks: records that do not match are
+    /// removed from the reads, coverage, and exports. A change re-queries every panel, expires
+    /// alignment handles, and marks retained evidence stale.
+    AlignmentViewFilter {
+        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+        /// entries.
+        #[schemars(length(min = 1, max = 1024))]
+        track_ids: Vec<u64>,
+        /// Up to 64 predicates combined with logical AND; only records matching all of them remain
+        /// in the view, coverage, and exports. An empty list clears the view filter.
+        #[schemars(length(max = 64))]
+        predicates: Vec<ToolAlignmentPredicate>,
+    },
+    /// Replace the highlight filter of the listed alignment tracks: matching records are
+    /// highlighted and nothing is removed.
+    AlignmentHighlightFilter {
+        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
+        /// entries.
+        #[schemars(length(min = 1, max = 1024))]
+        track_ids: Vec<u64>,
+        /// Up to 64 predicates combined with logical AND; matching records are highlighted but
+        /// nothing is removed. An empty list clears the highlight.
+        #[schemars(length(max = 64))]
+        predicates: Vec<ToolAlignmentPredicate>,
+    },
+}
+
+/// Core `setting` names whose published schema is the adapter's. The core form of each is still
+/// accepted when the argument carries core's `value` field.
+const ADAPTED_CORE_SETTINGS: [&str; 2] = ["alignment_view_filter", "alignment_highlight_filter"];
+
+impl ToolSetting {
+    fn into_core(self) -> AutomationSetting {
+        let expression = |predicates: Vec<ToolAlignmentPredicate>| AlignmentPredicateExpression {
+            version: 1,
+            all: predicates
+                .into_iter()
+                .map(ToolAlignmentPredicate::into_core)
+                .collect(),
+        };
         match self {
-            Self::Annotation => TrackChannel::Annotation,
-            Self::Reads => TrackChannel::Reads,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ToolPresentationNode {
-    Reference,
-    /// One track row in a presentation channel.
-    Track {
-        /// Presentation channel (pane) that owns the target: `annotation` or `reads`.
-        channel: ToolTrackChannel,
-        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        track_id: u64,
-    },
-    /// One presentation group in a channel.
-    Group {
-        /// Presentation channel (pane) that owns the target: `annotation` or `reads`.
-        channel: ToolTrackChannel,
-        /// Positive presentation-group ID as reported in `presentation_groups` of the workspace
-        /// snapshot.
-        #[schemars(range(min = 1))]
-        group_id: u32,
-    },
-}
-
-impl ToolPresentationNode {
-    const fn into_core(self) -> PresentationNodeId {
-        match self {
-            Self::Reference => PresentationNodeId::Reference,
-            Self::Track { channel, track_id } => PresentationNodeId::Track {
-                channel: channel.into_core(),
-                track_id: TrackId::new(track_id),
-            },
-            Self::Group { channel, group_id } => PresentationNodeId::Group {
-                channel: channel.into_core(),
-                group_id,
-            },
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
-#[serde(tag = "scope", rename_all = "snake_case")]
-pub enum ToolAlignmentPredicateScope {
-    #[default]
-    Anywhere,
-    /// Restrict the predicate to one reference base.
-    Position {
-        /// Contig (reference sequence) name exactly as the workspace reports it, e.g. `chr1`. An
-        /// unknown name matches nothing.
-        contig: String,
-        /// Zero-based genomic position on `contig` (one less than the one-based coordinate shown in
-        /// a locus string).
-        position: u64,
-    },
-    /// Restrict the predicate to one zero-based, half-open reference interval `[start, end)`.
-    Interval {
-        /// Contig (reference sequence) name exactly as the workspace reports it, e.g. `chr1`. An
-        /// unknown name matches nothing.
-        contig: String,
-        /// Zero-based inclusive start on `contig`, in bases.
-        start: u64,
-        /// Zero-based exclusive end on `contig` (half-open `[start, end)`); must be greater than
-        /// `start`.
-        end: u64,
-    },
-}
-
-impl ToolAlignmentPredicateScope {
-    fn into_core(self) -> AlignmentPredicateScope {
-        match self {
-            Self::Anywhere => AlignmentPredicateScope::Anywhere,
-            Self::Position { contig, position } => {
-                AlignmentPredicateScope::Position { contig, position }
+            Self::Core(setting) => setting,
+            Self::Adapter(ToolSettingAdapter::AlignmentColorTag {
+                track_ids: ids,
+                tag,
+            }) => {
+                // A tag of the wrong length becomes a zero byte, which core validation rejects.
+                let bytes = tag.as_bytes();
+                let tag = if bytes.len() == 2 {
+                    [bytes[0], bytes[1]]
+                } else {
+                    [0, 0]
+                };
+                AutomationSetting::AlignmentColorMode {
+                    track_ids: track_ids(&ids),
+                    value: AlignmentColorMode::Tag(tag),
+                }
             }
-            Self::Interval { contig, start, end } => {
-                AlignmentPredicateScope::Interval { contig, start, end }
-            }
+            Self::Adapter(ToolSettingAdapter::AlignmentViewFilter {
+                track_ids: ids,
+                predicates,
+            }) => AutomationSetting::AlignmentViewFilter {
+                track_ids: track_ids(&ids),
+                value: expression(predicates),
+            },
+            Self::Adapter(ToolSettingAdapter::AlignmentHighlightFilter {
+                track_ids: ids,
+                predicates,
+            }) => AutomationSetting::AlignmentHighlightFilter {
+                track_ids: track_ids(&ids),
+                value: expression(predicates),
+            },
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolAlignmentFlagPredicate {
-    Duplicate,
-    Secondary,
-    Supplementary,
-    FailedQualityControl,
-    Paired,
-    ProperPair,
-    MateMapped,
-    ReverseStrand,
-}
-
-impl ToolAlignmentFlagPredicate {
-    const fn into_core(self) -> AlignmentFlagPredicate {
-        match self {
-            Self::Duplicate => AlignmentFlagPredicate::Duplicate,
-            Self::Secondary => AlignmentFlagPredicate::Secondary,
-            Self::Supplementary => AlignmentFlagPredicate::Supplementary,
-            Self::FailedQualityControl => AlignmentFlagPredicate::FailedQualityControl,
-            Self::Paired => AlignmentFlagPredicate::Paired,
-            Self::ProperPair => AlignmentFlagPredicate::ProperPair,
-            Self::MateMapped => AlignmentFlagPredicate::MateMapped,
-            Self::ReverseStrand => AlignmentFlagPredicate::ReverseStrand,
+impl<'de> Deserialize<'de> for ToolSetting {
+    /// Chooses the adapter or the core type from the `setting` name, then deserialises as exactly
+    /// that type, so an invalid argument reports that type's own error instead of an untagged
+    /// "did not match any variant".
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = Value::deserialize(deserializer)?;
+        let name = value.get("setting").and_then(Value::as_str);
+        let adapted = name == Some("alignment_color_tag")
+            || (name.is_some_and(|name| ADAPTED_CORE_SETTINGS.contains(&name))
+                && value.get("value").is_none());
+        if adapted {
+            serde_json::from_value(value).map(Self::Adapter)
+        } else {
+            serde_json::from_value(value).map(Self::Core)
         }
+        .map_err(D::Error::custom)
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolAlignmentCigarEventPredicate {
-    Insertion,
-    Deletion,
-    Indel,
-    SoftClip,
-    HardClip,
-    ReferenceSkip,
-}
+impl JsonSchema for ToolSetting {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ToolSetting".into()
+    }
 
-impl ToolAlignmentCigarEventPredicate {
-    const fn into_core(self) -> AlignmentCigarEventPredicate {
-        match self {
-            Self::Insertion => AlignmentCigarEventPredicate::Insertion,
-            Self::Deletion => AlignmentCigarEventPredicate::Deletion,
-            Self::Indel => AlignmentCigarEventPredicate::Indel,
-            Self::SoftClip => AlignmentCigarEventPredicate::SoftClip,
-            Self::HardClip => AlignmentCigarEventPredicate::HardClip,
-            Self::ReferenceSkip => AlignmentCigarEventPredicate::ReferenceSkip,
-        }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let variants = |schema: schemars::Schema| {
+            schema
+                .to_value()
+                .get("oneOf")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let mut one_of = variants(AutomationSetting::json_schema(generator));
+        one_of.retain(|variant| {
+            variant
+                .pointer("/properties/setting/const")
+                .and_then(Value::as_str)
+                .is_none_or(|name| !ADAPTED_CORE_SETTINGS.contains(&name))
+        });
+        one_of.extend(variants(ToolSettingAdapter::json_schema(generator)));
+        schemars::json_schema!({
+            "description": "One typed setting, selected by its `setting` discriminator.",
+            "oneOf": one_of,
+        })
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolAlignmentAuxComparison {
-    Exists,
-    Equal,
-    NotEqual,
-    Greater,
-    GreaterOrEqual,
-    Less,
-    LessOrEqual,
-}
-
-impl ToolAlignmentAuxComparison {
-    const fn into_core(self) -> AlignmentAuxComparison {
-        match self {
-            Self::Exists => AlignmentAuxComparison::Exists,
-            Self::Equal => AlignmentAuxComparison::Equal,
-            Self::NotEqual => AlignmentAuxComparison::NotEqual,
-            Self::Greater => AlignmentAuxComparison::Greater,
-            Self::GreaterOrEqual => AlignmentAuxComparison::GreaterOrEqual,
-            Self::Less => AlignmentAuxComparison::Less,
-            Self::LessOrEqual => AlignmentAuxComparison::LessOrEqual,
-        }
-    }
-}
-
+/// Adapter, not a mirror: core `AlignmentAuxFilterValue` stores a float operand as its IEEE-754
+/// bit pattern (`float_bits`) so predicates stay `Eq`; the tool accepts an ordinary JSON number.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ToolAlignmentAuxValue {
-    /// Integer operand, compared numerically with integer tag values.
+    /// Integer operand, compared numerically with integer and character tag values.
     Integer(i64),
-    /// Floating-point operand.
+    /// Finite floating-point operand, compared with float tag values.
     Float(f64),
-    /// String operand, compared with string (`Z`) tag values.
+    /// String operand, compared in byte order with string (`Z`) and hex (`H`) tag values.
     String(String),
 }
 
@@ -1902,6 +1991,9 @@ impl ToolAlignmentAuxValue {
     }
 }
 
+/// Adapter, not a mirror: core `AlignmentViewPredicate` carries a SAM tag as two byte values, a
+/// base as its ASCII code, and a float operand as bits. The tool takes a two-character string, a
+/// one-letter string, and a JSON number, and converts. Every other field uses the core type.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(tag = "predicate", rename_all = "snake_case")]
 pub enum ToolAlignmentPredicate {
@@ -1916,7 +2008,7 @@ pub enum ToolAlignmentPredicate {
     /// Keep records by the state of one SAM flag.
     Flag {
         /// The SAM flag (or derived flag state) to test.
-        flag: ToolAlignmentFlagPredicate,
+        flag: AlignmentFlagPredicate,
         /// Required flag state: true keeps records with the flag set, false keeps records with it
         /// clear.
         expected: bool,
@@ -1943,21 +2035,23 @@ pub enum ToolAlignmentPredicate {
         #[schemars(length(min = 2, max = 2))]
         #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
         tag: String,
-        /// How the tag is tested. `exists` needs no `value`; every other comparison is false for
-        /// records lacking the tag.
-        comparison: ToolAlignmentAuxComparison,
-        /// Operand for the comparison. Required for every comparison except `exists`; without it
-        /// those comparisons match nothing.
+        /// How the tag is tested. Every comparison except `exists` is false for records lacking
+        /// the tag or holding a value of a different type from the operand.
+        comparison: AlignmentAuxComparison,
+        /// Operand for the comparison. Required for every comparison except `exists` and must be
+        /// omitted for `exists`; otherwise the viewer rejects the setting as invalid.
         value: Option<ToolAlignmentAuxValue>,
     },
     /// Keep records containing a CIGAR event of a given kind, optionally within a scope and length
     /// range.
     CigarEvent {
         /// The kind of CIGAR event to look for.
-        event: ToolAlignmentCigarEventPredicate,
-        /// Where the event must occur. Defaults to `anywhere` in the record.
+        event: AlignmentCigarEventPredicate,
+        /// Where the event must occur (default `anywhere`). Insertions and clips are located at
+        /// the single reference position where they occur; deletions and reference skips match
+        /// when their reference span overlaps the scope.
         #[serde(default)]
-        scope: ToolAlignmentPredicateScope,
+        scope: AlignmentPredicateScope,
         /// Inclusive lower bound on the event length, in bases. Omit for no lower bound.
         minimum_length: Option<u32>,
         /// Inclusive upper bound on the event length, in bases. Omit for no upper bound.
@@ -1977,12 +2071,12 @@ pub enum ToolAlignmentPredicate {
     Substitution {
         /// Where substitutions are counted. Defaults to `anywhere` in the record.
         #[serde(default)]
-        scope: ToolAlignmentPredicateScope,
-        /// Single ASCII base letter the read must show at a substituted position, e.g. `T`. Omit to
-        /// count any substituted base.
+        scope: AlignmentPredicateScope,
+        /// Base letter the read must show at a substituted position: `A`, `C`, `G`, `T`, or `N`
+        /// (either case); any other value is rejected. Omit to count any substituted base.
         observed_base: Option<char>,
         /// Inclusive lower bound on the number of matching substitutions within `scope`. Omit for
-        /// no lower bound.
+        /// the default of 1.
         minimum_count: Option<u32>,
         /// Inclusive upper bound on the number of matching substitutions within `scope`. Omit for
         /// no upper bound.
@@ -1996,10 +2090,7 @@ impl ToolAlignmentPredicate {
             Self::MappingQuality { minimum, maximum } => {
                 AlignmentViewPredicate::MappingQuality { minimum, maximum }
             }
-            Self::Flag { flag, expected } => AlignmentViewPredicate::Flag {
-                flag: flag.into_core(),
-                expected,
-            },
+            Self::Flag { flag, expected } => AlignmentViewPredicate::Flag { flag, expected },
             Self::TemplateLength { minimum, maximum } => {
                 AlignmentViewPredicate::TemplateLength { minimum, maximum }
             }
@@ -2015,7 +2106,7 @@ impl ToolAlignmentPredicate {
                         bytes.first().copied().unwrap_or_default(),
                         bytes.get(1).copied().unwrap_or_default(),
                     ],
-                    comparison: comparison.into_core(),
+                    comparison,
                     value: value.map(ToolAlignmentAuxValue::into_core),
                 }
             }
@@ -2025,8 +2116,8 @@ impl ToolAlignmentPredicate {
                 minimum_length,
                 maximum_length,
             } => AlignmentViewPredicate::CigarEvent {
-                event: event.into_core(),
-                scope: scope.into_core(),
+                event,
+                scope,
                 minimum_length,
                 maximum_length,
             },
@@ -2039,7 +2130,7 @@ impl ToolAlignmentPredicate {
                 minimum_count,
                 maximum_count,
             } => AlignmentViewPredicate::Substitution {
-                scope: scope.into_core(),
+                scope,
                 // Preserve an invalid non-ASCII request as an invalid byte so the canonical
                 // automation validator rejects it; never reinterpret it as the omitted/"any"
                 // base case.
@@ -2047,563 +2138,6 @@ impl ToolAlignmentPredicate {
                 minimum_count,
                 maximum_count,
             },
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(tag = "setting", rename_all = "snake_case")]
-pub enum ToolSetting {
-    WindowSize {
-        /// Window client-area width in logical points (not physical pixels), 640 to 3840.
-        #[schemars(range(min = 640, max = 3840))]
-        width: u32,
-        /// Window client-area height in logical points (not physical pixels), 400 to 2160.
-        #[schemars(range(min = 400, max = 2160))]
-        height: u32,
-    },
-    InterfaceScalePercent {
-        /// Interface zoom in percent, 75 to 200; 100 is the unscaled interface.
-        #[schemars(range(min = 75, max = 200))]
-        value: u16,
-    },
-    PropertiesPanelExpanded {
-        /// True expands the Properties panel, false collapses it.
-        value: bool,
-    },
-    PropertiesPanelWidth {
-        /// Properties panel width in logical points, 280 to 520.
-        #[schemars(range(min = 280.0, max = 520.0))]
-        value: f32,
-    },
-    PropertiesPanelResizeActive {
-        /// True marks a held Properties resize sash (a transient qualification signal); set it back
-        /// to false to release it and trigger the final refresh.
-        value: bool,
-    },
-    ShowReference {
-        /// True shows the reference sequence lane, false hides it.
-        value: bool,
-    },
-    ShowCoverage {
-        /// True shows alignment coverage, false hides it.
-        value: bool,
-    },
-    ShowReads {
-        /// True shows individual reads, false hides them.
-        value: bool,
-    },
-    ShowJunctions {
-        /// True shows splice-junction arcs, false hides them.
-        value: bool,
-    },
-    ViewAsPairs {
-        /// True draws paired reads as linked templates, false draws each read separately.
-        value: bool,
-    },
-    OverlappingMatePolicy {
-        /// How coverage counts bases where two mates of one template overlap.
-        value: ToolOverlappingMatePolicy,
-    },
-    AlignmentColorMode {
-        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
-        /// entries.
-        #[schemars(length(min = 1, max = 1024))]
-        track_ids: Vec<u64>,
-        /// The read colouring mode to apply to the listed tracks.
-        value: ToolAlignmentColorMode,
-    },
-    AlignmentColorTag {
-        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
-        /// entries.
-        #[schemars(length(min = 1, max = 1024))]
-        track_ids: Vec<u64>,
-        /// Two-character SAM auxiliary tag whose value colours each read, e.g. `HP` (a letter
-        /// followed by a letter or digit; case-sensitive).
-        #[schemars(length(min = 2, max = 2))]
-        #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
-        tag: String,
-    },
-    AlignmentViewFilter {
-        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
-        /// entries.
-        #[schemars(length(min = 1, max = 1024))]
-        track_ids: Vec<u64>,
-        /// Up to 64 predicates combined with logical AND; only records matching all of them remain
-        /// in the view, coverage, and exports. An empty list clears the view filter.
-        #[schemars(length(max = 64))]
-        predicates: Vec<ToolAlignmentPredicate>,
-    },
-    AlignmentHighlightFilter {
-        /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
-        /// entries.
-        #[schemars(length(min = 1, max = 1024))]
-        track_ids: Vec<u64>,
-        /// Up to 64 predicates combined with logical AND; matching records are highlighted but
-        /// nothing is removed. An empty list clears the highlight.
-        #[schemars(length(max = 64))]
-        predicates: Vec<ToolAlignmentPredicate>,
-    },
-    AlignmentDensity {
-        /// Read-row height multiplier, 0.25 to 4; 1.0 is the default row height and larger values
-        /// draw taller rows.
-        #[schemars(range(min = 0.25, max = 4.0))]
-        value: f32,
-    },
-    IncludeSecondary {
-        /// True includes secondary alignments (SAM flag 0x100), false excludes them.
-        value: bool,
-    },
-    IncludeSupplementary {
-        /// True includes supplementary alignments (SAM flag 0x800), false excludes them.
-        value: bool,
-    },
-    CoverageScaleTransform {
-        /// Vertical scale applied to coverage depth.
-        value: ToolCoverageScaleTransform,
-    },
-    ReadBaseDisplayMode {
-        /// Which read bases are drawn: mismatches only, all bases, or none.
-        value: ToolReadBaseDisplayMode,
-    },
-    ShadeReadBasesByQuality {
-        /// True shades read bases by their base quality, false draws them at full strength.
-        value: bool,
-    },
-    ShowModifiedBases {
-        /// True draws base-modification (MM/ML) calls, false hides them.
-        value: bool,
-    },
-    ModifiedBaseColorMode {
-        /// How base-modification calls are coloured.
-        value: ToolModifiedBaseColorMode,
-    },
-    PresentationSectionExpanded {
-        /// The presentation section (pane) to expand or collapse: `annotation` or `reads`.
-        channel: ToolTrackChannel,
-        /// True expands the section, false collapses it.
-        value: bool,
-    },
-    PresentationNodeVisible {
-        /// The reference lane, track, or group to show or hide.
-        target: ToolPresentationNode,
-        /// True shows the node, false hides it.
-        value: bool,
-    },
-    PresentationNodeHeight {
-        /// The reference lane, track, or group to resize.
-        target: ToolPresentationNode,
-        /// Preferred node height in logical points, 26 to 1200.
-        #[schemars(range(min = 26.0, max = 1200.0))]
-        value: f32,
-    },
-    PresentationGroupExpanded {
-        /// The group to expand or collapse (a `group` node).
-        target: ToolPresentationNode,
-        /// True expands the group to show its members, false collapses it.
-        value: bool,
-    },
-    PresentationGroupVisible {
-        /// The group to show or hide (a `group` node).
-        target: ToolPresentationNode,
-        /// True shows the group, false hides it.
-        value: bool,
-    },
-    PresentationCompositeVisible {
-        /// Presentation channel (pane) that owns the composite: `annotation` or `reads`.
-        channel: ToolTrackChannel,
-        /// Positive composite ID as reported in `presentation_composites` of the workspace
-        /// snapshot.
-        #[schemars(range(min = 1))]
-        composite_id: u32,
-        /// True shows the composite, false hides it.
-        value: bool,
-    },
-    PresentationGroup {
-        /// Presentation channel (pane) in which to create the group: `annotation` or `reads`.
-        channel: ToolTrackChannel,
-        /// Positive stable track IDs (`tracks[].id`) to place in one new presentation group; 2 to
-        /// 1024 entries, all in `channel`.
-        #[schemars(length(min = 2, max = 1024))]
-        track_ids: Vec<u64>,
-    },
-    PresentationUngroup {
-        /// The group to dissolve (a `group` node).
-        target: ToolPresentationNode,
-    },
-    ReadPaneHeight {
-        /// Height of the reads pane in logical points, 100 to 1200.
-        #[schemars(range(min = 100.0, max = 1200.0))]
-        value: f32,
-    },
-    TrackHeight {
-        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        track_id: u64,
-        /// Track height in logical points, 40 to 1200.
-        #[schemars(range(min = 40.0, max = 1200.0))]
-        value: f32,
-    },
-    TrackCollapsed {
-        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        track_id: u64,
-        /// True collapses the track, false expands it.
-        value: bool,
-    },
-    TrackVisible {
-        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        track_id: u64,
-        /// True shows the track, false hides it.
-        value: bool,
-    },
-    VerticalScrollPoints {
-        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        panel_id: u64,
-        /// Vertical scroll offset of the panel in logical points from the top (0 = top). Clamped to
-        /// the panel's `maximum_vertical_scroll_points`.
-        #[schemars(range(min = 0.0))]
-        value: f32,
-    },
-    AnnotationScrollPoints {
-        /// Positive stable panel ID whose scrollbar issues the request. The annotation camera is
-        /// workspace-wide, so the offset applies to every panel.
-        #[schemars(range(min = 1))]
-        panel_id: u64,
-        /// Vertical scroll offset of the workspace-wide annotation pane in logical points from the
-        /// top (0 = top). Clamped to `maximum_annotation_scroll_points`.
-        #[schemars(range(min = 0.0))]
-        value: f32,
-    },
-    ReadStackScrollPoints {
-        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        panel_id: u64,
-        /// Vertical scroll offset of this panel's read stack in logical points from the top (0 =
-        /// top). Clamped to the panel's `maximum_read_stack_scroll_points`.
-        #[schemars(range(min = 0.0))]
-        value: f32,
-    },
-    ReadPanelScrollPoints {
-        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        panel_id: u64,
-        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        track_id: u64,
-        /// Vertical scroll offset of this track's read panel in this genomic panel, in logical
-        /// points from the top (0 = top). Clamped to the maximum reported in `read_panel_states`.
-        #[schemars(range(min = 0.0))]
-        value: f32,
-    },
-    ReadPanelDensity {
-        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        panel_id: u64,
-        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        track_id: u64,
-        /// Read-row height multiplier for this track in this panel, 0.25 to 4; 1.0 is the default
-        /// row height and larger values draw taller rows.
-        #[schemars(range(min = 0.25, max = 4.0))]
-        value: f32,
-    },
-}
-
-impl ToolSetting {
-    fn into_core(self) -> AutomationSetting {
-        match self {
-            Self::WindowSize { width, height } => AutomationSetting::WindowSize { width, height },
-            Self::InterfaceScalePercent { value } => {
-                AutomationSetting::InterfaceScalePercent { value }
-            }
-            Self::PropertiesPanelExpanded { value } => {
-                AutomationSetting::PropertiesPanelExpanded { value }
-            }
-            Self::PropertiesPanelWidth { value } => {
-                AutomationSetting::PropertiesPanelWidth { value }
-            }
-            Self::PropertiesPanelResizeActive { value } => {
-                AutomationSetting::PropertiesPanelResizeActive { value }
-            }
-            Self::ShowReference { value } => AutomationSetting::ShowReference { value },
-            Self::ShowCoverage { value } => AutomationSetting::ShowCoverage { value },
-            Self::ShowReads { value } => AutomationSetting::ShowReads { value },
-            Self::ShowJunctions { value } => AutomationSetting::ShowJunctions { value },
-            Self::ViewAsPairs { value } => AutomationSetting::ViewAsPairs { value },
-            Self::OverlappingMatePolicy { value } => AutomationSetting::OverlappingMatePolicy {
-                value: value.into_core(),
-            },
-            Self::AlignmentColorMode {
-                track_ids: ids,
-                value,
-            } => AutomationSetting::AlignmentColorMode {
-                track_ids: track_ids(&ids),
-                value: value.into_core(),
-            },
-            Self::AlignmentColorTag {
-                track_ids: ids,
-                tag,
-            } => {
-                let bytes = tag.as_bytes();
-                debug_assert_eq!(bytes.len(), 2, "the MCP schema constrains SAM tags");
-                let tag = [
-                    bytes.first().copied().unwrap_or_default(),
-                    bytes.get(1).copied().unwrap_or_default(),
-                ];
-                AutomationSetting::AlignmentColorMode {
-                    track_ids: track_ids(&ids),
-                    value: AlignmentColorMode::Tag(tag),
-                }
-            }
-            Self::AlignmentViewFilter {
-                track_ids: ids,
-                predicates,
-            } => AutomationSetting::AlignmentViewFilter {
-                track_ids: track_ids(&ids),
-                value: AlignmentPredicateExpression {
-                    version: 1,
-                    all: predicates
-                        .into_iter()
-                        .map(ToolAlignmentPredicate::into_core)
-                        .collect(),
-                },
-            },
-            Self::AlignmentHighlightFilter {
-                track_ids: ids,
-                predicates,
-            } => AutomationSetting::AlignmentHighlightFilter {
-                track_ids: track_ids(&ids),
-                value: AlignmentPredicateExpression {
-                    version: 1,
-                    all: predicates
-                        .into_iter()
-                        .map(ToolAlignmentPredicate::into_core)
-                        .collect(),
-                },
-            },
-            Self::AlignmentDensity { value } => AutomationSetting::AlignmentDensity { value },
-            Self::IncludeSecondary { value } => AutomationSetting::IncludeSecondary { value },
-            Self::IncludeSupplementary { value } => {
-                AutomationSetting::IncludeSupplementary { value }
-            }
-            Self::CoverageScaleTransform { value } => AutomationSetting::CoverageScaleTransform {
-                value: value.into_core(),
-            },
-            Self::ReadBaseDisplayMode { value } => AutomationSetting::ReadBaseDisplayMode {
-                value: value.into_core(),
-            },
-            Self::ShadeReadBasesByQuality { value } => {
-                AutomationSetting::ShadeReadBasesByQuality { value }
-            }
-            Self::ShowModifiedBases { value } => AutomationSetting::ShowModifiedBases { value },
-            Self::ModifiedBaseColorMode { value } => AutomationSetting::ModifiedBaseColorMode {
-                value: value.into_core(),
-            },
-            Self::PresentationSectionExpanded { channel, value } => {
-                AutomationSetting::PresentationSectionExpanded {
-                    channel: channel.into_core(),
-                    value,
-                }
-            }
-            Self::PresentationNodeVisible { target, value } => {
-                AutomationSetting::PresentationNodeVisible {
-                    target: target.into_core(),
-                    value,
-                }
-            }
-            Self::PresentationNodeHeight { target, value } => {
-                AutomationSetting::PresentationNodeHeight {
-                    target: target.into_core(),
-                    value,
-                }
-            }
-            Self::PresentationGroupExpanded { target, value } => {
-                AutomationSetting::PresentationGroupExpanded {
-                    target: target.into_core(),
-                    value,
-                }
-            }
-            Self::PresentationGroupVisible { target, value } => {
-                AutomationSetting::PresentationGroupVisible {
-                    target: target.into_core(),
-                    value,
-                }
-            }
-            Self::PresentationCompositeVisible {
-                channel,
-                composite_id,
-                value,
-            } => AutomationSetting::PresentationCompositeVisible {
-                channel: channel.into_core(),
-                composite_id,
-                value,
-            },
-            Self::PresentationGroup { channel, track_ids } => {
-                AutomationSetting::PresentationGroup {
-                    channel: channel.into_core(),
-                    track_ids: track_ids.into_iter().map(TrackId::new).collect(),
-                }
-            }
-            Self::PresentationUngroup { target } => AutomationSetting::PresentationUngroup {
-                target: target.into_core(),
-            },
-            Self::ReadPaneHeight { value } => AutomationSetting::ReadPaneHeight { value },
-            Self::TrackHeight { track_id, value } => AutomationSetting::TrackHeight {
-                track_id: TrackId::new(track_id),
-                value,
-            },
-            Self::TrackCollapsed { track_id, value } => AutomationSetting::TrackCollapsed {
-                track_id: TrackId::new(track_id),
-                value,
-            },
-            Self::TrackVisible { track_id, value } => AutomationSetting::TrackVisible {
-                track_id: TrackId::new(track_id),
-                value,
-            },
-            Self::VerticalScrollPoints { panel_id, value } => {
-                AutomationSetting::VerticalScrollPoints {
-                    panel_id: PanelId::new(panel_id),
-                    value,
-                }
-            }
-            Self::AnnotationScrollPoints { panel_id, value } => {
-                AutomationSetting::AnnotationScrollPoints {
-                    panel_id: PanelId::new(panel_id),
-                    value,
-                }
-            }
-            Self::ReadStackScrollPoints { panel_id, value } => {
-                AutomationSetting::ReadStackScrollPoints {
-                    panel_id: PanelId::new(panel_id),
-                    value,
-                }
-            }
-            Self::ReadPanelScrollPoints {
-                panel_id,
-                track_id,
-                value,
-            } => AutomationSetting::ReadPanelScrollPoints {
-                panel_id: PanelId::new(panel_id),
-                track_id: TrackId::new(track_id),
-                value,
-            },
-            Self::ReadPanelDensity {
-                panel_id,
-                track_id,
-                value,
-            } => AutomationSetting::ReadPanelDensity {
-                panel_id: PanelId::new(panel_id),
-                track_id: TrackId::new(track_id),
-                value,
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolCoverageScaleTransform {
-    Linear,
-    SquareRoot,
-}
-
-impl ToolCoverageScaleTransform {
-    fn into_core(self) -> CoverageScaleTransform {
-        match self {
-            Self::Linear => CoverageScaleTransform::Linear,
-            Self::SquareRoot => CoverageScaleTransform::SquareRoot,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolOverlappingMatePolicy {
-    CountOnce,
-    CountBoth,
-}
-impl ToolOverlappingMatePolicy {
-    fn into_core(self) -> OverlappingMatePolicy {
-        match self {
-            Self::CountOnce => OverlappingMatePolicy::CountOnce,
-            Self::CountBoth => OverlappingMatePolicy::CountBoth,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolReadBaseDisplayMode {
-    Mismatches,
-    All,
-    Hidden,
-}
-impl ToolReadBaseDisplayMode {
-    fn into_core(self) -> ReadBaseDisplayMode {
-        match self {
-            Self::Mismatches => ReadBaseDisplayMode::Mismatches,
-            Self::All => ReadBaseDisplayMode::All,
-            Self::Hidden => ReadBaseDisplayMode::Hidden,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolModifiedBaseColorMode {
-    ByType,
-    Mono,
-    ModifiedVsUnmodified,
-}
-impl ToolModifiedBaseColorMode {
-    fn into_core(self) -> ModifiedBaseColorMode {
-        match self {
-            Self::ByType => ModifiedBaseColorMode::ByType,
-            Self::Mono => ModifiedBaseColorMode::Mono,
-            Self::ModifiedVsUnmodified => ModifiedBaseColorMode::ModifiedVsUnmodified,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolAlignmentColorMode {
-    None,
-    Strand,
-    MappingQuality,
-    ReadGroup,
-    Haplotype,
-    TemplateLength,
-    PairOrientation,
-    UnexpectedPair,
-    MateContig,
-    FirstOfPairStrand,
-}
-impl ToolAlignmentColorMode {
-    fn into_core(self) -> AlignmentColorMode {
-        match self {
-            Self::None => AlignmentColorMode::None,
-            Self::Strand => AlignmentColorMode::Strand,
-            Self::MappingQuality => AlignmentColorMode::MappingQuality,
-            Self::ReadGroup => AlignmentColorMode::ReadGroup,
-            Self::Haplotype => AlignmentColorMode::Haplotype,
-            Self::TemplateLength => AlignmentColorMode::TemplateLength,
-            Self::PairOrientation => AlignmentColorMode::PairOrientation,
-            Self::UnexpectedPair => AlignmentColorMode::UnexpectedPair,
-            Self::MateContig => AlignmentColorMode::MateContig,
-            Self::FirstOfPairStrand => AlignmentColorMode::FirstOfPairStrand,
         }
     }
 }
@@ -2619,7 +2153,7 @@ pub struct GroupArgs {
     pub mode: ToolGroupMode,
     /// Order of the resulting groups: `natural` (default) or `reverse`.
     #[serde(default)]
-    pub direction: ToolDirection,
+    pub direction: AlignmentOrderDirection,
     /// Two-character SAM auxiliary tag to group by, e.g. `HP` (a letter followed by a letter or
     /// digit). Required when `mode` is `tag`; ignored for every other mode.
     #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
@@ -2640,24 +2174,45 @@ pub struct GroupArgs {
     pub timeout_millis: u64,
 }
 
+/// Adapter, not a mirror: core `AlignmentGroupMode::Tag` carries the tag as two byte values
+/// (`{"tag": [72, 80]}`). The tool offers a plain `tag` mode and reads the tag from the separate
+/// two-character `tag` argument.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolGroupMode {
+    /// No grouping: one block containing every read.
     None,
+    /// Group into forward-strand and reverse-strand reads.
     Strand,
+    /// Group by read group (the `RG` tag); reads without it form their own group.
     ReadGroup,
+    /// Group by haplotype (the `HP` tag); reads without it form their own group.
     Haplotype,
+    /// Group into reads with and without a supplementary-alignment (`SA`) tag.
     Chimeric,
+    /// Group into supplementary records and primary/secondary records.
     Supplementary,
+    /// Group into reads with and without a soft or hard clip at their left (lower-coordinate)
+    /// end.
     LeftClip,
+    /// Group into reads with and without a soft or hard clip at their right
+    /// (higher-coordinate) end.
     RightClip,
+    /// Group by the relative orientation of the two mates.
     PairOrientation,
+    /// Group into expected (proper or concordant), unexpected, and unpaired reads.
     UnexpectedPair,
+    /// Group by the contig the mate maps to.
     MateContig,
+    /// Group by position in the template (first, last, unknown, or ambiguous).
     ReadOrder,
+    /// Group by the strand of the first read of the pair.
     FirstOfPairStrand,
+    /// Group by the read base observed at `anchor_position`.
     Base,
+    /// Group by the insertion observed at `anchor_position`.
     Insertion,
+    /// Group by the value of the SAM auxiliary tag named in the `tag` argument.
     Tag,
 }
 
@@ -2698,7 +2253,7 @@ pub struct SortArgs {
     pub mode: ToolSortMode,
     /// Sort direction: `natural` (default) or `reverse`.
     #[serde(default)]
-    pub direction: ToolDirection,
+    pub direction: AlignmentOrderDirection,
     /// Two-character SAM auxiliary tag to sort by, e.g. `HP` (a letter followed by a letter or
     /// digit). Required when `mode` is `tag`; ignored for every other mode.
     #[schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))]
@@ -2718,25 +2273,45 @@ pub struct SortArgs {
     pub timeout_millis: u64,
 }
 
+/// Adapter, not a mirror: core `AlignmentSortMode::Tag` carries the tag as two byte values. The
+/// tool offers a plain `tag` mode and reads the tag from the separate two-character `tag`
+/// argument.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSortMode {
+    /// Ascending alignment start, then end.
     Start,
+    /// Forward-strand reads before reverse-strand reads.
     Strand,
+    /// By the strand of the first read of the pair: forward first, unknown last.
     FirstOfPairStrand,
+    /// Highest mapping quality (MAPQ) first.
     MappingQuality,
+    /// By read name, in byte order.
     ReadName,
+    /// By read group (the `RG` tag); reads without it last.
     ReadGroup,
+    /// By haplotype (the `HP` tag); reads without it last.
     Haplotype,
+    /// Longest aligned length first.
     AlignedLength,
+    /// Longest clipping at the left (lower-coordinate) end first.
     LeftClip,
+    /// Longest clipping at the right (higher-coordinate) end first.
     RightClip,
+    /// Longest absolute template length first.
     TemplateLength,
+    /// By the relative orientation of the two mates.
     PairOrientation,
+    /// By the contig and then the position the mate maps to.
     MateContig,
+    /// By pair classification.
     PairStatus,
+    /// By position in the template (first read of the pair before last).
     ReadOrder,
+    /// By the read base observed at `anchor_position`.
     Base,
+    /// By the value of the SAM auxiliary tag named in the `tag` argument; reads without it last.
     Tag,
 }
 
@@ -2774,31 +2349,16 @@ fn valid_tag(tag: &str) -> Option<String> {
         .then(|| tag.to_owned())
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolDirection {
-    #[default]
-    Natural,
-    Reverse,
-}
-
-impl ToolDirection {
-    fn into_core(self) -> AlignmentOrderDirection {
-        match self {
-            Self::Natural => AlignmentOrderDirection::Natural,
-            Self::Reverse => AlignmentOrderDirection::Reverse,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FilterArgs {
     /// Positive stable alignment-track IDs (`tracks[].id` from `rgv_get_workspace`); 1 to 1024
     /// entries.
     #[schemars(length(min = 1, max = 1024))]
     pub track_ids: Vec<u64>,
-    /// RGV alignment-filter expression, validated by the viewer. An empty string clears the
-    /// alignment filter.
+    /// Semicolon-separated SAM-tag predicates combined with logical AND, at most 16384 bytes: a
+    /// bare tag (`HP`) requires the tag to exist; `TAG=value`, `TAG!=value`, `TAG>value`,
+    /// `TAG>=value`, `TAG<value`, `TAG<=value` compare its value (for example `HP=1;NM<=2`). An
+    /// empty string clears the filter.
     pub expression: String,
     /// When true (the default), wait after the operation until every query it triggered has
     /// settled, so the returned report describes the final state. Set false only to observe
@@ -2814,8 +2374,9 @@ pub struct FilterArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SelectArgs {
-    /// What to select: a track, a panel, or one genomic position on a track in a panel.
-    pub selection: ToolSelection,
+    /// What to select: a track, a panel, or one genomic position on a track in a panel. An
+    /// `exact_base` position selection can fit the panel's viewport to that single base.
+    pub selection: AutomationSelection,
     /// When true (the default), wait after the operation until every query it triggered has
     /// settled, so the returned report describes the final state. Set false only to observe
     /// intermediate state.
@@ -2826,85 +2387,6 @@ pub struct SelectArgs {
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(tag = "selection", rename_all = "snake_case")]
-pub enum ToolSelection {
-    /// Select a track.
-    Track {
-        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        track_id: u64,
-    },
-    /// Select a panel.
-    Panel {
-        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        panel_id: u64,
-    },
-    /// Select the evidence at one genomic position of a track in a panel.
-    Position {
-        /// Positive stable panel ID as reported by `rgv_get_workspace` (`panels[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        panel_id: u64,
-        /// Positive stable track ID as reported by `rgv_get_workspace` (`tracks[].id`); it is an
-        /// identity, not a display index.
-        #[schemars(range(min = 1))]
-        track_id: u64,
-        /// Zero-based genomic position on the panel's current contig (one less than the one-based
-        /// coordinate shown in a locus string).
-        position: u64,
-        /// `exact_base` (default) selects evidence for exactly that base, which may require a
-        /// one-base query for alignment evidence; `visible_bin` selects the currently rendered
-        /// bin containing it.
-        #[serde(default)]
-        granularity: ToolSelectionGranularity,
-    },
-}
-
-impl ToolSelection {
-    fn into_core(self) -> AutomationSelection {
-        match self {
-            Self::Track { track_id } => AutomationSelection::Track {
-                track_id: TrackId::new(track_id),
-            },
-            Self::Panel { panel_id } => AutomationSelection::Panel {
-                panel_id: PanelId::new(panel_id),
-            },
-            Self::Position {
-                panel_id,
-                track_id,
-                position,
-                granularity,
-            } => AutomationSelection::Position {
-                panel_id: PanelId::new(panel_id),
-                track_id: TrackId::new(track_id),
-                position,
-                granularity: granularity.into_core(),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolSelectionGranularity {
-    #[default]
-    ExactBase,
-    VisibleBin,
-}
-
-impl ToolSelectionGranularity {
-    fn into_core(self) -> AutomationSelectionGranularity {
-        match self {
-            Self::ExactBase => AutomationSelectionGranularity::ExactBase,
-            Self::VisibleBin => AutomationSelectionGranularity::VisibleBin,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2918,7 +2400,7 @@ pub struct PanelArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReviewNavigationArgs {
     /// Which review item to open: a specific item or the next pending one.
-    pub action: ToolReviewNavigation,
+    pub action: AutomationReviewNavigation,
     /// When true (the default), wait after the operation until every query it triggered has
     /// settled, so the returned report describes the final state. Set false only to observe
     /// intermediate state.
@@ -2929,26 +2411,6 @@ pub struct ReviewNavigationArgs {
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum ToolReviewNavigation {
-    /// Navigate to one review item.
-    Item {
-        /// Positive stable review-item ID as reported by `rgv_get_review_queue`.
-        #[schemars(range(min = 1))]
-        review_item_id: u64,
-    },
-    NextPending,
-}
-impl ToolReviewNavigation {
-    fn into_core(self) -> AutomationReviewNavigation {
-        match self {
-            Self::Item { review_item_id } => AutomationReviewNavigation::Item { review_item_id },
-            Self::NextPending => AutomationReviewNavigation::NextPending,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2958,7 +2420,7 @@ pub struct HistoryNavigationArgs {
     #[schemars(range(min = 1))]
     pub panel_id: u64,
     /// Move one step back or forward, or jump to an entry by index.
-    pub action: ToolHistoryNavigation,
+    pub action: AutomationHistoryNavigation,
     /// When true (the default), wait after the operation until every query it triggered has
     /// settled, so the returned report describes the final state. Set false only to observe
     /// intermediate state.
@@ -2969,28 +2431,6 @@ pub struct HistoryNavigationArgs {
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum ToolHistoryNavigation {
-    Back,
-    Forward,
-    /// Jump to one history entry.
-    Index {
-        /// Zero-based index of the history entry, as reported in `index` by
-        /// `rgv_get_navigation_history`.
-        index: usize,
-    },
-}
-impl ToolHistoryNavigation {
-    fn into_core(self) -> AutomationHistoryNavigation {
-        match self {
-            Self::Back => AutomationHistoryNavigation::Back,
-            Self::Forward => AutomationHistoryNavigation::Forward,
-            Self::Index { index } => AutomationHistoryNavigation::Index { index },
-        }
-    }
 }
 
 fn default_alignment_results() -> usize {
@@ -3008,7 +2448,7 @@ pub struct FindAlignmentsArgs {
     #[schemars(range(min = 1))]
     pub track_id: u64,
     /// Which records to find within the track's currently settled query scope.
-    pub selector: ToolAlignmentSelector,
+    pub selector: AutomationAlignmentSelector,
     /// Maximum number of hits to return, 1 to 128 (default 25).
     #[serde(default = "default_alignment_results")]
     #[schemars(range(min = 1, max = 128))]
@@ -3016,95 +2456,9 @@ pub struct FindAlignmentsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-#[serde(tag = "selector", rename_all = "snake_case")]
-pub enum ToolAlignmentSelector {
-    /// Find records by exact read name.
-    ExactReadName {
-        /// Exact, case-sensitive read name (QNAME). Treated as sensitive: matched only inside the
-        /// desktop process and never echoed in results.
-        read_name: String,
-    },
-    /// Find records covering one reference base.
-    Position {
-        /// Zero-based genomic position on the panel's current contig; matches records whose aligned
-        /// span `[start, end)` contains it.
-        position: u64,
-    },
-    /// Find records overlapping a zero-based, half-open interval `[start, end)`.
-    Interval {
-        /// Zero-based inclusive start on the panel's current contig, in bases.
-        start: u64,
-        /// Zero-based exclusive end (half-open `[start, end)`); must be greater than `start`.
-        /// Records overlapping the interval by at least one base match.
-        end: u64,
-    },
-    /// Find records by alignment properties; every supplied property must match.
-    Semantic {
-        /// Required alignment state: primary, secondary, or supplementary. Omit to accept any.
-        alignment_state: Option<ToolAlignmentState>,
-        /// Required pair classification, case-insensitive, with no separators: `unpaired`,
-        /// `readunmapped`, `mateunmapped`, `matemissing`, `intercontig`, `discordantorientation`,
-        /// `discordanttemplatelengthshort`, `discordanttemplatelengthlong`, `proper`, or
-        /// `concordant` (the `pair_class` values returned in hits). Omit to accept any.
-        pair_class: Option<String>,
-        /// True requires a mapped mate with a known position, false requires none. Omit to accept
-        /// either.
-        has_mapped_mate: Option<bool>,
-        /// True requires a navigable supplementary (split-read) chain, false requires none. Omit to
-        /// accept either.
-        has_supplementary_chain: Option<bool>,
-        /// True requires base-modification calls, false requires none. Fails with
-        /// `effective_state_unavailable` if modification evidence is not loaded. Omit to accept
-        /// either.
-        has_modified_bases: Option<bool>,
-    },
-}
-impl ToolAlignmentSelector {
-    fn into_core(self) -> AutomationAlignmentSelector {
-        match self {
-            Self::ExactReadName { read_name } => {
-                AutomationAlignmentSelector::ExactReadName { read_name }
-            }
-            Self::Position { position } => AutomationAlignmentSelector::Position { position },
-            Self::Interval { start, end } => AutomationAlignmentSelector::Interval { start, end },
-            Self::Semantic {
-                alignment_state,
-                pair_class,
-                has_mapped_mate,
-                has_supplementary_chain,
-                has_modified_bases,
-            } => AutomationAlignmentSelector::Semantic {
-                alignment_state: alignment_state.map(ToolAlignmentState::into_core),
-                pair_class,
-                has_mapped_mate,
-                has_supplementary_chain,
-                has_modified_bases,
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolAlignmentState {
-    Primary,
-    Secondary,
-    Supplementary,
-}
-impl ToolAlignmentState {
-    fn into_core(self) -> AutomationAlignmentState {
-        match self {
-            Self::Primary => AutomationAlignmentState::Primary,
-            Self::Secondary => AutomationAlignmentState::Secondary,
-            Self::Supplementary => AutomationAlignmentState::Supplementary,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AlignmentHandleArgs {
-    /// Opaque alignment handle returned by `rgv_find_alignments`. It expires when the backing query
-    /// changes (`stale_handle`).
+    /// Opaque alignment handle returned by `rgv_find_alignments`. It expires (`stale_handle`) when
+    /// the backing query changes or `rgv_find_alignments` is called again.
     pub handle: String,
     /// If set, the call fails with `workspace_revision_conflict` and changes nothing unless the
     /// viewer's current `workspace_revision` equals this value.
@@ -3112,7 +2466,7 @@ pub struct AlignmentHandleArgs {
     /// Viewport change applied with the selection: `none` (default) leaves the view, `center` keeps
     /// the span and centres the record, `fit` fits the record.
     #[serde(default)]
-    pub reveal: ToolAlignmentReveal,
+    pub reveal: AutomationAlignmentReveal,
     /// When true (the default), wait after the operation until every query it triggered has
     /// settled, so the returned report describes the final state. Set false only to observe
     /// intermediate state.
@@ -3125,36 +2479,18 @@ pub struct AlignmentHandleArgs {
     pub timeout_millis: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolAlignmentReveal {
-    #[default]
-    None,
-    Center,
-    Fit,
-}
-impl ToolAlignmentReveal {
-    fn into_core(self) -> AutomationAlignmentReveal {
-        match self {
-            Self::None => AutomationAlignmentReveal::None,
-            Self::Center => AutomationAlignmentReveal::Center,
-            Self::Fit => AutomationAlignmentReveal::Fit,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RelatedNavigationArgs {
     /// Which related record of the selected alignment to open: its mate or a supplementary-chain
     /// segment.
-    pub relationship: ToolAlignmentRelationship,
+    pub relationship: AutomationAlignmentRelationship,
     /// Zero-based index of the supplementary-chain segment, as reported in `segment_index` by
     /// `rgv_get_related_alignments`. Required for `supplementary_segment`; must be omitted for
     /// `mate`.
     pub segment_index: Option<usize>,
     /// Where to show the related record: the `current_panel` (default) or a `new_panel`.
     #[serde(default)]
-    pub destination: ToolNavigationDestination,
+    pub destination: AutomationNavigationDestination,
     /// If set, the call fails with `workspace_revision_conflict` and changes nothing unless the
     /// viewer's current `workspace_revision` equals this value.
     pub expected_workspace_revision: Option<u64>,
@@ -3168,37 +2504,6 @@ pub struct RelatedNavigationArgs {
     #[serde(default = "default_timeout")]
     #[schemars(range(min = 100, max = 600_000))]
     pub timeout_millis: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolAlignmentRelationship {
-    Mate,
-    SupplementarySegment,
-}
-impl ToolAlignmentRelationship {
-    fn into_core(self) -> AutomationAlignmentRelationship {
-        match self {
-            Self::Mate => AutomationAlignmentRelationship::Mate,
-            Self::SupplementarySegment => AutomationAlignmentRelationship::SupplementarySegment,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolNavigationDestination {
-    #[default]
-    CurrentPanel,
-    NewPanel,
-}
-impl ToolNavigationDestination {
-    fn into_core(self) -> AutomationNavigationDestination {
-        match self {
-            Self::CurrentPanel => AutomationNavigationDestination::CurrentPanel,
-            Self::NewPanel => AutomationNavigationDestination::NewPanel,
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3251,12 +2556,19 @@ pub struct CaptureWindowArgs {
     pub timeout_millis: u64,
 }
 
+/// Adapter, not a mirror: core `AutomationSnapshotScope` also has `native_window`, which this
+/// tool withholds because the native capture has its own identity checks in
+/// `rgv_capture_window`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSnapshotScope {
+    /// The committed workspace rectangle: every panel's tracks, without the application shell.
     #[default]
     VisibleWorkspace,
+    /// The active panel's visible canvas only.
     ActivePanel,
+    /// The active panel's complete content. Refused, without writing a partial file, unless
+    /// that content is already unscrolled and fits the captured canvas.
     FullActivePanel,
 }
 
@@ -3278,7 +2590,7 @@ pub struct ExportArgs {
     /// Which evidence to export for the active panel's current interval. RGV's tabular exports
     /// state their convention in a `# coordinates` header line (one-based `start`, one-based
     /// inclusive `end`).
-    pub kind: ToolExportKind,
+    pub kind: AutomationExportKind,
     /// When false (the default), read names in the inlined `inline_text` are replaced by
     /// export-local pseudonyms (`read_1`, `read_2`, ...; segments of one template share a
     /// pseudonym) and selected-evidence read identity is redacted. Set true to inline the original
@@ -3296,38 +2608,99 @@ pub struct ExportArgs {
     pub timeout_millis: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolExportKind {
-    Alignments,
-    FilteredAlignments,
-    EligibleAlignments,
-    Pileup,
-    SelectedEvidence,
-    Modifications,
-    Junctions,
-    Variants,
-    Quantitative,
-    Regions,
-    TrackNames,
+fn default_pileup_limit() -> usize {
+    DEFAULT_PILEUP_LIMIT
 }
 
-impl ToolExportKind {
-    fn into_core(self) -> AutomationExportKind {
-        match self {
-            Self::Alignments => AutomationExportKind::Alignments,
-            Self::FilteredAlignments => AutomationExportKind::FilteredAlignments,
-            Self::EligibleAlignments => AutomationExportKind::EligibleAlignments,
-            Self::Pileup => AutomationExportKind::Pileup,
-            Self::SelectedEvidence => AutomationExportKind::SelectedEvidence,
-            Self::Modifications => AutomationExportKind::Modifications,
-            Self::Junctions => AutomationExportKind::Junctions,
-            Self::Variants => AutomationExportKind::Variants,
-            Self::Quantitative => AutomationExportKind::Quantitative,
-            Self::Regions => AutomationExportKind::Regions,
-            Self::TrackNames => AutomationExportKind::TrackNames,
-        }
-    }
+fn default_variant_limit() -> usize {
+    DEFAULT_VARIANT_LIMIT
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct QueryPileupArgs {
+    /// Contig the caller expects the active panel to show, exactly as the workspace reports it
+    /// (e.g. `chr1`). Optional guard: when it differs from the panel's contig the call fails with
+    /// `interval_not_in_view` instead of answering for the wrong contig.
+    pub contig: Option<String>,
+    /// Zero-based position of the first base to report (one less than the one-based coordinate
+    /// in a locus string). Omit to start at the beginning of the current view.
+    pub start: Option<u64>,
+    /// Zero-based exclusive end (half-open `[start, end)`), which equals the one-based inclusive
+    /// end. Omit with `start` to report exactly that one base; omit both for the whole view.
+    pub end: Option<u64>,
+    /// Positive stable alignment-track IDs to report (`tracks[].id` from `rgv_get_workspace`).
+    /// Omit for every visible alignment track.
+    #[schemars(length(min = 1, max = 1024))]
+    pub track_ids: Option<Vec<u64>>,
+    /// Number of matching sites to skip, for paging (default 0). Use the previous result's
+    /// `page.next_offset`.
+    #[serde(default)]
+    pub offset: usize,
+    /// Maximum number of sites to return, 1 to 500 (default 50). `page.truncated` is true when
+    /// more sites match.
+    #[serde(default = "default_pileup_limit")]
+    #[schemars(range(min = 1, max = 500))]
+    pub limit: usize,
+    /// When true (the default), wait until all pending queries have settled before reading, so
+    /// the counts reflect the final state of the current view.
+    #[serde(default = "default_true")]
+    pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true.
+    #[serde(default = "default_timeout")]
+    #[schemars(range(min = 100, max = 600_000))]
+    pub timeout_millis: u64,
+}
+
+// Each flag is an independent opt-in of the tool's wire contract.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct QueryVariantsArgs {
+    /// Contig the caller expects the active panel to show, exactly as the workspace reports it
+    /// (e.g. `chr1`). Optional guard: when it differs from the panel's contig the call fails with
+    /// `interval_not_in_view` instead of answering for the wrong contig.
+    pub contig: Option<String>,
+    /// Zero-based inclusive start of the interval (one less than the one-based coordinate in a
+    /// locus string). Omit to start at the beginning of the current view.
+    pub start: Option<u64>,
+    /// Zero-based exclusive end (half-open `[start, end)`), which equals the one-based inclusive
+    /// end. Omit with `start` to ask about exactly that one base; omit both for the whole view.
+    pub end: Option<u64>,
+    /// Positive stable variant-track IDs to report (`tracks[].id` from `rgv_get_workspace`).
+    /// Omit for every visible variant track.
+    #[schemars(length(min = 1, max = 1024))]
+    pub track_ids: Option<Vec<u64>>,
+    /// When true, include each record's INFO fields (at most 64 per record, each value at most
+    /// 256 bytes, with truncation flags). Default false.
+    #[serde(default)]
+    pub include_info: bool,
+    /// When true, include each record's per-sample genotypes (at most 64 per record, with a
+    /// truncation flag). Default false.
+    #[serde(default)]
+    pub include_genotypes: bool,
+    /// When false (the default), sample names in genotypes are replaced by pseudonyms
+    /// (`sample_1`, `sample_2`, ... in first-appearance order, stable across pages). Set true to
+    /// return the original sample names.
+    #[serde(default)]
+    pub include_sample_names: bool,
+    /// Number of matching records to skip, for paging (default 0). Use the previous result's
+    /// `page.next_offset`.
+    #[serde(default)]
+    pub offset: usize,
+    /// Maximum number of records to return, 1 to 200 (default 25). `page.truncated` is true when
+    /// more records match.
+    #[serde(default = "default_variant_limit")]
+    #[schemars(range(min = 1, max = 200))]
+    pub limit: usize,
+    /// When true (the default), wait until all pending queries have settled before reading, so
+    /// the records reflect the final state of the current view.
+    #[serde(default = "default_true")]
+    pub wait_until_settled: bool,
+    /// Settlement timeout in milliseconds, 100 to 600000 (default 30000). Only used when
+    /// `wait_until_settled` is true.
+    #[serde(default = "default_timeout")]
+    #[schemars(range(min = 100, max = 600_000))]
+    pub timeout_millis: u64,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -3345,9 +2718,10 @@ pub struct OpenWorkspaceArgs {
     /// Must be true: opening a project replaces the entire visible workspace.
     pub confirm_replace: bool,
     /// What to do if the current workspace has unsaved changes: `reject` (default) fails with
-    /// `unsaved_changes`, `save_then_open` saves first, `discard` drops them.
+    /// `unsaved_changes`, `save_then_open` first saves to the workspace's existing project file
+    /// (and fails if it has none), `discard` drops them.
     #[serde(default)]
-    pub unsaved_changes: ToolUnsavedChangesPolicy,
+    pub unsaved_changes: AutomationUnsavedChangesPolicy,
     /// When true (the default), wait after the operation until every query it triggered has
     /// settled, so the returned report describes the final state. Set false only to observe
     /// intermediate state.
@@ -3360,31 +2734,13 @@ pub struct OpenWorkspaceArgs {
     pub timeout_millis: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolUnsavedChangesPolicy {
-    #[default]
-    Reject,
-    SaveThenOpen,
-    Discard,
-}
-impl ToolUnsavedChangesPolicy {
-    fn into_core(self) -> AutomationUnsavedChangesPolicy {
-        match self {
-            Self::Reject => AutomationUnsavedChangesPolicy::Reject,
-            Self::SaveThenOpen => AutomationUnsavedChangesPolicy::SaveThenOpen,
-            Self::Discard => AutomationUnsavedChangesPolicy::Discard,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecuteBatchArgs {
     /// One to 100 RGV automation command objects, executed in order; each has a `command`
     /// discriminator (e.g. `{"command": "goto", "loci": ["chr1:101-200"]}`). Locus strings are
     /// one-based inclusive; numeric `position`/`start`/`end` fields are zero-based, half-open.
     /// `exit` is always rejected.
-    #[schemars(length(min = 1, max = 100))]
+    #[schemars(with = "Vec<AutomationCommand>", length(min = 1, max = 100))]
     pub commands: Vec<Value>,
     /// Must be true for a batch containing `new_workspace`, which discards the visible workspace.
     /// Default false.
@@ -3958,7 +3314,7 @@ mod tests {
         let server = test_server(address, root.path());
         let args = |include_read_names| ExportArgs {
             path: "exports/reads.tsv".to_owned(),
-            kind: ToolExportKind::Alignments,
+            kind: AutomationExportKind::Alignments,
             include_read_names,
             wait_until_settled: false,
             timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
@@ -3987,6 +3343,521 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// Answers an evidence query batch the way the viewer does: writes `export` to the path the
+    /// adapter chose and reports success. Returns the batch for the caller to check.
+    fn evidence_response(body: &Value, kind: &str, export: &str) -> (u16, Value) {
+        let commands = body["commands"].as_array().unwrap();
+        let export_command = commands.last().unwrap();
+        assert_eq!(export_command["command"], "export");
+        assert_eq!(export_command["kind"], kind);
+        let path = export_command["path"].as_str().unwrap();
+        assert!(path.contains("mcp-artifacts"), "{path}");
+        std::fs::write(path, export).unwrap();
+        let results = commands
+            .iter()
+            .enumerate()
+            .map(|(index, command)| {
+                json!({
+                    "command_index": index, "command": command["command"],
+                    "status": "succeeded", "message": "ok"
+                })
+            })
+            .collect::<Vec<_>>();
+        (
+            200,
+            json!({
+                "schema_version": AUTOMATION_SCHEMA_VERSION, "succeeded": true, "results": results
+            }),
+        )
+    }
+
+    fn pileup_args(start: Option<u64>, end: Option<u64>) -> QueryPileupArgs {
+        QueryPileupArgs {
+            contig: None,
+            start,
+            end,
+            track_ids: None,
+            offset: 0,
+            limit: DEFAULT_PILEUP_LIMIT,
+            wait_until_settled: true,
+            timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
+        }
+    }
+
+    #[tokio::test]
+    async fn pileup_query_reads_a_temporary_export_without_mutating_the_viewer() {
+        let mut call = 0;
+        let (address, worker) = fake_viewer(3, move |url, body| {
+            assert_eq!(url, "/v1/batches");
+            call += 1;
+            let names = body["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|command| command["command"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            match call {
+                // Only settlement and a read-only export are ever sent.
+                1 => {
+                    assert_eq!(names, ["wait_until_settled", "export"]);
+                    evidence_response(body, "pileup", crate::evidence::tests::PILEUP)
+                }
+                2 => {
+                    assert_eq!(names, ["export"]);
+                    evidence_response(body, "pileup", crate::evidence::tests::PILEUP)
+                }
+                _ => (
+                    200,
+                    json!({
+                        "schema_version": AUTOMATION_SCHEMA_VERSION,
+                        "succeeded": false,
+                        "results": [{
+                            "command_index": 0, "command": "export", "status": "failed",
+                            "error_code": "unsupported_command",
+                            "message": "the committed alignment scene does not cover /Users/alice/x.bam"
+                        }]
+                    }),
+                ),
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let server = test_server(address, root.path());
+
+        let result = server
+            .query_pileup(Parameters(pileup_args(Some(101), None)))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["contig"], "chr1");
+        assert_eq!(structured["query_start"], 101);
+        assert_eq!(structured["query_end"], 102);
+        assert_eq!(structured["sites"][0]["position"], 101);
+        assert_eq!(structured["sites"][0]["depth"], 12);
+        assert_eq!(structured["sites"][0]["counts"]["C"], 11);
+        assert_eq!(structured["page"]["truncated"], false);
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+
+        // The tool does not navigate: an interval outside the exported view is refused, and
+        // the temporary export is still removed.
+        let mut outside = pileup_args(Some(5_000), Some(5_010));
+        outside.wait_until_settled = false;
+        let result = server.query_pileup(Parameters(outside)).await;
+        assert_eq!(result.is_error, Some(true));
+        let error = &result.structured_content.unwrap()["error"];
+        assert_eq!(error["code"], "interval_not_in_view");
+        assert!(error["message"].as_str().unwrap().contains("rgv_navigate"));
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+
+        // A viewer refusal keeps its code and its diagnostic, with the path redacted.
+        let result = server
+            .query_pileup(Parameters(pileup_args(None, None)))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let error = &result.structured_content.unwrap()["error"];
+        assert_eq!(error["code"], "unsupported_command");
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains("does not cover [path]/x.bam"), "{message}");
+        assert!(!message.contains("alice"));
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn variant_query_pages_and_pseudonymizes_samples_unless_opted_in() {
+        let (address, worker) = fake_viewer(3, |url, body| {
+            assert_eq!(url, "/v1/batches");
+            evidence_response(body, "variants", crate::evidence::tests::VARIANTS)
+        });
+        let root = tempfile::tempdir().unwrap();
+        let server = test_server(address, root.path());
+        let args = |include_genotypes, include_sample_names, limit| QueryVariantsArgs {
+            contig: Some("HLA-A*01:01".to_owned()),
+            start: None,
+            end: None,
+            track_ids: None,
+            include_info: false,
+            include_genotypes,
+            include_sample_names,
+            offset: 0,
+            limit,
+            wait_until_settled: false,
+            timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
+        };
+
+        let result = server
+            .query_variants(Parameters(args(false, false, 2)))
+            .await;
+        assert_eq!(result.is_error, Some(false));
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["variants"].as_array().unwrap().len(), 2);
+        assert_eq!(structured["variants"][0]["start"], 209);
+        assert_eq!(structured["variants"][0]["end"], 210);
+        assert_eq!(structured["page"]["total_matching"], 3);
+        assert_eq!(structured["page"]["truncated"], true);
+        assert_eq!(structured["page"]["next_offset"], 2);
+        assert_eq!(structured["source_export_truncated"], true);
+        assert!(!structured.to_string().contains("PATIENT"));
+
+        let result = server
+            .query_variants(Parameters(args(true, false, 25)))
+            .await;
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["sample_names"], "pseudonymized");
+        assert_eq!(
+            structured["variants"][0]["genotypes"][0]["sample"],
+            "sample_1"
+        );
+        assert!(!structured.to_string().contains("PATIENT"));
+
+        let result = server
+            .query_variants(Parameters(args(true, true, 25)))
+            .await;
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["sample_names"], "included");
+        assert_eq!(
+            structured["variants"][0]["genotypes"][0]["sample"],
+            "PATIENT_A"
+        );
+        assert_eq!(temporary_artifact_count(root.path()), 0);
+        worker.join().unwrap();
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn batch_and_workspace_guards_fail_before_anything_reaches_the_viewer() {
+        // The viewer answers exactly one request: the final, valid batch.
+        let (address, worker) = fake_viewer(1, |url, body| {
+            assert_eq!(url, "/v1/batches");
+            assert_eq!(body["commands"][0]["command"], "goto");
+            assert_eq!(
+                body["commands"][1]["setting"],
+                json!({"setting": "complete_read_limit", "track_ids": [3], "value": 5000})
+            );
+            (
+                200,
+                json!({
+                    "schema_version": AUTOMATION_SCHEMA_VERSION,
+                    "succeeded": true,
+                    "results": [
+                        {"command_index": 0, "command": "goto", "status": "succeeded", "message": "ok"},
+                        {"command_index": 1, "command": "configure", "status": "succeeded", "message": "ok"}
+                    ],
+                    "telemetry": {"run_elapsed_ms": 1.0}
+                }),
+            )
+        });
+        let root = tempfile::tempdir().unwrap();
+        let server = test_server(address, root.path());
+        let batch = |commands: Vec<Value>, allow_destructive| ExecuteBatchArgs {
+            commands,
+            allow_destructive,
+            include_telemetry: false,
+        };
+        let code = |result: &CallToolResult| {
+            assert_eq!(result.is_error, Some(true));
+            result.structured_content.as_ref().unwrap()["error"]["code"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        let empty = server
+            .execute_batch(Parameters(batch(Vec::new(), false)))
+            .await;
+        assert_eq!(code(&empty), "invalid_input");
+        let oversized = server
+            .execute_batch(Parameters(batch(
+                vec![json!({"command": "describe_workspace"}); MAXIMUM_MCP_BATCH_COMMANDS + 1],
+                false,
+            )))
+            .await;
+        assert_eq!(code(&oversized), "invalid_input");
+
+        // A command that does not match the published schema is a tool error naming the
+        // problem, not a protocol failure.
+        let unknown = server
+            .execute_batch(Parameters(batch(
+                vec![json!({"command": "teleport"})],
+                false,
+            )))
+            .await;
+        assert_eq!(code(&unknown), "invalid_batch");
+        let message = unknown.structured_content.unwrap()["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(message.contains("teleport"), "{message}");
+        let out_of_range = server
+            .execute_batch(Parameters(batch(
+                vec![json!({
+                    "command": "change_viewport", "panel_id": 1,
+                    "operation": {"operation": "zoom", "factor": 1000.0}
+                })],
+                false,
+            )))
+            .await;
+        assert_eq!(code(&out_of_range), "invalid_batch");
+        assert!(
+            out_of_range.structured_content.unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("zoom factor must be finite and between 0.01 and 100")
+        );
+
+        let exit = server
+            .execute_batch(Parameters(batch(vec![json!({"command": "exit"})], true)))
+            .await;
+        assert_eq!(code(&exit), "forbidden_command");
+        let destructive = server
+            .execute_batch(Parameters(batch(
+                vec![json!({"command": "new_workspace"})],
+                false,
+            )))
+            .await;
+        assert_eq!(code(&destructive), "destructive_confirmation_required");
+
+        let unconfirmed = server
+            .open_workspace(Parameters(OpenWorkspaceArgs {
+                path: "project.rgv.json".to_owned(),
+                confirm_replace: false,
+                unsaved_changes: AutomationUnsavedChangesPolicy::Reject,
+                wait_until_settled: true,
+                timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
+            }))
+            .await;
+        assert_eq!(code(&unconfirmed), "workspace_replacement_not_confirmed");
+        let missing = server
+            .open_workspace(Parameters(OpenWorkspaceArgs {
+                path: "absent.rgv.json".to_owned(),
+                confirm_replace: true,
+                unsaved_changes: AutomationUnsavedChangesPolicy::Reject,
+                wait_until_settled: true,
+                timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
+            }))
+            .await;
+        assert_eq!(code(&missing), "artifact_error");
+        for escaping in ["../outside.rgv.json", "/tmp/outside.rgv.json"] {
+            let escaped = server
+                .save_workspace(Parameters(SaveArgs {
+                    path: escaping.to_owned(),
+                }))
+                .await;
+            assert_eq!(code(&escaped), "artifact_error", "{escaping}");
+        }
+        let tagless_group = server
+            .group_alignments(Parameters(GroupArgs {
+                track_ids: vec![1],
+                mode: ToolGroupMode::Tag,
+                direction: AlignmentOrderDirection::Natural,
+                tag: Some("H".to_owned()),
+                anchor_position: None,
+                wait_until_settled: true,
+                timeout_millis: DEFAULT_SETTLE_TIMEOUT_MILLIS,
+            }))
+            .await;
+        assert_eq!(code(&tagless_group), "invalid_input");
+
+        // A valid batch in the published core wire form reaches the viewer unchanged,
+        // including a setting the typed tool used to withhold.
+        let valid = server
+            .execute_batch(Parameters(batch(
+                vec![
+                    json!({"command": "goto", "loci": ["chr1:101-200"]}),
+                    json!({"command": "configure", "setting": {
+                        "setting": "complete_read_limit", "track_ids": [3], "value": 5000
+                    }}),
+                ],
+                false,
+            )))
+            .await;
+        assert_eq!(valid.is_error, Some(false));
+        let structured = valid.structured_content.unwrap();
+        assert_eq!(structured["report"]["results"][1]["command"], "configure");
+        assert!(structured["report"].get("telemetry").is_none());
+        worker.join().unwrap();
+    }
+
+    fn setting(value: Value) -> Result<AutomationSetting, String> {
+        serde_json::from_value::<ToolSetting>(value)
+            .map(ToolSetting::into_core)
+            .map_err(|error| error.to_string())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn configure_accepts_every_core_setting_and_the_string_spellings() {
+        // The ten values the typed tool used to withhold, in their core wire form.
+        assert_eq!(
+            setting(json!({"setting": "complete_read_limit", "track_ids": [3], "value": 5000})),
+            Ok(AutomationSetting::CompleteReadLimit {
+                track_ids: vec![TrackId::new(3)],
+                value: 5000
+            })
+        );
+        assert_eq!(
+            setting(json!({"setting": "read_browsing_buffer_percent", "value": 150})),
+            Ok(AutomationSetting::ReadBrowsingBufferPercent { value: 150 })
+        );
+        assert_eq!(
+            setting(json!({"setting": "total_cache_budget_mib", "value": 1024})),
+            Ok(AutomationSetting::TotalCacheBudgetMib { value: 1024 })
+        );
+        assert_eq!(
+            setting(json!({"setting": "read_stacking_mode", "track_ids": [3], "value": "compact"})),
+            Ok(AutomationSetting::ReadStackingMode {
+                track_ids: vec![TrackId::new(3)],
+                value: rgv_core::ReadStackingMode::Compact
+            })
+        );
+        assert_eq!(
+            setting(json!({
+                "setting": "rebuild_stable_read_architecture", "panel_id": 1, "track_ids": [3]
+            })),
+            Ok(AutomationSetting::RebuildStableReadArchitecture {
+                panel_id: PanelId::new(1),
+                track_ids: vec![TrackId::new(3)]
+            })
+        );
+        let color = |value: Value| {
+            setting(json!({"setting": "alignment_color_mode", "track_ids": [3], "value": value}))
+                .map(|setting| match setting {
+                    AutomationSetting::AlignmentColorMode { value, .. } => value,
+                    other => panic!("unexpected setting {other:?}"),
+                })
+        };
+        assert_eq!(color(json!("strand")), Ok(AlignmentColorMode::Strand));
+        assert_eq!(
+            color(json!({"bisulfite": "chh"})),
+            Ok(AlignmentColorMode::Bisulfite(
+                rgv_core::BisulfiteContext::Chh
+            ))
+        );
+        assert_eq!(
+            color(json!({"smrt_kinetics": "ccs_forward_ipd"})),
+            Ok(AlignmentColorMode::SmrtKinetics(
+                rgv_core::SmrtKineticsMode::CcsForwardIpd
+            ))
+        );
+        assert_eq!(
+            color(json!({"ultima": {}})),
+            Ok(AlignmentColorMode::Ultima(
+                rgv_core::UltimaDisplayOptions::default()
+            ))
+        );
+        assert_eq!(
+            color(json!({"sbx": {"simplex_tail_mode": "hide"}})),
+            Ok(AlignmentColorMode::Sbx(rgv_core::SbxDisplayOptions {
+                simplex_tail_mode: rgv_core::SbxSimplexTailMode::Hide,
+                ..rgv_core::SbxDisplayOptions::default()
+            }))
+        );
+        assert_eq!(
+            color(json!({"tag": [72, 80]})),
+            Ok(AlignmentColorMode::Tag(*b"HP"))
+        );
+
+        // The string spellings convert to the same core values.
+        assert_eq!(
+            setting(json!({"setting": "alignment_color_tag", "track_ids": [3], "tag": "HP"})),
+            Ok(AutomationSetting::AlignmentColorMode {
+                track_ids: vec![TrackId::new(3)],
+                value: AlignmentColorMode::Tag(*b"HP")
+            })
+        );
+        let predicates = setting(json!({
+            "setting": "alignment_view_filter", "track_ids": [3],
+            "predicates": [
+                {"predicate": "auxiliary", "tag": "NM", "comparison": "less_or_equal",
+                 "value": {"type": "float", "value": 2.5}},
+                {"predicate": "substitution", "observed_base": "T",
+                 "scope": {"scope": "interval", "contig": "chr1", "start": 100, "end": 200}}
+            ]
+        }));
+        let core = setting(json!({
+            "setting": "alignment_view_filter", "track_ids": [3],
+            "value": {"version": 1, "all": [
+                {"predicate": "auxiliary", "tag": [78, 77], "comparison": "less_or_equal",
+                 "value": {"type": "float_bits", "value": 2.5_f64.to_bits()}},
+                {"predicate": "substitution", "observed_base": 84,
+                 "scope": {"scope": "interval", "contig": "chr1", "start": 100, "end": 200},
+                 "minimum_count": null, "maximum_count": null}
+            ]}
+        }));
+        assert!(predicates.is_ok(), "{predicates:?}");
+        assert_eq!(predicates, core);
+        assert!(matches!(
+            setting(json!({"setting": "alignment_highlight_filter", "track_ids": [3], "predicates": []})),
+            Ok(AutomationSetting::AlignmentHighlightFilter { value, .. }) if value.all.is_empty()
+        ));
+
+        // Invalid arguments report the chosen type's own error, not an untagged mismatch.
+        let unknown = setting(json!({"setting": "warp_drive", "value": true})).unwrap_err();
+        assert!(
+            unknown.contains("unknown variant `warp_drive`"),
+            "{unknown}"
+        );
+        let missing =
+            setting(json!({"setting": "alignment_color_tag", "track_ids": [3]})).unwrap_err();
+        assert!(missing.contains("missing field `tag`"), "{missing}");
+        let untagged = setting(json!({"value": true})).unwrap_err();
+        assert!(untagged.contains("setting"), "{untagged}");
+        // A tag of the wrong length cannot become a valid core tag.
+        let short =
+            setting(json!({"setting": "alignment_color_tag", "track_ids": [3], "tag": "H"}))
+                .unwrap();
+        let batch = AutomationBatch {
+            schema_version: BATCH_SCHEMA_VERSION,
+            commands: vec![AutomationCommand::Configure { setting: short }],
+        };
+        assert!(batch.validate().is_err());
+    }
+
+    #[test]
+    fn the_description_check_only_exempts_described_newtype_variants() {
+        let missing = |schema: Value| {
+            let mut missing = Vec::new();
+            undescribed_properties(&schema, "tool", &mut missing);
+            missing
+        };
+        // An internally tagged variant must describe its fields even when the variant itself
+        // is described.
+        assert_eq!(
+            missing(json!({"oneOf": [{
+                "description": "A described variant of the enum.",
+                "properties": {"command": {"const": "goto"}, "loci": {"type": "array"}}
+            }]})),
+            ["tool/oneOf.loci"]
+        );
+        // So must a struct with a single field and a struct-level description.
+        assert_eq!(
+            missing(json!({
+                "description": "A described argument struct.",
+                "properties": {"panel_id": {"type": "integer"}}
+            })),
+            ["tool.panel_id"]
+        );
+        // Newtype variants are described on the variant; an undescribed one is reported.
+        let externally_tagged = |description: Option<&str>| {
+            let mut variant = json!({
+                "additionalProperties": false,
+                "properties": {"tag": {"type": "array"}},
+                "required": ["tag"]
+            });
+            if let Some(description) = description {
+                variant["description"] = json!(description);
+            }
+            missing(json!({"oneOf": [variant]}))
+        };
+        assert!(externally_tagged(Some("Colour by a SAM auxiliary tag.")).is_empty());
+        assert_eq!(externally_tagged(None), ["tool/oneOf.tag"]);
+        assert_eq!(externally_tagged(Some("short")), ["tool/oneOf.tag"]);
+        let adjacently_tagged = missing(json!({"oneOf": [{
+            "description": "Integer operand of the comparison.",
+            "properties": {"type": {"const": "integer"}, "value": {"type": "integer"}}
+        }]}));
+        assert!(adjacently_tagged.is_empty());
+    }
+
     /// Collects `tool.path.to.property` for every schema property lacking a description.
     /// Internally tagged enum discriminators (single-constant strings) are exempt.
     fn undescribed_properties(schema: &Value, location: &str, missing: &mut Vec<String>) {
@@ -4003,10 +3874,27 @@ mod tests {
                             .get("description")
                             .and_then(Value::as_str)
                             .is_some_and(|description| description.len() >= 12);
-                        // `ToolAlignmentAuxValue` is adjacently tagged over newtype variants;
-                        // its operand is described on each variant rather than on `value`.
-                        let variant_described = location.contains("ToolAlignmentAuxValue")
-                            && object.get("description").is_some();
+                        // A newtype enum variant has no field of its own to document: schemars
+                        // puts the variant's doc comment on the variant object. That object is a
+                        // `oneOf` entry whose only property is the variant key (externally
+                        // tagged, `{"tag": [..]}`, closed with `additionalProperties: false`) or
+                        // whose properties are exactly the `type` constant and its `value`
+                        // (adjacently tagged, `{"type": "integer", "value": 1}`). Only those two
+                        // shapes are exempt, and only when the variant itself is described; a
+                        // struct or an internally tagged variant must describe every field.
+                        let externally_tagged = properties.len() == 1
+                            && object.get("additionalProperties") == Some(&Value::Bool(false));
+                        let adjacently_tagged = properties.len() == 2
+                            && name == "value"
+                            && properties
+                                .get("type")
+                                .is_some_and(|tag| tag.get("const").is_some());
+                        let variant_described = location.ends_with("/oneOf")
+                            && (externally_tagged || adjacently_tagged)
+                            && object
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .is_some_and(|description| description.len() >= 12);
                         if !discriminator && !described && !variant_described {
                             missing.push(format!("{location}.{name}"));
                         }
@@ -4134,6 +4022,8 @@ mod tests {
                 "rgv_navigate_related_alignment",
                 "rgv_navigate_review_item",
                 "rgv_open_workspace",
+                "rgv_query_pileup",
+                "rgv_query_variants",
                 "rgv_refresh_selection",
                 "rgv_remove_track",
                 "rgv_save_workspace",
@@ -4196,6 +4086,47 @@ mod tests {
         assert!(configure_schema.contains("alignment_color_mode"));
         assert!(configure_schema.contains("read_base_display_mode"));
         assert!(configure_schema.contains("^[A-Za-z][A-Za-z0-9]$"));
+        // The ten core values that used to be reachable only through `rgv_execute_batch`.
+        for typed in [
+            "complete_read_limit",
+            "read_browsing_buffer_percent",
+            "read_stacking_mode",
+            "rebuild_stable_read_architecture",
+            "total_cache_budget_mib",
+            "bisulfite",
+            "sbx",
+            "smrt_kinetics",
+            "ultima",
+            "alignment_color_tag",
+        ] {
+            assert!(configure_schema.contains(typed), "{typed}");
+        }
+        // The batch argument publishes the real command schema, not an opaque object list.
+        let batch_schema = schema_of("rgv_execute_batch");
+        for command in [
+            "describe_workspace",
+            "change_viewport",
+            "find_alignments",
+            "snapshot",
+        ] {
+            assert!(
+                batch_schema.contains(&format!("\"const\":\"{command}\"")),
+                "{command}"
+            );
+        }
+        assert!(batch_schema.contains("#/$defs/AutomationSetting"));
+        assert!(schema_of("rgv_query_pileup").contains("Zero-based position"));
+        assert!(schema_of("rgv_query_variants").contains("include_sample_names"));
+        for read_only_tool in ["rgv_query_pileup", "rgv_query_variants"] {
+            assert_eq!(
+                tools
+                    .iter()
+                    .find(|tool| tool.name == read_only_tool)
+                    .and_then(|tool| tool.annotations.as_ref())
+                    .and_then(|annotations| annotations.read_only_hint),
+                Some(true)
+            );
+        }
         let configure_properties = configure_input_schema
             .get("properties")
             .and_then(serde_json::Value::as_object)
@@ -4336,11 +4267,12 @@ mod tests {
             .collect()
     }
 
-    /// OPS-6: the hand-written `Tool*` argument enums mirror `rgv-core` wire types. With the core
-    /// `schema` feature both sides publish a schema, so the mirror can be checked mechanically:
-    /// every variant a tool offers must exist in core under the same wire identifier, and every
-    /// core variant must either be offered or be listed here as deliberately withheld. Adding,
-    /// renaming or removing a core variant therefore fails this test until the tool is updated.
+    /// OPS-6: tool arguments use the `rgv-core` wire types directly wherever the wire format is
+    /// identical. The few `Tool*` adapters that remain (each says why at its definition) are
+    /// checked mechanically against the core schema: every variant an adapter offers must exist
+    /// in core under the same wire identifier, and every core variant must either be offered or
+    /// be listed here as deliberately withheld. Adding, renaming or removing a core variant
+    /// therefore fails this test until the adapter is updated.
     #[allow(clippy::too_many_lines)]
     #[test]
     fn tool_argument_enums_cannot_drift_from_the_core_wire_types() {
@@ -4401,35 +4333,8 @@ mod tests {
                 }
             }};
         }
-        mirror!(
-            ToolViewportOperation,
-            rgv_core::AutomationViewportOperation,
-            []
-        );
         mirror!(ToolSource, rgv_core::TrackSource, []);
         mirror!(ToolTrackKind, rgv_core::TrackKind, []);
-        mirror!(ToolTrackChannel, rgv_core::TrackChannel, []);
-        mirror!(ToolPresentationNode, rgv_core::PresentationNodeId, []);
-        mirror!(
-            ToolAlignmentPredicateScope,
-            rgv_core::AlignmentPredicateScope,
-            []
-        );
-        mirror!(
-            ToolAlignmentFlagPredicate,
-            rgv_core::AlignmentFlagPredicate,
-            []
-        );
-        mirror!(
-            ToolAlignmentCigarEventPredicate,
-            rgv_core::AlignmentCigarEventPredicate,
-            []
-        );
-        mirror!(
-            ToolAlignmentAuxComparison,
-            rgv_core::AlignmentAuxComparison,
-            []
-        );
         // Adapter: core stores a float operand as its IEEE-754 bits (`float_bits`) so the
         // predicate stays `Eq`/hashable; the tool accepts an ordinary JSON number.
         mirror!(
@@ -4439,92 +4344,21 @@ mod tests {
             adapter_only: ["float"]
         );
         mirror!(ToolAlignmentPredicate, rgv_core::AlignmentViewPredicate, []);
-        // Adapter: `alignment_color_tag` is a tool-side variant that carries the SAM tag as a
-        // validated string and becomes `alignment_color_mode` with core's `tag` colour mode.
-        // The five withheld core settings are not offered as typed MCP settings; they remain
-        // reachable only through `rgv_execute_batch`.
+        // The configure argument is the core setting schema plus `alignment_color_tag`, the
+        // string spelling of the `tag` colour mode. No core setting is withheld.
         mirror!(
             ToolSetting,
             rgv_core::AutomationSetting,
-            [
-                "completereadlimit",
-                "readbrowsingbufferpercent",
-                "readstackingmode",
-                "rebuildstablereadarchitecture",
-                "totalcachebudgetmib",
-            ],
+            [],
             adapter_only: ["alignmentcolortag"]
-        );
-        mirror!(
-            ToolCoverageScaleTransform,
-            rgv_core::CoverageScaleTransform,
-            []
-        );
-        mirror!(
-            ToolOverlappingMatePolicy,
-            rgv_core::OverlappingMatePolicy,
-            []
-        );
-        mirror!(ToolReadBaseDisplayMode, rgv_core::ReadBaseDisplayMode, []);
-        mirror!(
-            ToolModifiedBaseColorMode,
-            rgv_core::ModifiedBaseColorMode,
-            []
-        );
-        // `tag` carries a payload and is offered as the `alignment_color_tag` setting instead; the
-        // platform-specific colour modes are not offered as typed MCP values.
-        mirror!(
-            ToolAlignmentColorMode,
-            rgv_core::AlignmentColorMode,
-            ["bisulfite", "sbx", "smrtkinetics", "tag", "ultima"]
         );
         mirror!(ToolGroupMode, rgv_core::AlignmentGroupMode, []);
         mirror!(ToolSortMode, rgv_core::AlignmentSortMode, []);
-        mirror!(ToolDirection, rgv_core::AlignmentOrderDirection, []);
-        mirror!(ToolSelection, rgv_core::AutomationSelection, []);
-        mirror!(
-            ToolSelectionGranularity,
-            rgv_core::AutomationSelectionGranularity,
-            []
-        );
-        mirror!(
-            ToolReviewNavigation,
-            rgv_core::AutomationReviewNavigation,
-            []
-        );
-        mirror!(
-            ToolHistoryNavigation,
-            rgv_core::AutomationHistoryNavigation,
-            []
-        );
-        mirror!(
-            ToolAlignmentSelector,
-            rgv_core::AutomationAlignmentSelector,
-            []
-        );
-        mirror!(ToolAlignmentState, rgv_core::AutomationAlignmentState, []);
-        mirror!(ToolAlignmentReveal, rgv_core::AutomationAlignmentReveal, []);
-        mirror!(
-            ToolAlignmentRelationship,
-            rgv_core::AutomationAlignmentRelationship,
-            []
-        );
-        mirror!(
-            ToolNavigationDestination,
-            rgv_core::AutomationNavigationDestination,
-            []
-        );
         // `native_window` is the separate `rgv_capture_window` tool.
         mirror!(
             ToolSnapshotScope,
             rgv_core::AutomationSnapshotScope,
             ["nativewindow"]
-        );
-        mirror!(ToolExportKind, rgv_core::AutomationExportKind, []);
-        mirror!(
-            ToolUnsavedChangesPolicy,
-            rgv_core::AutomationUnsavedChangesPolicy,
-            []
         );
         assert!(failures.is_empty(), "{failures:#?}");
     }

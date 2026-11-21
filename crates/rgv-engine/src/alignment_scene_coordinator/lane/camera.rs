@@ -107,6 +107,7 @@ impl AlignmentSceneSourceLane {
             self.vertical_residency_failed = false;
             self.filter_reference_horizon = None;
             self.speculation_refusal = None;
+            self.foreground_pressure_refusal = None;
         }
         if self
             .refusal

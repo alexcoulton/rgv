@@ -4,7 +4,12 @@ pub const MAXIMUM_TDF_CHANNELS: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct TrackId(u64);
+pub struct TrackId(
+    /// Positive stable track ID, as reported in the workspace snapshot (`tracks[].id`). It is
+    /// an identity, not a display index.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    u64,
+);
 
 impl TrackId {
     pub const fn new(value: u64) -> Self {
@@ -19,15 +24,25 @@ impl TrackId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum TrackKind {
+    /// Aligned reads (BAM or CRAM).
     Alignment,
+    /// A reference sequence (FASTA).
     Reference,
+    /// Interval features such as BED records.
     Feature,
+    /// Gene and transcript models.
     GeneModel,
+    /// Variant calls (VCF or BCF).
     Variant,
+    /// Mutation records (MAF).
     Mutation,
+    /// Genome-wide association results.
     Gwas,
+    /// A numeric signal along the genome (bigWig, TDF, bedGraph, or WIG).
     Quantitative,
+    /// Copy-number segments (SEG).
     CopyNumber,
+    /// Paired-interval interactions (BEDPE or interact).
     Interaction,
 }
 
@@ -295,8 +310,21 @@ impl InteractionTrackSettings {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub enum TrackSource {
-    Local { path: String },
-    Remote { url: String },
+    /// A file on the viewer's machine, written `{"Local": {"path": "..."}}`.
+    Local {
+        /// Local file path (non-empty, at most 16384 bytes in an automation command). In an
+        /// automation batch a relative path is resolved against the batch file's directory or,
+        /// through the control service, against the control root; a path outside the control
+        /// root is rejected.
+        path: String,
+    },
+    /// A remote file, written `{"Remote": {"url": "..."}}`.
+    Remote {
+        /// URL of the remote file (non-empty, at most 16384 bytes in an automation command).
+        /// Through the control service it must be `http` or `https` and may not target
+        /// localhost or a loopback, link-local, or private-network address literal.
+        url: String,
+    },
 }
 
 pub const MAX_VARIANT_SAMPLE_SUBSET: usize = 10_000;

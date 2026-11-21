@@ -135,149 +135,327 @@ impl AutomationBatch {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum AutomationCommand {
+    /// Return the complete workspace snapshot (genome, panels, tracks, layout, selection). Read-only.
     DescribeWorkspace,
+    /// Return the retained evidence snapshot of the active panel's selection, or `null` when
+    /// nothing is selected. Read-only.
     DescribeSelection,
+    /// Return the input-to-present timeline of the most recent vertical-scrollbar gesture, or
+    /// `null` when none was recorded. Read-only.
     DescribeInteractionTrace,
+    /// Return the status of the interaction recording (qualification tooling). Read-only.
     DescribeInteractionRecording,
+    /// Start recording native input events to a file (qualification tooling). Fails with
+    /// `invalid_state` in a build without diagnostics.
     StartInteractionRecording {
+        /// Output file for the recording. A relative path is resolved against the batch file's
+        /// directory or, through the control service, against the control root; a path outside
+        /// the control root is rejected.
         path: String,
+        /// Optional free-text fixture label stored in the recording header (non-empty, at most
+        /// 16384 bytes).
         #[serde(default)]
         fixture: Option<String>,
+        /// When false (the default), key presses that produce text are not recorded verbatim;
+        /// when true, typed text is kept in the recording.
         #[serde(default)]
         record_text: bool,
     },
+    /// Stop and finalise the interaction recording started by `start_interaction_recording`.
     StopInteractionRecording,
+    /// Open a native-input observation scope inside the active interaction recording
+    /// (qualification tooling).
     BeginNativeObservation {
+        /// Caller-chosen identifier of the stress run (non-empty, at most 16384 bytes).
         run_id: String,
+        /// Caller-chosen identifier of the step within the run (non-empty, at most 16384 bytes).
         step_id: String,
+        /// The window region the observed input is expected to land on. Omit for no
+        /// expectation.
         #[serde(default)]
         expected_target: Option<crate::interaction_stress::StressTarget>,
     },
+    /// Close the native-input observation scope and return its summary.
     EndNativeObservation,
+    /// Write a labelled workspace checkpoint into the active interaction recording.
     CheckpointInteractionRecording {
+        /// Checkpoint label (non-empty, at most 16384 bytes).
         label: String,
     },
+    /// Start the manual diagnostic trace. Fails with `invalid_state` in a build without
+    /// diagnostics.
     StartDiagnosticTrace,
+    /// Stop the manual diagnostic trace and save it; reports the event counts and saved path.
     StopDiagnosticTrace,
+    /// Clear the active panel's selection and retained evidence.
     ClearSelection,
+    /// Replace the active panel's retained evidence with a new evidence revision captured from
+    /// the current query. Fails with `no_selection` when nothing is selected. For an
+    /// `exact_base` selection whose one-base evidence is not available it first fits the
+    /// panel's viewport to that single base, which visibly changes the view.
     RefreshSelection,
+    /// Return the review queue (ID, label, locus, status per item). Read-only.
     DescribeReviewQueue,
+    /// Return one panel's navigation history without moving its cursor. Read-only.
     DescribeNavigationHistory {
+        /// Positive stable ID of the panel whose history to describe.
         panel_id: PanelId,
     },
+    /// Discard every track and panel, keeping only the active genome and the active panel's
+    /// locus. Destructive: unsaved workspace changes are lost without confirmation.
     NewWorkspace,
+    /// Replace the visible workspace with a saved RGV project file.
     OpenWorkspace {
+        /// Project file to open. A relative path is resolved against the batch file's directory
+        /// or, through the control service, against the control root; a path outside the
+        /// control root is rejected.
         path: String,
+        /// Must be true; otherwise the command fails with
+        /// `workspace_replacement_not_confirmed` and changes nothing.
         confirm_replace: bool,
+        /// What to do when the current workspace has unsaved changes (default `reject`).
         #[serde(default)]
         unsaved_changes: AutomationUnsavedChangesPolicy,
+        /// Time allowed for the project to load, in milliseconds, 100 to 600000 (default
+        /// 30000).
         #[serde(default = "default_settle_timeout_millis")]
+        #[cfg_attr(feature = "schema", schemars(range(min = 100, max = 600_000)))]
         timeout_millis: u64,
     },
+    /// Open a reference FASTA as the workspace genome. Only a local source is supported; a
+    /// remote source fails with `unsupported_command`.
     SetGenome {
+        /// The reference FASTA to open. Must be a local file.
         source: TrackSource,
+        /// Optional assembly display name (non-empty, at most 16384 bytes).
         #[serde(default)]
         name: Option<String>,
     },
+    /// Load one track and wait up to 30 seconds for its source to open. The result reports the
+    /// new stable track ID.
     LoadTrack {
+        /// Where to read the track from. A remote (HTTP/HTTPS) source is supported for
+        /// alignment tracks only; remote reference and annotation sources fail with
+        /// `unsupported_command`.
         source: TrackSource,
+        /// Track kind. Omit to infer it from the source's file name; an unrecognised name is
+        /// loaded as `Feature`.
         #[serde(default)]
         kind: Option<TrackKind>,
+        /// Optional display name for the track (non-empty, at most 16384 bytes).
         #[serde(default)]
         name: Option<String>,
     },
+    /// Remove one track from the workspace. Outstanding alignment handles expire and retained
+    /// evidence is marked stale.
     RemoveTrack {
+        /// Positive stable ID of the track to remove.
         track_id: TrackId,
     },
+    /// Navigate to one or more loci. A single locus retargets only the active panel and leaves
+    /// the other panels alone; two or more loci replace the whole panel arrangement with one
+    /// panel per locus, in order.
     Goto {
+        /// One to 16 locus strings, each a single whitespace-free token. Coordinates are
+        /// one-based and inclusive at both ends: `chr1:1,000,001-1,100,000` (thousands
+        /// separators optional), `chr1:12345` (that base with 20 bases of flank on each side),
+        /// or a bare contig name for the whole contig. Gene symbols are not resolved.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 16)))]
         loci: Vec<String>,
     },
+    /// Pan, zoom, or fit one panel's viewport. The panel becomes the active panel and the
+    /// result reports the exact resulting interval.
     ChangeViewport {
+        /// Positive stable ID of the panel to move.
         panel_id: PanelId,
+        /// The pan, zoom, or fit to apply. Numeric positions are zero-based; intervals are
+        /// half-open `[start, end)`.
         operation: AutomationViewportOperation,
     },
+    /// Append a new panel showing a locus.
     AddPanel {
+        /// Locus string with one-based inclusive coordinates, in the forms accepted by `goto`
+        /// (for example `chr1:1,000,001-1,100,000`).
         locus: String,
     },
+    /// Close one panel. Fails with `invalid_state` when the panel does not exist or is the only
+    /// remaining panel.
     ClosePanel {
+        /// Positive stable ID of the panel to close.
         panel_id: PanelId,
     },
+    /// Legacy untyped option. Prefer `configure`, whose variants are validated by type.
     SetOption {
+        /// What the option applies to: the workspace, one track, or one panel.
         scope: AutomationOptionScope,
+        /// Option name (non-empty, at most 16384 bytes). Workspace keys: `show_reference`,
+        /// `show_coverage`, `show_reads`, `show_junctions`, `show_junction_labels`,
+        /// `show_coverage_center_line`, `view_as_pairs`, `quality_weighted_alleles`,
+        /// `shade_read_bases_by_quality`, `show_modified_bases`, `show_modification_frequency`,
+        /// `minimum_mapping_quality`, `include_secondary`, `include_supplementary`,
+        /// `minimum_base_quality`, `minimum_allele_fraction`, `vertical_density`,
+        /// `coverage_scale_maximum`, `coverage_scale_transform`, `minimum_indel_size`,
+        /// `minimum_event_label_size`. Track keys: `visible`, `collapsed`, `height`, `name`,
+        /// `sample_key`. Panel keys: `vertical_scroll_points`, `annotation_scroll_points`. An
+        /// unknown key fails with `invalid_command`.
         key: String,
+        /// The option value as JSON (boolean, number, string, or null, depending on the key);
+        /// at most 65536 bytes when serialised.
         value: serde_json::Value,
     },
+    /// Apply one typed setting. The result reports `requested`, `effective`, `changed`, and
+    /// `clamped`.
     Configure {
+        /// The setting to apply, selected by its `setting` discriminator.
         setting: AutomationSetting,
     },
+    /// Group the reads of alignment tracks into labelled row blocks.
     Group {
+        /// Positive stable IDs of the alignment tracks to group; 1 to 1024 entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
+        /// Grouping mode. Ignored when `tag` is supplied.
         mode: AlignmentGroupMode,
+        /// Order of the resulting groups (default `natural`).
         #[serde(default)]
         direction: AlignmentOrderDirection,
+        /// Two-character SAM auxiliary tag to group by, e.g. `HP` (a letter followed by a letter
+        /// or digit). When supplied it overrides `mode` with tag grouping.
         #[serde(default)]
+        #[cfg_attr(
+            feature = "schema",
+            schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))
+        )]
         tag: Option<String>,
-        /// Fixed zero-based genomic anchor for position-aware grouping modes.
+        /// Zero-based genomic position on the active panel's contig that `base` and `insertion`
+        /// grouping examine. Only valid with those modes and without `tag`; defaults to the
+        /// centre of the active panel's viewport.
         #[serde(default)]
         anchor_position: Option<u64>,
     },
+    /// Sort the reads of alignment tracks within their groups.
     Sort {
+        /// Positive stable IDs of the alignment tracks to sort; 1 to 1024 entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
+        /// Sort key. Ignored when `tag` is supplied.
         mode: AlignmentSortMode,
+        /// Sort direction (default `natural`).
         #[serde(default)]
         direction: AlignmentOrderDirection,
+        /// Two-character SAM auxiliary tag to sort by, e.g. `HP` (a letter followed by a letter
+        /// or digit). When supplied it overrides `mode` with tag sorting.
         #[serde(default)]
+        #[cfg_attr(
+            feature = "schema",
+            schemars(regex(pattern = r"^[A-Za-z][A-Za-z0-9]$"))
+        )]
         tag: Option<String>,
-        /// Fixed zero-based genomic anchor for base sorting.
+        /// Zero-based genomic position on the active panel's contig whose read base `base`
+        /// sorting compares. Only valid with that mode and without `tag`; defaults to the
+        /// centre of the active panel's viewport.
         #[serde(default)]
         anchor_position: Option<u64>,
     },
+    /// Replace the auxiliary-tag filter of alignment tracks. This changes the alignment query:
+    /// outstanding alignment handles expire and retained evidence is marked stale.
     Filter {
+        /// Positive stable IDs of the alignment tracks to filter; 1 to 1024 entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
+        /// Semicolon-separated SAM-tag predicates combined with logical AND, at most 16384
+        /// bytes: a bare tag (`HP`) requires the tag to exist; `TAG=value`, `TAG!=value`,
+        /// `TAG>value`, `TAG>=value`, `TAG<value`, `TAG<=value` compare its value (for example
+        /// `HP=1;NM<=2`). An empty string clears the filter.
         expression: String,
     },
+    /// Select a track, a panel, or the evidence at one genomic position.
     Select {
+        /// What to select.
         selection: AutomationSelection,
     },
+    /// Find alignment records in one track of one panel and return opaque handles for them.
+    /// The search covers the interval the committed alignment scene has prepared (reported as
+    /// zero-based half-open `query_start`/`query_end`), which can be wider than the viewport.
+    /// Every call invalidates the handles returned by earlier calls. Fails with `too_dense`
+    /// when individual reads are not available at the current zoom.
     FindAlignments {
+        /// Positive stable ID of the panel to search in.
         panel_id: PanelId,
+        /// Positive stable ID of the alignment track to search.
         track_id: TrackId,
+        /// Which records to find.
         selector: AutomationAlignmentSelector,
+        /// Maximum number of hits to return, 1 to 128 (default 25). `truncated` reports
+        /// whether more records matched.
         #[serde(default = "default_alignment_result_limit")]
+        #[cfg_attr(feature = "schema", schemars(range(min = 1, max = 128)))]
         maximum_results: usize,
     },
+    /// Select the alignment record identified by a handle from `find_alignments`. Fails with
+    /// `stale_handle` when the handle is unknown or its query has changed.
     SelectAlignment {
+        /// Opaque alignment handle returned by `find_alignments` (non-empty, at most 16384
+        /// bytes). It expires when the backing query changes or `find_alignments` runs again.
         handle: String,
+        /// Viewport change applied with the selection (default `none`).
         #[serde(default)]
         reveal: AutomationAlignmentReveal,
+        /// If set, the command fails with `workspace_revision_conflict` and changes nothing
+        /// unless the viewer's current `workspace_revision` equals this value.
         #[serde(default)]
         expected_workspace_revision: Option<u64>,
     },
+    /// Describe the selected alignment's mate availability and supplementary-chain segments
+    /// (zero-based half-open `start`/`end` per segment). Read-only.
     DescribeRelatedAlignments,
+    /// Navigate to the selected alignment's mate or to one segment of its supplementary chain.
     NavigateRelatedAlignment {
+        /// Which related record to open.
         relationship: AutomationAlignmentRelationship,
+        /// Zero-based index into `supplementary_segments` as reported by
+        /// `describe_related_alignments`. Required for `supplementary_segment`; must be omitted
+        /// for `mate`.
         #[serde(default)]
         segment_index: Option<usize>,
+        /// Where to show the related record (default `current_panel`).
         #[serde(default)]
         destination: AutomationNavigationDestination,
+        /// If set, the command fails with `workspace_revision_conflict` and changes nothing
+        /// unless the viewer's current `workspace_revision` equals this value.
         #[serde(default)]
         expected_workspace_revision: Option<u64>,
     },
+    /// Navigate the active panel to a review item's locus.
     NavigateReviewItem {
+        /// Which review item to open.
         action: AutomationReviewNavigation,
     },
+    /// Move one panel through its navigation history. The panel becomes the active panel.
     NavigateHistory {
+        /// Positive stable ID of the panel whose history to traverse.
         panel_id: PanelId,
+        /// Step back, step forward, or jump to an entry.
         action: AutomationHistoryNavigation,
     },
+    /// Wait until every pending query and render has settled, so later commands observe the
+    /// final state. Fails with `timeout` when the deadline passes.
     WaitUntilSettled {
+        /// Maximum time to wait, in milliseconds, 100 to 600000 (default 30000).
         #[serde(default = "default_settle_timeout_millis")]
+        #[cfg_attr(feature = "schema", schemars(range(min = 100, max = 600_000)))]
         timeout_millis: u64,
     },
+    /// Write an image of the current view to a file.
     Snapshot {
+        /// Output image file. A relative path is resolved against the batch file's directory
+        /// or, through the control service, against the control root; a path outside the
+        /// control root is rejected.
         path: String,
+        /// Which part of the window to capture (default `visible_workspace`).
         #[serde(default)]
         scope: AutomationSnapshotScope,
+        /// Image format (default `png`). `native_window` supports `png` only.
         #[serde(default)]
         format: AutomationSnapshotFormat,
         /// PNG pixels per logical point, from 0.25 to 8. The default 1.0 gives one pixel per
@@ -287,15 +465,30 @@ pub enum AutomationCommand {
             default = "default_snapshot_scale",
             skip_serializing_if = "is_default_snapshot_scale"
         )]
+        #[cfg_attr(feature = "schema", schemars(range(min = 0.25, max = 8.0)))]
         scale: f32,
     },
+    /// Write a structured text export of evidence in the active panel's current interval. The
+    /// tabular alignment, pileup, modification, junction, variant, and quantitative exports
+    /// state their convention in a `# coordinates` header (`start` is one-based and `end` is
+    /// one-based inclusive), are capped at 64 MiB, and end with an `# export_truncated` line
+    /// when the cap is reached.
     Export {
+        /// Output file. A relative path is resolved against the batch file's directory or,
+        /// through the control service, against the control root; a path outside the control
+        /// root is rejected.
         path: String,
+        /// Which evidence to export.
         kind: AutomationExportKind,
     },
+    /// Save the workspace as an RGV project file.
     Save {
+        /// Output project file. A relative path is resolved against the batch file's directory
+        /// or, through the control service, against the control root; a path outside the
+        /// control root is rejected.
         path: String,
     },
+    /// Quit the application once the batch report has been written.
     Exit,
 }
 
@@ -605,19 +798,40 @@ impl AutomationCommand {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum AutomationViewportOperation {
+    /// Pan by a signed number of bases.
     PanBases {
+        /// Signed pan distance in bases (base pairs). Positive moves the view toward higher
+        /// coordinates, negative toward lower. Must not be zero; the view is clamped to the
+        /// contig.
         delta: i64,
     },
+    /// Pan by a signed fraction of the visible span.
     PanFraction {
+        /// Signed pan distance as a fraction of the currently visible span (1.0 = one full view
+        /// width). Positive moves toward higher coordinates. Must not be zero; -100 to 100. The
+        /// view is clamped to the contig.
+        #[cfg_attr(feature = "schema", schemars(range(min = -100.0, max = 100.0)))]
         fraction: f64,
     },
+    /// Zoom in or out around an anchor.
     Zoom {
+        /// Magnification factor, 0.01 to 100: above 1 zooms in (the visible span is divided by
+        /// the factor), below 1 zooms out.
+        #[cfg_attr(feature = "schema", schemars(range(min = 0.01, max = 100.0)))]
         factor: f64,
+        /// Zero-based genomic position on the panel's current contig that keeps its screen
+        /// position while zooming. Omit to zoom around the viewport centre.
         #[serde(default)]
         anchor_position: Option<u64>,
     },
+    /// Show exactly one zero-based, half-open interval `[start, end)` of the panel's current
+    /// contig.
     FitInterval {
+        /// Zero-based inclusive start of the interval, in bases, on the panel's current contig.
+        /// Clamped to the last base of the contig.
         start: u64,
+        /// Zero-based exclusive end of the interval (half-open `[start, end)`); must be greater
+        /// than `start`. Equals the one-based inclusive end. Clamped to the contig length.
         end: u64,
     },
 }
@@ -655,9 +869,13 @@ impl AutomationViewportOperation {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationUnsavedChangesPolicy {
+    /// Fail with `unsaved_changes` and leave the workspace untouched.
     #[default]
     Reject,
+    /// Save the current workspace to its existing project file first, then open. Fails with
+    /// `unsaved_changes` when the workspace has never been saved.
     SaveThenOpen,
+    /// Drop the unsaved changes and open.
     Discard,
 }
 
@@ -667,166 +885,360 @@ pub enum AutomationUnsavedChangesPolicy {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "setting", rename_all = "snake_case")]
 pub enum AutomationSetting {
+    /// Request a window client-area size. The window system may not honour it exactly.
     WindowSize {
+        /// Window client-area width in logical points (not physical pixels), 640 to 3840.
+        #[cfg_attr(feature = "schema", schemars(range(min = 640, max = 3840)))]
         width: u32,
+        /// Window client-area height in logical points (not physical pixels), 400 to 2160.
+        #[cfg_attr(feature = "schema", schemars(range(min = 400, max = 2160)))]
         height: u32,
     },
+    /// Set the interface zoom of the running window.
     InterfaceScalePercent {
+        /// Interface zoom in percent, 75 to 200; 100 is the unscaled interface.
+        #[cfg_attr(feature = "schema", schemars(range(min = 75, max = 200)))]
         value: u16,
     },
+    /// Set how far beyond the viewport reads are decoded ahead of panning. Saved to the user's
+    /// desktop settings, so it outlives the workspace; a change re-queries every panel.
     ReadBrowsingBufferPercent {
+        /// Decoded-read margin on each side of the viewport, as a percentage of the viewport
+        /// span, 0 to 400 (default 100).
+        #[cfg_attr(feature = "schema", schemars(range(min = 0, max = 400)))]
         value: u16,
     },
+    /// Set the total cache budget. Saved to the user's desktop settings, so it outlives the
+    /// workspace; a change re-queries every panel.
     TotalCacheBudgetMib {
+        /// Cache budget in mebibytes (MiB), 128 to 4096 (application default 512).
+        #[cfg_attr(feature = "schema", schemars(range(min = 128, max = 4096)))]
         value: usize,
     },
+    /// Expand or collapse the Properties panel.
     PropertiesPanelExpanded {
+        /// True expands the Properties panel, false collapses it.
         value: bool,
     },
+    /// Set the width of the Properties panel.
     PropertiesPanelWidth {
+        /// Properties panel width in logical points, 280 to 520.
+        #[cfg_attr(feature = "schema", schemars(range(min = 280.0, max = 520.0)))]
         value: f32,
     },
     /// Transient control signal matching a held Properties resize sash. This
     /// gesture state is never persisted in a project.
     PropertiesPanelResizeActive {
+        /// True marks the sash as held, deferring the resolution-dependent query refresh; false
+        /// releases it and schedules that refresh once.
         value: bool,
     },
+    /// Show or hide the reference sequence. Stored in the first (primary) alignment track's
+    /// display settings.
     ShowReference {
+        /// True shows the reference sequence, false hides it.
         value: bool,
     },
+    /// Show or hide alignment coverage. Stored in the first (primary) alignment track's display
+    /// settings.
     ShowCoverage {
+        /// True shows alignment coverage, false hides it.
         value: bool,
     },
+    /// Show or hide the reads row of the first (primary) alignment track. Other alignment
+    /// tracks are not changed; use `presentation_node_visible` to address a specific track.
     ShowReads {
+        /// True shows the primary alignment track's reads, false hides them.
         value: bool,
     },
+    /// Show or hide splice-junction arcs. Stored in the first (primary) alignment track's
+    /// display settings.
     ShowJunctions {
+        /// True shows splice-junction arcs, false hides them.
         value: bool,
     },
+    /// Draw paired reads as linked templates. Stored in the first (primary) alignment track's
+    /// display settings.
     ViewAsPairs {
+        /// True draws the two mates of a pair as one linked template, false draws each read
+        /// separately.
         value: bool,
     },
+    /// Choose how coverage counts bases covered by both mates of one template. Stored in the
+    /// first (primary) alignment track's settings; a change re-queries every panel, expires
+    /// alignment handles, and marks retained evidence stale.
     OverlappingMatePolicy {
+        /// The counting policy to apply.
         value: OverlappingMatePolicy,
     },
+    /// Set how reads are coloured on the listed alignment tracks.
     AlignmentColorMode {
+        /// Positive stable IDs of the alignment tracks to change; 1 to 1024 entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
+        /// The read colouring mode to apply to the listed tracks.
         value: AlignmentColorMode,
     },
+    /// Replace the view filter of the listed alignment tracks: records that do not match are
+    /// removed from the reads, coverage, and exports. A change re-queries every panel, expires
+    /// alignment handles, and marks retained evidence stale. A `substitution` predicate
+    /// requires a loaded reference.
     AlignmentViewFilter {
+        /// Positive stable IDs of the alignment tracks to change; 1 to 1024 entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
+        /// The predicates a record must satisfy. An expression with an empty `all` list clears
+        /// the filter.
         value: AlignmentPredicateExpression,
     },
+    /// Replace the highlight filter of the listed alignment tracks: matching records are
+    /// highlighted and nothing is removed. A `substitution` predicate requires a loaded
+    /// reference.
     AlignmentHighlightFilter {
+        /// Positive stable IDs of the alignment tracks to change; 1 to 1024 entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
+        /// The predicates a record must satisfy to be highlighted. An expression with an empty
+        /// `all` list clears the highlight.
         value: AlignmentPredicateExpression,
     },
+    /// Choose whether the listed alignment tracks keep reads on stable rows or repack them for
+    /// every query.
     ReadStackingMode {
+        /// Positive stable IDs of the alignment tracks to change; 1 to 1024 entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
+        /// The stacking mode to apply to the listed tracks.
         value: ReadStackingMode,
     },
+    /// Set the largest number of records for which the listed alignment tracks prepare
+    /// complete individual reads. The workspace-wide limit is raised to at least this value; a
+    /// change re-queries every panel, expires alignment handles, and marks retained evidence
+    /// stale.
     CompleteReadLimit {
+        /// Positive stable IDs of the alignment tracks to change; 1 to 1024 entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
+        /// Maximum number of alignment records, 1000 to 10000000.
+        #[cfg_attr(feature = "schema", schemars(range(min = 1000, max = 10_000_000)))]
         value: usize,
     },
     /// One-shot stable-baseline replacement. This is deliberately distinct
-    /// from the persistent compact stacking mode.
+    /// from the persistent compact stacking mode. Every listed track must use `stable` read
+    /// stacking. Also accepted under the legacy name `compact_repack_reads`.
     #[serde(alias = "compact_repack_reads")]
     RebuildStableReadArchitecture {
+        /// Positive stable ID of the panel whose row assignment is rebuilt.
         panel_id: PanelId,
+        /// Positive stable IDs of the alignment tracks to rebuild; 1 to 1024 entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 1, max = 1024)))]
         track_ids: Vec<TrackId>,
     },
+    /// Set the default read-row density of the first (primary) alignment track and clear that
+    /// track's per-panel density overrides.
     AlignmentDensity {
+        /// Read-row height multiplier: a row is 7 logical points tall at 1.0 and larger values
+        /// draw taller rows. Batch validation accepts 0.25 to 4, but the viewer rejects values
+        /// below 0.35 with `setting_out_of_range`, so the usable range is 0.35 to 4.
+        #[cfg_attr(feature = "schema", schemars(range(min = 0.25, max = 4.0)))]
         value: f32,
     },
+    /// Include or exclude secondary alignments. Stored in the first (primary) alignment track's
+    /// settings; a change re-queries every panel, expires alignment handles, and marks retained
+    /// evidence stale.
     IncludeSecondary {
+        /// True includes secondary alignments (SAM flag 0x100), false excludes them.
         value: bool,
     },
+    /// Include or exclude supplementary alignments. Stored in the first (primary) alignment
+    /// track's settings; a change re-queries every panel, expires alignment handles, and marks
+    /// retained evidence stale.
     IncludeSupplementary {
+        /// True includes supplementary alignments (SAM flag 0x800), false excludes them.
         value: bool,
     },
+    /// Set the vertical scale of coverage depth. Stored in the first (primary) alignment
+    /// track's display settings.
     CoverageScaleTransform {
+        /// The scale transform to apply.
         value: CoverageScaleTransform,
     },
+    /// Choose which read bases are drawn. Stored in the first (primary) alignment track's
+    /// display settings.
     ReadBaseDisplayMode {
+        /// The base display mode to apply.
         value: ReadBaseDisplayMode,
     },
+    /// Shade read bases by base quality. Stored in the first (primary) alignment track's
+    /// display settings.
     ShadeReadBasesByQuality {
+        /// True shades read bases by their base quality, false draws them at full strength.
         value: bool,
     },
+    /// Show or hide base-modification calls. Stored in the first (primary) alignment track's
+    /// display settings.
     ShowModifiedBases {
+        /// True draws base-modification (MM/ML) calls, false hides them.
         value: bool,
     },
+    /// Choose how base-modification calls are coloured. Stored in the first (primary) alignment
+    /// track's display settings.
     ModifiedBaseColorMode {
+        /// The colouring mode to apply.
         value: ModifiedBaseColorMode,
     },
+    /// Expand or collapse a whole presentation section without changing its members' own
+    /// visibility, grouping, or heights.
     PresentationSectionExpanded {
+        /// The section to expand or collapse.
         channel: crate::TrackChannel,
+        /// True expands the section, false collapses it.
         value: bool,
     },
+    /// Show or hide the content of the reference lane or of one track row.
     PresentationNodeVisible {
+        /// The node to show or hide: `reference` or a `track`. A `group` is rejected; use
+        /// `presentation_group_visible`.
         target: crate::PresentationNodeId,
+        /// True shows the node's content, false hides it.
         value: bool,
     },
+    /// Set the preferred height of the reference lane or of one track row.
     PresentationNodeHeight {
+        /// The node to resize: `reference` or a `track`. A `group` is rejected.
         target: crate::PresentationNodeId,
+        /// Preferred height in logical points: 26 to 1200 for the reference lane and
+        /// annotation-channel tracks, 40 to 1200 for reads-channel tracks.
+        #[cfg_attr(feature = "schema", schemars(range(min = 26.0, max = 1200.0)))]
         value: f32,
     },
+    /// Expand or collapse a presentation group's member rows.
     PresentationGroupExpanded {
+        /// The group to expand or collapse; must be a `group` node.
         target: crate::PresentationNodeId,
+        /// True shows the group's member rows, false collapses them.
         value: bool,
     },
+    /// Show or hide the content of a presentation group.
     PresentationGroupVisible {
+        /// The group to show or hide; must be a `group` node.
         target: crate::PresentationNodeId,
+        /// True shows the group's content, false hides it.
         value: bool,
     },
+    /// Show or hide a composite (for example a quantitative overlay) without changing its
+    /// members' own visibility.
     PresentationCompositeVisible {
+        /// Channel that owns the composite. Must be `annotation`; composites do not exist in
+        /// the reads channel.
         channel: crate::TrackChannel,
+        /// Positive composite ID as reported in `presentation_composites` of the workspace
+        /// snapshot.
+        #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
         composite_id: u32,
+        /// True shows the composite, false hides it.
         value: bool,
     },
+    /// Place tracks of one channel in a new presentation group.
     PresentationGroup {
+        /// Channel in which to create the group.
         channel: crate::TrackChannel,
+        /// Positive stable IDs of the tracks to group; 2 to 1024 distinct entries.
+        #[cfg_attr(feature = "schema", schemars(length(min = 2, max = 1024)))]
         track_ids: Vec<TrackId>,
     },
+    /// Dissolve a presentation group, returning its members to the top level.
     PresentationUngroup {
+        /// The group to dissolve; must be a `group` node.
         target: crate::PresentationNodeId,
     },
+    /// Set the height of the reads pane.
     ReadPaneHeight {
+        /// Height of the reads pane in logical points, 100 to 1200.
+        #[cfg_attr(feature = "schema", schemars(range(min = 100.0, max = 1200.0)))]
         value: f32,
     },
+    /// Set the preferred height of a track's annotation-channel row.
     TrackHeight {
+        /// Positive stable ID of the track, as reported in the workspace snapshot
+        /// (`tracks[].id`).
         track_id: TrackId,
+        /// Track height in logical points, 40 to 1200.
+        #[cfg_attr(feature = "schema", schemars(range(min = 40.0, max = 1200.0)))]
         value: f32,
     },
+    /// Hide or show the content of a track's annotation-channel row. `value: true` is the same
+    /// operation as `track_visible` with `value: false`.
     TrackCollapsed {
+        /// Positive stable ID of the track, as reported in the workspace snapshot
+        /// (`tracks[].id`).
         track_id: TrackId,
+        /// True hides the row's content, false shows it.
         value: bool,
     },
+    /// Show or hide the content of a track's annotation-channel row.
     TrackVisible {
+        /// Positive stable ID of the track, as reported in the workspace snapshot
+        /// (`tracks[].id`).
         track_id: TrackId,
+        /// True shows the row's content, false hides it.
         value: bool,
     },
+    /// Scroll the read panel of the first (primary) alignment track in one genomic panel.
     VerticalScrollPoints {
+        /// Positive stable ID of the panel, as reported in the workspace snapshot
+        /// (`panels[].id`).
         panel_id: PanelId,
+        /// Vertical scroll offset in logical points from the top (0 = top), non-negative.
+        /// Clamped to the read panel's maximum; the result's `effective` gives the applied
+        /// value.
+        #[cfg_attr(feature = "schema", schemars(range(min = 0.0)))]
         value: f32,
     },
+    /// Scroll the annotation pane. The annotation camera is workspace-wide, so the offset
+    /// applies to every panel.
     AnnotationScrollPoints {
+        /// Positive stable ID of the panel whose scrollbar issues the request. It must exist
+        /// but does not make the offset panel-local.
         panel_id: PanelId,
+        /// Vertical scroll offset of the annotation pane in logical points from the top (0 =
+        /// top), non-negative. Clamped to `maximum_annotation_scroll_points`.
+        #[cfg_attr(feature = "schema", schemars(range(min = 0.0)))]
         value: f32,
     },
+    /// Scroll one genomic panel's read stack (the column of read tracks).
     ReadStackScrollPoints {
+        /// Positive stable ID of the panel, as reported in the workspace snapshot
+        /// (`panels[].id`).
         panel_id: PanelId,
+        /// Vertical scroll offset of this panel's read stack in logical points from the top (0
+        /// = top), non-negative. Clamped to the stack's maximum.
+        #[cfg_attr(feature = "schema", schemars(range(min = 0.0)))]
         value: f32,
     },
+    /// Scroll one alignment track's read panel in one genomic panel.
     ReadPanelScrollPoints {
+        /// Positive stable ID of the panel, as reported in the workspace snapshot
+        /// (`panels[].id`).
         panel_id: PanelId,
+        /// Positive stable ID of the alignment track whose read panel to scroll.
         track_id: TrackId,
+        /// Vertical scroll offset in logical points from the top (0 = top), non-negative.
+        /// Clamped to the maximum reported in the panel's `read_panel_states`.
+        #[cfg_attr(feature = "schema", schemars(range(min = 0.0)))]
         value: f32,
     },
+    /// Override the read-row density of one alignment track in one genomic panel.
     ReadPanelDensity {
+        /// Positive stable ID of the panel, as reported in the workspace snapshot
+        /// (`panels[].id`).
         panel_id: PanelId,
+        /// Positive stable ID of the alignment track whose density to override.
         track_id: TrackId,
+        /// Read-row height multiplier, 0.25 to 4: a row is 7 logical points tall at 1.0 and
+        /// larger values draw taller rows. The viewer raises values below 0.35 to 0.35 and
+        /// reports the result as `clamped`.
+        #[cfg_attr(feature = "schema", schemars(range(min = 0.25, max = 4.0)))]
         value: f32,
     },
 }
@@ -1020,25 +1432,50 @@ impl AutomationSetting {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "selector", rename_all = "snake_case")]
 pub enum AutomationAlignmentSelector {
+    /// Find records by exact read name.
     ExactReadName {
+        /// Exact, case-sensitive read name (QNAME); non-empty, at most 16384 bytes. Treated as
+        /// sensitive: it is matched inside the viewer, never echoed in results, and redacted
+        /// when a batch is serialised.
         read_name: String,
     },
+    /// Find records covering one reference base.
     Position {
+        /// Zero-based genomic position on the panel's current contig; matches records whose
+        /// aligned span `[start, end)` contains it.
         position: u64,
     },
+    /// Find records overlapping a zero-based, half-open interval `[start, end)`.
     Interval {
+        /// Zero-based inclusive start on the panel's current contig, in bases.
         start: u64,
+        /// Zero-based exclusive end (half-open `[start, end)`); must be greater than `start`.
+        /// Records overlapping the interval by at least one base match.
         end: u64,
     },
+    /// Find records by alignment properties; every supplied property must match.
     Semantic {
+        /// Required alignment state. Omit to accept any.
         #[serde(default)]
         alignment_state: Option<AutomationAlignmentState>,
+        /// Required pair classification, compared case-insensitively with no separators:
+        /// `unpaired`, `readunmapped`, `mateunmapped`, `matemissing`, `intercontig`,
+        /// `discordantorientation`, `discordanttemplatelengthshort`,
+        /// `discordanttemplatelengthlong`, `proper`, or `concordant` (the `pair_class` values
+        /// returned in hits). Omit to accept any.
         #[serde(default)]
         pair_class: Option<String>,
+        /// True requires a mapped mate with a known contig and position, false requires the
+        /// absence of one. Omit to accept either.
         #[serde(default)]
         has_mapped_mate: Option<bool>,
+        /// True requires a navigable supplementary (split-read) chain of more than one segment,
+        /// false requires none. Omit to accept either.
         #[serde(default)]
         has_supplementary_chain: Option<bool>,
+        /// True requires at least one base-modification call, false requires none. The search
+        /// fails with `effective_state_unavailable` when modification evidence is not loaded
+        /// at the current detail. Omit to accept either.
         #[serde(default)]
         has_modified_bases: Option<bool>,
     },
@@ -1063,8 +1500,11 @@ impl AutomationAlignmentSelector {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationAlignmentState {
+    /// Neither secondary (SAM flag 0x100) nor supplementary (0x800).
     Primary,
+    /// Secondary alignment (SAM flag 0x100 set).
     Secondary,
+    /// Supplementary alignment (SAM flag 0x800 set).
     Supplementary,
 }
 
@@ -1072,9 +1512,12 @@ pub enum AutomationAlignmentState {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationAlignmentReveal {
+    /// Leave the viewport unchanged.
     #[default]
     None,
+    /// Keep the current span and centre it on the record's midpoint.
     Center,
+    /// Fit the viewport to the record's aligned span.
     Fit,
 }
 
@@ -1082,7 +1525,10 @@ pub enum AutomationAlignmentReveal {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationAlignmentRelationship {
+    /// The selected read's mate.
     Mate,
+    /// One segment of the selected read's supplementary (split-read) chain, chosen by
+    /// `segment_index`.
     SupplementarySegment,
 }
 
@@ -1090,8 +1536,10 @@ pub enum AutomationAlignmentRelationship {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationNavigationDestination {
+    /// Retarget the active panel.
     #[default]
     CurrentPanel,
+    /// Open the destination in a new panel.
     NewPanel,
 }
 
@@ -1099,7 +1547,13 @@ pub enum AutomationNavigationDestination {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum AutomationReviewNavigation {
-    Item { review_item_id: u64 },
+    /// Navigate to one review item.
+    Item {
+        /// Positive stable review-item ID as reported by `describe_review_queue`.
+        #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+        review_item_id: u64,
+    },
+    /// Navigate to the first review item whose status is still pending.
     NextPending,
 }
 
@@ -1116,9 +1570,16 @@ impl AutomationReviewNavigation {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum AutomationHistoryNavigation {
+    /// Step to the previous history entry. Fails with `history_boundary` at the oldest entry.
     Back,
+    /// Step to the next history entry. Fails with `history_boundary` at the newest entry.
     Forward,
-    Index { index: usize },
+    /// Jump to one history entry.
+    Index {
+        /// Zero-based index of the history entry, as reported in `entries[].index` by
+        /// `describe_navigation_history`.
+        index: usize,
+    },
 }
 
 fn default_alignment_result_limit() -> usize {
@@ -1865,8 +2326,12 @@ pub struct AutomationSelectionSnapshot {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationSelectionGranularity {
+    /// Select the evidence for exactly the requested base. When one-base evidence is not
+    /// available at the current zoom, the panel's viewport is first fitted to that single base
+    /// and the command waits up to 30 seconds for the query, which visibly changes the view.
     #[default]
     ExactBase,
+    /// Select the currently rendered bin that contains the position, without changing zoom.
     VisibleBin,
 }
 
@@ -2162,9 +2627,18 @@ fn normalize_automation_path(path: &Path) -> PathBuf {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum AutomationOptionScope {
+    /// A workspace-wide option.
     Workspace,
-    Track { track_id: TrackId },
-    Panel { panel_id: PanelId },
+    /// An option of one track.
+    Track {
+        /// Positive stable ID of the track the option applies to.
+        track_id: TrackId,
+    },
+    /// An option of one panel.
+    Panel {
+        /// Positive stable ID of the panel the option applies to.
+        panel_id: PanelId,
+    },
 }
 
 impl AutomationOptionScope {
@@ -2182,16 +2656,29 @@ impl AutomationOptionScope {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "selection", rename_all = "snake_case")]
 pub enum AutomationSelection {
+    /// Select a track in the active panel.
     Track {
+        /// Positive stable ID of the track to select.
         track_id: TrackId,
     },
+    /// Make a panel the active panel.
     Panel {
+        /// Positive stable ID of the panel to activate.
         panel_id: PanelId,
     },
+    /// Select the evidence at one genomic position of a track in a panel: the pileup column of
+    /// an alignment track, or on an annotation track the shortest feature or variant record
+    /// covering the position, or the quantitative record at it. The panel becomes active and,
+    /// when the position is outside its viewport, is recentred on it.
     Position {
+        /// Positive stable ID of the panel to select in.
         panel_id: PanelId,
+        /// Positive stable ID of the track whose evidence to select.
         track_id: TrackId,
+        /// Zero-based genomic position on the panel's current contig (one less than the
+        /// one-based coordinate shown in a locus string). Must be less than the contig length.
         position: u64,
+        /// How precisely the evidence is resolved (default `exact_base`).
         #[serde(default)]
         granularity: AutomationSelectionGranularity,
     },
@@ -2223,10 +2710,16 @@ fn default_alignment_density() -> f32 {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationSnapshotScope {
+    /// The committed workspace rectangle: every panel's tracks, without the application shell.
     #[default]
     VisibleWorkspace,
+    /// The active panel's visible canvas only.
     ActivePanel,
+    /// The active panel's complete content. Refused, without writing a partial file, unless
+    /// that content is already unscrolled and fits the captured canvas.
     FullActivePanel,
+    /// The whole native window client area, including menus, the Properties panel, and status.
+    /// PNG only, at the window's own pixel density.
     NativeWindow,
 }
 
@@ -2234,8 +2727,10 @@ pub enum AutomationSnapshotScope {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationSnapshotFormat {
+    /// Raster PNG image.
     #[default]
     Png,
+    /// Vector SVG image. Not available for the `native_window` scope.
     Svg,
 }
 
@@ -2245,15 +2740,31 @@ pub enum AutomationSnapshotFormat {
 pub enum AutomationExportKind {
     /// Backward-compatible alias for the committed filtered alignment view.
     Alignments,
+    /// One row per alignment record that passes the view filter, including its read name.
+    /// Fails with `too_dense` when individual reads are not available at the current zoom.
     FilteredAlignments,
+    /// One row per alignment record eligible for the view before the view filter is applied,
+    /// including its read name. Fails with `too_dense` when individual reads are not
+    /// available at the current zoom.
     EligibleAlignments,
+    /// One row per covered base: depth, strand depths, A/C/G/T/N, insertion and deletion
+    /// counts, and mean base and mapping quality. Bases with no coverage are omitted.
     Pileup,
+    /// The retained evidence of the current selection. Fails with `no_selection` when nothing
+    /// is selected and `selection_stale` when the evidence is stale.
     SelectedEvidence,
+    /// Base-modification summaries per position. Requires modified-base frequency collection
+    /// to be enabled.
     Modifications,
+    /// Splice-junction summaries of the visible alignment tracks.
     Junctions,
+    /// Variant records of the visible variant tracks, with their INFO fields and genotypes.
     Variants,
+    /// Value windows of the visible quantitative tracks.
     Quantitative,
+    /// The workspace's regions of interest in BED format (zero-based, half-open).
     Regions,
+    /// The names of the workspace's tracks.
     TrackNames,
 }
 

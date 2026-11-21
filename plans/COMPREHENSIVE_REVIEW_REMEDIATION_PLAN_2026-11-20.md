@@ -176,14 +176,16 @@ Run after Wave 1 is green. Each item is one reviewable change.
 - [x] SCENE-3 page keys without evidence/atlas revisions (page reuse across extension)
 - [~] SCENE-4 / SCENE-7 incremental row atlas extension; stable rows under sort/group
       — view-as-pairs and leftward extension of ordered layouts still rebuild
-- [ ] ARCH-3 charge-actual-after-build with per-owner soft budgets and LRU; exact ledger only in
+- [~] ARCH-3 charge-actual-after-build with per-owner soft budgets and LRU; exact ledger only in
       Complete mode; GPU pages outside the ledger
+      — `AlignmentMemoryPolicy::Bounded` is the default; `Complete` keeps the strict path.
+        GPU has a private budget but no "draw what fits"; no settings UI for the policy
 - [ ] SCENE-9 / REND-8 compact handles, primitives and 16-byte GPU instances with a palette
       uniform (unlocks REND-10 theming and PROD-17)
 - [~] SCENE-10 fused single-pass summary tiles; generic `SummaryTile<Family>`
       — one selection per tile and tile-clipped walks; six tile types remain
 - [~] ENG-2 decoder stream continuation and chunk-level resume
-      — continuation and hysteresis done; chunk-level resume needs an rgv-hts resume API
+      — continuation and hysteresis done; rgv-hts resume API added, engine adoption pending
 - [x] ENG-7 resumable/cancellable scene builds
       — desktop keeps the incumbent scene on screen during a staged build
 - [x] ENG-15 coordinator split into modules; pressure classification on error types
@@ -197,12 +199,16 @@ Run after Wave 1 is green. Each item is one reviewable change.
 - [x] HTS-8 index-chunk-driven read-ahead; HTS-12 shared decompression pool
       — HTS-12 as a process-wide thread allowance (rust-htslib pools cannot be shared);
         CRAM read-ahead unchanged
-- [ ] HTS-15 / OPS-10 converge on one alignment backend
+- [~] HTS-15 / OPS-10 converge on one alignment backend
+      — shared `BackendRecord` logic and a differential suite (four divergences fixed);
+        benchmark and recommendation in ADR 0002; no backend removed; htslib `curl` no longer
+        used for alignments but still reached by faidx/bcf path strings
 - [x] UI-13 / APP-16 split `ui/tracks.rs`, remove glob preludes, diagnostics behind a facade
       — boundary violations found are listed for Wave 3; per-frame paint step still ~1,100 lines
-- [~] OPS-6 derive MCP schemas from core types
-      — core `schema` feature and drift test done; `Tool*` mirrors not replaced; batch
-        `commands` still untyped (217 nested fields need verified descriptions)
+- [x] OPS-6 derive MCP schemas from core types
+      — 25 mirrors removed, batch commands typed, every field described; `rgv_query_pileup`
+        and `rgv_query_variants` added (OPS-8 part); feature query and goto-gene need
+        desktop commands
 
 ## Wave 3 — architecture
 

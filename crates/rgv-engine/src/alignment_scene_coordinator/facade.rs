@@ -198,4 +198,13 @@ where
     ) -> Result<AlignmentCoordinatorEviction, AlignmentSceneCoordinatorError<B::Error>> {
         self.source.evict_inactive_until(target_charged)
     }
+
+    /// See [`AlignmentSceneSourceCoordinator::trim_bounded_caches`].
+    #[allow(clippy::result_large_err)]
+    pub fn trim_bounded_caches(
+        &mut self,
+        maximum_entries: usize,
+    ) -> Result<super::AlignmentBoundedTrim, AlignmentSceneCoordinatorError<B::Error>> {
+        self.source.trim_bounded_caches(maximum_entries)
+    }
 }

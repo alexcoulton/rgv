@@ -8,30 +8,32 @@ use std::{
     time::Instant,
 };
 
-use rgv_core::{ContigId, GenomicInterval, OverlappingMatePolicy, ReferenceDictionary};
+use rgv_core::{GenomicInterval, OverlappingMatePolicy, ReferenceDictionary};
 use rust_htslib::{
-    bam::{self, Read as _, record::Aux},
+    bam::{self, Read as _},
     tpool::ThreadPool,
 };
 use thiserror::Error;
 
 use crate::{
-    AlignmentBatch, AlignmentFilter, AlignmentFlags, AlignmentHeaderMetadata,
-    AlignmentOverlapIndex, AlignmentReadGroup, AlignmentRecord, AlignmentRecordView,
-    AlignmentSourceFormat, AlignmentSourceStamp, AuxField, AuxValue, CigarOp, CigarOpKind,
-    HttpRangeConfig, JunctionSummary, PairSummary, PileupProvenance, PileupSummary, ReferenceSlice,
-    RemoteError, SequenceData, SequenceView,
+    AlignmentBatch, AlignmentFilter, AlignmentHeaderMetadata, AlignmentOverlapIndex,
+    AlignmentReadGroup, AlignmentRecord, AlignmentRecordView, AlignmentSourceFormat,
+    AlignmentSourceStamp, AuxValue, HttpRangeConfig, JunctionSummary, PairSummary,
+    PileupProvenance, PileupSummary, PositionedChunkReceipt, ReferenceSlice, RemoteError,
+    SequenceData, SequenceView,
+    alignment::BatchOverflow,
     alignment::alignment_header_metadata_from_sam,
-    alignment::{BatchOverflow, FilteredRecordReason},
-    bisulfite_strand_is_reverse,
-    index_overview::{load_local_alignment_index_overview, local_alignment_index_candidates},
-    junction::{
-        JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
+    backend_record::{
+        PileupAlignment, PositionedAdmission, PositionedBlockBuilder, RegionQueryAccumulator,
+        add_alignment_pileup, junction_strand_input,
     },
+    index_overview::{load_local_alignment_index_overview, local_alignment_index_candidates},
+    junction::JunctionSummaryBuilder,
     pileup::{
-        MateAlignment, MateOverlapMask, OverlapCollapser, PileupBuilder, aligned_observation,
+        MateAlignment, MateOverlapMask, OverlapCollapser, PileupBuilder,
         base_observation_is_counted,
     },
+    positioned_resume::{ChunkCompletion, ChunkExtent},
     source_revision::{LocalSourceGuard, local_source_stamp},
 };
 
@@ -740,114 +742,24 @@ fn add_record_view_pileup(
     collect_alleles: bool,
     overlap_mask: Option<&MateOverlapMask>,
 ) -> Result<u64, AlignmentError> {
-    let mut reference_position = record.start();
-    let mut read_position = 0_usize;
-    let (sequence, qualities) = match record.sequence() {
+    let observations = collect_alleles.then(|| match record.sequence() {
         SequenceView::Present { bases, qualities } => (bases, qualities.unwrap_or(&[])),
         SequenceView::NotLoaded | SequenceView::Missing => (&[][..], &[][..]),
-    };
-    let flags = record.flags();
-    let reverse = flags.is_reverse();
-    let bisulfite_reverse = bisulfite_strand_is_reverse(flags);
-    let mut collapsed_bases = 0_u64;
-    let mut aligned_segments = Vec::new();
-    let mut record_junctions = RecordJunctionCollector::default();
-    for operation in record.cigar() {
-        match operation.kind {
-            CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
-                record_junctions.add_aligned(operation.len);
-                let end = reference_position.saturating_add(u64::from(operation.len));
-                collapsed_bases = collapsed_bases.saturating_add(unmasked_depth_range(
-                    overlap_mask,
-                    reference_position,
-                    end,
-                    |start, end| aligned_segments.push((start, end)),
-                ));
-                if collect_alleles {
-                    for offset in 0..operation.len as usize {
-                        let position = reference_position.saturating_add(offset as u64);
-                        if overlap_mask.is_some_and(|mask| mask.masks_base(position)) {
-                            continue;
-                        }
-                        let sequence_index = read_position.saturating_add(offset);
-                        let Some((base, quality)) =
-                            aligned_observation(sequence, qualities, sequence_index)
-                        else {
-                            continue;
-                        };
-                        pileup.add_base_with_bisulfite_strand(
-                            position,
-                            base,
-                            quality,
-                            reverse,
-                            bisulfite_reverse,
-                        );
-                    }
-                }
-                read_position = read_position.saturating_add(operation.len as usize);
-                reference_position = end;
-            }
-            CigarOpKind::Deletion => {
-                let end = reference_position.saturating_add(u64::from(operation.len));
-                collapsed_bases = collapsed_bases.saturating_add(unmasked_deletion_range(
-                    overlap_mask,
-                    reference_position,
-                    end,
-                    |start, end| pileup.add_deletion(start, end, reverse),
-                ));
-                reference_position = end;
-            }
-            CigarOpKind::ReferenceSkip => {
-                let end = reference_position.saturating_add(u64::from(operation.len));
-                record_junctions.add_skip(reference_position, end);
-                reference_position = end;
-            }
-            CigarOpKind::Insertion => {
-                if !overlap_mask.is_some_and(|mask| mask.masks_indel(reference_position)) {
-                    pileup.add_insertion(reference_position, reverse);
-                }
-                read_position = read_position.saturating_add(operation.len as usize);
-            }
-            CigarOpKind::SoftClip => {
-                read_position = read_position.saturating_add(operation.len as usize);
-            }
-            CigarOpKind::HardClip | CigarOpKind::Padding => {}
-        }
-    }
-    pileup.add_aligned_record(aligned_segments, reverse, record.mapping_quality());
-    let (record_junctions, dropped_record_junctions) = record_junctions.finish();
-    junctions.add_record_junctions(
-        &record_junctions,
-        dropped_record_junctions,
-        reverse,
-        record_view_junction_strand(record)?,
-    );
-    Ok(collapsed_bases)
-}
-
-fn record_view_junction_strand(
-    record: AlignmentRecordView<'_>,
-) -> Result<JunctionStrandInput, AlignmentError> {
-    Ok(match record.auxiliary_field(*b"XS")? {
-        Some(AuxField {
-            value: AuxValue::Character(b'+'),
-            ..
-        }) => JunctionStrandInput::Tagged(JunctionStrand::Positive),
-        Some(AuxField {
-            value: AuxValue::String(value),
-            ..
-        }) if value == "+" => JunctionStrandInput::Tagged(JunctionStrand::Positive),
-        Some(AuxField {
-            value: AuxValue::Character(b'-'),
-            ..
-        }) => JunctionStrandInput::Tagged(JunctionStrand::Negative),
-        Some(AuxField {
-            value: AuxValue::String(value),
-            ..
-        }) if value == "-" => JunctionStrandInput::Tagged(JunctionStrand::Negative),
-        Some(_) => JunctionStrandInput::Invalid,
-        None => JunctionStrandInput::Missing,
-    })
+    });
+    let strand = record.auxiliary_field(*b"XS")?;
+    Ok(add_alignment_pileup(
+        &PileupAlignment {
+            start: record.start(),
+            cigar: record.cigar(),
+            flags: record.flags(),
+            mapping_quality: record.mapping_quality(),
+            observations,
+            junction_strand: junction_strand_input(strand.as_ref().map(|field| &field.value)),
+        },
+        pileup,
+        junctions,
+        overlap_mask,
+    ))
 }
 
 pub trait AlignmentSource {
@@ -974,15 +886,18 @@ pub enum PositionedAlignmentStreamCheckpoint {
 }
 
 struct LocalPositionedStreamState {
-    interval: GenomicInterval,
-    admission_interval: GenomicInterval,
-    options: QueryOptions,
-    stats: QueryStats,
+    admission: PositionedAdmission,
     current_block: Option<u64>,
-    current_records: Vec<PositionedAlignmentRecord>,
-    current_span: Option<(u64, u64)>,
+    block: PositionedBlockBuilder,
     pending: Option<(bam::Record, crate::AlignmentSourcePosition)>,
     reached_end: bool,
+    cancelled: bool,
+    /// Virtual offset just past the last record processed into the current block.
+    block_end: u64,
+    /// A record of the target beyond the current block was read (or skipped).
+    later_record_seen: bool,
+    /// Receipt of the block the last checkpoint returned.
+    receipt: Option<PositionedChunkReceipt>,
 }
 
 pub struct LocalAlignmentSource {
@@ -1045,15 +960,18 @@ impl LocalAlignmentSource {
             Some("cram") => LocalAlignmentEncoding::Cram,
             _ => LocalAlignmentEncoding::Unknown,
         };
-        let remote_url = is_remote_url(&raw_path)
-            .then(|| url::Url::parse(&raw_path))
-            .transpose()?;
-        let mut reader = if let Some(url) = remote_url.as_ref() {
-            if options.index_path.is_some() {
-                return Err(AlignmentError::RemoteIndexOverrideUnsupported);
-            }
-            bam::IndexedReader::from_url(url)?
-        } else if let Some(index_path) = &options.index_path {
+        if has_url_scheme(&raw_path) {
+            // Remote objects are read by the pure-Rust range reader, which accounts, bounds,
+            // authenticates and cancels every request. `HTSlib` never opens a URL, whatever
+            // its scheme (it would hand `http`, `ftp`, `s3` and `gs` alike to libcurl).
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "HTSlib does not open alignment URLs; http and https URLs are opened through \
+                 ProductionAlignmentSource and other schemes are not supported",
+            )
+            .into());
+        }
+        let mut reader = if let Some(index_path) = &options.index_path {
             bam::IndexedReader::from_path_and_index(path, index_path)?
         } else {
             bam::IndexedReader::from_path(path)?
@@ -1101,32 +1019,28 @@ impl LocalAlignmentSource {
             ))?;
         let index_overview =
             load_local_alignment_index_overview(path, options.index_path.as_deref(), &dictionary);
-        let (source_stamp, source_guard) = if remote_url.is_none() {
-            let format = match encoding {
-                LocalAlignmentEncoding::Bam => Some(AlignmentSourceFormat::Bam),
-                LocalAlignmentEncoding::Cram => Some(AlignmentSourceFormat::Cram),
-                LocalAlignmentEncoding::Unknown => None,
-            };
-            if let Some(format) = format {
-                let index_path =
-                    local_alignment_index_candidates(path, options.index_path.as_deref(), format)
-                        .into_iter()
-                        .find(|candidate| candidate.is_file())
-                        .ok_or_else(|| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                "opened alignment index could not be resolved for revision capture",
-                            )
-                        })?;
-                let guard = LocalSourceGuard::capture(path, &index_path)?;
-                let stamp = options.source_stamp_override.map_or_else(
-                    || local_source_stamp(path, &index_path, format, &dictionary, &metadata),
-                    Ok,
-                )?;
-                (Some(stamp), Some(guard))
-            } else {
-                (options.source_stamp_override, None)
-            }
+        let format = match encoding {
+            LocalAlignmentEncoding::Bam => Some(AlignmentSourceFormat::Bam),
+            LocalAlignmentEncoding::Cram => Some(AlignmentSourceFormat::Cram),
+            LocalAlignmentEncoding::Unknown => None,
+        };
+        let (source_stamp, source_guard) = if let Some(format) = format {
+            let index_path =
+                local_alignment_index_candidates(path, options.index_path.as_deref(), format)
+                    .into_iter()
+                    .find(|candidate| candidate.is_file())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "opened alignment index could not be resolved for revision capture",
+                        )
+                    })?;
+            let guard = LocalSourceGuard::capture(path, &index_path)?;
+            let stamp = options.source_stamp_override.map_or_else(
+                || local_source_stamp(path, &index_path, format, &dictionary, &metadata),
+                Ok,
+            )?;
+            (Some(stamp), Some(guard))
         } else {
             (options.source_stamp_override, None)
         };
@@ -1166,12 +1080,7 @@ impl LocalAlignmentSource {
         if self.encoding != LocalAlignmentEncoding::Bam {
             return Err(AlignmentError::PositionedStreamUnsupported);
         }
-        if !interval.contains_interval(admission_interval) {
-            return Err(AlignmentError::AdmissionIntervalOutsideQuery {
-                query: interval,
-                admission: admission_interval,
-            });
-        }
+        let admission = PositionedAdmission::new(interval, admission_interval, options)?;
         if let Some(guard) = &self.source_guard
             && !guard.validate()?
         {
@@ -1184,20 +1093,55 @@ impl LocalAlignmentSource {
         let end = i64::try_from(interval.end()).map_err(|_| AlignmentError::CoordinateOverflow)?;
         self.reader.fetch((tid, start, end))?;
         self.positioned_stream = Some(LocalPositionedStreamState {
-            interval,
-            admission_interval,
-            stats: QueryStats {
-                complete_read_limit: options.max_records.get(),
-                ..QueryStats::default()
-            },
-            options,
+            admission,
             current_block: None,
-            current_records: Vec::new(),
-            current_span: None,
+            block: PositionedBlockBuilder::default(),
             pending: None,
             reached_end: false,
+            cancelled: false,
+            block_end: 0,
+            later_record_seen: false,
+            receipt: None,
         });
         Ok(())
+    }
+
+    /// Starts a positioned stream like [`Self::begin_positioned_stream_with_admission`] that
+    /// does not decode the chunks named by `skip` again.
+    ///
+    /// `skip` holds receipts of chunks an earlier stream of this source returned and whose
+    /// records the caller still has. A receipt is honoured when
+    /// [`PositionedChunkReceipt::can_resume`] holds for `interval` and `options`; any other is
+    /// ignored and its chunk is decoded as usual. The number honoured is returned.
+    ///
+    /// The stream then returns exactly the blocks a fresh stream would, in the same order,
+    /// except the skipped ones, and completes with the statistics a fresh stream would report:
+    /// the skipped chunks' records are accounted (seen, filtered, eligible, admitted) from
+    /// their receipts, restricted to `interval` and `admission_interval`.
+    ///
+    /// `HTSlib` learns which block a record belongs to only by reading it, so the first record
+    /// of a run of consecutive skipped chunks is read and dropped before the reader seeks past
+    /// the run; the rest of the run is neither inflated nor parsed.
+    pub fn begin_positioned_stream_resuming(
+        &mut self,
+        interval: GenomicInterval,
+        admission_interval: GenomicInterval,
+        options: QueryOptions,
+        skip: Vec<PositionedChunkReceipt>,
+    ) -> Result<usize, AlignmentError> {
+        self.begin_positioned_stream_with_admission(interval, admission_interval, options)?;
+        Ok(self
+            .positioned_stream
+            .as_mut()
+            .expect("the positioned stream was just started")
+            .admission
+            .set_skipped(skip, PositionedChunkReceipt::is_bam))
+    }
+
+    /// The receipt of the block the last checkpoint returned, once. Keep it with the block's
+    /// records to let a later [`Self::begin_positioned_stream_resuming`] skip the chunk.
+    pub fn take_positioned_chunk_receipt(&mut self) -> Option<PositionedChunkReceipt> {
+        self.positioned_stream.as_mut()?.receipt.take()
     }
 
     /// Abandons the unfinished positioned transaction without invalidating any blocks already
@@ -1207,6 +1151,7 @@ impl LocalAlignmentSource {
     }
 
     /// Performs at most one physical BAM owner unit of source work.
+    #[allow(clippy::too_many_lines)]
     pub fn next_positioned_stream_checkpoint(
         &mut self,
         keep_going: &dyn Fn() -> bool,
@@ -1227,14 +1172,16 @@ impl LocalAlignmentSource {
                 {
                     return self.finish_positioned_block();
                 }
-                let mut state = self
+                let state = self
                     .positioned_stream
                     .take()
                     .expect("active positioned stream was checked");
-                finalize_positioned_stream_stats(&mut state.stats);
+                let cancelled = state.cancelled;
+                let (interval, mut totals) = state.admission.finish();
+                totals.cancelled = cancelled;
                 let completion = PositionedAlignmentStreamCompletion {
-                    interval: state.interval,
-                    stats: state.stats,
+                    interval,
+                    stats: totals,
                 };
                 return Ok(if completion.stats.cancelled {
                     PositionedAlignmentStreamCheckpoint::Cancelled(completion)
@@ -1281,31 +1228,49 @@ impl LocalAlignmentSource {
                 .as_ref()
                 .and_then(|state| state.current_block)
                 .is_some_and(|current| current != compressed_offset);
-            if has_completed_block {
-                self.positioned_stream
-                    .as_mut()
-                    .expect("active positioned stream was checked")
-                    .pending = Some((record, source_position));
-                return self.finish_positioned_block();
-            }
-
+            let record_end = match source_position {
+                crate::AlignmentSourcePosition::BamVirtualOffset(offset) => offset,
+                crate::AlignmentSourcePosition::CramRecord { .. } => 0,
+            };
             let state = self
                 .positioned_stream
                 .as_mut()
                 .expect("active positioned stream was checked");
-            state.stats.records_seen = state.stats.records_seen.saturating_add(1);
-            if state
-                .stats
-                .records_seen
-                .is_multiple_of(state.options.cancellation_chunk.get())
-                && !keep_going()
+            if state.admission.resume().has_skipped()
+                && let Some(resume_at) = state
+                    .admission
+                    .skip_from_owner(compressed_offset, record_end)
             {
-                state.stats.cancelled = true;
-                state.reached_end = true;
+                // The record belongs to a chunk the caller already holds: drop it and seek
+                // past that chunk and the skipped chunks directly following it.
+                state.later_record_seen = true;
+                self.reader.seek(
+                    i64::try_from(resume_at).map_err(|_| AlignmentError::CoordinateOverflow)?,
+                )?;
                 continue;
             }
+            if has_completed_block {
+                state.pending = Some((record, source_position));
+                state.later_record_seen = true;
+                return self.finish_positioned_block();
+            }
+            if state.admission.note_seen() && !keep_going() {
+                state.cancelled = true;
+                state.reached_end = true;
+                state.block.mark_incomplete();
+                continue;
+            }
+            if state.current_block.is_none() {
+                state.later_record_seen = false;
+            }
             state.current_block = Some(compressed_offset);
-            process_positioned_bam_record(state, record, source_position)?;
+            state.block_end = record_end;
+            state.admission.process(
+                &record,
+                source_position,
+                compressed_offset,
+                &mut state.block,
+            )?;
         }
     }
 
@@ -1320,34 +1285,35 @@ impl LocalAlignmentSource {
             .current_block
             .take()
             .ok_or(AlignmentError::NoActivePositionedStream)?;
-        state.current_records.sort_by(|left, right| {
-            (
-                left.record.start,
-                left.record.end,
-                &left.record.read_name,
-                left.source_position,
-            )
-                .cmp(&(
-                    right.record.start,
-                    right.record.end,
-                    &right.record.read_name,
-                    right.source_position,
-                ))
-        });
-        Ok(PositionedAlignmentStreamCheckpoint::Block(
-            PositionedAlignmentBlock {
-                compressed_offset,
-                records: std::mem::take(&mut state.current_records),
-                genomic_span: state.current_span.take().and_then(|(start, end)| {
-                    GenomicInterval::new(state.interval.contig(), start, end).ok()
+        let interval = state.admission.interval;
+        let block = state.block.finish(compressed_offset, interval);
+        state.receipt = Some(state.admission.issue_receipt(
+            &mut state.block,
+            ChunkCompletion {
+                owner: compressed_offset,
+                cram_slice_landmark: None,
+                // HTSlib's region iterator does not expose where a record starts.
+                extent: Some(ChunkExtent {
+                    start: None,
+                    end: state.block_end,
                 }),
+                left_complete: None,
+                right_complete: std::mem::take(&mut state.later_record_seen),
             },
-        ))
+        ));
+        Ok(PositionedAlignmentStreamCheckpoint::Block(block))
     }
 }
 
-fn is_remote_url(value: &str) -> bool {
-    value.starts_with("http://") || value.starts_with("https://")
+/// Whether `value` is a URL (`scheme://...`) rather than a filesystem path.
+fn has_url_scheme(value: &str) -> bool {
+    value.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.len() > 1
+            && scheme.starts_with(|first: char| first.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "+.-".contains(character))
+    })
 }
 
 impl AlignmentSource for LocalAlignmentSource {
@@ -1386,32 +1352,8 @@ impl AlignmentSource for LocalAlignmentSource {
         let end = i64::try_from(interval.end()).map_err(|_| AlignmentError::CoordinateOverflow)?;
         self.reader.fetch((tid, start, end))?;
 
-        let maximum_records = options.max_records.get();
-        let mut stats = QueryStats {
-            complete_read_limit: maximum_records,
-            ..QueryStats::default()
-        };
-        let mut retained = Vec::new();
-        let mut filtered_records = AlignmentBatch::default();
-        let mut too_dense = false;
-        let mut pileup = PileupBuilder::new(
-            interval,
-            options.coverage_bins.get(),
-            options.minimum_base_quality,
-        );
-        let mut modifications = options.collect_modifications.then(|| {
-            crate::modification_summary::ModificationSummaryBuilder::new(
-                interval,
-                options.coverage_bins.get(),
-            )
-        });
-        let mut junctions = JunctionSummaryBuilder::new(
-            interval,
-            options.minimum_junction_flank,
-            self.normalization_mapped_records,
-        );
-        let mut pairs = crate::pair::PairSummaryBuilder::new();
-        let mut overlap_collapser = OverlapCollapser::new(options.overlapping_mate_policy);
+        let mut accumulator =
+            RegionQueryAccumulator::new(interval, &options, self.normalization_mapped_records);
         let mut record = bam::Record::new();
         while let Some(result) = self.reader.read(&mut record) {
             result?;
@@ -1419,282 +1361,11 @@ impl AlignmentSource for LocalAlignmentSource {
                 .then(|| u64::try_from(self.reader.tell()).ok())
                 .flatten()
                 .map(crate::AlignmentSourcePosition::bam_virtual_offset);
-            stats.records_seen += 1;
-            if stats
-                .records_seen
-                .is_multiple_of(options.cancellation_chunk.get())
-                && !keep_going()
-            {
-                stats.cancelled = true;
+            if !accumulator.add(&record, source_position, keep_going)? {
                 break;
             }
-            let flags = AlignmentFlags::from_bits(record.flags());
-            // One CIGAR view per record: span, mate-overlap, pileup and normalization share it.
-            let cigar_view = record.cigar();
-            let record_span = u64::try_from(record.pos()).ok().and_then(|start| {
-                u64::try_from(cigar_view.end_pos())
-                    .ok()
-                    .filter(|end| *end > start)
-                    .map(|end| (start, end))
-            });
-            let mut note_filtered = |reason| {
-                if let Some((start, end)) = record_span {
-                    filtered_records.push_filtered_record(start, end, reason);
-                } else {
-                    filtered_records.mark_filtered_record_spans_incomplete();
-                }
-            };
-            if flags.is_unmapped() {
-                stats.records_filtered_unmapped += 1;
-                note_filtered(FilteredRecordReason::Unmapped);
-                continue;
-            }
-            if !options.include_secondary && flags.is_secondary() {
-                stats.records_filtered_secondary += 1;
-                note_filtered(FilteredRecordReason::Secondary);
-                continue;
-            }
-            if !options.include_supplementary && flags.is_supplementary() {
-                stats.records_filtered_supplementary += 1;
-                note_filtered(FilteredRecordReason::Supplementary);
-                continue;
-            }
-            if !options.filter.matches(&record)? {
-                stats.records_filtered_user += 1;
-                stats.records_filtered_duplicate += usize::from(flags.is_duplicate());
-                stats.records_filtered_qc_failed += usize::from(flags.is_qc_failed());
-                note_filtered(FilteredRecordReason::User {
-                    duplicate: flags.is_duplicate(),
-                    qc_failed: flags.is_qc_failed(),
-                });
-                continue;
-            }
-            stats.records_eligible += 1;
-            stats.complete_read_records_eligible =
-                stats.complete_read_records_eligible.saturating_add(1);
-            if stats.records_eligible > maximum_records && !too_dense {
-                retained.clear();
-                retained.shrink_to_fit();
-                too_dense = true;
-            }
-            pairs.add_fields(
-                record.qname(),
-                ContigId::new(u32::try_from(record.tid()).unwrap_or_default()),
-                flags,
-                u32::try_from(record.mtid()).ok().map(ContigId::new),
-                record.insert_size(),
-            );
-            let record_start = u64::try_from(record.pos()).unwrap_or_default();
-            let record_end = u64::try_from(cigar_view.end_pos()).unwrap_or(record_start);
-            let overlap_mask = {
-                let base_count = record.seq_len();
-                let qualities = record.qual();
-                overlap_collapser.mask_for_alignment(
-                    MateAlignment {
-                        read_name: record.qname(),
-                        contig: ContigId::new(u32::try_from(record.tid()).unwrap_or_default()),
-                        start: record_start,
-                        end: record_end,
-                        flags,
-                        mate_contig: u32::try_from(record.mtid()).ok().map(ContigId::new),
-                        mate_start: u64::try_from(record.mpos()).ok(),
-                    },
-                    cigar_view.iter().map(htslib_cigar_op),
-                    |read_position| {
-                        !options.collect_alleles
-                            || base_observation_is_counted(
-                                base_count,
-                                qualities,
-                                read_position,
-                                options.minimum_base_quality,
-                            )
-                    },
-                )
-            };
-            overlap_collapser.note_collapsed(add_record_pileup(
-                &record,
-                &cigar_view,
-                &mut pileup,
-                &mut junctions,
-                options.collect_alleles,
-                overlap_mask.as_ref(),
-            ));
-            let normalized_for_modifications = if let Some(builder) = &mut modifications {
-                let normalized =
-                    normalize_record_with_cigar(&record, &cigar_view, QueryDetail::Full, &[])?;
-                builder.add_record(&normalized);
-                Some(normalized)
-            } else {
-                None
-            };
-
-            if !too_dense {
-                let normalized = match normalized_for_modifications {
-                    // Modification rendering, export, inspection, and MCP
-                    // discovery must all observe the same complete record set.
-                    // The summary already paid the cost to normalize the full
-                    // record, so do not discard its sequence/tags.
-                    Some(normalized) => normalized,
-                    None => normalize_record_with_cigar(
-                        &record,
-                        &cigar_view,
-                        options.detail,
-                        &options.retained_auxiliary_tags,
-                    )?,
-                };
-                retained.push((normalized, source_position));
-            }
         }
-
-        retained.sort_by(|left, right| {
-            (left.0.start, left.0.end, &left.0.read_name).cmp(&(
-                right.0.start,
-                right.0.end,
-                &right.0.read_name,
-            ))
-        });
-        let mut batch = AlignmentBatch::default();
-        for (record, source_position) in &retained {
-            if let Some(source_position) = source_position {
-                batch
-                    .push_with_source_position(record, *source_position)
-                    .map_err(AlignmentError::BatchOverflow)?;
-            } else {
-                batch.push(record).map_err(AlignmentError::BatchOverflow)?;
-            }
-        }
-        batch.absorb_filtered_records(filtered_records);
-        stats.records_emitted = retained.len();
-        stats.truncated = too_dense;
-        stats.individual_reads = if too_dense {
-            IndividualReadStatus::TooDense {
-                limit: maximum_records,
-            }
-        } else {
-            IndividualReadStatus::Complete
-        };
-        let mut pileup = pileup.finish(PileupProvenance {
-            eligible_records: stats.records_eligible,
-            rendered_records: stats.records_emitted,
-            all_eligible_records: !stats.cancelled,
-            allele_observations_available: options.collect_alleles,
-            overlapping_mate_policy: overlap_collapser.policy(),
-            overlap_collapse_complete: overlap_collapser.complete(),
-            collapsed_mate_bases: overlap_collapser.collapsed_mate_bases(),
-            ..PileupProvenance::default()
-        });
-        if let Some(modifications) = modifications {
-            pileup.modifications = modifications.finish(stats.records_eligible, !stats.cancelled);
-        }
-        debug_assert!(batch.validate());
-        Ok(AlignmentQuery {
-            interval,
-            header: Arc::clone(&self.header),
-            batch,
-            pileup,
-            junctions: junctions.finish(stats.records_eligible, !stats.cancelled),
-            pairs: pairs.finish(!stats.cancelled),
-            reference: None,
-            stats,
-        })
-    }
-}
-
-fn process_positioned_bam_record(
-    state: &mut LocalPositionedStreamState,
-    record: bam::Record,
-    source_position: crate::AlignmentSourcePosition,
-) -> Result<(), AlignmentError> {
-    let flags = AlignmentFlags::from_bits(record.flags());
-    // One CIGAR view per record, shared by the span and the normalized record.
-    let cigar_view = record.cigar();
-    let record_span = u64::try_from(record.pos()).ok().and_then(|start| {
-        u64::try_from(cigar_view.end_pos())
-            .ok()
-            .filter(|end| *end > start)
-            .map(|end| (start, end))
-    });
-    if let Some((start, end)) = record_span {
-        state.current_span = Some(
-            state
-                .current_span
-                .map_or((start, end), |(minimum, maximum)| {
-                    (minimum.min(start), maximum.max(end))
-                }),
-        );
-    }
-    if flags.is_unmapped() {
-        state.stats.records_filtered_unmapped =
-            state.stats.records_filtered_unmapped.saturating_add(1);
-        return Ok(());
-    }
-    if !state.options.include_secondary && flags.is_secondary() {
-        state.stats.records_filtered_secondary =
-            state.stats.records_filtered_secondary.saturating_add(1);
-        return Ok(());
-    }
-    if !state.options.include_supplementary && flags.is_supplementary() {
-        state.stats.records_filtered_supplementary =
-            state.stats.records_filtered_supplementary.saturating_add(1);
-        return Ok(());
-    }
-    if !state.options.filter.matches(&record)? {
-        state.stats.records_filtered_user = state.stats.records_filtered_user.saturating_add(1);
-        state.stats.records_filtered_duplicate = state
-            .stats
-            .records_filtered_duplicate
-            .saturating_add(usize::from(flags.is_duplicate()));
-        state.stats.records_filtered_qc_failed = state
-            .stats
-            .records_filtered_qc_failed
-            .saturating_add(usize::from(flags.is_qc_failed()));
-        return Ok(());
-    }
-    state.stats.records_eligible = state.stats.records_eligible.saturating_add(1);
-    if record_span.is_some_and(|(start, end)| {
-        start < state.admission_interval.end() && end > state.admission_interval.start()
-    }) {
-        state.stats.complete_read_records_eligible =
-            state.stats.complete_read_records_eligible.saturating_add(1);
-    }
-    // Continue evaluating the exact filter population after the Complete admission limit is
-    // crossed, but do not retain an unbounded rejected individual-read candidate. Blocks already
-    // returned remain valid salvageable fragments for a later smaller target.
-    if state.stats.complete_read_records_eligible > state.options.max_records.get() {
-        return Ok(());
-    }
-    let detail = if state.options.collect_modifications {
-        QueryDetail::Full
-    } else {
-        state.options.detail
-    };
-    let normalized = normalize_record_with_cigar(
-        &record,
-        &cigar_view,
-        detail,
-        if state.options.collect_modifications {
-            &[]
-        } else {
-            &state.options.retained_auxiliary_tags
-        },
-    )?;
-    state.current_records.push(PositionedAlignmentRecord {
-        record: normalized,
-        source_position,
-    });
-    state.stats.records_emitted = state.stats.records_emitted.saturating_add(1);
-    Ok(())
-}
-
-pub(crate) fn finalize_positioned_stream_stats(stats: &mut QueryStats) {
-    let limit = stats.complete_read_limit;
-    if stats.complete_read_records_eligible > limit {
-        stats.records_emitted = 0;
-        stats.truncated = true;
-        stats.individual_reads = IndividualReadStatus::TooDense { limit };
-    } else {
-        stats.truncated = false;
-        stats.individual_reads = IndividualReadStatus::Complete;
+        accumulator.finish(Arc::clone(&self.header))
     }
 }
 
@@ -1717,264 +1388,15 @@ fn cancelled_query(
     }
 }
 
-fn unmasked_depth_range(
-    mask: Option<&MateOverlapMask>,
-    start: u64,
-    end: u64,
-    mut add: impl FnMut(u64, u64),
-) -> u64 {
-    if let Some(mask) = mask {
-        mask.add_unmasked_depth_range(start, end, add)
-    } else {
-        add(start, end);
-        0
-    }
-}
-
-fn unmasked_deletion_range(
-    mask: Option<&MateOverlapMask>,
-    start: u64,
-    end: u64,
-    mut add: impl FnMut(u64, u64),
-) -> u64 {
-    if let Some(mask) = mask {
-        mask.add_unmasked_deletion_range(start, end, add)
-    } else {
-        add(start, end);
-        0
-    }
-}
-
-// By reference because it maps over `CigarStringView::iter`, which yields references.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn htslib_cigar_op(operation: &rust_htslib::bam::record::Cigar) -> CigarOp {
-    use rust_htslib::bam::record::Cigar;
-
-    CigarOp {
-        kind: match operation {
-            Cigar::Match(_) => CigarOpKind::Match,
-            Cigar::Ins(_) => CigarOpKind::Insertion,
-            Cigar::Del(_) => CigarOpKind::Deletion,
-            Cigar::RefSkip(_) => CigarOpKind::ReferenceSkip,
-            Cigar::SoftClip(_) => CigarOpKind::SoftClip,
-            Cigar::HardClip(_) => CigarOpKind::HardClip,
-            Cigar::Pad(_) => CigarOpKind::Padding,
-            Cigar::Equal(_) => CigarOpKind::SequenceMatch,
-            Cigar::Diff(_) => CigarOpKind::SequenceMismatch,
-        },
-        len: operation.len(),
-    }
-}
-
-fn add_record_pileup(
-    record: &bam::Record,
-    cigar: &rust_htslib::bam::record::CigarStringView,
-    pileup: &mut PileupBuilder,
-    junctions: &mut JunctionSummaryBuilder,
-    collect_alleles: bool,
-    overlap_mask: Option<&MateOverlapMask>,
-) -> u64 {
-    use rust_htslib::bam::record::Cigar;
-
-    let Ok(mut reference_position) = u64::try_from(record.pos()) else {
-        return 0;
-    };
-    let mut read_position = 0_usize;
-    // Bases are decoded one at a time and only when alleles are collected; depth-only queries
-    // never touch the packed sequence.
-    let sequence = record.seq();
-    let sequence_length = sequence.len();
-    let qualities = record.qual();
-    let flags = AlignmentFlags::from_bits(record.flags());
-    let reverse = flags.is_reverse();
-    let bisulfite_reverse = bisulfite_strand_is_reverse(flags);
-    let mapping_quality = (record.mapq() != u8::MAX).then_some(record.mapq());
-    let mut collapsed_bases = 0_u64;
-    let mut aligned_segments = Vec::new();
-    let mut record_junctions = RecordJunctionCollector::default();
-    for operation in cigar {
-        match operation {
-            Cigar::Match(len) | Cigar::Equal(len) | Cigar::Diff(len) => {
-                record_junctions.add_aligned(*len);
-                let end = reference_position.saturating_add(u64::from(*len));
-                collapsed_bases = collapsed_bases.saturating_add(unmasked_depth_range(
-                    overlap_mask,
-                    reference_position,
-                    end,
-                    |start, end| aligned_segments.push((start, end)),
-                ));
-                if collect_alleles {
-                    for offset in 0..*len as usize {
-                        let position = reference_position.saturating_add(offset as u64);
-                        if overlap_mask.is_some_and(|mask| mask.masks_base(position)) {
-                            continue;
-                        }
-                        let sequence_index = read_position.saturating_add(offset);
-                        if sequence_index >= sequence_length {
-                            continue;
-                        }
-                        let base = sequence[sequence_index];
-                        let quality = qualities
-                            .get(sequence_index)
-                            .copied()
-                            .filter(|quality| *quality != u8::MAX);
-                        pileup.add_base_with_bisulfite_strand(
-                            position,
-                            base,
-                            quality,
-                            reverse,
-                            bisulfite_reverse,
-                        );
-                    }
-                }
-                read_position = read_position.saturating_add(*len as usize);
-                reference_position = end;
-            }
-            Cigar::Del(len) => {
-                let end = reference_position.saturating_add(u64::from(*len));
-                collapsed_bases = collapsed_bases.saturating_add(unmasked_deletion_range(
-                    overlap_mask,
-                    reference_position,
-                    end,
-                    |start, end| pileup.add_deletion(start, end, reverse),
-                ));
-                reference_position = end;
-            }
-            Cigar::RefSkip(len) => {
-                let end = reference_position.saturating_add(u64::from(*len));
-                record_junctions.add_skip(reference_position, end);
-                reference_position = end;
-            }
-            Cigar::Ins(len) => {
-                if !overlap_mask.is_some_and(|mask| mask.masks_indel(reference_position)) {
-                    pileup.add_insertion(reference_position, reverse);
-                }
-                read_position = read_position.saturating_add(*len as usize);
-            }
-            Cigar::SoftClip(len) => {
-                read_position = read_position.saturating_add(*len as usize);
-            }
-            Cigar::HardClip(_) | Cigar::Pad(_) => {}
-        }
-    }
-    pileup.add_aligned_record(aligned_segments, reverse, mapping_quality);
-    let (record_junctions, dropped_record_junctions) = record_junctions.finish();
-    junctions.add_record_junctions(
-        &record_junctions,
-        dropped_record_junctions,
-        reverse,
-        htslib_junction_strand(record),
-    );
-    collapsed_bases
-}
-
-fn htslib_junction_strand(record: &bam::Record) -> JunctionStrandInput {
-    match record.aux(b"XS") {
-        Ok(Aux::Char(b'+') | Aux::String("+")) => {
-            JunctionStrandInput::Tagged(JunctionStrand::Positive)
-        }
-        Ok(Aux::Char(b'-') | Aux::String("-")) => {
-            JunctionStrandInput::Tagged(JunctionStrand::Negative)
-        }
-        Ok(_) => JunctionStrandInput::Invalid,
-        Err(_) => JunctionStrandInput::Missing,
-    }
-}
-
 #[cfg(test)]
 fn normalize_record(
     record: &bam::Record,
     detail: QueryDetail,
     retained_auxiliary_tags: &[[u8; 2]],
 ) -> Result<AlignmentRecord, AlignmentError> {
-    normalize_record_with_cigar(record, &record.cigar(), detail, retained_auxiliary_tags)
-}
-
-fn normalize_record_with_cigar(
-    record: &bam::Record,
-    cigar_view: &rust_htslib::bam::record::CigarStringView,
-    detail: QueryDetail,
-    retained_auxiliary_tags: &[[u8; 2]],
-) -> Result<AlignmentRecord, AlignmentError> {
-    let tid = u32::try_from(record.tid()).map_err(|_| AlignmentError::UnmappedRecord)?;
-    let start = u64::try_from(record.pos()).map_err(|_| AlignmentError::UnmappedRecord)?;
-    let end =
-        u64::try_from(cigar_view.end_pos()).map_err(|_| AlignmentError::CoordinateOverflow)?;
-    let cigar = cigar_view.iter().map(htslib_cigar_op).collect();
-    let sequence = if detail == QueryDetail::Layout {
-        SequenceData::NotLoaded
-    } else if record.seq_len() == 0 {
-        SequenceData::Missing
-    } else {
-        let qualities = (!record.qual().iter().all(|quality| *quality == u8::MAX))
-            .then(|| record.qual().to_vec());
-        SequenceData::Present {
-            bases: record.seq().as_bytes(),
-            qualities,
-        }
-    };
-    let auxiliary_fields = if detail == QueryDetail::Full || !retained_auxiliary_tags.is_empty() {
-        record
-            .aux_iter()
-            .map(|result| {
-                let (tag, value) = result?;
-                let tag: [u8; 2] = tag.try_into().map_err(|_| AlignmentError::InvalidAuxTag)?;
-                Ok((tag, value))
-            })
-            .filter_map(|result| match result {
-                Ok((tag, value))
-                    if detail == QueryDetail::Full || retained_auxiliary_tags.contains(&tag) =>
-                {
-                    Some(Ok(AuxField {
-                        tag,
-                        value: normalize_aux(value),
-                    }))
-                }
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<Result<Vec<_>, AlignmentError>>()?
-    } else {
-        Vec::new()
-    };
-
-    Ok(AlignmentRecord {
-        contig: ContigId::new(tid),
-        start,
-        end: end.max(start.saturating_add(1)),
-        flags: AlignmentFlags::from_bits(record.flags()),
-        mapping_quality: (record.mapq() != u8::MAX).then_some(record.mapq()),
-        mate_contig: u32::try_from(record.mtid()).ok().map(ContigId::new),
-        mate_start: u64::try_from(record.mpos()).ok(),
-        template_length: record.insert_size(),
-        read_name: record.qname().to_vec(),
-        cigar,
-        sequence,
-        auxiliary_fields,
-    })
-}
-
-fn normalize_aux(value: Aux<'_>) -> AuxValue {
-    match value {
-        Aux::Char(value) => AuxValue::Character(value),
-        Aux::I8(value) => AuxValue::Signed(i64::from(value)),
-        Aux::U8(value) => AuxValue::Unsigned(u64::from(value)),
-        Aux::I16(value) => AuxValue::Signed(i64::from(value)),
-        Aux::U16(value) => AuxValue::Unsigned(u64::from(value)),
-        Aux::I32(value) => AuxValue::Signed(i64::from(value)),
-        Aux::U32(value) => AuxValue::Unsigned(u64::from(value)),
-        Aux::Float(value) => AuxValue::Float(value),
-        Aux::Double(value) => AuxValue::Double(value),
-        Aux::String(value) => AuxValue::String(value.to_owned()),
-        Aux::HexByteArray(value) => AuxValue::HexByteArray(value.to_owned()),
-        Aux::ArrayI8(values) => AuxValue::SignedArray(values.iter().map(i64::from).collect()),
-        Aux::ArrayU8(values) => AuxValue::UnsignedArray(values.iter().map(u64::from).collect()),
-        Aux::ArrayI16(values) => AuxValue::SignedArray(values.iter().map(i64::from).collect()),
-        Aux::ArrayU16(values) => AuxValue::UnsignedArray(values.iter().map(u64::from).collect()),
-        Aux::ArrayI32(values) => AuxValue::SignedArray(values.iter().map(i64::from).collect()),
-        Aux::ArrayU32(values) => AuxValue::UnsignedArray(values.iter().map(u64::from).collect()),
-        Aux::ArrayFloat(values) => AuxValue::FloatArray(values.iter().collect()),
-    }
+    let mut cigar = Vec::new();
+    crate::backend_record::BackendRecord::cigar_into(record, &mut cigar)?;
+    crate::backend_record::normalize_record(record, &cigar, detail, retained_auxiliary_tags)
 }
 
 #[derive(Debug, Error)]
@@ -2034,6 +1456,9 @@ pub enum AlignmentError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    use rgv_core::ContigId;
+    use rust_htslib::bam::record::Aux;
 
     use super::*;
 

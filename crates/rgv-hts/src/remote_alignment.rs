@@ -14,34 +14,18 @@ use noodles::{
     cram,
     csi::BinningIndex,
     fasta,
-    sam::{
-        self,
-        alignment::record::{
-            cigar::op::Kind,
-            data::field::{Value, value::Array},
-        },
-    },
+    sam::{self, alignment::record::cigar::op::Kind},
 };
 use rgv_core::{ContigId, GenomicInterval, ReferenceDictionary};
 
 use crate::{
-    AlignmentBatch, AlignmentError, AlignmentFlags, AlignmentHeaderMetadata, AlignmentOpenOptions,
-    AlignmentQuery, AlignmentReadGroup, AlignmentRecord, AlignmentSource, AlignmentSourceFormat,
-    AlignmentSourceStamp, AuxComparison, AuxField, AuxValue, CigarOp, CigarOpKind,
-    FastaOpenOptions, FastaReference, HttpRangeConfig, HttpRangeReader, JunctionSummary,
-    LocalAlignmentSource, MAX_ALIGNMENT_READ_GROUPS, PileupProvenance, PileupSummary, QueryDetail,
-    QueryOptions, QueryStats, RemoteCancellation, RemoteError, RemoteIoStats, RemoteTransferBudget,
-    SequenceData,
-    alignment::FilteredRecordReason,
-    associated_remote_url, bisulfite_strand_is_reverse,
+    AlignmentBatch, AlignmentError, AlignmentHeaderMetadata, AlignmentOpenOptions, AlignmentQuery,
+    AlignmentSource, AlignmentSourceFormat, AlignmentSourceStamp, FastaOpenOptions, FastaReference,
+    HttpRangeConfig, HttpRangeReader, JunctionSummary, LocalAlignmentSource, PileupSummary,
+    PositionedChunkReceipt, QueryOptions, QueryStats, RemoteCancellation, RemoteError,
+    RemoteIoStats, RemoteTransferBudget, associated_remote_url,
+    backend_record::{AsBackendRecord, RegionQueryAccumulator},
     index_overview::local_alignment_index_candidates,
-    junction::{
-        JunctionStrand, JunctionStrandInput, JunctionSummaryBuilder, RecordJunctionCollector,
-    },
-    pileup::{
-        MateAlignment, MateOverlapMask, OverlapCollapser, PileupBuilder, aligned_observation,
-        base_observation_is_counted,
-    },
     read_remote_object_bounded, remote_url_with_extension,
     source_revision::{LocalSourceGuard, digest_bytes, local_source_stamp, remote_source_stamp},
 };
@@ -61,57 +45,22 @@ const MAX_REMOTE_CRAI_COMPRESSED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_CRAI_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REMOTE_CRAI_RECORDS: usize = 1_000_000;
 
+/// Header metadata through the one SAM-text parser the `HTSlib` path uses, so read groups and
+/// reference sequences are interpreted (and bounded) identically for every backend.
 fn alignment_header_metadata_from_noodles(header: &sam::Header) -> AlignmentHeaderMetadata {
-    use sam::header::record::value::map::{read_group::tag, tag::Other};
-
-    let mut metadata = AlignmentHeaderMetadata::default();
-    let maximum_homopolymer_tag =
-        Other::<tag::Standard>::try_from(*b"mc").expect("mc is a valid SAM header tag");
-    let ultima_orientation_tag =
-        Other::<tag::Standard>::try_from(*b"tp").expect("tp is a valid SAM header tag");
-    for (id, read_group) in header.read_groups() {
-        let id: &[u8] = id.as_ref();
-        if id.is_empty() || id.len() > crate::alignment::MAX_ALIGNMENT_READ_GROUP_ID_BYTES {
-            continue;
-        }
-        if metadata.read_groups.len() == MAX_ALIGNMENT_READ_GROUPS {
-            metadata.read_groups_omitted = metadata.read_groups_omitted.saturating_add(1);
-            continue;
-        }
-        let platform = read_group
-            .other_fields()
-            .get(&tag::PLATFORM)
-            .and_then(|value| std::str::from_utf8(value.as_ref()).ok())
-            .map(ToOwned::to_owned);
-        let maximum_homopolymer_length = read_group
-            .other_fields()
-            .get(&maximum_homopolymer_tag)
-            .and_then(|value| std::str::from_utf8(value.as_ref()).ok())
-            .and_then(|value| value.parse::<u16>().ok())
-            .filter(|value| *value > 0);
-        let ultima_tag_orientation = read_group
-            .other_fields()
-            .get(&ultima_orientation_tag)
-            .and_then(|value| {
-                let value: &[u8] = value.as_ref();
-                match value {
-                    b"reference" => Some(crate::UltimaTagOrientation::Reference),
-                    b"synthesis" => Some(crate::UltimaTagOrientation::Synthesis),
-                    _ => None,
-                }
-            });
-        metadata.read_groups.push(AlignmentReadGroup {
-            id: id.to_vec(),
-            platform,
-            maximum_homopolymer_length,
-            ultima_tag_orientation,
-        });
+    let mut text = Vec::new();
+    if sam::io::Writer::new(&mut text)
+        .write_header(header)
+        .is_err()
+    {
+        return AlignmentHeaderMetadata::default();
     }
-    metadata
+    crate::alignment::alignment_header_metadata_from_sam(&text)
 }
 
-/// Production alignment backend selection. Local files and CRAM use `HTSlib`; remote BAM uses the
-/// observable pure-Rust range path.
+/// Production alignment backend selection. Local BAM uses `HTSlib`; local CRAM and every remote
+/// object (BAM or CRAM, whatever its URL looks like) use noodles, remote ones over the
+/// observable range reader. `HTSlib` never opens a URL.
 pub enum ProductionAlignmentSource {
     Htslib(LocalAlignmentSource),
     LocalCram(Box<LocalCramAlignmentSource>),
@@ -130,23 +79,38 @@ impl ProductionAlignmentSource {
     ) -> Result<Self, AlignmentError> {
         let path = path.as_ref();
         let raw = path.to_string_lossy();
-        let remote_extension = (raw.starts_with("http://") || raw.starts_with("https://"))
-            .then(|| url::Url::parse(&raw).ok())
-            .flatten()
-            .and_then(|url| {
-                std::path::Path::new(url.path())
-                    .extension()
-                    .map(|extension| extension.to_string_lossy().to_ascii_lowercase())
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            let kind = url::Url::parse(&raw).ok().and_then(|url| {
+                let extension = std::path::Path::new(url.path()).extension()?;
+                if extension.eq_ignore_ascii_case("bam") {
+                    Some(RemoteAlignmentKind::Bam)
+                } else if extension.eq_ignore_ascii_case("cram") {
+                    Some(RemoteAlignmentKind::Cram)
+                } else {
+                    None
+                }
             });
-        if remote_extension.as_deref() == Some("bam") {
-            RemoteBamAlignmentSource::open(raw.as_ref(), options)
-                .map(Box::new)
-                .map(Self::RemoteBam)
-        } else if remote_extension.as_deref() == Some("cram") {
-            RemoteCramAlignmentSource::open(raw.as_ref(), options)
-                .map(Box::new)
-                .map(Self::RemoteCram)
-        } else if path
+            let mut source = HttpRangeReader::open(raw.as_ref(), options.remote_range.clone())?;
+            // A URL that does not name its format (an object key, a download endpoint, a
+            // signed link) is identified by the object's leading bytes.
+            let kind = match kind {
+                Some(kind) => kind,
+                None => sniff_remote_alignment(&mut source)?,
+            };
+            return match kind {
+                RemoteAlignmentKind::Bam => {
+                    RemoteBamAlignmentSource::open_source(raw.as_ref(), source, options)
+                        .map(Box::new)
+                        .map(Self::RemoteBam)
+                }
+                RemoteAlignmentKind::Cram => {
+                    RemoteCramAlignmentSource::open_source(raw.as_ref(), source, options)
+                        .map(Box::new)
+                        .map(Self::RemoteCram)
+                }
+            };
+        }
+        if path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("cram"))
@@ -229,9 +193,30 @@ impl ProductionAlignmentSource {
         admission_interval: GenomicInterval,
         options: QueryOptions,
     ) -> Result<(), AlignmentError> {
+        self.begin_positioned_stream_resuming(interval, admission_interval, options, Vec::new())
+            .map(|_| ())
+    }
+
+    /// Starts a positioned acquisition that does not decode the chunks named by `skip` again;
+    /// see [`LocalAlignmentSource::begin_positioned_stream_resuming`] for the contract. Returns
+    /// how many receipts were honoured.
+    ///
+    /// What skipping saves depends on the backend. Remote BAM recognises a skipped chunk by its
+    /// start offset before reading it: its bytes are left out of the range plan and are neither
+    /// requested nor inflated, except the BGZF block in which the last skipped chunk ends,
+    /// which also holds the start of what follows (and any hole in the plan smaller than the
+    /// range reader's coalescing gap). CRAM (local and remote) never selects a skipped slice:
+    /// it is neither read nor decoded. Local BAM reads one record per run of skipped chunks.
+    pub fn begin_positioned_stream_resuming(
+        &mut self,
+        interval: GenomicInterval,
+        admission_interval: GenomicInterval,
+        options: QueryOptions,
+        skip: Vec<PositionedChunkReceipt>,
+    ) -> Result<usize, AlignmentError> {
         match self {
             Self::Htslib(source) => {
-                source.begin_positioned_stream_with_admission(interval, admission_interval, options)
+                source.begin_positioned_stream_resuming(interval, admission_interval, options, skip)
             }
             Self::LocalCram(source) => {
                 source.positioned_stream = None;
@@ -244,13 +229,15 @@ impl ProductionAlignmentSource {
                 // Each transaction has its own reference budget; slices fetch only their span.
                 source.reference_query_bases.store(0, Ordering::Relaxed);
                 source.reader.reference_sequence_repository().clear();
-                source.positioned_stream = Some(NoodlesPositionedStream::begin_cram(
+                let (stream, skipped) = NoodlesPositionedStream::begin_cram(
                     &source.reader,
                     interval,
                     admission_interval,
                     options,
-                )?);
-                Ok(())
+                    skip,
+                )?;
+                source.positioned_stream = Some(stream);
+                Ok(skipped)
             }
             Self::RemoteCram(source) => {
                 source.positioned_stream = None;
@@ -260,26 +247,42 @@ impl ProductionAlignmentSource {
                 // Each transaction has its own reference budget; slices fetch only their span.
                 source.reference_query_bases.store(0, Ordering::Relaxed);
                 source.reader.reference_sequence_repository().clear();
-                source.positioned_stream = Some(NoodlesPositionedStream::begin_cram(
+                let (stream, skipped) = NoodlesPositionedStream::begin_cram(
                     &source.reader,
                     interval,
                     admission_interval,
                     options,
-                )?);
-                Ok(())
+                    skip,
+                )?;
+                source.positioned_stream = Some(stream);
+                Ok(skipped)
             }
             Self::RemoteBam(source) => {
                 source.positioned_stream = None;
                 let region = remote_bam_region(&source.dictionary, interval)?;
-                source.positioned_stream = Some(NoodlesPositionedStream::begin_bam(
+                let (stream, skipped) = NoodlesPositionedStream::begin_bam(
                     &source.index,
                     interval,
                     admission_interval,
                     options,
                     &region,
-                )?);
-                Ok(())
+                    skip,
+                )?;
+                source.positioned_stream = Some(stream);
+                Ok(skipped)
             }
+        }
+    }
+
+    /// The receipt of the block the last checkpoint returned, once; see
+    /// [`LocalAlignmentSource::take_positioned_chunk_receipt`]. `None` after a checkpoint that
+    /// was not a block, and for the empty progress block of a CRAM container without records.
+    pub fn take_positioned_chunk_receipt(&mut self) -> Option<PositionedChunkReceipt> {
+        match self {
+            Self::Htslib(source) => source.take_positioned_chunk_receipt(),
+            Self::LocalCram(source) => source.positioned_stream.as_mut()?.take_receipt(),
+            Self::RemoteBam(source) => source.positioned_stream.as_mut()?.take_receipt(),
+            Self::RemoteCram(source) => source.positioned_stream.as_mut()?.take_receipt(),
         }
     }
 
@@ -339,6 +342,62 @@ impl ProductionAlignmentSource {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteAlignmentKind {
+    Bam,
+    Cram,
+}
+
+/// Identifies a remote alignment object by its magic bytes: a CRAM file definition starts with
+/// `CRAM`; a BAM is a BGZF stream whose first block inflates to `BAM\1`. The reader is left at
+/// the start of the object, with the sniffed bytes in its cache for the header read.
+fn sniff_remote_alignment(
+    source: &mut HttpRangeReader,
+) -> Result<RemoteAlignmentKind, AlignmentError> {
+    use io::Seek as _;
+
+    const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+    let unrecognised = || {
+        AlignmentError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the remote object is neither BAM nor CRAM (unrecognised leading bytes)",
+        ))
+    };
+    let mut magic = [0_u8; 4];
+    source.seek(SeekFrom::Start(0))?;
+    let mut filled = 0;
+    while filled < magic.len() {
+        match source.read(&mut magic[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    source.seek(SeekFrom::Start(0))?;
+    let kind = if &magic[..filled] == b"CRAM" {
+        RemoteAlignmentKind::Cram
+    } else if filled >= 2 && magic[..2] == GZIP_MAGIC {
+        let mut inflated = [0_u8; 4];
+        noodles::bgzf::io::Reader::new(&mut *source)
+            .read_exact(&mut inflated)
+            .map_err(|error| match error.kind() {
+                // Not a BGZF stream, or one shorter than a BAM magic; anything else (a
+                // failed, refused or cancelled transfer) is reported as what it is.
+                io::ErrorKind::InvalidData
+                | io::ErrorKind::InvalidInput
+                | io::ErrorKind::UnexpectedEof => unrecognised(),
+                _ => AlignmentError::Io(error),
+            })?;
+        if &inflated != b"BAM\x01" {
+            return Err(unrecognised());
+        }
+        RemoteAlignmentKind::Bam
+    } else {
+        return Err(unrecognised());
+    };
+    source.seek(SeekFrom::Start(0))?;
+    Ok(kind)
 }
 
 impl From<LocalAlignmentSource> for ProductionAlignmentSource {
@@ -568,6 +627,14 @@ pub struct RemoteBamAlignmentSource {
 impl RemoteBamAlignmentSource {
     pub fn open(url: &str, options: &AlignmentOpenOptions) -> Result<Self, AlignmentError> {
         let source = HttpRangeReader::open(url, options.remote_range.clone())?;
+        Self::open_source(url, source, options)
+    }
+
+    fn open_source(
+        url: &str,
+        source: HttpRangeReader,
+        options: &AlignmentOpenOptions,
+    ) -> Result<Self, AlignmentError> {
         let source_version = source.object_version();
         let (index, index_stats, index_digest) = open_index(
             url,
@@ -649,6 +716,14 @@ pub struct RemoteCramAlignmentSource {
 impl RemoteCramAlignmentSource {
     pub fn open(url: &str, options: &AlignmentOpenOptions) -> Result<Self, AlignmentError> {
         let source = HttpRangeReader::open(url, options.remote_range.clone())?;
+        Self::open_source(url, source, options)
+    }
+
+    fn open_source(
+        url: &str,
+        source: HttpRangeReader,
+        options: &AlignmentOpenOptions,
+    ) -> Result<Self, AlignmentError> {
         let source_version = source.object_version();
         let (index, index_stats, index_digest) = open_cram_index(
             url,
@@ -1357,7 +1432,7 @@ where
                     else {
                         continue;
                     };
-                    if !(start < interval.end() && interval.start() < end) {
+                    if !placement_intersects((start, end), interval) {
                         continue;
                     }
                     require_record_inside_served_span(record, (start, end), served)?;
@@ -1489,7 +1564,14 @@ where
     R: sam::alignment::Record,
 {
     Ok(noodles_record_span_on(record, header, interval.contig())?
-        .is_some_and(|(start, end)| start < interval.end() && interval.start() < end))
+        .is_some_and(|span| placement_intersects(span, interval)))
+}
+
+/// Whether a record placed on `(start, end)` is returned by a regional query of `interval`. A
+/// placed record that consumes no reference base (an unmapped mate placed at its partner, or a
+/// CIGAR of `*`) occupies one base, as in `HTSlib` and samtools.
+fn placement_intersects((start, end): (u64, u64), interval: GenomicInterval) -> bool {
+    start < interval.end() && interval.start() < end.max(start.saturating_add(1))
 }
 
 /// Whether a record placed on the interval's contig starts at or beyond the interval's end.
@@ -1538,7 +1620,6 @@ where
     Ok(Some((start, record_reference_end(record, start)?)))
 }
 
-#[allow(clippy::too_many_lines)]
 fn query_positioned_noodles_records<R, I>(
     records: I,
     header: &sam::Header,
@@ -1549,255 +1630,21 @@ fn query_positioned_noodles_records<R, I>(
     keep_going: &dyn Fn() -> bool,
 ) -> Result<AlignmentQuery, AlignmentError>
 where
-    R: sam::alignment::Record,
+    R: AsBackendRecord,
     I: IntoIterator<Item = Result<(R, Option<crate::AlignmentSourcePosition>), AlignmentError>>,
 {
-    let mut pileup = PileupBuilder::new(
-        interval,
-        options.coverage_bins.get(),
-        options.minimum_base_quality,
-    );
-    let mut modifications = options.collect_modifications.then(|| {
-        crate::modification_summary::ModificationSummaryBuilder::new(
-            interval,
-            options.coverage_bins.get(),
-        )
-    });
-    let mut junctions = JunctionSummaryBuilder::new(
-        interval,
-        options.minimum_junction_flank,
-        normalization_mapped_records,
-    );
-    let mut pairs = crate::pair::PairSummaryBuilder::new();
-    let mut overlap_collapser = OverlapCollapser::new(options.overlapping_mate_policy);
-    let maximum_records = options.max_records.get();
-    let mut retained = Vec::new();
-    let mut filtered_records = AlignmentBatch::default();
-    let mut too_dense = false;
-    let mut stats = QueryStats {
-        complete_read_limit: maximum_records,
-        ..QueryStats::default()
-    };
+    let mut accumulator =
+        RegionQueryAccumulator::new(interval, options, normalization_mapped_records);
     for result in records {
         let (record, source_position) = result?;
-        stats.records_seen = stats.records_seen.saturating_add(1);
-        if stats
-            .records_seen
-            .is_multiple_of(options.cancellation_chunk.get())
-            && !keep_going()
-        {
-            stats.cancelled = true;
+        if !accumulator.add(&record.backend_record(header), source_position, keep_going)? {
             break;
         }
-        let record_span = record
-            .alignment_start()
-            .transpose()
-            .ok()
-            .flatten()
-            .map(|position| position.get() as u64 - 1)
-            .and_then(|start| {
-                record_reference_end(&record, start)
-                    .ok()
-                    .filter(|end| *end > start)
-                    .map(|end| (start, end))
-            });
-        let mut note_filtered = |reason| {
-            if let Some((start, end)) = record_span {
-                filtered_records.push_filtered_record(start, end, reason);
-            } else {
-                filtered_records.mark_filtered_record_spans_incomplete();
-            }
-        };
-        match eligibility(&record, header, options)? {
-            Eligibility::Eligible => {}
-            Eligibility::Unmapped => {
-                stats.records_filtered_unmapped = stats.records_filtered_unmapped.saturating_add(1);
-                note_filtered(FilteredRecordReason::Unmapped);
-                continue;
-            }
-            Eligibility::Secondary => {
-                stats.records_filtered_secondary =
-                    stats.records_filtered_secondary.saturating_add(1);
-                note_filtered(FilteredRecordReason::Secondary);
-                continue;
-            }
-            Eligibility::Supplementary => {
-                stats.records_filtered_supplementary =
-                    stats.records_filtered_supplementary.saturating_add(1);
-                note_filtered(FilteredRecordReason::Supplementary);
-                continue;
-            }
-            Eligibility::UserFilter {
-                duplicate,
-                qc_failed,
-            } => {
-                stats.records_filtered_user = stats.records_filtered_user.saturating_add(1);
-                stats.records_filtered_duplicate = stats
-                    .records_filtered_duplicate
-                    .saturating_add(usize::from(duplicate));
-                stats.records_filtered_qc_failed = stats
-                    .records_filtered_qc_failed
-                    .saturating_add(usize::from(qc_failed));
-                note_filtered(FilteredRecordReason::User {
-                    duplicate,
-                    qc_failed,
-                });
-                continue;
-            }
-        }
-        stats.records_eligible = stats.records_eligible.saturating_add(1);
-        stats.complete_read_records_eligible =
-            stats.complete_read_records_eligible.saturating_add(1);
-        if stats.records_eligible > maximum_records && !too_dense {
-            retained.clear();
-            retained.shrink_to_fit();
-            too_dense = true;
-        }
-        let flags = AlignmentFlags::from_bits(record.flags()?.bits());
-        let record_contig = record
-            .reference_sequence_id(header)
-            .transpose()?
-            .map_or(interval.contig(), |value| ContigId::new(value as u32));
-        let mate_contig = record
-            .mate_reference_sequence_id(header)
-            .transpose()?
-            .map(|value| ContigId::new(value as u32));
-        let mate_start = record
-            .mate_alignment_start()
-            .transpose()?
-            .map(|position| position.get() as u64 - 1);
-        pairs.add_fields(
-            record.name().map_or(&[][..], AsRef::<[u8]>::as_ref),
-            record_contig,
-            flags,
-            mate_contig,
-            i64::from(record.template_length()?),
-        );
-        let record_start = record
-            .alignment_start()
-            .transpose()?
-            .map_or(0, |position| position.get() as u64 - 1);
-        let record_end = record_reference_end(&record, record_start)?;
-        let observations = options
-            .collect_alleles
-            .then(|| -> io::Result<_> {
-                Ok((
-                    record.sequence().iter().collect::<Vec<_>>(),
-                    record
-                        .quality_scores()
-                        .iter()
-                        .collect::<io::Result<Vec<_>>>()?,
-                ))
-            })
-            .transpose()?;
-        let mate_cigar = mate_overlap_cigar(&record, record_start, mate_start)?;
-        let overlap_mask = overlap_collapser.mask_for_alignment(
-            MateAlignment {
-                read_name: record.name().map_or(&[][..], AsRef::<[u8]>::as_ref),
-                contig: record_contig,
-                start: record_start,
-                end: record_end,
-                flags,
-                mate_contig,
-                mate_start,
-            },
-            mate_cigar,
-            |read_position| {
-                observations.as_ref().is_none_or(|(bases, qualities)| {
-                    base_observation_is_counted(
-                        bases.len(),
-                        qualities,
-                        read_position,
-                        options.minimum_base_quality,
-                    )
-                })
-            },
-        );
-        overlap_collapser.note_collapsed(add_pileup(
-            &record,
-            &mut pileup,
-            &mut junctions,
-            observations.as_ref(),
-            overlap_mask.as_ref(),
-        )?);
-        let normalized_for_modifications = if let Some(builder) = &mut modifications {
-            let normalized = normalize_record(&record, header, QueryDetail::Full, &[])?;
-            builder.add_record(&normalized);
-            Some(normalized)
-        } else {
-            None
-        };
-        if !too_dense {
-            let normalized = match normalized_for_modifications {
-                // Keep the record used for modification aggregation so
-                // inspectors and automation cannot contradict the complete
-                // rendered/exported modification evidence.
-                Some(normalized) => normalized,
-                None => normalize_record(
-                    &record,
-                    header,
-                    options.detail,
-                    &options.retained_auxiliary_tags,
-                )?,
-            };
-            retained.push((normalized, source_position));
-        }
     }
-    if stats.cancelled {
+    if accumulator.cancelled() {
         return Ok(cancelled_query(interval, metadata));
     }
-
-    retained.sort_by(|left, right| {
-        (left.0.start, left.0.end, &left.0.read_name).cmp(&(
-            right.0.start,
-            right.0.end,
-            &right.0.read_name,
-        ))
-    });
-    let mut batch = AlignmentBatch::default();
-    for (record, source_position) in &retained {
-        if let Some(source_position) = source_position {
-            batch
-                .push_with_source_position(record, *source_position)
-                .map_err(AlignmentError::BatchOverflow)?;
-        } else {
-            batch.push(record).map_err(AlignmentError::BatchOverflow)?;
-        }
-    }
-    batch.absorb_filtered_records(filtered_records);
-    stats.records_emitted = retained.len();
-    stats.truncated = too_dense;
-    stats.individual_reads = if too_dense {
-        crate::IndividualReadStatus::TooDense {
-            limit: maximum_records,
-        }
-    } else {
-        crate::IndividualReadStatus::Complete
-    };
-    let mut pileup = pileup.finish(PileupProvenance {
-        eligible_records: stats.records_eligible,
-        rendered_records: stats.records_emitted,
-        all_eligible_records: !stats.cancelled,
-        allele_observations_available: options.collect_alleles,
-        overlapping_mate_policy: overlap_collapser.policy(),
-        overlap_collapse_complete: overlap_collapser.complete(),
-        collapsed_mate_bases: overlap_collapser.collapsed_mate_bases(),
-        ..PileupProvenance::default()
-    });
-    if let Some(modifications) = modifications {
-        pileup.modifications = modifications.finish(stats.records_eligible, !stats.cancelled);
-    }
-    debug_assert!(batch.validate());
-    Ok(AlignmentQuery {
-        interval,
-        header: metadata,
-        batch,
-        pileup,
-        junctions: junctions.finish(stats.records_eligible, !stats.cancelled),
-        pairs: pairs.finish(!stats.cancelled),
-        reference: None,
-        stats,
-    })
+    accumulator.finish(metadata)
 }
 
 enum RemoteIndex {
@@ -2098,229 +1945,6 @@ fn cancelled_query(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Eligibility {
-    Eligible,
-    Unmapped,
-    Secondary,
-    Supplementary,
-    UserFilter { duplicate: bool, qc_failed: bool },
-}
-
-fn eligibility(
-    record: &dyn sam::alignment::Record,
-    _header: &sam::Header,
-    options: &QueryOptions,
-) -> Result<Eligibility, AlignmentError> {
-    let flags = record.flags()?.bits();
-    if flags & 0x4 != 0 {
-        return Ok(Eligibility::Unmapped);
-    }
-    if !options.include_secondary && flags & 0x100 != 0 {
-        return Ok(Eligibility::Secondary);
-    }
-    if !options.include_supplementary && flags & 0x800 != 0 {
-        return Ok(Eligibility::Supplementary);
-    }
-    let filtered = || Eligibility::UserFilter {
-        duplicate: flags & 0x400 != 0,
-        qc_failed: flags & 0x200 != 0,
-    };
-    let filter = &options.filter;
-    if flags & filter.required_flags != filter.required_flags || flags & filter.excluded_flags != 0
-    {
-        return Ok(filtered());
-    }
-    let mapping_quality = record
-        .mapping_quality()
-        .transpose()?
-        .map(|value| value.get());
-    if let Some(minimum) = filter.minimum_mapping_quality
-        && mapping_quality.is_none_or(|value| value < minimum)
-    {
-        return Ok(filtered());
-    }
-    let data = record.data();
-    for predicate in &filter.auxiliary {
-        let tag = sam::alignment::record::data::field::Tag::new(predicate.tag[0], predicate.tag[1]);
-        let value = data.get(&tag).transpose()?.map(normalize_aux).transpose()?;
-        if predicate.comparison == AuxComparison::Exists {
-            if value.is_none() {
-                return Ok(filtered());
-            }
-        } else if !value
-            .as_ref()
-            .is_some_and(|value| predicate.matches_value(value))
-        {
-            return Ok(filtered());
-        }
-    }
-    Ok(Eligibility::Eligible)
-}
-
-/// Decodes the CIGAR for mate-overlap bookkeeping, but only for a record that can be the
-/// earlier mate of a pair (it starts at or before its mate); later mates only consume a mask.
-fn mate_overlap_cigar(
-    record: &dyn sam::alignment::Record,
-    record_start: u64,
-    mate_start: Option<u64>,
-) -> Result<Vec<CigarOp>, AlignmentError> {
-    if mate_start.is_none_or(|mate_start| record_start > mate_start) {
-        return Ok(Vec::new());
-    }
-    record
-        .cigar()
-        .iter()
-        .map(|result| {
-            let operation = result?;
-            Ok(CigarOp {
-                kind: cigar_op_kind(operation.kind()),
-                len: u32::try_from(operation.len())
-                    .map_err(|_| AlignmentError::CoordinateOverflow)?,
-            })
-        })
-        .collect()
-}
-
-const fn cigar_op_kind(kind: Kind) -> CigarOpKind {
-    match kind {
-        Kind::Match => CigarOpKind::Match,
-        Kind::Insertion => CigarOpKind::Insertion,
-        Kind::Deletion => CigarOpKind::Deletion,
-        Kind::Skip => CigarOpKind::ReferenceSkip,
-        Kind::SoftClip => CigarOpKind::SoftClip,
-        Kind::HardClip => CigarOpKind::HardClip,
-        Kind::Pad => CigarOpKind::Padding,
-        Kind::SequenceMatch => CigarOpKind::SequenceMatch,
-        Kind::SequenceMismatch => CigarOpKind::SequenceMismatch,
-    }
-}
-
-fn add_pileup(
-    record: &dyn sam::alignment::Record,
-    pileup: &mut PileupBuilder,
-    junctions: &mut JunctionSummaryBuilder,
-    observations: Option<&(Vec<u8>, Vec<u8>)>,
-    overlap_mask: Option<&MateOverlapMask>,
-) -> Result<u64, AlignmentError> {
-    let Some(start) = record.alignment_start().transpose()? else {
-        return Ok(0);
-    };
-    let mut reference_position =
-        u64::try_from(start.get() - 1).map_err(|_| AlignmentError::CoordinateOverflow)?;
-    let mut read_position = 0_usize;
-    let flags = AlignmentFlags::from_bits(record.flags()?.bits());
-    let reverse = flags.is_reverse();
-    let bisulfite_reverse = bisulfite_strand_is_reverse(flags);
-    let mapping_quality = record
-        .mapping_quality()
-        .transpose()?
-        .map(|value| value.get());
-    let mut collapsed_bases = 0_u64;
-    let mut aligned_segments = Vec::new();
-    let mut record_junctions = RecordJunctionCollector::default();
-    for result in record.cigar().iter() {
-        let operation = result?;
-        let length = operation.len();
-        match operation.kind() {
-            Kind::Match | Kind::SequenceMatch | Kind::SequenceMismatch => {
-                record_junctions.add_aligned(u32::try_from(length).unwrap_or(u32::MAX));
-                let end = reference_position.saturating_add(length as u64);
-                let mut add_segment = |start, end| aligned_segments.push((start, end));
-                collapsed_bases =
-                    collapsed_bases.saturating_add(if let Some(mask) = overlap_mask {
-                        mask.add_unmasked_depth_range(reference_position, end, add_segment)
-                    } else {
-                        add_segment(reference_position, end);
-                        0
-                    });
-                if let Some((sequence, qualities)) = observations {
-                    for offset in 0..length {
-                        let position = reference_position.saturating_add(offset as u64);
-                        if overlap_mask.is_some_and(|mask| mask.masks_base(position)) {
-                            continue;
-                        }
-                        let sequence_index = read_position.saturating_add(offset);
-                        let Some((base, quality)) =
-                            aligned_observation(sequence, qualities, sequence_index)
-                        else {
-                            continue;
-                        };
-                        pileup.add_base_with_bisulfite_strand(
-                            position,
-                            base,
-                            quality,
-                            reverse,
-                            bisulfite_reverse,
-                        );
-                    }
-                }
-                read_position = read_position.saturating_add(length);
-                reference_position = end;
-            }
-            Kind::Deletion => {
-                let end = reference_position.saturating_add(length as u64);
-                let mut add_deletion = |start, end| pileup.add_deletion(start, end, reverse);
-                collapsed_bases =
-                    collapsed_bases.saturating_add(if let Some(mask) = overlap_mask {
-                        mask.add_unmasked_deletion_range(reference_position, end, add_deletion)
-                    } else {
-                        add_deletion(reference_position, end);
-                        0
-                    });
-                reference_position = end;
-            }
-            Kind::Skip => {
-                let end = reference_position.saturating_add(length as u64);
-                record_junctions.add_skip(reference_position, end);
-                reference_position = end;
-            }
-            Kind::Insertion => {
-                if !overlap_mask.is_some_and(|mask| mask.masks_indel(reference_position)) {
-                    pileup.add_insertion(reference_position, reverse);
-                }
-                read_position = read_position.saturating_add(length);
-            }
-            Kind::SoftClip => {
-                read_position = read_position.saturating_add(length);
-            }
-            Kind::HardClip | Kind::Pad => {}
-        }
-    }
-    pileup.add_aligned_record(aligned_segments, reverse, mapping_quality);
-    let (record_junctions, dropped_record_junctions) = record_junctions.finish();
-    junctions.add_record_junctions(
-        &record_junctions,
-        dropped_record_junctions,
-        reverse,
-        noodles_junction_strand(record)?,
-    );
-    Ok(collapsed_bases)
-}
-
-fn noodles_junction_strand(
-    record: &dyn sam::alignment::Record,
-) -> Result<JunctionStrandInput, AlignmentError> {
-    for result in record.data().iter() {
-        let (tag, value) = result?;
-        if tag.as_ref() != b"XS" {
-            continue;
-        }
-        return Ok(match value {
-            Value::Character(b'+') => JunctionStrandInput::Tagged(JunctionStrand::Positive),
-            Value::Character(b'-') => JunctionStrandInput::Tagged(JunctionStrand::Negative),
-            Value::String(value) if AsRef::<[u8]>::as_ref(value) == b"+" => {
-                JunctionStrandInput::Tagged(JunctionStrand::Positive)
-            }
-            Value::String(value) if AsRef::<[u8]>::as_ref(value) == b"-" => {
-                JunctionStrandInput::Tagged(JunctionStrand::Negative)
-            }
-            _ => JunctionStrandInput::Invalid,
-        });
-    }
-    Ok(JunctionStrandInput::Missing)
-}
-
 fn record_reference_end(
     record: &dyn sam::alignment::Record,
     start: u64,
@@ -2340,186 +1964,6 @@ fn record_reference_end(
         }
     }
     Ok(end)
-}
-
-#[allow(clippy::too_many_lines)]
-fn normalize_record(
-    record: &dyn sam::alignment::Record,
-    header: &sam::Header,
-    detail: QueryDetail,
-    retained_auxiliary_tags: &[[u8; 2]],
-) -> Result<AlignmentRecord, AlignmentError> {
-    let contig = record
-        .reference_sequence_id(header)
-        .transpose()?
-        .ok_or(AlignmentError::UnmappedRecord)?;
-    let start = record
-        .alignment_start()
-        .transpose()?
-        .ok_or(AlignmentError::UnmappedRecord)?
-        .get()
-        - 1;
-    let cigar = record
-        .cigar()
-        .iter()
-        .map(|result| {
-            let operation = result?;
-            Ok(CigarOp {
-                kind: match operation.kind() {
-                    Kind::Match => CigarOpKind::Match,
-                    Kind::Insertion => CigarOpKind::Insertion,
-                    Kind::Deletion => CigarOpKind::Deletion,
-                    Kind::Skip => CigarOpKind::ReferenceSkip,
-                    Kind::SoftClip => CigarOpKind::SoftClip,
-                    Kind::HardClip => CigarOpKind::HardClip,
-                    Kind::Pad => CigarOpKind::Padding,
-                    Kind::SequenceMatch => CigarOpKind::SequenceMatch,
-                    Kind::SequenceMismatch => CigarOpKind::SequenceMismatch,
-                },
-                len: u32::try_from(operation.len())
-                    .map_err(|_| AlignmentError::CoordinateOverflow)?,
-            })
-        })
-        .collect::<Result<Vec<_>, AlignmentError>>()?;
-    let reference_length = cigar
-        .iter()
-        .filter(|operation| {
-            matches!(
-                operation.kind,
-                CigarOpKind::Match
-                    | CigarOpKind::Deletion
-                    | CigarOpKind::ReferenceSkip
-                    | CigarOpKind::SequenceMatch
-                    | CigarOpKind::SequenceMismatch
-            )
-        })
-        .fold(0_u64, |length, operation| {
-            length.saturating_add(u64::from(operation.len))
-        });
-    let sequence = if detail == QueryDetail::Layout {
-        SequenceData::NotLoaded
-    } else if record.sequence().is_empty() {
-        SequenceData::Missing
-    } else {
-        let qualities = record
-            .quality_scores()
-            .iter()
-            .collect::<io::Result<Vec<_>>>()?;
-        SequenceData::Present {
-            bases: record.sequence().iter().collect(),
-            qualities: (!qualities.iter().all(|quality| *quality == u8::MAX)).then_some(qualities),
-        }
-    };
-    let auxiliary_fields = if detail == QueryDetail::Full || !retained_auxiliary_tags.is_empty() {
-        record
-            .data()
-            .iter()
-            .map(|result| {
-                let (tag, value) = result?;
-                Ok((*tag.as_ref(), value))
-            })
-            .filter_map(|result| match result {
-                Ok((tag, value))
-                    if detail == QueryDetail::Full || retained_auxiliary_tags.contains(&tag) =>
-                {
-                    Some(normalize_aux(value).map(|value| AuxField { tag, value }))
-                }
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect::<Result<Vec<_>, AlignmentError>>()?
-    } else {
-        Vec::new()
-    };
-    let mate_contig = record
-        .mate_reference_sequence_id(header)
-        .transpose()?
-        .map(|value| ContigId::new(value as u32));
-    let mate_start = record
-        .mate_alignment_start()
-        .transpose()?
-        .map(|value| value.get() as u64 - 1);
-    Ok(AlignmentRecord {
-        contig: ContigId::new(
-            u32::try_from(contig).map_err(|_| AlignmentError::CoordinateOverflow)?,
-        ),
-        start: start as u64,
-        end: (start as u64)
-            .saturating_add(reference_length)
-            .max((start as u64).saturating_add(1)),
-        flags: AlignmentFlags::from_bits(record.flags()?.bits()),
-        mapping_quality: record
-            .mapping_quality()
-            .transpose()?
-            .map(|value| value.get()),
-        mate_contig,
-        mate_start,
-        template_length: i64::from(record.template_length()?),
-        read_name: record
-            .name()
-            .map_or_else(Vec::new, |name| name.iter().copied().collect()),
-        cigar,
-        sequence,
-        auxiliary_fields,
-    })
-}
-
-fn normalize_aux(value: Value<'_>) -> Result<AuxValue, AlignmentError> {
-    Ok(match value {
-        Value::Character(value) => AuxValue::Character(value),
-        Value::Int8(value) => AuxValue::Signed(i64::from(value)),
-        Value::UInt8(value) => AuxValue::Unsigned(u64::from(value)),
-        Value::Int16(value) => AuxValue::Signed(i64::from(value)),
-        Value::UInt16(value) => AuxValue::Unsigned(u64::from(value)),
-        Value::Int32(value) => AuxValue::Signed(i64::from(value)),
-        Value::UInt32(value) => AuxValue::Unsigned(u64::from(value)),
-        Value::Float(value) => AuxValue::Float(value),
-        Value::String(value) => AuxValue::String(String::from_utf8_lossy(value).into_owned()),
-        Value::Hex(value) => AuxValue::HexByteArray(String::from_utf8_lossy(value).into_owned()),
-        Value::Array(array) => normalize_array(array)?,
-    })
-}
-
-fn normalize_array(array: Array<'_>) -> Result<AuxValue, AlignmentError> {
-    Ok(match array {
-        Array::Int8(values) => AuxValue::SignedArray(
-            values
-                .iter()
-                .map(|value| value.map(i64::from))
-                .collect::<io::Result<_>>()?,
-        ),
-        Array::UInt8(values) => AuxValue::UnsignedArray(
-            values
-                .iter()
-                .map(|value| value.map(u64::from))
-                .collect::<io::Result<_>>()?,
-        ),
-        Array::Int16(values) => AuxValue::SignedArray(
-            values
-                .iter()
-                .map(|value| value.map(i64::from))
-                .collect::<io::Result<_>>()?,
-        ),
-        Array::UInt16(values) => AuxValue::UnsignedArray(
-            values
-                .iter()
-                .map(|value| value.map(u64::from))
-                .collect::<io::Result<_>>()?,
-        ),
-        Array::Int32(values) => AuxValue::SignedArray(
-            values
-                .iter()
-                .map(|value| value.map(i64::from))
-                .collect::<io::Result<_>>()?,
-        ),
-        Array::UInt32(values) => AuxValue::UnsignedArray(
-            values
-                .iter()
-                .map(|value| value.map(u64::from))
-                .collect::<io::Result<_>>()?,
-        ),
-        Array::Float(values) => AuxValue::FloatArray(values.iter().collect::<io::Result<_>>()?),
-    })
 }
 
 #[cfg(test)]
@@ -2551,7 +1995,15 @@ mod tests {
     };
     use tiny_http::{Header, Response, Server, StatusCode};
 
+    mod differential;
+    mod resume;
+    mod url_routing;
+
     use super::*;
+    use crate::{
+        AlignmentRecord, QueryDetail,
+        backend_record::{Eligibility, eligibility},
+    };
 
     #[test]
     fn cram_alignment_and_reference_share_one_transfer_budget() {
@@ -2933,7 +2385,12 @@ mod tests {
         };
 
         assert_eq!(
-            eligibility(&record, &header, &options).unwrap(),
+            eligibility(
+                &record.backend_record(&header),
+                crate::AlignmentFlags::from_bits(record.flags().bits()),
+                &options
+            )
+            .unwrap(),
             Eligibility::Unmapped
         );
     }

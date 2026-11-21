@@ -159,7 +159,7 @@ impl Viewer {
         );
         let retry_was_pending = self.alignment_gpu_publication_retry.is_some();
         let attempt = if retry_was_pending {
-            let snapshot = match self.alignment_scene_ledger.progress() {
+            let snapshot = match self.alignment_gpu_ledger.progress() {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     self.alignment_gpu_publication_retry = None;
@@ -554,7 +554,7 @@ impl Viewer {
                 "summary_pages": protected_summary_pages.len(),
             }),
         );
-        let budget_bytes = match self.alignment_scene_ledger.progress() {
+        let budget_bytes = match self.alignment_gpu_ledger.progress() {
             Ok(snapshot) => snapshot.budget,
             Err(error) => {
                 self.report_error(format!("Could not inspect alignment GPU budget: {error}"));

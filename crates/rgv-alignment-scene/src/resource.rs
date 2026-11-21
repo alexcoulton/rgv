@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+pub use rgv_core::AlignmentMemoryPolicy;
 use thiserror::Error;
 
 /// Identity of one retained CPU or GPU allocation.
@@ -207,6 +208,140 @@ impl AllocationClass {
     const fn is_gpu_transition_allocation(self) -> bool {
         matches!(self, Self::GpuPage | Self::TransitionFrame)
     }
+
+    /// The budget owner this class is accounted to under [`AlignmentMemoryPolicy::Bounded`].
+    /// Each owner is one eviction domain: the evidence store trims `Evidence` and `Summary`,
+    /// the presentation store trims `Presentation`, and the renderer trims `Gpu`.
+    #[must_use]
+    pub const fn owner(self) -> AllocationOwner {
+        match self {
+            Self::CoreChunk
+            | Self::PayloadSidecar
+            | Self::OverlapIndex
+            | Self::EvidenceRootMetadata
+            | Self::RowAtlas => AllocationOwner::Evidence,
+            Self::ExactSummary | Self::SummaryRootMetadata | Self::AnnotationIndex => {
+                AllocationOwner::Summary
+            }
+            Self::SemanticPage | Self::PresentationScene | Self::NavigationHistory => {
+                AllocationOwner::Presentation
+            }
+            Self::GpuPage | Self::TransitionFrame => AllocationOwner::Gpu,
+        }
+    }
+
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::CoreChunk,
+        Self::PayloadSidecar,
+        Self::OverlapIndex,
+        Self::EvidenceRootMetadata,
+        Self::ExactSummary,
+        Self::SummaryRootMetadata,
+        Self::AnnotationIndex,
+        Self::RowAtlas,
+        Self::SemanticPage,
+        Self::PresentationScene,
+        Self::GpuPage,
+        Self::TransitionFrame,
+        Self::NavigationHistory,
+    ];
+}
+
+/// One independently budgeted cache owner. Under [`AlignmentMemoryPolicy::Bounded`] every owner
+/// has a fixed share of the user's cache budget, so no owner can starve another and none needs
+/// another to reclaim before it can proceed.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AllocationOwner {
+    /// Decoded source chunks, their indices and sidecars, evidence roots and row atlases.
+    Evidence,
+    /// Exact summary tiles, summary roots and annotation indices.
+    Summary,
+    /// Semantic read/summary pages and presentation scenes.
+    Presentation,
+    /// GPU pages and transition frames: a disposable derivative of the CPU pages.
+    Gpu,
+}
+
+impl AllocationOwner {
+    pub const ALL: [Self; 4] = [Self::Evidence, Self::Summary, Self::Presentation, Self::Gpu];
+}
+
+/// Fixed owner shares of the total cache budget, in thousandths. They always sum to 1000.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocationOwnerShares {
+    evidence: u16,
+    summary: u16,
+    presentation: u16,
+    gpu: u16,
+}
+
+impl Default for AllocationOwnerShares {
+    fn default() -> Self {
+        Self {
+            evidence: 400,
+            summary: 100,
+            presentation: 250,
+            gpu: 250,
+        }
+    }
+}
+
+impl AllocationOwnerShares {
+    /// Returns `None` unless the four shares sum to exactly 1000.
+    #[must_use]
+    pub const fn new(evidence: u16, summary: u16, presentation: u16, gpu: u16) -> Option<Self> {
+        if evidence as u32 + summary as u32 + presentation as u32 + gpu as u32 == 1_000 {
+            Some(Self {
+                evidence,
+                summary,
+                presentation,
+                gpu,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn permille(self, owner: AllocationOwner) -> u16 {
+        match owner {
+            AllocationOwner::Evidence => self.evidence,
+            AllocationOwner::Summary => self.summary,
+            AllocationOwner::Presentation => self.presentation,
+            AllocationOwner::Gpu => self.gpu,
+        }
+    }
+
+    /// `owner`'s share of `total` bytes, rounded down.
+    #[must_use]
+    pub fn share_of(self, total: usize, owner: AllocationOwner) -> usize {
+        let share = (total as u128).saturating_mul(u128::from(self.permille(owner))) / 1_000;
+        usize::try_from(share).unwrap_or(usize::MAX)
+    }
+}
+
+/// Constant-size view of one owner's budget under [`AlignmentMemoryPolicy::Bounded`].
+///
+/// Under [`AlignmentMemoryPolicy::Complete`] the ledger has one shared budget; `soft_budget` and
+/// `hard_cap` then both report it and `charged`/`pinned` still report this owner's own bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AllocationOwnerUsage {
+    pub owner: AllocationOwner,
+    pub charged: usize,
+    /// Charged bytes of this owner with at least one pin.
+    pub pinned: usize,
+    /// The owner's caches are evicted, least recently used first, down to this many bytes.
+    pub soft_budget: usize,
+    /// Content which cannot be evicted may exceed `soft_budget` up to this many bytes.
+    pub hard_cap: usize,
+}
+
+impl AllocationOwnerUsage {
+    /// Bytes the owner's caches must release to return to their share.
+    #[must_use]
+    pub const fn overage(self) -> usize {
+        self.charged.saturating_sub(self.soft_budget)
+    }
 }
 
 /// O(1) retained-byte reconciliation by allocation class. The fixed array is internal so adding
@@ -274,12 +409,27 @@ impl LedgerRetainedBreakdown {
             .saturating_add(self.bytes(AllocationClass::TransitionFrame))
     }
 
+    /// Bytes charged to every class accounted to `owner`.
+    #[must_use]
+    pub fn owner_bytes(self, owner: AllocationOwner) -> usize {
+        owner_class_bytes(&self.by_class, owner)
+    }
+
     #[must_use]
     pub fn total(self) -> usize {
         self.by_class
             .into_iter()
             .fold(0_usize, usize::saturating_add)
     }
+}
+
+fn owner_class_bytes(by_class: &[usize; AllocationClass::COUNT], owner: AllocationOwner) -> usize {
+    AllocationClass::ALL
+        .into_iter()
+        .filter(|class| class.owner() == owner)
+        .fold(0_usize, |total, class| {
+            total.saturating_add(by_class[class.index()])
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -611,6 +761,7 @@ pub struct AllocationRecordSnapshot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LedgerSnapshot {
+    pub policy: AlignmentMemoryPolicy,
     /// Capacity-mutation revision shared with [`LedgerProgress`].
     pub progress_revision: u64,
     /// Changes whenever a retained-budget policy changes. Candidate reservations capture this
@@ -650,6 +801,7 @@ pub type LedgerInventory = LedgerSnapshot;
 /// reserved for explicit diagnostics and eviction planning.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LedgerProgress {
+    pub policy: AlignmentMemoryPolicy,
     pub policy_revision: u64,
     pub budget: usize,
     pub transition_reserve: usize,
@@ -739,6 +891,7 @@ impl LedgerSnapshot {
     #[must_use]
     pub const fn capacity_progress(&self) -> LedgerProgress {
         LedgerProgress {
+            policy: self.policy,
             policy_revision: self.policy_revision,
             budget: self.budget,
             transition_reserve: self.transition_reserve,
@@ -796,6 +949,8 @@ struct LedgerInner {
     progress_watchers: Vec<SyncSender<()>>,
     operation_counters: LedgerOperationCounters,
     policy_revision: u64,
+    policy: AlignmentMemoryPolicy,
+    shares: AllocationOwnerShares,
     budget: usize,
     transition_reserve: usize,
     transient_budget: usize,
@@ -819,6 +974,7 @@ struct LedgerInner {
     /// Sum of the charged capacity of records with at least one pin. A record contributes once,
     /// irrespective of its pin count, matching the historical full-snapshot definition.
     pinned: usize,
+    pinned_by_class: [usize; AllocationClass::COUNT],
     transient_resources: HashMap<TransientResourceClass, TransientUsage>,
     records: HashMap<AllocationId, AllocationRecord>,
 }
@@ -882,7 +1038,82 @@ impl LedgerInner {
             ReservationKind::Transition => &mut self.transient_transition,
         }
     }
+
+    const fn bounded(&self) -> bool {
+        matches!(self.policy, AlignmentMemoryPolicy::Bounded)
+    }
+
+    fn owner_charged(&self, owner: AllocationOwner) -> usize {
+        owner_class_bytes(&self.charged_by_class, owner)
+    }
+
+    fn owner_soft_budget(&self, owner: AllocationOwner) -> usize {
+        if self.bounded() {
+            self.shares.share_of(self.budget, owner)
+        } else {
+            self.budget
+        }
+    }
+
+    /// Unevictable content of a CPU owner may borrow one further share, never more than the
+    /// whole budget. The GPU owner is a disposable cache and never exceeds its own share.
+    fn owner_hard_cap(&self, owner: AllocationOwner) -> usize {
+        let soft = self.owner_soft_budget(owner);
+        if !self.bounded() || owner == AllocationOwner::Gpu {
+            soft
+        } else {
+            soft.saturating_mul(BOUNDED_HARD_CAP_SHARES)
+                .min(self.budget)
+        }
+    }
+
+    fn owner_usage(&self, owner: AllocationOwner) -> AllocationOwnerUsage {
+        AllocationOwnerUsage {
+            owner,
+            charged: self.owner_charged(owner),
+            pinned: owner_class_bytes(&self.pinned_by_class, owner),
+            soft_budget: self.owner_soft_budget(owner),
+            hard_cap: self.owner_hard_cap(owner),
+        }
+    }
+
+    /// The budget a retained GPU replacement is proved against: the whole ledger under
+    /// `Complete`, the GPU owner's own share under `Bounded`. Returns
+    /// `(charged, base limit, overlap allowance)`.
+    fn replacement_scope(&self) -> (usize, usize, usize) {
+        if self.bounded() {
+            let share = self.owner_soft_budget(AllocationOwner::Gpu);
+            (
+                self.owner_charged(AllocationOwner::Gpu),
+                share,
+                self.transition_reserve.min(share),
+            )
+        } else {
+            (self.charged, self.budget, self.transition_reserve)
+        }
+    }
+
+    /// One build may not plan more retained bytes, or more scratch, than this under `Bounded`.
+    /// Neither is held against a budget there, so this is the bound on a pathological input.
+    fn bounded_build_cap(&self) -> usize {
+        self.transient_budget.max(self.budget)
+    }
+
+    fn note_pinned(&mut self, class: AllocationClass, bytes: usize) {
+        self.pinned = self.pinned.saturating_add(bytes);
+        self.pinned_by_class[class.index()] =
+            self.pinned_by_class[class.index()].saturating_add(bytes);
+    }
+
+    fn note_unpinned(&mut self, class: AllocationClass, bytes: usize) {
+        self.pinned = self.pinned.saturating_sub(bytes);
+        self.pinned_by_class[class.index()] =
+            self.pinned_by_class[class.index()].saturating_sub(bytes);
+    }
 }
+
+/// Soft shares a CPU owner's unevictable content may occupy before a build reports pressure.
+const BOUNDED_HARD_CAP_SHARES: usize = 2;
 
 #[derive(Clone, Debug)]
 pub struct AllocationLedger {
@@ -895,8 +1126,28 @@ impl AllocationLedger {
         Self::new_with_transient_budget(budget, transition_reserve, budget)
     }
 
+    /// A strict ledger ([`AlignmentMemoryPolicy::Complete`]). The product default is `Bounded`
+    /// and is selected with [`Self::with_policy`]; the bare constructors keep the original
+    /// reserve-before-build contract.
     #[must_use]
     pub fn new_with_transient_budget(
+        budget: usize,
+        transition_reserve: usize,
+        transient_budget: usize,
+    ) -> Self {
+        Self::with_policy(
+            AlignmentMemoryPolicy::Complete,
+            budget,
+            transition_reserve,
+            transient_budget,
+        )
+    }
+
+    /// `budget` is the user's total cache budget under either policy. Under `Bounded` it is
+    /// divided between the owners by [`AllocationOwnerShares`].
+    #[must_use]
+    pub fn with_policy(
+        policy: AlignmentMemoryPolicy,
         budget: usize,
         transition_reserve: usize,
         transient_budget: usize,
@@ -907,6 +1158,8 @@ impl AllocationLedger {
                 progress_watchers: Vec::new(),
                 operation_counters: LedgerOperationCounters::default(),
                 policy_revision: 1,
+                policy,
+                shares: AllocationOwnerShares::default(),
                 budget,
                 transition_reserve,
                 transient_budget,
@@ -922,10 +1175,76 @@ impl AllocationLedger {
                 transient_transition: 0,
                 transient_high_water: 0,
                 pinned: 0,
+                pinned_by_class: [0; AllocationClass::COUNT],
                 transient_resources: HashMap::new(),
                 records: HashMap::new(),
             })),
         }
+    }
+
+    pub fn policy(&self) -> Result<AlignmentMemoryPolicy, LedgerError> {
+        Ok(self.inner.lock().map_err(|_| LedgerError::Poisoned)?.policy)
+    }
+
+    /// Whether builds charge what they retained and caches are trimmed afterwards.
+    #[must_use]
+    pub fn is_bounded(&self) -> bool {
+        self.policy()
+            .is_ok_and(|policy| policy == AlignmentMemoryPolicy::Bounded)
+    }
+
+    /// Switches the memory policy. Outstanding reservations keep the terms they were made under
+    /// and release exactly what they hold, so accounting stays exact across the switch.
+    pub fn set_policy(&self, policy: AlignmentMemoryPolicy) -> Result<(), LedgerError> {
+        let mut inner = self.inner.lock().map_err(|_| LedgerError::Poisoned)?;
+        if inner.policy != policy {
+            if let Some(bundle_id) = inner.prepared_replacement_settlement {
+                return Err(LedgerError::ReplacementTransitionActive { bundle_id });
+            }
+            inner.advance_policy_revision()?;
+            inner.policy = policy;
+        }
+        Ok(())
+    }
+
+    pub fn set_owner_shares(&self, shares: AllocationOwnerShares) -> Result<(), LedgerError> {
+        let mut inner = self.inner.lock().map_err(|_| LedgerError::Poisoned)?;
+        if inner.shares != shares {
+            if let Some(bundle_id) = inner.prepared_replacement_settlement {
+                return Err(LedgerError::ReplacementTransitionActive { bundle_id });
+            }
+            inner.advance_policy_revision()?;
+            inner.shares = shares;
+        }
+        Ok(())
+    }
+
+    /// Constant-size budget view of one owner.
+    pub fn owner_usage(&self, owner: AllocationOwner) -> Result<AllocationOwnerUsage, LedgerError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| LedgerError::Poisoned)?
+            .owner_usage(owner))
+    }
+
+    /// The pressure a build reports when `unevictable` bytes of `owner` cannot fit its hard cap.
+    /// `requested` exceeds `limit`, so the refusal is intrinsic: no amount of eviction clears it.
+    pub fn owner_cap_pressure(
+        &self,
+        owner: AllocationOwner,
+        unevictable: usize,
+    ) -> Result<Option<LedgerError>, LedgerError> {
+        let inner = self.inner.lock().map_err(|_| LedgerError::Poisoned)?;
+        let limit = inner.owner_hard_cap(owner);
+        Ok(
+            (inner.bounded() && unevictable > limit).then(|| LedgerError::BudgetExceeded {
+                requested: unevictable,
+                charged: inner.owner_charged(owner),
+                reserved: 0,
+                limit,
+            }),
+        )
     }
 
     /// Subscribes to coalesced capacity changes without exposing the allocation inventory.
@@ -946,6 +1265,7 @@ impl AllocationLedger {
             .progress_snapshots
             .saturating_add(1);
         Ok(LedgerProgress {
+            policy: inner.policy,
             policy_revision: inner.policy_revision,
             budget: inner.budget,
             transition_reserve: inner.transition_reserve,
@@ -1024,6 +1344,29 @@ impl AllocationLedger {
         kind: ReservationKind,
     ) -> Result<AllocationReservation, LedgerError> {
         let mut inner = self.inner.lock().map_err(|_| LedgerError::Poisoned)?;
+        let gpu_scoped = inner.bounded();
+        if gpu_scoped && class.owner() != AllocationOwner::Gpu {
+            // Charge actual, after build: the handle holds nothing and `register` charges what
+            // the build retained. The owning store then trims its caches back to their share.
+            // The bound is only a sanity check on this one build: a plan larger than the whole
+            // budget fails alone, intrinsically, instead of exhausting memory.
+            let limit = inner.bounded_build_cap();
+            if maximum_bytes > limit {
+                return Err(LedgerError::BudgetExceeded {
+                    requested: maximum_bytes,
+                    charged: inner.owner_charged(class.owner()),
+                    reserved: 0,
+                    limit,
+                });
+            }
+            return Ok(AllocationReservation {
+                inner: Arc::clone(&self.inner),
+                class,
+                kind,
+                remaining: usize::MAX,
+                provisional: true,
+            });
+        }
         if let Some(bundle_id) = inner.prepared_replacement_settlement {
             return Err(LedgerError::ReplacementTransitionActive { bundle_id });
         }
@@ -1040,15 +1383,26 @@ impl AllocationLedger {
         } else {
             kind
         };
-        let requested_total = inner
-            .charged
+        // Under `Bounded` only the GPU owner holds reservations, against its own share.
+        let (charged, limit) = if gpu_scoped {
+            let (charged, base, overlap) = inner.replacement_scope();
+            (
+                charged,
+                base.saturating_add(match effective_kind {
+                    ReservationKind::Normal => 0,
+                    ReservationKind::Transition => overlap,
+                }),
+            )
+        } else {
+            (inner.charged, inner.reservation_limit(effective_kind))
+        };
+        let requested_total = charged
             .saturating_add(inner.total_reserved())
             .saturating_add(maximum_bytes);
-        let limit = inner.reservation_limit(effective_kind);
         if requested_total > limit {
             return Err(LedgerError::BudgetExceeded {
                 requested: maximum_bytes,
-                charged: inner.charged,
+                charged,
                 reserved: inner.total_reserved(),
                 limit,
             });
@@ -1063,6 +1417,7 @@ impl AllocationLedger {
             class,
             kind: effective_kind,
             remaining: maximum_bytes,
+            provisional: false,
         })
     }
 
@@ -1134,8 +1489,8 @@ impl AllocationLedger {
             )?;
         }
 
-        let occupied = inner
-            .charged
+        let (scope_charged, base_limit_bytes, overlap_allowance) = inner.replacement_scope();
+        let occupied = scope_charged
             .checked_add(inner.reserved_normal)
             .and_then(|total| total.checked_add(inner.reserved_transition))
             .ok_or(AllocationBundleError::AccountingOverflow {
@@ -1147,15 +1502,15 @@ impl AllocationLedger {
             .ok_or(AllocationBundleError::AccountingOverflow {
                 operation: AllocationBundleAccountingOperation::SteadyProjection,
             })?;
-        if projected_steady > inner.budget {
+        if projected_steady > base_limit_bytes {
             return Err(AllocationBundleError::SteadyBudgetExceeded {
                 candidate: maximum_bytes,
                 occupied,
                 retiring: retiring_bytes,
-                limit: inner.budget,
+                limit: base_limit_bytes,
             });
         }
-        let overlap_limit = inner.budget.checked_add(inner.transition_reserve).ok_or(
+        let overlap_limit = base_limit_bytes.checked_add(overlap_allowance).ok_or(
             AllocationBundleError::AccountingOverflow {
                 operation: AllocationBundleAccountingOperation::OverlapLimit,
             },
@@ -1193,7 +1548,6 @@ impl AllocationLedger {
         }
         inner.reserved_transition = reserved_transition;
         inner.note_progress();
-        let base_limit_bytes = inner.budget;
         drop(inner);
 
         Ok(AllocationBundleReservation {
@@ -1222,15 +1576,29 @@ impl AllocationLedger {
         kind: ReservationKind,
     ) -> Result<TransientResourceReservation, LedgerError> {
         let mut inner = self.inner.lock().map_err(|_| LedgerError::Poisoned)?;
-        let requested_total = inner.total_transient().saturating_add(maximum_bytes);
-        let limit = inner.transient_reservation_limit(kind);
-        if requested_total > limit {
-            return Err(LedgerError::TransientBudgetExceeded {
-                class,
-                requested: maximum_bytes,
-                transient: inner.total_transient(),
-                limit,
-            });
+        if inner.bounded() {
+            // Scratch is reported but held against no budget. One build asking for more than
+            // the per-build cap fails alone, as an intrinsic refusal.
+            let limit = inner.bounded_build_cap();
+            if maximum_bytes > limit {
+                return Err(LedgerError::TransientBudgetExceeded {
+                    class,
+                    requested: maximum_bytes,
+                    transient: 0,
+                    limit,
+                });
+            }
+        } else {
+            let requested_total = inner.total_transient().saturating_add(maximum_bytes);
+            let limit = inner.transient_reservation_limit(kind);
+            if requested_total > limit {
+                return Err(LedgerError::TransientBudgetExceeded {
+                    class,
+                    requested: maximum_bytes,
+                    transient: inner.total_transient(),
+                    limit,
+                });
+            }
         }
         *inner.transient_mut(kind) = inner.transient_mut(kind).saturating_add(maximum_bytes);
         let total_transient = inner.total_transient();
@@ -1360,6 +1728,7 @@ impl AllocationLedger {
             .collect::<Vec<_>>();
         transient_resources.sort_by_key(|usage| usage.class);
         Ok(LedgerSnapshot {
+            policy: inner.policy,
             progress_revision: inner.progress_revision,
             policy_revision: inner.policy_revision,
             budget: inner.budget,
@@ -1474,6 +1843,9 @@ pub struct AllocationReservation {
     class: AllocationClass,
     kind: ReservationKind,
     remaining: usize,
+    /// A `Bounded` reservation holds no capacity: `register` charges the retained bytes and
+    /// nothing is released when the handle drops.
+    provisional: bool,
 }
 
 impl AllocationReservation {
@@ -1487,7 +1859,7 @@ impl AllocationReservation {
         charged_capacity: usize,
         last_used_revision: u64,
     ) -> Result<AllocationLease, LedgerError> {
-        if charged_capacity > self.remaining {
+        if !self.provisional && charged_capacity > self.remaining {
             return Err(LedgerError::ReservationExceeded {
                 requested: charged_capacity,
                 remaining: self.remaining,
@@ -1502,9 +1874,11 @@ impl AllocationReservation {
         inner.charged = inner.charged.saturating_add(charged_capacity);
         inner.charged_by_class[self.class.index()] =
             inner.charged_by_class[self.class.index()].saturating_add(charged_capacity);
-        *inner.reserved_mut(self.kind) = inner
-            .reserved_mut(self.kind)
-            .saturating_sub(charged_capacity);
+        if !self.provisional {
+            *inner.reserved_mut(self.kind) = inner
+                .reserved_mut(self.kind)
+                .saturating_sub(charged_capacity);
+        }
         inner.records.insert(
             id,
             AllocationRecord {
@@ -1517,7 +1891,9 @@ impl AllocationReservation {
             },
         );
         inner.note_progress();
-        self.remaining = self.remaining.saturating_sub(charged_capacity);
+        if !self.provisional {
+            self.remaining = self.remaining.saturating_sub(charged_capacity);
+        }
         Ok(AllocationLease {
             inner: Arc::clone(&self.inner),
             id,
@@ -1527,7 +1903,7 @@ impl AllocationReservation {
 
 impl Drop for AllocationReservation {
     fn drop(&mut self) {
-        if self.remaining == 0 {
+        if self.remaining == 0 || self.provisional {
             return;
         }
         if let Ok(mut inner) = self.inner.lock() {
@@ -1867,8 +2243,8 @@ impl AllocationBundleCommit {
                 },
             )?;
         }
-        let occupied = inner
-            .charged
+        let (scope_charged, scope_limit, _) = inner.replacement_scope();
+        let occupied = scope_charged
             .checked_add(inner.reserved_normal)
             .and_then(|total| total.checked_add(inner.reserved_transition))
             .ok_or(AllocationBundleError::AccountingOverflow {
@@ -1879,7 +2255,7 @@ impl AllocationBundleCommit {
                 operation: AllocationBundleAccountingOperation::SettlementSteadyProjection,
             },
         )?;
-        let settlement_limit = self.base_limit_bytes.max(inner.budget);
+        let settlement_limit = self.base_limit_bytes.max(scope_limit);
         if projected_steady > settlement_limit {
             return Err(AllocationBundleError::SteadyStateNotReached {
                 occupied: projected_steady,
@@ -1908,14 +2284,14 @@ impl AllocationBundleCommit {
                 return Err(AllocationBundleError::RetirementIncomplete(claim.id));
             }
         }
-        let occupied = inner
-            .charged
+        let (scope_charged, scope_limit, _) = inner.replacement_scope();
+        let occupied = scope_charged
             .checked_add(inner.reserved_normal)
             .and_then(|total| total.checked_add(inner.reserved_transition))
             .ok_or(AllocationBundleError::AccountingOverflow {
                 operation: AllocationBundleAccountingOperation::SettlementOccupied,
             })?;
-        let settlement_limit = self.base_limit_bytes.max(inner.budget);
+        let settlement_limit = self.base_limit_bytes.max(scope_limit);
         if occupied > settlement_limit {
             return Err(AllocationBundleError::SteadyStateNotReached {
                 occupied,
@@ -1970,7 +2346,8 @@ impl AllocationBundleCommit {
             );
         }
         let occupied = inner
-            .charged
+            .replacement_scope()
+            .0
             .checked_add(inner.reserved_normal)
             .and_then(|total| total.checked_add(inner.reserved_transition))
             .expect("prepared replacement settlement occupied-byte arithmetic overflowed");
@@ -2091,12 +2468,13 @@ impl AllocationLease {
                 .records
                 .get_mut(&self.id)
                 .ok_or(LedgerError::UnknownAllocation(self.id))?;
-            let newly_pinned_bytes = (record.pins == 0).then_some(record.charged_capacity);
+            let newly_pinned_bytes =
+                (record.pins == 0).then_some((record.class, record.charged_capacity));
             record.pins = record.pins.saturating_add(1);
             newly_pinned_bytes
         };
-        if let Some(bytes) = newly_pinned_bytes {
-            inner.pinned = inner.pinned.saturating_add(bytes);
+        if let Some((class, bytes)) = newly_pinned_bytes {
+            inner.note_pinned(class, bytes);
         }
         inner.note_progress();
         drop(inner);
@@ -2117,8 +2495,9 @@ impl AllocationLease {
                 .records
                 .get(&self.id)
                 .ok_or(LedgerError::UnknownAllocation(self.id))?;
-            let newly_pinned_bytes = (record.pins == 0).then_some(record.charged_capacity);
-            let allowed = newly_pinned_bytes.is_none_or(|bytes| {
+            let newly_pinned_bytes =
+                (record.pins == 0).then_some((record.class, record.charged_capacity));
+            let allowed = newly_pinned_bytes.is_none_or(|(_, bytes)| {
                 inner.pinned.saturating_add(bytes) <= maximum_total_pinned_bytes
             });
             (newly_pinned_bytes, allowed)
@@ -2132,8 +2511,8 @@ impl AllocationLease {
             .expect("optional pin allocation was validated under the same ledger lock");
         record.references = record.references.saturating_add(1);
         record.pins = record.pins.saturating_add(1);
-        if let Some(bytes) = newly_pinned_bytes {
-            inner.pinned = inner.pinned.saturating_add(bytes);
+        if let Some((class, bytes)) = newly_pinned_bytes {
+            inner.note_pinned(class, bytes);
         }
         inner.note_progress();
         drop(inner);
@@ -2198,12 +2577,13 @@ impl Drop for PinnedAllocationLease {
     fn drop(&mut self) {
         if let Ok(mut inner) = self.lease.inner.lock() {
             let unpinned_bytes = inner.records.get_mut(&self.lease.id).and_then(|record| {
-                let unpinned_bytes = (record.pins == 1).then_some(record.charged_capacity);
+                let unpinned_bytes =
+                    (record.pins == 1).then_some((record.class, record.charged_capacity));
                 record.pins = record.pins.saturating_sub(1);
                 unpinned_bytes
             });
-            if let Some(bytes) = unpinned_bytes {
-                inner.pinned = inner.pinned.saturating_sub(bytes);
+            if let Some((class, bytes)) = unpinned_bytes {
+                inner.note_unpinned(class, bytes);
             }
             if unpinned_bytes.is_some() {
                 inner.note_progress();
@@ -2431,6 +2811,232 @@ mod tests {
                 |token| token.claims.clone(),
             ),
         )
+    }
+
+    fn bounded(budget: usize) -> AllocationLedger {
+        AllocationLedger::with_policy(AlignmentMemoryPolicy::Bounded, budget, budget, budget)
+    }
+
+    #[test]
+    fn bounded_reservations_hold_nothing_and_register_charges_the_retained_bytes() {
+        let ledger = bounded(1_000);
+        // A worst-case bound of the whole budget, far above the owner's share, is admitted.
+        let mut reservation = ledger
+            .reserve(AllocationClass::CoreChunk, 1_000, ReservationKind::Normal)
+            .unwrap();
+        // Only a single build planning more than the whole budget is refused, intrinsically.
+        let refused = ledger
+            .reserve(AllocationClass::CoreChunk, 1_001, ReservationKind::Normal)
+            .unwrap_err();
+        assert!(refused.intrinsically_exceeds_limit());
+        assert_eq!(ledger.progress().unwrap().reserved, 0);
+        let first = reservation.register(300, 1).unwrap();
+        // More than the bound that was asked for, and more than the owner's share, still charges.
+        let second = reservation.register(900, 2).unwrap();
+        let progress = ledger.progress().unwrap();
+        assert_eq!(progress.charged, 1_200);
+        assert_eq!(progress.reserved, 0);
+        drop(reservation);
+        assert_eq!(ledger.progress().unwrap().reserved, 0);
+        let usage = ledger.owner_usage(AllocationOwner::Evidence).unwrap();
+        assert_eq!(
+            (usage.charged, usage.soft_budget, usage.hard_cap),
+            (1_200, 400, 800)
+        );
+        assert_eq!(usage.overage(), 800);
+        drop((first, second));
+        assert_eq!(ledger.progress().unwrap().charged, 0);
+    }
+
+    #[test]
+    fn bounded_owners_are_isolated_and_only_the_gpu_share_is_strict() {
+        let ledger = bounded(1_000);
+        // Evidence far over its share does not shrink what the GPU owner may reserve.
+        let evidence = ledger
+            .reserve(AllocationClass::CoreChunk, 0, ReservationKind::Normal)
+            .unwrap()
+            .register(5_000, 1)
+            .unwrap();
+        let mut gpu = ledger
+            .reserve(AllocationClass::GpuPage, 250, ReservationKind::Normal)
+            .unwrap();
+        assert_eq!(ledger.progress().unwrap().reserved, 250);
+        // The GPU owner cannot exceed its own share, whatever the CPU owners hold.
+        assert!(matches!(
+            ledger.reserve(AllocationClass::GpuPage, 1, ReservationKind::Normal),
+            Err(LedgerError::BudgetExceeded {
+                requested: 1,
+                charged: 0,
+                reserved: 250,
+                limit: 250,
+            })
+        ));
+        let page = gpu.register(200, 2).unwrap();
+        drop(gpu);
+        let usage = ledger.owner_usage(AllocationOwner::Gpu).unwrap();
+        assert_eq!(
+            (usage.charged, usage.soft_budget, usage.hard_cap),
+            (200, 250, 250)
+        );
+        // A full GPU share never refuses a CPU charge.
+        let summary = ledger
+            .reserve(AllocationClass::ExactSummary, 10, ReservationKind::Normal)
+            .unwrap()
+            .register(10, 3)
+            .unwrap();
+        assert_eq!(
+            ledger
+                .owner_usage(AllocationOwner::Summary)
+                .unwrap()
+                .charged,
+            10
+        );
+        drop((evidence, page, summary));
+        let progress = ledger.progress().unwrap();
+        assert_eq!((progress.charged, progress.reserved), (0, 0));
+    }
+
+    #[test]
+    fn bounded_scratch_is_reported_but_only_the_per_build_cap_refuses_it() {
+        let ledger = bounded(1_000);
+        // Concurrent scratch well past the budget is admitted and reported.
+        let first = ledger
+            .reserve_transient(
+                TransientResourceClass::SemanticPageBuilder,
+                900,
+                ReservationKind::Normal,
+            )
+            .unwrap();
+        let second = ledger
+            .reserve_transient(
+                TransientResourceClass::ExactSummaryBuilder,
+                900,
+                ReservationKind::Normal,
+            )
+            .unwrap();
+        assert_eq!(ledger.progress().unwrap().transient, 1_800);
+        drop((first, second));
+        assert_eq!(ledger.progress().unwrap().transient, 0);
+        // One pathological build fails alone, as an intrinsic refusal.
+        let refused = ledger
+            .reserve_transient(
+                TransientResourceClass::SemanticPageBuilder,
+                1_001,
+                ReservationKind::Normal,
+            )
+            .unwrap_err();
+        assert!(refused.intrinsically_exceeds_limit());
+        assert_eq!(ledger.progress().unwrap().transient, 0);
+    }
+
+    #[test]
+    fn pressure_is_reported_only_when_unevictable_bytes_exceed_the_hard_cap() {
+        let ledger = bounded(1_000);
+        assert_eq!(
+            ledger
+                .owner_cap_pressure(AllocationOwner::Evidence, 800)
+                .unwrap(),
+            None
+        );
+        let pressure = ledger
+            .owner_cap_pressure(AllocationOwner::Evidence, 801)
+            .unwrap()
+            .expect("unevictable content above the hard cap is pressure");
+        assert!(pressure.intrinsically_exceeds_limit());
+        // The strict policy never reports cap pressure: its reservations already refused.
+        let strict = AllocationLedger::new(1_000, 0);
+        assert_eq!(
+            strict
+                .owner_cap_pressure(AllocationOwner::Evidence, usize::MAX)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn switching_policy_keeps_outstanding_reservations_exact() {
+        let ledger = AllocationLedger::new(1_000, 0);
+        assert_eq!(ledger.policy().unwrap(), AlignmentMemoryPolicy::Complete);
+        let mut strict = ledger
+            .reserve(AllocationClass::CoreChunk, 600, ReservationKind::Normal)
+            .unwrap();
+        let revision = ledger.progress().unwrap().policy_revision;
+        ledger.set_policy(AlignmentMemoryPolicy::Bounded).unwrap();
+        assert_eq!(ledger.progress().unwrap().policy_revision, revision + 1);
+        let mut provisional = ledger
+            .reserve(AllocationClass::CoreChunk, 600, ReservationKind::Normal)
+            .unwrap();
+        ledger.set_policy(AlignmentMemoryPolicy::Complete).unwrap();
+        // Each handle keeps the terms it was made under.
+        let first = strict.register(100, 1).unwrap();
+        let second = provisional.register(700, 2).unwrap();
+        assert_eq!(ledger.progress().unwrap().reserved, 500);
+        drop((strict, provisional));
+        let progress = ledger.progress().unwrap();
+        assert_eq!((progress.charged, progress.reserved), (800, 0));
+        drop((first, second));
+        assert_eq!(ledger.progress().unwrap().charged, 0);
+    }
+
+    #[test]
+    fn pinned_bytes_are_tracked_per_owner() {
+        let ledger = bounded(1_000);
+        let chunk = ledger
+            .reserve(AllocationClass::CoreChunk, 0, ReservationKind::Normal)
+            .unwrap()
+            .register(70, 1)
+            .unwrap();
+        let page = ledger
+            .reserve(AllocationClass::SemanticPage, 0, ReservationKind::Normal)
+            .unwrap()
+            .register(30, 1)
+            .unwrap();
+        let first = chunk.pin().unwrap();
+        let second = chunk.pin().unwrap();
+        let page_pin = page.pin().unwrap();
+        assert_eq!(
+            ledger
+                .owner_usage(AllocationOwner::Evidence)
+                .unwrap()
+                .pinned,
+            70
+        );
+        assert_eq!(
+            ledger
+                .owner_usage(AllocationOwner::Presentation)
+                .unwrap()
+                .pinned,
+            30
+        );
+        drop(first);
+        assert_eq!(
+            ledger
+                .owner_usage(AllocationOwner::Evidence)
+                .unwrap()
+                .pinned,
+            70
+        );
+        drop((second, page_pin));
+        assert_eq!(
+            ledger
+                .owner_usage(AllocationOwner::Evidence)
+                .unwrap()
+                .pinned,
+            0
+        );
+        assert_eq!(ledger.progress().unwrap().pinned, 0);
+    }
+
+    #[test]
+    fn owner_shares_must_sum_to_the_whole_budget() {
+        assert!(AllocationOwnerShares::new(400, 100, 250, 250).is_some());
+        assert!(AllocationOwnerShares::new(400, 100, 250, 249).is_none());
+        let shares = AllocationOwnerShares::default();
+        let total = AllocationOwner::ALL
+            .into_iter()
+            .map(|owner| shares.share_of(1 << 30, owner))
+            .sum::<usize>();
+        assert!(total <= 1 << 30 && total > (1 << 30) - 4);
     }
 
     #[test]

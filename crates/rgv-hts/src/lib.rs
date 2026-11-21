@@ -1,6 +1,7 @@
 //! Alignment and reference I/O boundary.
 
 mod alignment;
+mod backend_record;
 mod bisulfite;
 mod exact_depth;
 mod filter;
@@ -12,6 +13,7 @@ mod modification_summary;
 mod modified_bases;
 mod pair;
 mod pileup;
+mod positioned_resume;
 mod reference;
 mod remote;
 mod remote_alignment;
@@ -82,6 +84,7 @@ pub use pileup::{
     QualityWeightedAlleleSupport, add_unmasked_range, aligned_observation,
     base_observation_is_counted,
 };
+pub use positioned_resume::PositionedChunkReceipt;
 pub use reference::{FastaOpenOptions, FastaReference, ReferenceSlice};
 pub use remote::{
     HttpRangeConfig, HttpRangeReader, RemoteAuthentication, RemoteCancellation, RemoteError,

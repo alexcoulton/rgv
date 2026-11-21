@@ -487,6 +487,27 @@ where
         Some(work)
     }
 
+    /// Abandons the active foreground transaction because its evidence cannot fit, and withdraws
+    /// the intent which would restart it. Returns `None`, changing nothing, when the active
+    /// work is not a foreground transaction.
+    pub fn abort_active_foreground(&mut self) -> Option<SourceWork> {
+        let active_is_foreground = self
+            .schedule
+            .active()
+            .is_some_and(|work| work.kind() == SourceIntentKind::Foreground);
+        if !active_is_foreground {
+            return None;
+        }
+        let work = self
+            .schedule
+            .abandon_active()
+            .expect("an observed active foreground work item remains active");
+        self.backend.cancel(&work);
+        self.transaction_chunks.clear();
+        self.cancel_failed_work_if_current(&work);
+        Some(work)
+    }
+
     /// Executes one bounded actor step. A returned `None` means there is currently no desired or
     /// non-discardable work.
     pub fn pump_once(

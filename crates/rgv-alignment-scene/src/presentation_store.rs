@@ -15,10 +15,10 @@ use crate::{
     AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory, AlignmentPageIdentity,
     AlignmentPageKey, AlignmentPresentationScene, AlignmentPresentationSceneError,
     AlignmentRowAtlas, AlignmentSceneSnapshot, AlignmentSceneSnapshotError, AlignmentSemanticPage,
-    AllocationId, AllocationLedger, AllocationRecordSnapshot, CanonicalGenomicTile,
-    CanonicalRowBlock, ExactSummaryRoot, JunctionAnnotationIndex, LedgerError,
-    PresentationContract, ReferenceRevision, ReservationKind, RevisionFingerprint, SceneRevision,
-    SemanticPageError, SummaryPageFamily, SummaryPageKey, SummarySemanticPage,
+    AllocationId, AllocationLedger, AllocationOwner, AllocationRecordSnapshot, BoundedCacheTrim,
+    CanonicalGenomicTile, CanonicalRowBlock, ExactSummaryRoot, JunctionAnnotationIndex,
+    LedgerError, PresentationContract, ReferenceRevision, ReservationKind, RevisionFingerprint,
+    SceneRevision, SemanticPageError, SummaryPageFamily, SummaryPageKey, SummarySemanticPage,
     SummarySemanticPageError,
 };
 
@@ -717,7 +717,123 @@ impl AlignmentPresentationStore {
         budget: usize,
     ) -> Result<PresentationStorePressure, AlignmentPresentationStoreError> {
         self.ledger.set_budget(budget)?;
-        self.evict_inactive_until(budget)
+        let pressure = self.evict_inactive_until(budget)?;
+        // Under `Bounded` the new total also shrinks this owner's share.
+        self.trim_to_owner_budget(usize::MAX)?;
+        Ok(pressure)
+    }
+
+    /// Keeps the semantic-page cache inside the presentation owner's share under
+    /// [`AlignmentMemoryPolicy::Bounded`](crate::AlignmentMemoryPolicy) by releasing
+    /// least-recently-used pages. It is a no-op under `Complete`.
+    ///
+    /// Never released: a page of any owner's prepared scene. Pages the cameras require but no
+    /// scene has staged yet are the last candidates. `pressure` is set only when the content
+    /// which cannot be released alone exceeds the owner's hard cap.
+    #[allow(clippy::result_large_err)]
+    pub fn trim_to_owner_budget(
+        &mut self,
+        maximum_entries: usize,
+    ) -> Result<BoundedCacheTrim, AlignmentPresentationStoreError> {
+        let mut trim = BoundedCacheTrim {
+            complete: true,
+            ..BoundedCacheTrim::default()
+        };
+        if !self.ledger.is_bounded() {
+            return Ok(trim);
+        }
+        let owner = AllocationOwner::Presentation;
+        let usage = self.ledger.owner_usage(owner)?;
+        if usage.overage() == 0 {
+            return Ok(trim);
+        }
+        let protected_read_pages = self
+            .prepared_by_owner
+            .values()
+            .flat_map(|snapshot| snapshot.reads().pages().iter().map(|page| page.key()))
+            .collect::<HashSet<_>>();
+        let protected_summary_pages = self
+            .prepared_by_owner
+            .values()
+            .flat_map(|snapshot| snapshot.summary_pages().iter().map(|page| page.key()))
+            .collect::<HashSet<_>>();
+        let candidates = self
+            .eviction_index
+            .iter()
+            .filter(|(_, _, _, candidate)| match candidate {
+                CachedPageLocation::Read(key) => !protected_read_pages.contains(key),
+                CachedPageLocation::Summary(key) => !protected_summary_pages.contains(key),
+            })
+            .take(maximum_entries.saturating_add(1))
+            .copied()
+            .collect::<Vec<_>>();
+        let mut exhausted = true;
+        for indexed @ (_, _, _, candidate) in candidates {
+            if self.ledger.owner_usage(owner)?.overage() == 0 {
+                break;
+            }
+            if trim.evicted_entries >= maximum_entries {
+                exhausted = false;
+                break;
+            }
+            self.eviction_index.remove(&indexed);
+            match candidate {
+                CachedPageLocation::Read(key) => {
+                    self.forget_read_page(key);
+                    trim.evicted_read_pages = trim.evicted_read_pages.saturating_add(1);
+                }
+                CachedPageLocation::Summary(key) => {
+                    self.summary_pages.remove(&key);
+                }
+            }
+            trim.evicted_entries = trim.evicted_entries.saturating_add(1);
+        }
+        let usage = self.ledger.owner_usage(owner)?;
+        trim.complete = usage.overage() == 0 || exhausted;
+        if trim.complete && usage.charged > usage.hard_cap {
+            // What the prepared scenes need, plus whatever else survived the trim unpinned. A
+            // scene another holder still presents is pinned too, but it retires when its
+            // successor is presented and is not held against that successor.
+            let prepared = self.prepared_by_owner.values().flat_map(|snapshot| {
+                snapshot
+                    .reads()
+                    .pages()
+                    .iter()
+                    .map(|page| page.allocation())
+                    .chain(
+                        snapshot
+                            .summary_pages()
+                            .iter()
+                            .map(|page| page.allocation()),
+                    )
+            });
+            let cached = self
+                .read_pages
+                .values()
+                .map(|cached| cached.page.allocation())
+                .chain(
+                    self.summary_pages
+                        .values()
+                        .map(|cached| cached.page.allocation()),
+                );
+            let mut seen = HashSet::<AllocationId>::new();
+            let mut unevictable = 0_usize;
+            for (needed, allocation) in prepared
+                .map(|allocation| (true, allocation))
+                .chain(cached.map(|allocation| (false, allocation)))
+            {
+                if !seen.insert(allocation.id()) {
+                    continue;
+                }
+                let record = allocation.snapshot()?;
+                if needed || record.pins == 0 {
+                    unevictable = unevictable.saturating_add(record.charged_capacity);
+                }
+            }
+            trim.pressure = self.ledger.owner_cap_pressure(owner, unevictable)?;
+            trim.pressure_owner = trim.pressure.map(|_| owner);
+        }
+        Ok(trim)
     }
 
     /// Releases inactive semantic cache ownership toward a shared-ledger headroom target without

@@ -99,6 +99,7 @@ where
                 telemetry: AlignmentSceneCoordinatorTelemetry::default(),
                 refusal: None,
                 speculation_refusal: None,
+                foreground_pressure_refusal: None,
                 vertical_residency_budget_limited: false,
                 vertical_residency_failed: false,
                 vertical_read_residency: None,
@@ -231,11 +232,16 @@ where
         let capacity_plan = entered_disjoint_island
             .then(|| self.foreground_capacity_plan(owner, 0))
             .transpose()?;
+        // Under `Bounded` every owner trims itself after each worker turn, so no low-water
+        // mark has to be established ahead of a disjoint transition.
+        let bounded = self.actor.store().ledger().is_bounded();
         update_result.map(|mut update| {
             update.capacity_plan = capacity_plan;
-            update.proactive_reclaim_target = capacity_plan.and_then(|capacity| {
-                (capacity.charged > capacity.low_water_target).then_some(capacity.low_water_target)
-            });
+            update.proactive_reclaim_target =
+                capacity_plan.filter(|_| !bounded).and_then(|capacity| {
+                    (capacity.charged > capacity.low_water_target)
+                        .then_some(capacity.low_water_target)
+                });
             update
         })
     }
@@ -787,6 +793,7 @@ where
         // scene candidate be attempted once more.
         lane.foreground_row_pause = None;
         lane.scene_build_failed = false;
+        lane.foreground_pressure_refusal = None;
 
         let camera_sequence = desired.camera_sequence;
         let before = self

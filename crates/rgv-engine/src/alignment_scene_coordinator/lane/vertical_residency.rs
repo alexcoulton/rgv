@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, num::NonZeroU32, ops::Range, time::Instant};
 
 use rgv_alignment_scene::{
     AlignmentPresentationStore, AlignmentPresentationStoreError, AlignmentSceneSnapshot,
-    CanonicalRowBlock, GeometryLod, ReservationKind,
+    AllocationOwner, CanonicalRowBlock, GeometryLod, LedgerError, ReservationKind,
 };
 
 use crate::{SourceIntentKind, SourceOwnerId};
@@ -231,17 +231,34 @@ impl AlignmentSceneSourceLane {
         let (presentation_contract, reference) =
             self.available_presentation_contract(desired.source_horizon);
         let prepare_started = Instant::now();
-        let prepared = presentation.warm_read_row_block(
-            current.reads().evidence(),
-            current.reads().atlas(),
-            presentation_contract,
-            current.prepared_interval(),
-            target_block,
-            self.contract.contig_length,
-            self.contract.geometry_tile_bases,
-            reference,
-            ReservationKind::Normal,
-        );
+        // Under `Bounded` a warm page is never refused; it would evict an older warm page
+        // instead. Optional warming therefore stops once its owner's share is full.
+        let share_full = presentation
+            .ledger()
+            .owner_usage(AllocationOwner::Presentation)
+            .ok()
+            .filter(|usage| presentation.ledger().is_bounded() && usage.overage() > 0)
+            .map(|usage| LedgerError::BudgetExceeded {
+                requested: usage.charged,
+                charged: usage.charged,
+                reserved: 0,
+                limit: usage.soft_budget,
+            });
+        let prepared = if let Some(pressure) = share_full {
+            Err(AlignmentPresentationStoreError::Ledger(pressure))
+        } else {
+            presentation.warm_read_row_block(
+                current.reads().evidence(),
+                current.reads().atlas(),
+                presentation_contract,
+                current.prepared_interval(),
+                target_block,
+                self.contract.contig_length,
+                self.contract.geometry_tile_bases,
+                reference,
+                ReservationKind::Normal,
+            )
+        };
         let prepare_elapsed_nanoseconds = elapsed_nanoseconds(prepare_started);
         let candidate = match prepared {
             Ok(candidate) => candidate,

@@ -30,6 +30,10 @@ impl AlignmentSceneSourceLane {
         ) else {
             return Ok(None);
         };
+        if self.foreground_pressure_refusal == Some(desired.source_horizon) {
+            // Already reported: this horizon's evidence cannot fit the evidence owner's cap.
+            return Ok(None);
+        }
         let admission_target = desired.camera.interval();
         // The physical acquisition fills the coherent browsing horizon, while Complete-read
         // admission is evaluated only against the exact visible camera. If independently cached

@@ -1912,6 +1912,12 @@ impl AlignmentRowAtlas {
         Ok(AlignmentRowAtlasPins { allocations })
     }
 
+    /// Every allocation this atlas owns: its metadata and each row layer.
+    pub(crate) fn allocation_leases(&self) -> impl Iterator<Item = &AllocationLease> {
+        std::iter::once(&self.metadata_allocation)
+            .chain(self.layers.iter().map(|layer| &layer.allocation))
+    }
+
     pub(crate) fn touch(
         &self,
         ledger: &AllocationLedger,

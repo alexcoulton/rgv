@@ -258,9 +258,12 @@ impl SessionViewPanel {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ReadBaseDisplayMode {
+    /// Draw only read bases that differ from the reference.
     #[default]
     Mismatches,
+    /// Draw every read base.
     All,
+    /// Draw no read bases.
     Hidden,
 }
 
@@ -268,9 +271,12 @@ pub enum ReadBaseDisplayMode {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ModifiedBaseColorMode {
+    /// One colour per modification type (exact palette unverified).
     #[default]
     ByType,
+    /// A single colour for every modification call (exact rendering unverified).
     Mono,
+    /// Contrast modified calls with unmodified canonical bases.
     ModifiedVsUnmodified,
 }
 
@@ -282,12 +288,18 @@ pub enum ModifiedBaseColorMode {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum BisulfiteContext {
+    /// `CG` (`CpG`) context.
     #[default]
     Cg,
+    /// `CHG` context (`H` is A, C, or T).
     Chg,
+    /// `CHH` context (`H` is A, C, or T).
     Chh,
+    /// `HCG` context (`H` is A, C, or T).
     Hcg,
+    /// `GCH` context (`H` is A, C, or T).
     Gch,
+    /// `WCG` context (`W` is A or T).
     Wcg,
 }
 
@@ -300,12 +312,18 @@ pub enum BisulfiteContext {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SmrtKineticsMode {
+    /// Inter-pulse duration of subread/CLR records (the `ip` array).
     #[default]
     SubreadIpd,
+    /// Pulse width of subread/CLR records (the `pw` array).
     SubreadPulseWidth,
+    /// Forward-strand inter-pulse duration of CCS records.
     CcsForwardIpd,
+    /// Forward-strand pulse width of CCS records.
     CcsForwardPulseWidth,
+    /// Reverse-strand inter-pulse duration of CCS records.
     CcsReverseIpd,
+    /// Reverse-strand pulse width of CCS records.
     CcsReversePulseWidth,
 }
 
@@ -313,17 +331,22 @@ pub enum SmrtKineticsMode {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum UltimaQualityMode {
+    /// Take a homopolymer indel's quality from the base whose `tp` value matches the indel's
+    /// direction.
     #[default]
     Directional,
+    /// Take a homopolymer indel's quality as the minimum base quality across the homopolymer.
     Minimum,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UltimaDisplayOptions {
+    /// How the quality of a homopolymer indel is derived (default `directional`).
     #[serde(default)]
     pub quality_mode: UltimaQualityMode,
-    /// Overrides the Ultima `mc` read-group field when present.
+    /// Overrides the Ultima `mc` read-group field when present. Maximum homopolymer length, in
+    /// bases; omit to use the value from the file's read group.
     #[serde(default)]
     pub maximum_homopolymer_length_override: Option<u16>,
 }
@@ -332,19 +355,27 @@ pub struct UltimaDisplayOptions {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SbxSimplexTailMode {
+    /// Draw simplex-tail bases like any other base.
     Off,
+    /// Mark simplex-tail bases.
     #[default]
     Highlight,
+    /// Do not draw simplex-tail bases.
     Hide,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SbxDisplayOptions {
+    /// How simplex-tail bases are drawn (default `highlight`).
     #[serde(default)]
     pub simplex_tail_mode: SbxSimplexTailMode,
+    /// Highest Phred base quality, 0 to 255, at which a base counts as discordant when
+    /// classifying insertions (default 10).
     #[serde(default = "default_sbx_discordant_quality_maximum")]
     pub discordant_quality_maximum: u8,
+    /// Highest Phred base quality, 0 to 255, at which a run of bases at either end of a read
+    /// counts as simplex tail (default 30).
     #[serde(default = "default_sbx_simplex_tail_quality_maximum")]
     pub simplex_tail_quality_maximum: u8,
 }
@@ -363,8 +394,10 @@ impl Default for SbxDisplayOptions {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OverlappingMatePolicy {
+    /// Count a base covered by both mates of one template once.
     #[default]
     CountOnce,
+    /// Count a base covered by both mates of one template twice, once per mate.
     CountBoth,
 }
 
@@ -405,21 +438,41 @@ pub enum SashimiCountMode {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentColorMode {
+    /// Neutral colour for every read.
     #[default]
     None,
+    /// Colour by alignment strand (forward or reverse).
     Strand,
+    /// Colour by mapping quality (MAPQ).
     MappingQuality,
+    /// Colour by read group (the `RG` tag).
     ReadGroup,
+    /// Colour by haplotype (the `HP` tag).
     Haplotype,
+    /// Colour by absolute template length and pair classification.
     TemplateLength,
+    /// Colour by the relative orientation of the two mates.
     PairOrientation,
+    /// Colour by pair classification, distinguishing unexpected pairs from proper ones.
     UnexpectedPair,
+    /// Colour by the contig the mate maps to.
     MateContig,
+    /// Colour by the strand of the first read of the pair.
     FirstOfPairStrand,
+    /// Bisulfite-conversion colouring for the given cytosine context, e.g.
+    /// `{"bisulfite": "cg"}`.
     Bisulfite(BisulfiteContext),
+    /// SMRT kinetics colouring by the given per-base signal, e.g.
+    /// `{"smrt_kinetics": "subread_ipd"}`.
     SmrtKinetics(SmrtKineticsMode),
+    /// Ultima homopolymer-indel quality overlays, e.g. `{"ultima": {}}` for the defaults.
     Ultima(UltimaDisplayOptions),
+    /// SBX insertion-discordance and simplex-tail overlays, e.g. `{"sbx": {}}` for the
+    /// defaults.
     Sbx(SbxDisplayOptions),
+    /// Colour by the value of a SAM auxiliary tag, given as its two ASCII byte values, e.g.
+    /// `{"tag": [72, 80]}` for `HP`. The first byte must be a letter and the second a letter
+    /// or digit.
     Tag([u8; 2]),
 }
 
@@ -427,22 +480,41 @@ pub enum AlignmentColorMode {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentGroupMode {
+    /// No grouping: one block containing every read.
     #[default]
     None,
+    /// Group into forward-strand and reverse-strand reads.
     Strand,
+    /// Group by read group (the `RG` tag); reads without it form their own group.
     ReadGroup,
+    /// Group by haplotype (the `HP` tag); reads without it form their own group.
     Haplotype,
+    /// Group into reads with and without a supplementary-alignment (`SA`) tag.
     Chimeric,
+    /// Group into supplementary records and primary/secondary records.
     Supplementary,
+    /// Group into reads with and without a soft or hard clip at their left (lower-coordinate)
+    /// end.
     LeftClip,
+    /// Group into reads with and without a soft or hard clip at their right
+    /// (higher-coordinate) end.
     RightClip,
+    /// Group by the relative orientation of the two mates.
     PairOrientation,
+    /// Group into expected (proper or concordant), unexpected, and unpaired reads.
     UnexpectedPair,
+    /// Group by the contig the mate maps to.
     MateContig,
+    /// Group by position in the template (first, last, unknown, or ambiguous).
     ReadOrder,
+    /// Group by the strand of the first read of the pair.
     FirstOfPairStrand,
+    /// Group by the read base observed at the anchor position.
     Base,
+    /// Group by the insertion observed at the anchor position.
     Insertion,
+    /// Group by the value of a SAM auxiliary tag, given as its two ASCII byte values, e.g.
+    /// `{"tag": [72, 80]}` for `HP`. Reads without the tag form their own group.
     Tag([u8; 2]),
 }
 
@@ -450,8 +522,10 @@ pub enum AlignmentGroupMode {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentOrderDirection {
+    /// The mode's own order (for example ascending start, or highest mapping quality first).
     #[default]
     Natural,
+    /// The reverse of the mode's own order.
     Reverse,
 }
 
@@ -459,23 +533,41 @@ pub enum AlignmentOrderDirection {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentSortMode {
+    /// Ascending alignment start, then end.
     #[default]
     Start,
+    /// Forward-strand reads before reverse-strand reads.
     Strand,
+    /// By the strand of the first read of the pair: forward first, unknown last.
     FirstOfPairStrand,
+    /// Highest mapping quality (MAPQ) first.
     MappingQuality,
+    /// By read name, in byte order.
     ReadName,
+    /// By read group (the `RG` tag); reads without it last.
     ReadGroup,
+    /// By haplotype (the `HP` tag); reads without it last.
     Haplotype,
+    /// Longest aligned length first.
     AlignedLength,
+    /// Longest clipping at the left (lower-coordinate) end first.
     LeftClip,
+    /// Longest clipping at the right (higher-coordinate) end first.
     RightClip,
+    /// Longest absolute template length first.
     TemplateLength,
+    /// By the relative orientation of the two mates.
     PairOrientation,
+    /// By the contig and then the position the mate maps to.
     MateContig,
+    /// By pair classification.
     PairStatus,
+    /// By position in the template (first read of the pair before last).
     ReadOrder,
+    /// By the read base observed at the anchor position.
     Base,
+    /// By the value of a SAM auxiliary tag, given as its two ASCII byte values, e.g.
+    /// `{"tag": [72, 80]}` for `HP`; reads without the tag last.
     Tag([u8; 2]),
 }
 
@@ -484,9 +576,14 @@ pub enum AlignmentSortMode {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlignmentPredicateExpression {
+    /// Expression format version. Must be 1 (the default).
     #[serde(default = "default_alignment_predicate_version")]
+    #[cfg_attr(feature = "schema", schemars(range(min = 1, max = 1)))]
     pub version: u16,
+    /// Up to 64 predicates combined with logical AND: a record matches only when every
+    /// predicate matches. An empty list matches every record.
     #[serde(default)]
+    #[cfg_attr(feature = "schema", schemars(length(max = 64)))]
     pub all: Vec<AlignmentViewPredicate>,
 }
 
@@ -507,14 +604,26 @@ const fn default_alignment_predicate_version() -> u16 {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum AlignmentPredicateScope {
+    /// No positional restriction: anywhere in the record.
     Anywhere,
+    /// Restrict the predicate to one reference base.
     Position {
+        /// Contig (reference sequence) name exactly as the workspace reports it, e.g. `chr1`;
+        /// non-empty, at most 1024 bytes. An unknown name matches nothing.
         contig: String,
+        /// Zero-based genomic position on `contig` (one less than the one-based coordinate shown
+        /// in a locus string).
         position: u64,
     },
+    /// Restrict the predicate to one zero-based, half-open reference interval `[start, end)`.
     Interval {
+        /// Contig (reference sequence) name exactly as the workspace reports it, e.g. `chr1`;
+        /// non-empty, at most 1024 bytes. An unknown name matches nothing.
         contig: String,
+        /// Zero-based inclusive start on `contig`, in bases.
         start: u64,
+        /// Zero-based exclusive end on `contig` (half-open `[start, end)`); must be greater than
+        /// `start`.
         end: u64,
     },
 }
@@ -529,13 +638,21 @@ impl Default for AlignmentPredicateScope {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentFlagPredicate {
+    /// PCR or optical duplicate (SAM flag 0x400).
     Duplicate,
+    /// Secondary alignment (SAM flag 0x100).
     Secondary,
+    /// Supplementary alignment (SAM flag 0x800).
     Supplementary,
+    /// Failed platform or vendor quality checks (SAM flag 0x200).
     FailedQualityControl,
+    /// Read is paired (SAM flag 0x1).
     Paired,
+    /// Read is mapped in a proper pair (SAM flag 0x2).
     ProperPair,
+    /// Read is paired (0x1) and its mate is not unmapped (0x8 clear).
     MateMapped,
+    /// Read aligns to the reverse strand (SAM flag 0x10).
     ReverseStrand,
 }
 
@@ -543,11 +660,17 @@ pub enum AlignmentFlagPredicate {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentCigarEventPredicate {
+    /// Insertion (CIGAR `I`).
     Insertion,
+    /// Deletion (CIGAR `D`).
     Deletion,
+    /// Insertion or deletion (CIGAR `I` or `D`).
     Indel,
+    /// Soft clip (CIGAR `S`).
     SoftClip,
+    /// Hard clip (CIGAR `H`).
     HardClip,
+    /// Reference skip, such as a spliced intron (CIGAR `N`).
     ReferenceSkip,
 }
 
@@ -555,12 +678,19 @@ pub enum AlignmentCigarEventPredicate {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentAuxComparison {
+    /// The tag is present; takes no operand.
     Exists,
+    /// The tag's value equals the operand.
     Equal,
+    /// The tag is present with a comparable value that differs from the operand.
     NotEqual,
+    /// The tag's value is greater than the operand.
     Greater,
+    /// The tag's value is greater than or equal to the operand.
     GreaterOrEqual,
+    /// The tag's value is less than the operand.
     Less,
+    /// The tag's value is less than or equal to the operand.
     LessOrEqual,
 }
 
@@ -568,8 +698,14 @@ pub enum AlignmentAuxComparison {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum AlignmentAuxFilterValue {
+    /// Integer operand, compared numerically with integer and character tag values.
     Integer(i64),
+    /// Floating-point operand, compared with float tag values. Stored as the IEEE-754 bit
+    /// pattern of a 64-bit float, written as an unsigned integer (for example
+    /// 4607182418800017408 for 1.0); the value must be finite.
     FloatBits(u64),
+    /// String operand, compared in byte order with string (`Z`) and hex (`H`) tag values; at
+    /// most 65536 bytes.
     String(String),
 }
 
@@ -577,42 +713,92 @@ pub enum AlignmentAuxFilterValue {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "predicate", rename_all = "snake_case")]
 pub enum AlignmentViewPredicate {
+    /// Match records whose mapping quality (MAPQ) lies in an inclusive range. Records without a
+    /// mapping quality never match.
     MappingQuality {
+        /// Inclusive lower bound on MAPQ (0 to 255). Omit for no lower bound; must not exceed
+        /// `maximum`.
         minimum: Option<u8>,
+        /// Inclusive upper bound on MAPQ (0 to 255). Omit for no upper bound.
         maximum: Option<u8>,
     },
+    /// Match records by the state of one SAM flag.
     Flag {
+        /// The SAM flag (or derived flag state) to test.
         flag: AlignmentFlagPredicate,
+        /// Required flag state: true matches records with the flag set, false matches records
+        /// with it clear.
         expected: bool,
     },
+    /// Match records whose absolute template length (|TLEN|) lies in an inclusive range.
     TemplateLength {
+        /// Inclusive lower bound on the absolute template length |TLEN|, in bases. Omit for no
+        /// lower bound; must not exceed `maximum`.
         minimum: Option<u64>,
+        /// Inclusive upper bound on the absolute template length |TLEN|, in bases. Omit for no
+        /// upper bound.
         maximum: Option<u64>,
     },
+    /// Match records whose mate maps to a named contig.
     MateContig {
+        /// Contig name of the mate, exactly as the workspace reports it; non-empty, at most
+        /// 1024 bytes. An unknown name matches nothing.
         contig: String,
     },
+    /// Match records by the presence or value of one SAM auxiliary tag.
     Auxiliary {
+        /// The two-character SAM auxiliary tag as its two ASCII byte values, e.g. `[72, 80]` for
+        /// `HP` or `[78, 77]` for `NM`. The first byte must be a letter and the second a letter
+        /// or digit.
         tag: [u8; 2],
+        /// How the tag is tested. Every comparison except `exists` is false for records lacking
+        /// the tag or holding a value of a different type from the operand.
         comparison: AlignmentAuxComparison,
+        /// Operand for the comparison. Required for every comparison except `exists`, and must
+        /// be omitted for `exists`; otherwise the predicate is rejected as invalid.
         value: Option<AlignmentAuxFilterValue>,
     },
+    /// Match records containing a CIGAR event of a given kind, optionally within a scope and
+    /// length range.
     CigarEvent {
+        /// The kind of CIGAR event to look for.
         event: AlignmentCigarEventPredicate,
+        /// Where the event must occur (default `anywhere`). Insertions and clips are located at
+        /// the single reference position where they occur; deletions and reference skips match
+        /// when their reference span overlaps the scope.
         #[serde(default)]
         scope: AlignmentPredicateScope,
+        /// Inclusive lower bound on the event length, in bases. Omit for no lower bound; must
+        /// not exceed `maximum_length`.
         minimum_length: Option<u32>,
+        /// Inclusive upper bound on the event length, in bases. Omit for no upper bound.
         maximum_length: Option<u32>,
     },
+    /// Match records whose aligned length lies in an inclusive range.
     AlignedLength {
+        /// Inclusive lower bound on the aligned length: the sum of CIGAR `M`, `=`, and `X`
+        /// operation lengths, in bases (not the reference span). Omit for no lower bound; must
+        /// not exceed `maximum`.
         minimum: Option<u64>,
+        /// Inclusive upper bound on the aligned length: the sum of CIGAR `M`, `=`, and `X`
+        /// operation lengths, in bases. Omit for no upper bound.
         maximum: Option<u64>,
     },
+    /// Match records by their base substitutions relative to the reference. Requires a loaded
+    /// reference sequence.
     Substitution {
+        /// Where substitutions are counted (default `anywhere` in the record).
         #[serde(default)]
         scope: AlignmentPredicateScope,
+        /// Base the read must show at a substituted position, as an ASCII byte value: 65 `A`, 67
+        /// `C`, 71 `G`, 84 `T`, or 78 `N` (lower-case values are accepted). Omit to count any
+        /// substituted base.
         observed_base: Option<u8>,
+        /// Inclusive lower bound on the number of matching substitutions within `scope`. Omit
+        /// for the default of 1.
         minimum_count: Option<u32>,
+        /// Inclusive upper bound on the number of matching substitutions within `scope`. Omit
+        /// for no upper bound; must not be below `minimum_count`.
         maximum_count: Option<u32>,
     },
 }
@@ -873,8 +1059,11 @@ impl Default for SessionFilters {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CoverageScaleTransform {
+    /// Bar height proportional to depth.
     #[default]
     Linear,
+    /// Bar height proportional to the square root of depth, which makes low coverage easier to
+    /// see.
     SquareRoot,
 }
 
@@ -930,7 +1119,10 @@ pub struct SessionAlignmentTrack {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TrackChannel {
+    /// The annotation pane, which holds the reference lane, annotation tracks, and the
+    /// annotation-channel row of each alignment track.
     Annotation,
+    /// The reads pane: the individual-read rows of alignment tracks.
     Reads,
 }
 
@@ -1009,13 +1201,23 @@ pub struct WorkspacePresentation {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PresentationNodeId {
+    /// The reference sequence lane (annotation channel).
     Reference,
+    /// One track row in a presentation channel.
     Track {
+        /// Presentation channel (pane) that owns the row.
         channel: TrackChannel,
+        /// Positive stable ID of the track, as reported in the workspace snapshot
+        /// (`tracks[].id`).
         track_id: TrackId,
     },
+    /// One presentation group in a channel.
     Group {
+        /// Presentation channel (pane) that owns the group.
         channel: TrackChannel,
+        /// Positive presentation-group ID as reported in `presentation_groups` of the workspace
+        /// snapshot. IDs are never reused.
+        #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
         group_id: u32,
     },
 }

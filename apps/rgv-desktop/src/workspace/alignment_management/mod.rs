@@ -20,6 +20,7 @@ pub(crate) use gpu_publication::{
     alignment_gpu_bundle_error_is_deferred, alignment_read_camera_capture_error_is_deferred,
     alignment_summary_camera_capture_error_is_deferred,
 };
+pub(crate) use gpu_budget::alignment_gpu_ledger_for;
 pub(crate) use gpu_publication::{
     alignment_scene_snapshot_satisfies_contract, alignment_scene_staging_frame_is_current,
 };

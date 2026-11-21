@@ -8,7 +8,12 @@ use crate::{TrackId, ViewportGeneration};
 /// resizing, or activating a panel must never change this value.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct PanelId(u64);
+pub struct PanelId(
+    /// Positive stable panel ID, as reported in the workspace snapshot (`panels[].id`). It is
+    /// an identity, not a display index.
+    #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+    u64,
+);
 
 impl PanelId {
     pub const fn new(value: u64) -> Self {

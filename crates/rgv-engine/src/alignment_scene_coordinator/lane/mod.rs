@@ -61,6 +61,10 @@ pub(crate) struct AlignmentSceneSourceLane {
     /// Optional margin which exceeded its own bounded acquisition policy. This suppresses only
     /// an identical speculative retry and is cleared by a new source horizon.
     pub(crate) speculation_refusal: Option<GenomicInterval>,
+    /// Source horizon whose evidence alone exceeded the evidence owner's hard cap under the
+    /// `Bounded` memory policy. The request was reported once; the same horizon is not decoded
+    /// again until the horizon, the budget or an explicit retry changes the decision.
+    pub(crate) foreground_pressure_refusal: Option<GenomicInterval>,
     pub(crate) vertical_residency_budget_limited: bool,
     /// Terminal only for optional full-height warming under the current scene authority. This
     /// prevents a deterministic semantic-page failure from spinning in the worker and from

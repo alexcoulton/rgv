@@ -14,7 +14,9 @@ noodles-bgzf.workspace = true
 noodles110.workspace = true
 reqwest.workspace = true
 rsomics-bamio.workspace = true
-rust-htslib.workspace = true
+# `curl` only for the `rust-htslib-http` comparison workload; nothing else in the workspace lets
+# HTSlib open a URL, so the workspace dependency itself no longer needs the feature.
+rust-htslib = { workspace = true, features = ["curl"] }
 serde.workspace = true
 serde_json.workspace = true
 tiny_http.workspace = true

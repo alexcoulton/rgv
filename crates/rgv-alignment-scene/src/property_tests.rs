@@ -9,7 +9,9 @@
 //!   every tile seam, both counting overlapping mates twice and collapsing them onto what the
 //!   earlier mate actually contributed (its CIGAR and base-quality eligibility);
 //! * no builder ever retains more than it reserved (a build fails, or a debug assertion fires,
-//!   when one does).
+//!   when one does);
+//! * ledger accounting is exact under random build, evict, abandon and removal sequences, under
+//!   both memory policies, and trimming never costs published content or a truthful certificate.
 //!
 //! A failure message always names the seed, so a case can be replayed on its own.
 
@@ -32,16 +34,16 @@ use rgv_hts::{
 };
 
 use crate::{
-    AlignmentHandle, AlignmentPageFamily, AlignmentPageKey, AlignmentPresentationStore,
-    AlignmentReadLabelMode, AlignmentRowAtlas, AlignmentSemanticPage, AlignmentSourceRevision,
-    AlignmentStyleContract, AlleleSummaryContract, AlleleSummaryDetail, AllocationClass,
-    AllocationLedger, CanonicalGenomicTile, CanonicalRecordChunk, CanonicalRowBlock,
-    CapabilityRequirement, CompleteCoverage, ContractFingerprint, DepthSummaryContract,
-    EvidenceAcquisition, EvidenceChunk, EvidenceRoot, EvidenceStore, ExactAlleleSummaryTile,
-    ExactDepthSummaryTile, ExactSummaryRoot, FilteredRecordProvenance, GeometryLod, LayoutContract,
-    PayloadContract, PayloadSidecar, PresentationContract, ReadSampling, ReferenceRevision,
-    ReservationKind, RevisionFingerprint, RowAtlasRevision, SourceChunkId, SourceFingerprint,
-    SummaryContract,
+    AlignmentHandle, AlignmentMemoryPolicy, AlignmentPageFamily, AlignmentPageKey,
+    AlignmentPresentationStore, AlignmentReadLabelMode, AlignmentRowAtlas, AlignmentSemanticPage,
+    AlignmentSourceRevision, AlignmentStyleContract, AlleleSummaryContract, AlleleSummaryDetail,
+    AllocationClass, AllocationLedger, AllocationOwner, CanonicalGenomicTile, CanonicalRecordChunk,
+    CanonicalRowBlock, CapabilityRequirement, CompleteCoverage, ContractFingerprint,
+    DepthSummaryContract, EvidenceAcquisition, EvidenceChunk, EvidenceRoot, EvidenceStore,
+    ExactAlleleSummaryTile, ExactDepthSummaryTile, ExactSummaryRoot, FilteredRecordProvenance,
+    GeometryLod, LayoutContract, LedgerError, PayloadContract, PayloadSidecar,
+    PresentationContract, ReadSampling, ReferenceRevision, ReservationKind, RevisionFingerprint,
+    RowAtlasRevision, SourceChunkId, SourceFingerprint, SummaryContract,
 };
 
 const RECORD_CONTRACT: ContractFingerprint = ContractFingerprint::new(23);
@@ -843,6 +845,8 @@ fn drive_steps(
         );
         // Pressure between steps must never cost the published locus its cache entries.
         store.evict_inactive_until(0).unwrap();
+        // Under `Bounded` the owner trim runs as well; it is a no-op under `Complete`.
+        store.trim_to_owner_budgets(&[], usize::MAX).unwrap();
     }
 }
 
@@ -2506,5 +2510,548 @@ fn exact_summaries_select_each_tile_once_for_all_families() {
             first.root().depth_tiles().len()
         );
         assert_eq!(world.ledger.snapshot().unwrap().transient, 0, "seed {seed}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Memory policy: charge-actual accounting, owner budgets and trimming (ARCH-3)
+// ---------------------------------------------------------------------------------------------
+
+const POLICIES: [AlignmentMemoryPolicy; 2] = [
+    AlignmentMemoryPolicy::Bounded,
+    AlignmentMemoryPolicy::Complete,
+];
+
+/// A generated world whose ledger runs under `policy`. The source chunks are charged either way.
+fn policy_world(seed: u64, policy: AlignmentMemoryPolicy) -> World {
+    let world = World::new(seed);
+    world.ledger.set_policy(policy).unwrap();
+    world
+}
+
+/// The ledger's totals are exactly the sum of its live allocation records, class by class and
+/// owner by owner, and nothing is held in reserve between operations.
+fn assert_ledger_exact(ledger: &AllocationLedger, context: &str) {
+    let snapshot = ledger.snapshot().unwrap();
+    assert_eq!(snapshot.reserved, 0, "{context}: reservation left behind");
+    assert_eq!(snapshot.transient, 0, "{context}: scratch left behind");
+    let sum = |keep: &dyn Fn(&crate::AllocationRecordSnapshot) -> bool| {
+        snapshot
+            .records
+            .iter()
+            .filter(|record| keep(record))
+            .map(|record| record.charged_capacity)
+            .sum::<usize>()
+    };
+    assert_eq!(snapshot.charged, sum(&|_| true), "{context}: charged");
+    assert_eq!(
+        snapshot.pinned,
+        sum(&|record| record.pins > 0),
+        "{context}: pinned"
+    );
+    for class in AllocationClass::ALL {
+        assert_eq!(
+            snapshot.retained.bytes(class),
+            sum(&|record| record.class == class),
+            "{context}: {class:?}"
+        );
+    }
+    for owner in AllocationOwner::ALL {
+        let usage = ledger.owner_usage(owner).unwrap();
+        assert_eq!(
+            usage.charged,
+            sum(&|record| record.class.owner() == owner),
+            "{context}: {owner:?} charged"
+        );
+        assert_eq!(
+            usage.pinned,
+            sum(&|record| record.class.owner() == owner && record.pins > 0),
+            "{context}: {owner:?} pinned"
+        );
+    }
+    assert!(
+        snapshot.records.iter().all(|record| record.references > 0),
+        "{context}: an allocation record outlived its last lease"
+    );
+}
+
+/// The authority and scene a random sequence currently has on screen.
+struct Onscreen {
+    target: GenomicInterval,
+    evidence: Arc<EvidenceRoot>,
+    summaries: Arc<ExactSummaryRoot>,
+    atlas: Arc<AlignmentRowAtlas>,
+    rows: BTreeMap<AlignmentHandle, (u32, u64, u64)>,
+}
+
+fn pinned(allocation: &crate::AllocationLease) -> bool {
+    allocation
+        .snapshot()
+        .is_ok_and(|record| record.pins > 0 && record.references > 0)
+}
+
+/// Nothing the published authority or the staged scene owns was released, and the store still
+/// answers for the published locus from cache.
+fn assert_onscreen_intact(
+    store: &mut EvidenceStore,
+    pages: &AlignmentPresentationStore,
+    onscreen: &Onscreen,
+    scene: Option<&Arc<crate::AlignmentSceneSnapshot>>,
+    layout: LayoutContract,
+    context: &str,
+) {
+    assert!(
+        store
+            .current()
+            .is_some_and(|current| Arc::ptr_eq(current, &onscreen.evidence)),
+        "{context}: published evidence replaced"
+    );
+    for chunk in onscreen.evidence.chunks() {
+        assert!(pinned(chunk.core_allocation()), "{context}: chunk unpinned");
+        assert!(pinned(chunk.overlap_allocation()), "{context}: index");
+    }
+    for tile in onscreen.summaries.depth_tiles() {
+        assert!(pinned(tile.allocation()), "{context}: depth tile unpinned");
+    }
+    for allocation in onscreen.atlas.allocation_leases() {
+        assert!(pinned(allocation), "{context}: row atlas unpinned");
+    }
+    assert!(
+        store.cached_covers(onscreen.target, &payload_contract()),
+        "{context}: published locus no longer covered"
+    );
+    // Rows of the published locus are answered by the published atlas, unchanged.
+    let again = store
+        .prepare_row_atlas(
+            &onscreen.evidence,
+            onscreen.target,
+            layout,
+            ReservationKind::Normal,
+        )
+        .unwrap_or_else(|error| panic!("{context}: rows of the published locus: {error}"));
+    assert_eq!(
+        atlas_rows(again.root(), onscreen.target, context),
+        onscreen.rows,
+        "{context}: row assignment changed"
+    );
+    if let Some(scene) = scene {
+        assert!(
+            pages
+                .prepared()
+                .is_some_and(|prepared| Arc::ptr_eq(prepared, scene)),
+            "{context}: staged scene replaced"
+        );
+        for page in scene.reads().pages() {
+            assert!(pinned(page.allocation()), "{context}: read page unpinned");
+        }
+        for page in scene.summary_pages() {
+            assert!(
+                pinned(page.allocation()),
+                "{context}: summary page unpinned"
+            );
+        }
+    }
+}
+
+/// A coverage claim is honoured: whatever the store says it covers, it can build, with every
+/// read overlapping that interval present.
+fn assert_certificates_truthful(
+    world: &World,
+    store: &mut EvidenceStore,
+    rng: &mut XorShift,
+    context: &str,
+) {
+    for _ in 0..4 {
+        let start = rng.below(world.contig_length - 1);
+        let probe = interval(start, rng.between(start + 1, world.contig_length));
+        if !store.cached_covers(probe, &payload_contract()) {
+            continue;
+        }
+        let root = store
+            .prepare(probe, payload_contract(), ReservationKind::Normal)
+            .unwrap_or_else(|error| panic!("{context}: claimed {probe:?} but: {error}"));
+        assert!(root.root().coverage().covers(probe), "{context}: {probe:?}");
+        assert_eq!(
+            root.root().select(probe).unwrap().len(),
+            world.overlapping(probe).count(),
+            "{context}: {probe:?} is certified but reads are missing"
+        );
+    }
+}
+
+fn is_budget_refusal<E: std::fmt::Display>(error: &E) -> bool {
+    error.to_string().contains("allocation budget exceeded")
+}
+
+/// Random build / publish / abandon / warm / trim / budget-edit / removal sequences under both
+/// policies. After every operation the ledger is exact and everything on screen is intact; when
+/// the store and scene are dropped the ledger returns to exactly the fixture's own chunks.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn accounting_is_exact_under_random_build_evict_abandon_sequences_in_both_policies() {
+    let mut trims_with_evictions = 0_u64;
+    let mut pressures = 0_u64;
+    let mut refusals = 0_u64;
+    for policy in POLICIES {
+        for seed in 0..CASES {
+            let world = policy_world(seed, policy);
+            let ledger = world.ledger.clone();
+            let bounded = policy == AlignmentMemoryPolicy::Bounded;
+            let baseline = ledger.progress().unwrap().charged;
+            let expected = pileup(&world);
+            let mut rng = XorShift::new(seed ^ 0x0a3c_3000);
+            let layout = layout(ReadStackingMode::Compact, ReadSampling::Complete);
+            let presentation = PresentationContract {
+                reference: None,
+                annotation: None,
+                ..random_presentation(&mut rng)
+            };
+            let row_block_rows = NonZeroU32::new(8).unwrap();
+            let random_budget =
+                |rng: &mut XorShift| usize::try_from(rng.between(1, baseline as u64 * 12)).unwrap();
+            if bounded {
+                ledger.set_budget(random_budget(&mut rng)).unwrap();
+            }
+            let mut store = world.store();
+            let mut pages = AlignmentPresentationStore::new(ledger.clone());
+            let mut onscreen: Option<Onscreen> = None;
+            let mut scene: Option<Arc<crate::AlignmentSceneSnapshot>> = None;
+            let mut next_step = 0_usize;
+            for operation in 0..48 {
+                let context = format!("{policy:?} seed {seed} operation {operation}");
+                let kind = rng.below(11);
+                match kind {
+                    // Admit the next piece (or revisit the target) and publish its authority.
+                    0..=2 => {
+                        let (piece, target, _) = world.steps[next_step.min(world.steps.len() - 1)];
+                        if next_step < world.steps.len() {
+                            store.admit(world.acquisition(piece)).unwrap();
+                            next_step += 1;
+                        }
+                        let evidence = store
+                            .prepare(target, payload_contract(), ReservationKind::Normal)
+                            .unwrap_or_else(|error| panic!("{context}: evidence: {error}"));
+                        let summaries = store
+                            .prepare_exact_summaries(
+                                evidence.root(),
+                                target,
+                                world.tile_bases,
+                                world.contig_length,
+                                summary_contract(OverlappingMatePolicy::CountBoth),
+                                None,
+                                ReservationKind::Normal,
+                            )
+                            .unwrap_or_else(|error| panic!("{context}: summaries: {error}"));
+                        let rows = store
+                            .prepare_row_atlas(
+                                evidence.root(),
+                                target,
+                                layout,
+                                ReservationKind::Normal,
+                            )
+                            .unwrap_or_else(|error| panic!("{context}: rows: {error}"));
+                        let (evidence, summaries, atlas) = store
+                            .publish_complete_authority(evidence, summaries, rows)
+                            .unwrap();
+                        // Exact summaries stay exact whatever was trimmed before this build.
+                        assert_summaries_match_pileup(&world, &expected, &summaries, &context);
+                        let rows = atlas_rows(&atlas, target, &context);
+                        scene = None;
+                        pages.remove_owner(crate::AlignmentPresentationOwner::default());
+                        onscreen = Some(Onscreen {
+                            target,
+                            evidence,
+                            summaries,
+                            atlas,
+                            rows,
+                        });
+                    }
+                    // A staged build abandoned after a random stage.
+                    3 => {
+                        if let Some(current) = &onscreen {
+                            let stages = rng.below(3);
+                            let evidence = store
+                                .prepare(
+                                    current.target,
+                                    payload_contract(),
+                                    ReservationKind::Normal,
+                                )
+                                .unwrap_or_else(|error| panic!("{context}: evidence: {error}"));
+                            let summaries = (stages >= 1).then(|| {
+                                store
+                                    .prepare_exact_summaries(
+                                        evidence.root(),
+                                        current.target,
+                                        world.tile_bases,
+                                        world.contig_length,
+                                        summary_contract(OverlappingMatePolicy::CountOnce),
+                                        None,
+                                        ReservationKind::Normal,
+                                    )
+                                    .unwrap_or_else(|error| panic!("{context}: {error}"))
+                            });
+                            let rows = (stages >= 2).then(|| {
+                                store
+                                    .prepare_row_atlas(
+                                        evidence.root(),
+                                        current.target,
+                                        layout,
+                                        ReservationKind::Normal,
+                                    )
+                                    .unwrap_or_else(|error| panic!("{context}: {error}"))
+                            });
+                            drop((evidence, summaries, rows));
+                        }
+                    }
+                    // Prepare a scene; stage it, or abandon the candidate.
+                    4 | 5 => {
+                        if let Some(current) = &onscreen {
+                            let rows = 0..u32::try_from(current.atlas.row_count()).unwrap();
+                            let candidate = pages
+                                .prepare(
+                                    &current.evidence,
+                                    &current.summaries,
+                                    &current.atlas,
+                                    presentation,
+                                    current.target,
+                                    rows,
+                                    world.contig_length,
+                                    world.tile_bases,
+                                    row_block_rows,
+                                    None,
+                                    ReservationKind::Normal,
+                                )
+                                .unwrap_or_else(|error| panic!("{context}: scene: {error}"));
+                            // A page answered from cache, or rebuilt after a trim, is the page
+                            // a clean build produces.
+                            for page in candidate.snapshot().reads().pages().iter().take(6) {
+                                let key = page.key();
+                                let fresh = AlignmentSemanticPage::build(
+                                    AlignmentPageKey::new(
+                                        current.evidence.source_revision(),
+                                        current.evidence.revision(),
+                                        current.atlas.revision(),
+                                        current.atlas.layout_contract().fingerprint(),
+                                        presentation.page_fingerprint(key.family()),
+                                        key.genomic_tile(),
+                                        key.row_block(),
+                                        key.family(),
+                                        presentation.geometry_lod,
+                                    ),
+                                    &current.evidence,
+                                    &current.atlas,
+                                    presentation,
+                                    world.contig_length,
+                                    None,
+                                    &ledger,
+                                    ReservationKind::Normal,
+                                    7,
+                                )
+                                .unwrap_or_else(|error| panic!("{context}: fresh: {error}"));
+                                assert_pages_structurally_equal(page, &fresh, &context);
+                            }
+                            if kind == 4 {
+                                scene = Some(pages.stage(candidate));
+                            }
+                        }
+                    }
+                    // Optional warm-up of one row block.
+                    6 => {
+                        if let Some(current) = &onscreen
+                            && current.atlas.row_count() > 0
+                        {
+                            let blocks = (current.atlas.row_count() as u64)
+                                .div_ceil(u64::from(row_block_rows.get()));
+                            pages
+                                .warm_read_row_block(
+                                    &current.evidence,
+                                    &current.atlas,
+                                    presentation,
+                                    current.target,
+                                    CanonicalRowBlock::new(
+                                        u32::try_from(rng.below(blocks)).unwrap(),
+                                        row_block_rows,
+                                    ),
+                                    world.contig_length,
+                                    world.tile_bases,
+                                    None,
+                                    ReservationKind::Normal,
+                                )
+                                .unwrap_or_else(|error| panic!("{context}: warm: {error}"));
+                        }
+                    }
+                    // Cache maintenance, in bounded quanta or to completion.
+                    7 | 8 => {
+                        let quantum = if rng.chance(1, 2) {
+                            usize::MAX
+                        } else {
+                            usize::try_from(rng.between(1, 6)).unwrap()
+                        };
+                        if bounded {
+                            let shielded = onscreen
+                                .as_ref()
+                                .filter(|_| rng.chance(1, 2))
+                                .map(|current| vec![current.target])
+                                .unwrap_or_default();
+                            let trim = store.trim_to_owner_budgets(&shielded, quantum).unwrap();
+                            let page_trim = pages.trim_to_owner_budget(quantum).unwrap();
+                            trims_with_evictions +=
+                                u64::from(trim.evicted_entries + page_trim.evicted_entries > 0);
+                            for (pressure, owners) in [
+                                (
+                                    trim.pressure,
+                                    &[AllocationOwner::Evidence, AllocationOwner::Summary][..],
+                                ),
+                                (page_trim.pressure, &[AllocationOwner::Presentation][..]),
+                            ] {
+                                let Some(pressure) = pressure else {
+                                    continue;
+                                };
+                                pressures += 1;
+                                // Pressure is intrinsic and names real unevictable bytes.
+                                let LedgerError::BudgetExceeded {
+                                    requested, limit, ..
+                                } = pressure
+                                else {
+                                    panic!("{context}: {pressure:?}");
+                                };
+                                assert!(pressure.intrinsically_exceeds_limit(), "{context}");
+                                assert!(
+                                    owners.iter().any(|owner| {
+                                        let usage = ledger.owner_usage(*owner).unwrap();
+                                        usage.hard_cap == limit && requested <= usage.charged
+                                    }),
+                                    "{context}: {pressure:?}"
+                                );
+                            }
+                            if quantum == usize::MAX && shielded.is_empty() {
+                                assert!(trim.complete && page_trim.complete, "{context}");
+                                // Nothing is unevictable in the summary owner except pins.
+                                let usage = ledger.owner_usage(AllocationOwner::Summary).unwrap();
+                                assert!(
+                                    usage.charged <= usage.soft_budget.max(usage.pinned),
+                                    "{context}: summaries {usage:?}"
+                                );
+                                // A complete trim is a fixed point.
+                                let again = store.trim_to_owner_budgets(&[], usize::MAX).unwrap();
+                                assert_eq!(again.evicted_entries, 0, "{context}");
+                                assert_eq!(
+                                    pages
+                                        .trim_to_owner_budget(usize::MAX)
+                                        .unwrap()
+                                        .evicted_entries,
+                                    0,
+                                    "{context}"
+                                );
+                            }
+                        } else {
+                            let target = usize::try_from(rng.below(baseline as u64 * 2)).unwrap();
+                            store.evict_inactive_batch(target, quantum).unwrap();
+                            pages.evict_inactive_batch(target, quantum).unwrap();
+                        }
+                    }
+                    // A budget edit. Under `Complete` a full ledger refuses the next build and
+                    // leaves no trace of the attempt.
+                    9 => {
+                        if bounded {
+                            let budget = random_budget(&mut rng);
+                            store.reduce_budget(budget).unwrap();
+                            pages.reduce_budget(budget).unwrap();
+                        } else if let Some(current) = &onscreen {
+                            let before = ledger.progress().unwrap();
+                            ledger.set_budget(before.charged).unwrap();
+                            let refused = store.prepare(
+                                current.target,
+                                payload_contract(),
+                                ReservationKind::Normal,
+                            );
+                            assert!(
+                                refused.as_ref().is_err_and(is_budget_refusal),
+                                "{context}: a full strict ledger admitted a build"
+                            );
+                            refusals += 1;
+                            assert_eq!(
+                                ledger.progress().unwrap().charged,
+                                before.charged,
+                                "{context}: a refused build left bytes charged"
+                            );
+                            ledger.set_budget(before.budget).unwrap();
+                        }
+                    }
+                    // Track removal: every store-owned byte goes with it.
+                    _ => {
+                        scene = None;
+                        onscreen = None;
+                        drop(std::mem::replace(&mut store, world.store()));
+                        drop(std::mem::replace(
+                            &mut pages,
+                            AlignmentPresentationStore::new(ledger.clone()),
+                        ));
+                        next_step = 0;
+                        assert_eq!(
+                            ledger.progress().unwrap().charged,
+                            baseline,
+                            "{context}: removal leaked"
+                        );
+                    }
+                }
+                assert_ledger_exact(&ledger, &context);
+                if let Some(current) = &onscreen {
+                    assert_onscreen_intact(
+                        &mut store,
+                        &pages,
+                        current,
+                        scene.as_ref(),
+                        layout,
+                        &context,
+                    );
+                }
+                assert_certificates_truthful(&world, &mut store, &mut rng, &context);
+                assert_ledger_exact(&ledger, &context);
+            }
+            drop((scene, onscreen, store, pages));
+            assert_eq!(
+                ledger.progress().unwrap().charged,
+                baseline,
+                "{policy:?} seed {seed}: bytes leaked past the last owner"
+            );
+            drop(world);
+            let empty = ledger.snapshot().unwrap();
+            assert_eq!(empty.charged, 0, "{policy:?} seed {seed}");
+            assert_eq!(empty.pinned, 0, "{policy:?} seed {seed}");
+            assert!(empty.records.is_empty(), "{policy:?} seed {seed}");
+        }
+    }
+    eprintln!(
+        "memory policy: {trims_with_evictions} trims evicted, {pressures} pressures, {refusals} strict refusals"
+    );
+    // Vacuous unless the bounded trim actually evicts and the strict ledger actually refuses.
+    assert!(trims_with_evictions > 0, "no bounded trim ever evicted");
+    assert!(refusals > 0, "the strict ledger never refused a build");
+}
+
+/// The exact-summary and extension properties hold unchanged when the same worlds run under
+/// `Bounded` with a budget far below their size and the owner trim after every step.
+#[test]
+fn bounded_worlds_keep_summaries_exact_and_extensions_equal_to_clean_builds() {
+    for seed in 0..CASES {
+        let world = policy_world(seed, AlignmentMemoryPolicy::Bounded);
+        world.ledger.set_budget(1 << 10).unwrap();
+        let expected = pileup(&world);
+        drive(
+            &world,
+            layout(ReadStackingMode::Compact, ReadSampling::Complete),
+            OverlappingMatePolicy::CountBoth,
+            |context, target, _, evidence, summaries, atlas| {
+                assert_summaries_match_pileup(&world, &expected, summaries, context);
+                let clean = world.clean_evidence(target);
+                assert_eq!(
+                    evidence.select(target).unwrap().len(),
+                    clean.select(target).unwrap().len(),
+                    "{context}: extended evidence differs from a clean build"
+                );
+                atlas_rows(atlas, target, context);
+            },
+        );
     }
 }

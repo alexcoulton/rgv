@@ -118,17 +118,17 @@ pub use presentation_store::{
     PresentationStorePressure,
 };
 pub use resource::{
-    AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory,
+    AlignmentCacheResidencyClass, AlignmentCacheResidencyInventory, AlignmentMemoryPolicy,
     AllocationBundleAccountingOperation, AllocationBundleActual, AllocationBundleCommit,
     AllocationBundleDemand, AllocationBundleError, AllocationBundleLease,
     AllocationBundleReservation, AllocationBundleSlot, AllocationBundleSpec, AllocationClass,
-    AllocationId, AllocationLease, AllocationLedger, AllocationRecordSnapshot,
-    AllocationReservation, AllocationRetirementClaim, AllocationRetirementClaimBuilder,
-    AllocationRetirementClaimSet, AllocationRetirementToken, LedgerError, LedgerInventory,
-    LedgerOperationCounters, LedgerProgress, LedgerProgressEpoch, LedgerProgressSubscription,
-    LedgerRetainedBreakdown, LedgerSnapshot, PinnedAllocationLease,
-    PreparedAllocationBundleSettlement, ReservationKind, TransientResourceClass,
-    TransientResourceReservation, TransientResourceSnapshot,
+    AllocationId, AllocationLease, AllocationLedger, AllocationOwner, AllocationOwnerShares,
+    AllocationOwnerUsage, AllocationRecordSnapshot, AllocationReservation,
+    AllocationRetirementClaim, AllocationRetirementClaimBuilder, AllocationRetirementClaimSet,
+    AllocationRetirementToken, LedgerError, LedgerInventory, LedgerOperationCounters,
+    LedgerProgress, LedgerProgressEpoch, LedgerProgressSubscription, LedgerRetainedBreakdown,
+    LedgerSnapshot, PinnedAllocationLease, PreparedAllocationBundleSettlement, ReservationKind,
+    TransientResourceClass, TransientResourceReservation, TransientResourceSnapshot,
 };
 pub use revision::{
     AlignmentSourceRevision, AnnotationRevision, EvidenceRevision, ReferenceRevision,
@@ -158,8 +158,8 @@ pub use semantic_page::{
     UltimaUnavailableToken,
 };
 pub use store::{
-    EvidenceCandidate, EvidenceStore, EvidenceStoreError, ExactSummaryCandidate, RowAtlasCandidate,
-    StorePressure,
+    BoundedCacheTrim, EvidenceCandidate, EvidenceStore, EvidenceStoreError, ExactSummaryCandidate,
+    RowAtlasCandidate, StorePressure,
 };
 pub use summary::{ExactDepthSummaryError, ExactDepthSummaryKey, ExactDepthSummaryTile};
 pub use summary_page::{

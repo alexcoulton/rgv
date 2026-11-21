@@ -395,6 +395,7 @@ fn pump_until_idle(coordinator: &mut TestCoordinator) -> Vec<&'static str> {
 }
 
 mod admission;
+mod bounded;
 mod camera;
 mod capacity;
 mod pressure;

@@ -36,6 +36,16 @@ enum Command {
         #[arg(long, default_value = "benchmark-results/latest.json")]
         output: PathBuf,
     },
+    /// Compare the two production decoders (rust-htslib and noodles) on a local BAM, with one
+    /// and four inflate threads, at layout and full-detail decode levels (HTS-15).
+    CompareBackends {
+        #[arg(default_value = "benchmark-data/mixed.bam")]
+        input: PathBuf,
+        #[arg(long, default_value_t = 9)]
+        iterations: usize,
+        #[arg(long, default_value = "benchmark-results/backend-compare.json")]
+        output: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -52,9 +62,15 @@ fn main() -> Result<()> {
             remote_latency_ms,
             output,
         } => runner::run(&input, iterations, remote_latency_ms, &output),
+        Command::CompareBackends {
+            input,
+            iterations,
+            output,
+        } => backend_compare::run(&input, iterations, &output),
     }
 }
 
+mod backend_compare;
 mod generate;
 mod remote;
 mod runner;

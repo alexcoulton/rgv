@@ -1087,6 +1087,13 @@ fn scene_worker_loop<B>(
             }
         }
 
+        // 2. Bounded-policy maintenance: every owner trims its own caches back to its share.
+        // Constant time while inside budget, and a no-op under the strict policy.
+        let Some(trim_complete) = run_bounded_trim(&mut coordinator, &request_tokens, output)
+        else {
+            return;
+        };
+
         coordinator.set_capacity_reclaim_active(pending_eviction.is_some());
         let source_was_waiting = std::mem::take(&mut source_waiting);
         let source_pending = coordinator.has_pending_source_work();
@@ -1159,6 +1166,8 @@ fn scene_worker_loop<B>(
                     return;
                 }
             }
+            // An unfinished trim is the next thing to do, not a reason to sleep.
+            WorkerTurn::Wait if !trim_complete => {}
             WorkerTurn::Wait => {
                 // Nothing is runnable. Block until a request arrives or the decoder signals a
                 // finished unit; the timeout is only a safety net.
@@ -1184,6 +1193,50 @@ fn scene_worker_loop<B>(
                 }
             }
         }
+    }
+}
+
+/// Runs one `Bounded`-policy trim quantum and reports the request it had to abandon, if any.
+/// Returns whether the trim finished, or `None` once the event receiver is gone.
+///
+/// This replaces the reclaim transaction under `Bounded`: no owner waits for another, nothing is
+/// retried, and the one pressure which can still occur (unevictable content alone over an
+/// owner's hard cap) arrives latched and is reported exactly once through the existing event.
+fn run_bounded_trim<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    request_tokens: &BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+) -> Option<bool>
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + Send + Sync + 'static,
+{
+    match coordinator.trim_bounded_caches(MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM) {
+        Ok(trim) => {
+            if let Some(pressure) = trim.pressure
+                && !send_resource_pressure(
+                    output,
+                    pressure.owner,
+                    current_request_token(request_tokens, pressure.owner),
+                    pressure.target,
+                    AlignmentSceneEngineOperation::PumpSource,
+                    pressure.intent,
+                    pressure.pressure,
+                )
+            {
+                return None;
+            }
+            Some(trim.complete)
+        }
+        // A trim which cannot run is reported once per occurrence and never blocks the worker.
+        Err(error) => send_error(
+            output,
+            None,
+            None,
+            AlignmentSceneEngineOperation::EvictInactive,
+            error,
+        )
+        .then_some(true),
     }
 }
 
@@ -1224,8 +1277,7 @@ where
             }
             let stopped_without_progress = eviction.quantum_entries == 0;
             let complete = eviction.reclaim_complete || stopped_without_progress;
-            pending.accumulated =
-                Some(merge_inactive_eviction(pending.accumulated, eviction));
+            pending.accumulated = Some(merge_inactive_eviction(pending.accumulated, eviction));
             if complete {
                 let eviction = pending
                     .accumulated
@@ -1621,6 +1673,11 @@ fn schedule_internal_reclaim<B>(
     let LedgerError::BudgetExceeded { requested, .. } = pressure else {
         return;
     };
+    if coordinator.actor().store().ledger().is_bounded() {
+        // A `Bounded` refusal is intrinsic to one build or one request. Evicting caches cannot
+        // admit it, and the owners already trim themselves after every turn.
+        return;
+    }
     let Ok(plan) = coordinator.foreground_capacity_plan(owner, requested) else {
         return;
     };
@@ -2859,7 +2916,10 @@ mod tests {
         // Wait until the worker has installed its waker and found the decoder busy.
         let deadline = Instant::now() + Duration::from_secs(30);
         while polls.load(Ordering::SeqCst) == 0 {
-            assert!(Instant::now() < deadline, "the worker never reached the decoder");
+            assert!(
+                Instant::now() < deadline,
+                "the worker never reached the decoder"
+            );
             thread::yield_now();
         }
         let before = polls.load(Ordering::SeqCst);
@@ -2963,6 +3023,128 @@ mod tests {
             repeated_pressures <= 2,
             "the same refusal was reported {repeated_pressures} more times"
         );
+    }
+
+    fn bounded_ledger(budget: usize) -> AllocationLedger {
+        AllocationLedger::with_policy(
+            rgv_alignment_scene::AlignmentMemoryPolicy::Bounded,
+            budget,
+            budget,
+            64 << 20,
+        )
+    }
+
+    #[test]
+    fn bounded_worker_reports_over_cap_evidence_exactly_once_and_then_goes_quiet() {
+        // No budget to speak of: the first decoded chunk already exceeds the evidence cap.
+        let (engine, contract, policy, camera, _) =
+            test_engine_with_ledger(None, bounded_ledger(1));
+        let owner = SourceOwnerId::new(92);
+        engine.try_insert_lane(owner, contract, policy).unwrap();
+        engine.try_update_camera(owner, camera).unwrap();
+        let AlignmentSceneEngineEvent::ResourcePressure {
+            intent,
+            pressure,
+            disposition,
+            ..
+        } = receive_matching(&engine, |event| {
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::ResourcePressure { owner: seen, .. } if *seen == owner
+            )
+        })
+        else {
+            unreachable!("the predicate admits only resource pressure");
+        };
+        assert_eq!(intent, SourceIntentKind::Foreground);
+        assert!(pressure.intrinsically_exceeds_limit());
+        assert_eq!(
+            disposition,
+            AlignmentSceneResourcePressureDisposition::Infeasible
+        );
+
+        // Latched: no second report, no reclaim transaction, no retry, and the worker idles.
+        let quiet_until = Instant::now() + Duration::from_millis(1_500);
+        while Instant::now() < quiet_until {
+            if let Some(
+                event @ (AlignmentSceneEngineEvent::ResourcePressure { .. }
+                | AlignmentSceneEngineEvent::InactiveEvicted { .. }
+                | AlignmentSceneEngineEvent::InactiveEvictionProgress { .. }
+                | AlignmentSceneEngineEvent::InactiveEvictionSuperseded { .. }
+                | AlignmentSceneEngineEvent::Error { .. }),
+            ) = engine.receive_timeout(Duration::from_millis(100)).unwrap()
+            {
+                panic!("bounded pressure was followed by {event:?}");
+            }
+        }
+        let progress = engine.ledger().progress().unwrap();
+        assert_eq!((progress.reserved, progress.transient), (0, 0));
+    }
+
+    #[test]
+    fn bounded_worker_publishes_then_trims_its_caches_without_any_pressure_event() {
+        let (engine, contract, policy, camera, _) =
+            test_engine_with_ledger(None, bounded_ledger(64 << 20));
+        let owner = SourceOwnerId::new(93);
+        engine.try_insert_lane(owner, contract, policy).unwrap();
+        engine.try_update_camera(owner, camera).unwrap();
+        let no_pressure = |event: &AlignmentSceneEngineEvent| {
+            assert!(
+                !matches!(
+                    event,
+                    AlignmentSceneEngineEvent::ResourcePressure { .. }
+                        | AlignmentSceneEngineEvent::BudgetPressure { .. }
+                        | AlignmentSceneEngineEvent::InactiveEvicted { .. }
+                        | AlignmentSceneEngineEvent::InactiveEvictionProgress { .. }
+                        | AlignmentSceneEngineEvent::InactiveEvictionSuperseded { .. }
+                        | AlignmentSceneEngineEvent::Error { .. }
+                ),
+                "bounded navigation emitted {event:?}"
+            );
+        };
+        receive_matching(&engine, |event| {
+            no_pressure(event);
+            matches!(
+                event,
+                AlignmentSceneEngineEvent::FrameUpdated { owner: seen, frame, .. }
+                    if *seen == owner && frame.visible_complete()
+            )
+        });
+        // Let read-ahead and optional warming fill the caches.
+        while let Some(event) = engine.receive_timeout(Duration::from_millis(400)).unwrap() {
+            no_pressure(&event);
+        }
+
+        // Shrink the budget under the idle worker: every owner returns to its share (or to what
+        // is pinned on screen) by itself, with no request from the caller.
+        let ledger = engine.ledger().clone();
+        let pinned = ledger.progress().unwrap().pinned;
+        ledger.set_budget(pinned.max(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(event) = engine.receive_timeout(Duration::from_millis(100)).unwrap() {
+                no_pressure(&event);
+            }
+            let settled = [
+                rgv_alignment_scene::AllocationOwner::Evidence,
+                rgv_alignment_scene::AllocationOwner::Summary,
+                rgv_alignment_scene::AllocationOwner::Presentation,
+            ]
+            .into_iter()
+            .all(|owner| {
+                let usage = ledger.owner_usage(owner).unwrap();
+                usage.charged <= usage.soft_budget.max(usage.pinned)
+            });
+            if settled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the idle bounded worker never trimmed: {:?}",
+                ledger.progress().unwrap()
+            );
+        }
+        assert_eq!(ledger.progress().unwrap().pinned, pinned);
     }
 
     #[test]

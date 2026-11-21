@@ -90,6 +90,19 @@ pub struct AlignmentCoordinatorEviction {
     pub reclaim_complete: bool,
 }
 
+/// One maintenance pass of the `Bounded` memory policy over the source and presentation caches.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentBoundedTrim {
+    pub evicted_entries: usize,
+    /// `false` when the entry quantum ran out with an owner still over its share.
+    pub complete: bool,
+    /// Optional read-ahead was withdrawn because unevictable evidence exceeded its cap.
+    pub speculation_aborted: bool,
+    /// The in-flight request which was abandoned because unevictable content alone exceeds an
+    /// owner's hard cap. It is latched: the caller reports it once.
+    pub pressure: Option<AlignmentSceneOwnerPressure>,
+}
+
 /// Source-level coordinator event. A source actor is shared by all panel owners; publication is
 /// therefore explicitly attributed to the lane whose latest intent completed.
 #[derive(Clone, Debug)]

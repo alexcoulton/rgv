@@ -438,12 +438,20 @@ impl Viewer {
         // One enforcing authority is shared by every alignment source, immutable scene layer, and
         // derived GPU page. The explicit transition reserve permits one old and one candidate
         // visible set; transient decoder/upload work is reported under its own equal ceiling.
-        let alignment_scene_ledger = AllocationLedger::new_with_transient_budget(
+        // The memory policy is read once: the renderers' leases belong to the ledger they were
+        // charged to, so a change of policy takes effect at the next launch.
+        let alignment_scene_ledger = AllocationLedger::with_policy(
+            settings.alignment_memory_policy,
             total_cache_bytes,
             total_cache_bytes,
             total_cache_bytes,
         );
         let alignment_ledger_progress = alignment_scene_ledger.subscribe_progress();
+        let alignment_gpu_ledger = crate::workspace::alignment_management::alignment_gpu_ledger_for(
+            &alignment_scene_ledger,
+            total_cache_bytes,
+        );
+        let alignment_gpu_ledger_progress = alignment_gpu_ledger.subscribe_progress();
         let context_lane_gpu_budget_bytes = total_cache_bytes;
         let (track_specifications, tracks) = build_track_specs(&options);
         let contig_aliases = launch_contig_aliases(&options)?;
@@ -837,6 +845,8 @@ impl Viewer {
             context_scene_gpu_frame: ContextSceneGpuFrame::default(),
             alignment_scene_ledger,
             alignment_ledger_progress,
+            alignment_gpu_ledger,
+            alignment_gpu_ledger_progress,
             alignment_gpu_renderer,
             alignment_summary_gpu_renderer,
             alignment_gpu_last_prepare_stats: AlignmentGpuPrepareStats::default(),
