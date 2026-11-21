@@ -30,8 +30,12 @@ use crate::{
     source_revision::{LocalSourceGuard, digest_bytes, local_source_stamp, remote_source_stamp},
 };
 
+mod in_memory;
+mod local_bam;
 mod positioned_stream;
 
+pub use in_memory::MAX_IN_MEMORY_ALIGNMENT_BYTES;
+pub use local_bam::LocalBamAlignmentSource;
 use positioned_stream::NoodlesPositionedStream;
 
 /// Remote BAM stream and its index. They are kept apart (instead of in a noodles
@@ -39,6 +43,24 @@ use positioned_stream::NoodlesPositionedStream;
 /// moved onto its worker thread.
 type NoodlesReader = noodles::bgzf::io::Reader<HttpRangeReader>;
 type NoodlesCramReader = cram::io::IndexedReader<HttpRangeReader>;
+
+/// The BGZF stream the noodles BAM front ends decode: the remote range reader or a local file.
+/// The record iteration, positioned streams and resume logic are generic over it, so a local
+/// and a remote BAM are read by the same code.
+pub(crate) trait BamBlockStream:
+    noodles::bgzf::io::BufRead + noodles::bgzf::io::Seek
+{
+    /// Announces the `(start, end)` virtual-offset ranges about to be read. A remote stream
+    /// plans its range requests from them; a local file has nothing to plan.
+    fn plan_reads(&mut self, _chunks: Vec<(u64, u64)>) {}
+}
+
+impl BamBlockStream for NoodlesReader {
+    fn plan_reads(&mut self, chunks: Vec<(u64, u64)>) {
+        self.get_mut().set_bgzf_read_plan(chunks);
+    }
+}
+
 const MAX_REMOTE_ALIGNMENT_INDEX_BYTES: usize = 256 * 1024 * 1024;
 const MAX_REMOTE_CRAM_REFERENCE_BASES: usize = 512 * 1024 * 1024;
 const MAX_REMOTE_CRAI_COMPRESSED_BYTES: usize = 16 * 1024 * 1024;
@@ -58,11 +80,13 @@ fn alignment_header_metadata_from_noodles(header: &sam::Header) -> AlignmentHead
     crate::alignment::alignment_header_metadata_from_sam(&text)
 }
 
-/// Production alignment backend selection. Local BAM uses `HTSlib`; local CRAM and every remote
+/// Production alignment backend selection. Local BAM uses `HTSlib` unless
+/// [`AlignmentOpenOptions::local_bam_backend`] asks for noodles; local CRAM and every remote
 /// object (BAM or CRAM, whatever its URL looks like) use noodles, remote ones over the
 /// observable range reader. `HTSlib` never opens a URL.
 pub enum ProductionAlignmentSource {
     Htslib(LocalAlignmentSource),
+    LocalBam(Box<LocalBamAlignmentSource>),
     LocalCram(Box<LocalCramAlignmentSource>),
     RemoteBam(Box<RemoteBamAlignmentSource>),
     RemoteCram(Box<RemoteCramAlignmentSource>),
@@ -110,22 +134,46 @@ impl ProductionAlignmentSource {
                 }
             };
         }
-        if path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("cram"))
-        {
+        let has_extension = |expected: &str| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
+        };
+        if has_extension("cram") {
             LocalCramAlignmentSource::open(path, options)
                 .map(Box::new)
                 .map(Self::LocalCram)
+        } else if has_extension("sam") {
+            // Plain-text SAM has no index: it is loaded whole, up to a size cap.
+            Self::open_in_memory(path, options)
+        } else if options.local_bam_backend == crate::AlignmentBackendPreference::Noodles
+            && has_extension("bam")
+        {
+            // Only a file named `.bam`: anything else keeps `HTSlib`'s format detection.
+            LocalBamAlignmentSource::open(path, options)
+                .map(Box::new)
+                .map(Self::LocalBam)
         } else {
             LocalAlignmentSource::open(path, options).map(Self::Htslib)
         }
     }
 
+    /// Loads a plain-text SAM file, or a BAM file without an index (sorted or not), into
+    /// memory and serves it like any indexed alignment source; see
+    /// [`LocalBamAlignmentSource::open_in_memory`] for the size cap. [`Self::open`] does this
+    /// by itself for a file named `.sam`; an unindexed `.bam` has to be opened here.
+    pub fn open_in_memory(
+        path: impl AsRef<std::path::Path>,
+        options: &AlignmentOpenOptions,
+    ) -> Result<Self, AlignmentError> {
+        LocalBamAlignmentSource::open_in_memory(path, options)
+            .map(Box::new)
+            .map(Self::LocalBam)
+    }
+
     pub fn remote_io_stats(&self) -> Option<RemoteIoStats> {
         match self {
-            Self::Htslib(_) | Self::LocalCram(_) => None,
+            Self::Htslib(_) | Self::LocalBam(_) | Self::LocalCram(_) => None,
             Self::RemoteBam(source) => Some(source.remote_io_stats()),
             Self::RemoteCram(source) => Some(source.remote_io_stats()),
         }
@@ -133,7 +181,7 @@ impl ProductionAlignmentSource {
 
     pub fn set_remote_transfer_budget(&mut self, budget: Option<RemoteTransferBudget>) {
         match self {
-            Self::Htslib(_) | Self::LocalCram(_) => {}
+            Self::Htslib(_) | Self::LocalBam(_) | Self::LocalCram(_) => {}
             Self::RemoteBam(source) => source.set_transfer_budget(budget),
             Self::RemoteCram(source) => source.set_transfer_budget(budget),
         }
@@ -142,6 +190,7 @@ impl ProductionAlignmentSource {
     pub fn index_overview(&self) -> Option<&crate::AlignmentIndexOverview> {
         match self {
             Self::Htslib(source) => source.index_overview(),
+            Self::LocalBam(source) => source.index_overview(),
             Self::LocalCram(_) => None,
             Self::RemoteBam(source) => source.index_overview.as_ref(),
             Self::RemoteCram(_) => None,
@@ -153,6 +202,7 @@ impl ProductionAlignmentSource {
     pub fn header_metadata(&self) -> &Arc<AlignmentHeaderMetadata> {
         match self {
             Self::Htslib(source) => source.header_metadata(),
+            Self::LocalBam(source) => &source.metadata,
             Self::LocalCram(source) => &source.metadata,
             Self::RemoteBam(source) => &source.metadata,
             Self::RemoteCram(source) => &source.metadata,
@@ -164,6 +214,7 @@ impl ProductionAlignmentSource {
     pub fn normalization_mapped_records(&self) -> Option<u64> {
         match self {
             Self::Htslib(source) => source.normalization_mapped_records(),
+            Self::LocalBam(source) => source.normalization_mapped_records,
             Self::RemoteBam(source) => source.normalization_mapped_records,
             Self::LocalCram(_) | Self::RemoteCram(_) => None,
         }
@@ -178,7 +229,7 @@ impl ProductionAlignmentSource {
     /// Installs or clears the cancellation probe consulted by remote range requests.
     pub fn set_remote_cancellation(&mut self, cancellation: Option<RemoteCancellation>) {
         match self {
-            Self::Htslib(_) | Self::LocalCram(_) => {}
+            Self::Htslib(_) | Self::LocalBam(_) | Self::LocalCram(_) => {}
             Self::RemoteBam(source) => source.set_cancellation(cancellation),
             Self::RemoteCram(source) => source.set_cancellation(cancellation),
         }
@@ -206,7 +257,8 @@ impl ProductionAlignmentSource {
     /// requested nor inflated, except the BGZF block in which the last skipped chunk ends,
     /// which also holds the start of what follows (and any hole in the plan smaller than the
     /// range reader's coalescing gap). CRAM (local and remote) never selects a skipped slice:
-    /// it is neither read nor decoded. Local BAM reads one record per run of skipped chunks.
+    /// it is neither read nor decoded. Local BAM through `HTSlib` reads one record per run of
+    /// skipped chunks; local BAM through noodles seeks past them like remote BAM.
     pub fn begin_positioned_stream_resuming(
         &mut self,
         interval: GenomicInterval,
@@ -217,6 +269,9 @@ impl ProductionAlignmentSource {
         match self {
             Self::Htslib(source) => {
                 source.begin_positioned_stream_resuming(interval, admission_interval, options, skip)
+            }
+            Self::LocalBam(source) => {
+                source.begin_positioned_stream(interval, admission_interval, options, skip)
             }
             Self::LocalCram(source) => {
                 source.positioned_stream = None;
@@ -280,6 +335,7 @@ impl ProductionAlignmentSource {
     pub fn take_positioned_chunk_receipt(&mut self) -> Option<PositionedChunkReceipt> {
         match self {
             Self::Htslib(source) => source.take_positioned_chunk_receipt(),
+            Self::LocalBam(source) => source.positioned_stream.as_mut()?.take_receipt(),
             Self::LocalCram(source) => source.positioned_stream.as_mut()?.take_receipt(),
             Self::RemoteBam(source) => source.positioned_stream.as_mut()?.take_receipt(),
             Self::RemoteCram(source) => source.positioned_stream.as_mut()?.take_receipt(),
@@ -290,6 +346,7 @@ impl ProductionAlignmentSource {
     pub fn cancel_positioned_stream(&mut self) {
         match self {
             Self::Htslib(source) => source.cancel_positioned_stream(),
+            Self::LocalBam(source) => source.positioned_stream = None,
             Self::LocalCram(source) => source.positioned_stream = None,
             Self::RemoteBam(source) => source.positioned_stream = None,
             Self::RemoteCram(source) => source.positioned_stream = None,
@@ -303,6 +360,7 @@ impl ProductionAlignmentSource {
     ) -> Result<crate::PositionedAlignmentStreamCheckpoint, AlignmentError> {
         match self {
             Self::Htslib(source) => source.next_positioned_stream_checkpoint(keep_going),
+            Self::LocalBam(source) => source.next_positioned_stream_checkpoint(),
             Self::LocalCram(source) => positioned_stream::next_cram_checkpoint(
                 &mut source.positioned_stream,
                 &mut source.reader,
@@ -331,6 +389,7 @@ impl ProductionAlignmentSource {
     ) -> Result<AlignmentQuery, AlignmentError> {
         match self {
             Self::Htslib(source) => source.query(interval, options, cancellation.as_ref()),
+            Self::LocalBam(source) => source.query(interval, options, cancellation.as_ref()),
             Self::LocalCram(source) => source.query(interval, options, cancellation.as_ref()),
             Self::RemoteBam(source) => {
                 source.set_cancellation(Some(Arc::clone(cancellation)));
@@ -429,6 +488,7 @@ impl AlignmentSource for ProductionAlignmentSource {
     fn reference_dictionary(&self) -> &ReferenceDictionary {
         match self {
             Self::Htslib(source) => source.reference_dictionary(),
+            Self::LocalBam(source) => source.reference_dictionary(),
             Self::LocalCram(source) => source.reference_dictionary(),
             Self::RemoteBam(source) => source.reference_dictionary(),
             Self::RemoteCram(source) => source.reference_dictionary(),
@@ -438,6 +498,7 @@ impl AlignmentSource for ProductionAlignmentSource {
     fn source_stamp(&self) -> Option<AlignmentSourceStamp> {
         match self {
             Self::Htslib(source) => source.source_stamp(),
+            Self::LocalBam(source) => source.source_stamp(),
             Self::LocalCram(source) => source.source_stamp(),
             Self::RemoteBam(source) => source.source_stamp(),
             Self::RemoteCram(source) => source.source_stamp(),
@@ -452,6 +513,7 @@ impl AlignmentSource for ProductionAlignmentSource {
     ) -> Result<AlignmentQuery, AlignmentError> {
         match self {
             Self::Htslib(source) => source.query(interval, options, keep_going),
+            Self::LocalBam(source) => source.query(interval, options, keep_going),
             Self::LocalCram(source) => source.query(interval, options, keep_going),
             Self::RemoteBam(source) => source.query(interval, options, keep_going),
             Self::RemoteCram(source) => source.query(interval, options, keep_going),
@@ -1038,17 +1100,8 @@ impl AlignmentSource for RemoteBamAlignmentSource {
         )
         .map_err(|_| AlignmentError::CoordinateOverflow)?;
         let region = Region::new(contig.name(), start..=end);
-        let records = positioned_bam_records(
-            &mut self.reader,
-            &self.index,
+        positioned_bam_records(&mut self.reader, &self.index, interval, &region)?.query(
             &self.header,
-            interval,
-            &region,
-        )?;
-        query_positioned_noodles_records(
-            records,
-            &self.header,
-            interval,
             &options,
             self.normalization_mapped_records,
             Arc::clone(&self.metadata),
@@ -1061,9 +1114,8 @@ impl AlignmentSource for RemoteBamAlignmentSource {
 ///
 /// Nothing is buffered: the consumer applies filters, the record limit and cancellation as each
 /// record arrives, so a dense region costs one record of memory instead of every record in it.
-struct PositionedBamRecords<'a> {
-    reader: bam::io::Reader<&'a mut NoodlesReader>,
-    header: &'a sam::Header,
+struct PositionedBamRecords<'a, B> {
+    reader: bam::io::Reader<&'a mut B>,
     interval: GenomicInterval,
     chunks: std::vec::IntoIter<noodles::csi::binning_index::index::reference_sequence::bin::Chunk>,
     /// End of the index chunk being read; `None` before the next chunk is entered.
@@ -1071,16 +1123,15 @@ struct PositionedBamRecords<'a> {
     /// Virtual offset just past the last record read. Chunks are visited in file order, so a
     /// record ending at or before it was already produced by an overlapping chunk.
     high_water: u64,
-    scratch: bam::Record,
-    finished: bool,
+    /// The record the last successful [`Self::advance`] read.
+    record: bam::Record,
 }
 
-impl PositionedBamRecords<'_> {
-    fn next_record(
-        &mut self,
-    ) -> Result<Option<(bam::Record, Option<crate::AlignmentSourcePosition>)>, AlignmentError> {
-        use noodles::bgzf::io::Seek as _;
-
+impl<B: BamBlockStream> PositionedBamRecords<'_, B> {
+    /// Reads the next record intersecting the interval into `self.record` and returns where
+    /// it ends in the file; `None` once the region is exhausted. The record buffer is reused,
+    /// so a query allocates per record only what normalisation keeps.
+    fn advance(&mut self) -> Result<Option<crate::AlignmentSourcePosition>, AlignmentError> {
         loop {
             let Some(chunk_end) = self.chunk_end else {
                 let Some(chunk) = self.chunks.next() else {
@@ -1093,7 +1144,7 @@ impl PositionedBamRecords<'_> {
                 continue;
             };
             if self.reader.get_ref().virtual_position() >= chunk_end
-                || self.reader.read_record(&mut self.scratch)? == 0
+                || self.reader.read_record(&mut self.record)? == 0
             {
                 self.chunk_end = None;
                 continue;
@@ -1103,9 +1154,9 @@ impl PositionedBamRecords<'_> {
                 continue;
             }
             self.high_water = end_position;
-            if !noodles_record_intersects(&self.scratch, self.header, self.interval)? {
-                if noodles_record_starts_at_or_after_end(&self.scratch, self.header, self.interval)?
-                {
+            let placement = bam_record_placement(&self.record)?;
+            if !bam_placement_intersects(placement, self.interval) {
+                if bam_placement_starts_at_or_after_end(placement, self.interval) {
                     // Coordinate order: nothing later in the file can intersect, so the
                     // remaining chunks (records of coarser bins, far ahead) are never fetched.
                     self.chunks = Vec::new().into_iter();
@@ -1114,55 +1165,61 @@ impl PositionedBamRecords<'_> {
                 }
                 continue;
             }
-            return Ok(Some((
-                std::mem::take(&mut self.scratch),
-                Some(crate::AlignmentSourcePosition::bam_virtual_offset(
-                    end_position,
-                )),
+            return Ok(Some(crate::AlignmentSourcePosition::bam_virtual_offset(
+                end_position,
             )));
         }
     }
-}
 
-impl Iterator for PositionedBamRecords<'_> {
-    type Item = Result<(bam::Record, Option<crate::AlignmentSourcePosition>), AlignmentError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
+    /// Folds the region's records into a one-shot query result.
+    fn query(
+        mut self,
+        header: &sam::Header,
+        options: &QueryOptions,
+        normalization_mapped_records: Option<u64>,
+        metadata: Arc<AlignmentHeaderMetadata>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Result<AlignmentQuery, AlignmentError> {
+        let interval = self.interval;
+        let mut accumulator =
+            RegionQueryAccumulator::new(interval, options, normalization_mapped_records);
+        while let Some(source_position) = self.advance()? {
+            let record = self.record.backend_record(header);
+            if !accumulator.add(&record, Some(source_position), keep_going)? {
+                break;
+            }
         }
-        let next = self.next_record().transpose();
-        self.finished = !matches!(next, Some(Ok(_)));
-        next
+        if accumulator.cancelled() {
+            return Ok(cancelled_query(interval, metadata));
+        }
+        accumulator.finish(metadata)
     }
 }
 
-fn positioned_bam_records<'a>(
-    reader: &'a mut NoodlesReader,
+fn positioned_bam_records<'a, B: BamBlockStream>(
+    reader: &'a mut B,
     index: &RemoteIndex,
-    header: &'a sam::Header,
     interval: GenomicInterval,
     region: &Region,
-) -> Result<PositionedBamRecords<'a>, AlignmentError> {
+) -> Result<PositionedBamRecords<'a, B>, AlignmentError> {
     let reference_sequence_id =
         usize::try_from(interval.contig().get()).map_err(|_| AlignmentError::CoordinateOverflow)?;
     let mut chunks = index.query(reference_sequence_id, region.interval())?;
     chunks.sort_by_key(|chunk| (chunk.start(), chunk.end()));
     // Fetch what the index says this region needs, not a fixed read-ahead window.
-    reader.get_mut().set_bgzf_read_plan(
+    reader.plan_reads(
         chunks
             .iter()
-            .map(|chunk| (u64::from(chunk.start()), u64::from(chunk.end()))),
+            .map(|chunk| (u64::from(chunk.start()), u64::from(chunk.end())))
+            .collect(),
     );
     Ok(PositionedBamRecords {
         reader: bam::io::Reader::from(reader),
-        header,
         interval,
         chunks: chunks.into_iter(),
         chunk_end: None,
         high_water: 0,
-        scratch: bam::Record::default(),
-        finished: false,
+        record: bam::Record::default(),
     })
 }
 
@@ -1555,16 +1612,60 @@ where
     })
 }
 
-fn noodles_record_intersects<R>(
-    record: &R,
-    header: &sam::Header,
+/// Contig and zero-based half-open reference span of a placed BAM record, read from the
+/// record's bytes. It answers what [`noodles_record_span_on`] does for any noodles record,
+/// without the boxed CIGAR iteration of the generic record trait.
+fn bam_record_placement(
+    record: &bam::Record,
+) -> Result<Option<(ContigId, u64, u64)>, AlignmentError> {
+    let Some(reference_sequence_id) = record.reference_sequence_id().transpose()? else {
+        return Ok(None);
+    };
+    let Some(contig) = u32::try_from(reference_sequence_id).ok().map(ContigId::new) else {
+        return Ok(None);
+    };
+    let Some(start) = record.alignment_start().transpose()? else {
+        return Ok(None);
+    };
+    let start = u64::try_from(start.get())
+        .map_err(|_| AlignmentError::CoordinateOverflow)?
+        .saturating_sub(1);
+    let mut end = start;
+    for chunk in record.cigar().as_bytes().chunks_exact(4) {
+        let raw = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        match raw & 0xf {
+            // M, D, N, = and X consume the reference.
+            0 | 2 | 3 | 7 | 8 => end = end.saturating_add(u64::from(raw >> 4)),
+            1 | 4 | 5 | 6 => {}
+            _ => {
+                return Err(AlignmentError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "alignment has an unknown CIGAR operation",
+                )));
+            }
+        }
+    }
+    Ok(Some((contig, start, end)))
+}
+
+/// Whether a BAM record with this placement is returned by a regional query of `interval`.
+fn bam_placement_intersects(
+    placement: Option<(ContigId, u64, u64)>,
     interval: GenomicInterval,
-) -> Result<bool, AlignmentError>
-where
-    R: sam::alignment::Record,
-{
-    Ok(noodles_record_span_on(record, header, interval.contig())?
-        .is_some_and(|span| placement_intersects(span, interval)))
+) -> bool {
+    placement.is_some_and(|(contig, start, end)| {
+        contig == interval.contig() && placement_intersects((start, end), interval)
+    })
+}
+
+/// Whether a BAM record placed on the interval's contig starts at or beyond the interval's
+/// end. An indexed BAM is coordinate-sorted, so every later record of the file does too.
+fn bam_placement_starts_at_or_after_end(
+    placement: Option<(ContigId, u64, u64)>,
+    interval: GenomicInterval,
+) -> bool {
+    placement
+        .is_some_and(|(contig, start, _)| contig == interval.contig() && start >= interval.end())
 }
 
 /// Whether a record placed on `(start, end)` is returned by a regional query of `interval`. A
@@ -1572,28 +1673,6 @@ where
 /// CIGAR of `*`) occupies one base, as in `HTSlib` and samtools.
 fn placement_intersects((start, end): (u64, u64), interval: GenomicInterval) -> bool {
     start < interval.end() && interval.start() < end.max(start.saturating_add(1))
-}
-
-/// Whether a record placed on the interval's contig starts at or beyond the interval's end.
-/// An indexed BAM is coordinate-sorted, so every later record of the file does too.
-fn noodles_record_starts_at_or_after_end<R>(
-    record: &R,
-    header: &sam::Header,
-    interval: GenomicInterval,
-) -> Result<bool, AlignmentError>
-where
-    R: sam::alignment::Record,
-{
-    let Some(reference_sequence_id) = record.reference_sequence_id(header).transpose()? else {
-        return Ok(false);
-    };
-    if u32::try_from(reference_sequence_id).ok().map(ContigId::new) != Some(interval.contig()) {
-        return Ok(false);
-    }
-    Ok(record
-        .alignment_start()
-        .transpose()?
-        .is_some_and(|start| start.get() as u64 > interval.end()))
 }
 
 /// Zero-based half-open reference span of a record placed on `contig`.
@@ -1996,6 +2075,7 @@ mod tests {
     use tiny_http::{Header, Response, Server, StatusCode};
 
     mod differential;
+    mod in_memory;
     mod resume;
     mod url_routing;
 

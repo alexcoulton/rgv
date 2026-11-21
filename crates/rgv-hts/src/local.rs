@@ -128,18 +128,19 @@ impl QueryOptions {
 
 /// A bounded count of `HTSlib` decompression threads shared by every holder of a lease.
 #[derive(Debug)]
-struct DecompressionThreadAllowance {
+pub(crate) struct DecompressionThreadAllowance {
     leased: AtomicU32,
 }
 
 /// The allowance all open local alignment sources of the process draw from.
-static DECOMPRESSION_THREADS: DecompressionThreadAllowance = DecompressionThreadAllowance {
-    leased: AtomicU32::new(0),
-};
+pub(crate) static DECOMPRESSION_THREADS: DecompressionThreadAllowance =
+    DecompressionThreadAllowance {
+        leased: AtomicU32::new(0),
+    };
 
 /// Most `HTSlib` decompression threads all open local alignment sources may hold together:
 /// the machine's parallelism, kept between 2 and 16.
-fn decompression_thread_limit() -> u32 {
+pub(crate) fn decompression_thread_limit() -> u32 {
     static LIMIT: OnceLock<u32> = OnceLock::new();
     *LIMIT.get_or_init(|| {
         std::thread::available_parallelism()
@@ -161,14 +162,22 @@ fn decompression_thread_limit() -> u32 {
 /// raises the process's decompression thread count beyond [`decompression_thread_limit`]. A
 /// source that finds the allowance exhausted decompresses on its own thread.
 #[derive(Debug)]
-struct DecompressionThreadLease {
+pub(crate) struct DecompressionThreadLease {
     allowance: &'static DecompressionThreadAllowance,
-    threads: u32,
+    pub(crate) threads: u32,
 }
 
 impl DecompressionThreadAllowance {
+    /// An allowance nothing has been leased from.
+    #[cfg(test)]
+    pub(crate) const fn new() -> Self {
+        Self {
+            leased: AtomicU32::new(0),
+        }
+    }
+
     /// Leases up to `requested` threads, as many as `limit` still leaves.
-    fn lease(&'static self, requested: u32, limit: u32) -> DecompressionThreadLease {
+    pub(crate) fn lease(&'static self, requested: u32, limit: u32) -> DecompressionThreadLease {
         let mut threads = 0;
         let _ = self
             .leased
@@ -191,14 +200,32 @@ impl Drop for DecompressionThreadLease {
     }
 }
 
+/// Which decoder reads a local BAM file opened through
+/// [`ProductionAlignmentSource::open`](crate::ProductionAlignmentSource::open).
+///
+/// Both produce the same records, statistics, pileups, block identities and source positions
+/// (the differential suite holds them to that); see ADR 0002, "Backend convergence", for what
+/// differs and for what has to hold before the default changes. Local CRAM and every remote
+/// source are read by `noodles` whatever this says.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum AlignmentBackendPreference {
+    /// `rust-htslib`: the default.
+    #[default]
+    Htslib,
+    /// `noodles` over the local file: the decoder that already serves remote BAM.
+    Noodles,
+}
+
 #[derive(Clone, Debug)]
 pub struct AlignmentOpenOptions {
     pub index_path: Option<PathBuf>,
     pub reference_path: Option<PathBuf>,
-    /// Most `HTSlib` decompression threads a local source asks for. The grant is capped by a
-    /// process-wide allowance sized from the machine's parallelism, so the total over every
-    /// open source stays bounded however many are open.
+    /// Most decompression threads a local BAM source asks for, with either local backend. The
+    /// grant is capped by a process-wide allowance sized from the machine's parallelism, so
+    /// the total over every open source stays bounded however many are open.
     pub decompression_threads: NonZeroU32,
+    /// Decoder for a local BAM file. The default is `HTSlib`.
+    pub local_bam_backend: AlignmentBackendPreference,
     pub remote_index_url: Option<String>,
     pub remote_reference_index_url: Option<String>,
     pub remote_range: HttpRangeConfig,
@@ -215,6 +242,7 @@ impl Default for AlignmentOpenOptions {
             index_path: None,
             reference_path: None,
             decompression_threads: NonZeroU32::new(4).unwrap(),
+            local_bam_backend: AlignmentBackendPreference::Htslib,
             remote_index_url: None,
             remote_reference_index_url: None,
             remote_range: HttpRangeConfig {
@@ -980,7 +1008,7 @@ impl LocalAlignmentSource {
             return Err(AlignmentError::InvalidAlignmentHeader);
         }
         if let Some(reference_path) = &options.reference_path {
-            reader.set_reference(reference_path)?;
+            reader.set_reference(refuse_reference_url(reference_path)?)?;
         }
         let decompression_threads = DECOMPRESSION_THREADS.lease(
             options.decompression_threads.get(),
@@ -1306,7 +1334,7 @@ impl LocalAlignmentSource {
 }
 
 /// Whether `value` is a URL (`scheme://...`) rather than a filesystem path.
-fn has_url_scheme(value: &str) -> bool {
+pub(crate) fn has_url_scheme(value: &str) -> bool {
     value.split_once("://").is_some_and(|(scheme, _)| {
         scheme.len() > 1
             && scheme.starts_with(|first: char| first.is_ascii_alphabetic())
@@ -1314,6 +1342,34 @@ fn has_url_scheme(value: &str) -> bool {
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || "+.-".contains(character))
     })
+}
+
+/// `HTSlib` would fetch a reference URL through libcurl, unaccounted and unauthenticated.
+fn refuse_reference_url(reference_path: &Path) -> Result<&Path, AlignmentError> {
+    if has_url_scheme(&reference_path.to_string_lossy()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "HTSlib does not open reference URLs; a CRAM with a remote reference is opened \
+             through ProductionAlignmentSource, which reads the reference over the range reader",
+        )
+        .into());
+    }
+    Ok(reference_path)
+}
+
+/// The scheme of a location that is a URL RGV cannot open: anything but `http`, `https` (read
+/// by the range reader) and `file` (a local file). `s3://`, `gs://`, `ftp://` and the like
+/// must be refused by name instead of being handed to `HTSlib`, which would pass them to
+/// libcurl or fail with an opaque "could not open" error.
+pub(crate) fn unsupported_url_scheme(value: &str) -> Option<&str> {
+    if !has_url_scheme(value) {
+        return None;
+    }
+    let scheme = value.split_once("://")?.0;
+    (!["http", "https", "file"]
+        .iter()
+        .any(|supported| scheme.eq_ignore_ascii_case(supported)))
+    .then_some(scheme)
 }
 
 impl AlignmentSource for LocalAlignmentSource {

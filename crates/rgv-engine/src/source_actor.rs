@@ -293,6 +293,39 @@ pub trait CanonicalAlignmentSourceBackend {
 
     fn retarget(&mut self, work: &SourceWork) -> Result<(), Self::Error>;
 
+    /// Like [`Self::begin_work`], for a backend that can skip source units whose records
+    /// `store` still holds. Returns the resident chunks the stream will not decode again: they
+    /// are part of this transaction exactly as if it had decoded them, and the actor adds them
+    /// to it. A chunk may be returned only if `store` holds it now, with a payload satisfying
+    /// the work's, and it contains every record of its source unit that the work's target
+    /// returns. The default starts a fresh stream and skips nothing.
+    fn begin_work_resuming(
+        &mut self,
+        work: &SourceWork,
+        store: &EvidenceStore,
+    ) -> Result<Vec<Arc<EvidenceChunk>>, Self::Error> {
+        self.begin_work(work, &store.ledger()).map(|()| Vec::new())
+    }
+
+    /// Like [`Self::retarget`], with the contract of [`Self::begin_work_resuming`]. Chunks the
+    /// superseded stream already delivered are resident, so an overlapping retarget does not
+    /// decode them again.
+    fn retarget_resuming(
+        &mut self,
+        work: &SourceWork,
+        _store: &EvidenceStore,
+    ) -> Result<Vec<Arc<EvidenceChunk>>, Self::Error> {
+        self.retarget(work).map(|()| Vec::new())
+    }
+
+    /// Reports the chunk the store keeps for the [`CanonicalDecodeCheckpoint::Chunk`] this
+    /// backend just returned: that chunk, or a resident one holding the same records.
+    fn chunk_admitted(&mut self, _work: &SourceWork, _chunk: &Arc<EvidenceChunk>) {}
+
+    /// Makes the backend's next streams fresh. The actor calls this when a transaction built
+    /// from skipped chunks did not certify, so a bad resumption cannot repeat.
+    fn forget_resumable_chunks(&mut self) {}
+
     fn cancel(&mut self, work: &SourceWork);
 
     /// Offers a callback the backend invokes, from any thread, whenever a
@@ -522,6 +555,11 @@ where
             if let Some(work) = &failed_work {
                 self.backend.cancel(&work);
             }
+            if matches!(error, AlignmentSourceActorError::Acquisition(_)) {
+                // The transaction's chunks did not add up to its certified population. If
+                // skipped chunks were part of it, the retry must not skip them again.
+                self.backend.forget_resumable_chunks();
+            }
             self.transaction_chunks.clear();
             return Err(match failed_work {
                 Some(work) => error.with_work(work),
@@ -548,9 +586,11 @@ where
                 AlignmentSourceActorAction::Work(work) => {
                     self.transaction_chunks.clear();
                     self.last_progress = None;
-                    self.backend
-                        .begin_work(&work, &self.store.ledger())
+                    let resident = self
+                        .backend
+                        .begin_work_resuming(&work, &self.store)
                         .map_err(AlignmentSourceActorError::Backend)?;
+                    self.adopt_resident_chunks(resident)?;
                     Ok(Some(AlignmentSourceActorEvent::WorkStarted(work)))
                 }
             };
@@ -579,6 +619,7 @@ where
                 self.last_progress = Some(genomic_span);
                 let disposition = self.schedule.completed_chunk(completed)?;
                 let chunk = self.store.admit_chunk(chunk)?;
+                self.backend.chunk_admitted(&work, &chunk);
                 if !self
                     .transaction_chunks
                     .iter()
@@ -596,9 +637,11 @@ where
                     SourceCheckpointDecision::Retarget { previous, current } => {
                         let salvaged_chunks = self.transaction_chunks.len();
                         self.transaction_chunks.clear();
-                        self.backend
-                            .retarget(&current)
+                        let resident = self
+                            .backend
+                            .retarget_resuming(&current, &self.store)
                             .map_err(AlignmentSourceActorError::Backend)?;
+                        self.adopt_resident_chunks(resident)?;
                         Ok(Some(AlignmentSourceActorEvent::WorkRetargeted {
                             previous,
                             current,
@@ -664,6 +707,28 @@ where
         }
     }
 
+    /// Makes resident chunks whose source units the new stream skips part of the transaction,
+    /// one per source unit, and marks them recently used. They are held from here to the end
+    /// of the transaction like chunks the stream decodes, so a reclaim in between cannot take
+    /// their records away from the acquisition.
+    #[allow(clippy::result_large_err)]
+    fn adopt_resident_chunks(
+        &mut self,
+        resident: Vec<Arc<EvidenceChunk>>,
+    ) -> Result<(), AlignmentSourceActorError<B::Error>> {
+        for chunk in resident {
+            let chunk = self.store.admit_chunk(chunk)?;
+            if !self
+                .transaction_chunks
+                .iter()
+                .any(|candidate| candidate.chunk().id() == chunk.chunk().id())
+            {
+                self.transaction_chunks.push(chunk);
+            }
+        }
+        Ok(())
+    }
+
     fn checkpoint_without_chunk(
         &mut self,
         genomic_span: GenomicInterval,
@@ -676,9 +741,11 @@ where
                 let salvaged_chunks = self.transaction_chunks.len();
                 self.transaction_chunks.clear();
                 self.last_progress = None;
-                self.backend
-                    .retarget(&current)
+                let resident = self
+                    .backend
+                    .retarget_resuming(&current, &self.store)
                     .map_err(AlignmentSourceActorError::Backend)?;
+                self.adopt_resident_chunks(resident)?;
                 Ok(AlignmentSourceActorEvent::WorkRetargeted {
                     previous,
                     current,

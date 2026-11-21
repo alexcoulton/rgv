@@ -7,6 +7,11 @@ mod remote;
 mod remote_tests;
 
 pub use remote::MAX_REMOTE_VARIANT_ID_SCAN_BYTES;
+pub(super) use remote::{
+    MAX_REMOTE_TEXT_INDEX_BYTES, RemoteVariantIndex as RemoteTabixIndex, TABIX_FLAG_ZERO_BASED,
+    TabixColumns, combine_stats as combine_remote_stats, parse_text_index,
+    read_line as read_bgzf_line, strtoll,
+};
 pub(crate) use remote::{fuzz_variant_index, fuzz_variant_line_interval};
 
 /// Indexed VCF/BCF source. A local file is read by `HTSlib`; a remote bgzipped VCF or BCF is
@@ -59,6 +64,13 @@ impl LocalVariantSource {
     ) -> Result<Self, TrackError> {
         let path = path.as_ref();
         let raw = path.to_string_lossy();
+        if let Some(scheme) = crate::local::unsupported_url_scheme(&raw) {
+            // Refused by name: `HTSlib` would hand `s3://`, `gs://` or `ftp://` to libcurl.
+            return Err(TrackError::Backend(format!(
+                "unsupported URL scheme {scheme}: a variant file is opened from a local path \
+                 or an http(s) URL"
+            )));
+        }
         let backend = if is_remote_url(&raw) {
             VariantBackend::Remote(Box::new(remote::RemoteVariantFile::open(
                 &raw,

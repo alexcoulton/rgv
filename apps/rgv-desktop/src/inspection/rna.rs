@@ -818,11 +818,15 @@ pub(crate) fn paint_supplementary_chain_diagram(
     let desired = egui::vec2(ui.available_width().max(320.0), 112.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, 3.0, egui::Color32::from_gray(250));
+    painter.rect_filled(
+        rect,
+        3.0,
+        crate::theme::adapt(egui::Color32::from_gray(250)),
+    );
     painter.rect_stroke(
         rect,
         3.0,
-        egui::Stroke::new(1.0, egui::Color32::from_gray(190)),
+        egui::Stroke::new(1.0, crate::theme::adapt(egui::Color32::from_gray(190))),
         egui::StrokeKind::Inside,
     );
     let label_width = 92.0;
@@ -845,14 +849,14 @@ pub(crate) fn paint_supplementary_chain_diagram(
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(11.0),
-            egui::Color32::from_gray(55),
+            crate::theme::adapt(egui::Color32::from_gray(55)),
         );
         painter.line_segment(
             [
                 egui::pos2(lane.left(), centre_y),
                 egui::pos2(lane.right(), centre_y),
             ],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(165)),
+            egui::Stroke::new(1.0, crate::theme::adapt(egui::Color32::from_gray(165))),
         );
         let count = order.len().max(1) as f32;
         let slot_width = lane.width() / count;
@@ -880,18 +884,21 @@ pub(crate) fn paint_supplementary_chain_diagram(
             .intersect(lane.expand2(egui::vec2(0.0, 10.0)));
             let source = &chain.segments[segment_index];
             let fill = if source.reverse {
-                egui::Color32::from_rgb(126, 87, 194)
+                crate::theme::adapt(egui::Color32::from_rgb(126, 87, 194))
             } else {
-                egui::Color32::from_rgb(44, 119, 176)
+                crate::theme::adapt(egui::Color32::from_rgb(44, 119, 176))
             };
             painter.rect_filled(block, 2.0, fill);
             painter.rect_stroke(
                 block,
                 2.0,
                 if segment_index == chain.active_segment {
-                    egui::Stroke::new(2.5, egui::Color32::from_rgb(230, 126, 34))
+                    egui::Stroke::new(
+                        2.5,
+                        crate::theme::adapt(egui::Color32::from_rgb(230, 126, 34)),
+                    )
                 } else {
-                    egui::Stroke::new(0.75, egui::Color32::from_gray(55))
+                    egui::Stroke::new(0.75, crate::theme::adapt(egui::Color32::from_gray(55)))
                 },
                 egui::StrokeKind::Outside,
             );
@@ -902,7 +909,7 @@ pub(crate) fn paint_supplementary_chain_diagram(
                     egui::Align2::CENTER_CENTER,
                     format!("{}{strand}", segment_index + 1),
                     egui::FontId::monospace(10.0),
-                    egui::Color32::WHITE,
+                    crate::theme::adapt(egui::Color32::WHITE),
                 );
             }
             let response = ui
@@ -942,7 +949,7 @@ pub(crate) fn paint_supplementary_chain_diagram(
                 painter.rect_stroke(
                     block.expand(2.0),
                     2.0,
-                    egui::Stroke::new(2.0, egui::Color32::BLACK),
+                    egui::Stroke::new(2.0, crate::theme::adapt(egui::Color32::BLACK)),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -959,7 +966,7 @@ pub(crate) fn paint_supplementary_chain_diagram(
             diagram.read_length
         ),
         egui::FontId::proportional(10.0),
-        egui::Color32::from_gray(75),
+        crate::theme::adapt(egui::Color32::from_gray(75)),
     );
     clicked
 }

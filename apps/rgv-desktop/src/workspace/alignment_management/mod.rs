@@ -4,7 +4,7 @@ mod dispatch;
 mod gpu_budget;
 mod gpu_bundle;
 mod gpu_prefetch;
-mod gpu_publication;
+pub(crate) mod gpu_publication;
 #[cfg(test)]
 mod gpu_publication_retry_tests;
 mod interactions;

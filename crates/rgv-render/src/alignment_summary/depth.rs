@@ -7,22 +7,66 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+/// One depth run: twelve bytes (it was thirty-two, twelve of them padding). Offsets are whole
+/// bases from the page start, as in `AlignmentGpuInstance`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
 pub struct AlignmentSummaryGpuDepthInstance {
-    pub start_offset: [f32; 2],
-    pub end_offset: [f32; 2],
+    start: u32,
+    length: u32,
     pub depth: u32,
-    pub(super) padding: [u32; 3],
 }
 
 impl AlignmentSummaryGpuDepthInstance {
+    /// Packs one run, refusing a span the instance cannot hold exactly. `page` only labels the
+    /// error.
+    // The page error type every summary packing path already returns.
+    #[allow(clippy::result_large_err)]
+    pub fn new(
+        page: SummaryPageKey,
+        start_offset: u64,
+        end_offset: u64,
+        depth: u32,
+    ) -> Result<Self, AlignmentSummaryGpuPageError> {
+        if start_offset >= end_offset {
+            return Err(AlignmentSummaryGpuPageError::InvalidSemanticSpan {
+                page,
+                start: start_offset,
+                end: end_offset,
+            });
+        }
+        if end_offset > crate::MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET {
+            return Err(AlignmentSummaryGpuPageError::SemanticOffsetOutOfRange {
+                page,
+                start: start_offset,
+                end: end_offset,
+                limit: crate::MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET,
+            });
+        }
+        Ok(Self {
+            // Both fit: `end_offset` is at most 7e8.
+            start: start_offset as u32,
+            length: (end_offset - start_offset) as u32,
+            depth,
+        })
+    }
+
+    /// Whole bases from the page start to the run's start.
+    #[must_use]
+    pub const fn start_offset(&self) -> u64 {
+        self.start as u64
+    }
+
+    /// Whole bases from the page start to the run's end (exclusive).
+    #[must_use]
+    pub const fn end_offset(&self) -> u64 {
+        self.start as u64 + self.length as u64
+    }
+
     pub(super) fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
-            0 => Float32x2,
-            1 => Float32x2,
-            2 => Uint32
-        ];
+        // `[start, length]` and the depth.
+        const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+            wgpu::vertex_attr_array![0 => Uint32x2, 1 => Uint32];
         wgpu::VertexBufferLayout {
             array_stride: size_of::<Self>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -39,11 +83,13 @@ pub fn project_alignment_summary_depth_instance(
     scale_maximum: u32,
     transform: CoverageScaleTransform,
 ) -> Option<AlignmentSummaryGpuProjectedBounds> {
-    let (x, width) = projected_horizontal(
-        instance.start_offset,
-        instance.end_offset,
+    let clip = camera.clip();
+    let (x, width) = projected_horizontal_exact(
+        instance.start_offset() as f64,
+        instance.end_offset() as f64,
         page_start,
         camera,
+        [clip.x, clip.x + clip.width],
     )?;
     let height = (transformed_depth_fraction(instance.depth, scale_maximum, transform)
         * camera.clip().height)
@@ -197,12 +243,12 @@ pub(super) fn pack_depth_page(
                 page.key(),
             ));
         };
-        instances.push(AlignmentSummaryGpuDepthInstance {
-            start_offset: split_f64(primitive.start_offset as f64),
-            end_offset: split_f64(primitive.end_offset as f64),
+        instances.push(AlignmentSummaryGpuDepthInstance::new(
+            page.key(),
+            primitive.start_offset,
+            primitive.end_offset,
             depth,
-            padding: [0; 3],
-        });
+        )?);
     }
     instances.shrink_to_fit();
     Ok(PackedAlignmentSummaryPage::Depth {

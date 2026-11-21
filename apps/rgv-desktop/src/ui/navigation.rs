@@ -148,7 +148,11 @@ pub struct OverviewInteraction {
 
 fn elided_text(painter: &egui::Painter, value: &str, font: &FontId, maximum_width: f32) -> String {
     if painter
-        .layout_no_wrap(value.to_owned(), font.clone(), Color32::WHITE)
+        .layout_no_wrap(
+            value.to_owned(),
+            font.clone(),
+            crate::theme::adapt(Color32::WHITE),
+        )
         .size()
         .x
         <= maximum_width
@@ -160,7 +164,11 @@ fn elided_text(painter: &egui::Painter, value: &str, font: &FontId, maximum_widt
         characters.pop();
         let candidate = format!("{}…", characters.iter().collect::<String>());
         if painter
-            .layout_no_wrap(candidate.clone(), font.clone(), Color32::WHITE)
+            .layout_no_wrap(
+                candidate.clone(),
+                font.clone(),
+                crate::theme::adapt(Color32::WHITE),
+            )
             .size()
             .x
             <= maximum_width
@@ -190,10 +198,18 @@ fn layout_metadata_text(
     let right = row.right() - 8.0_f32.min(row.width() * 0.5);
     let length_label = format!("{} bp", format_genomic_position(contig_length));
     let length_size = painter
-        .layout_no_wrap(length_label.clone(), font.clone(), Color32::from_gray(90))
+        .layout_no_wrap(
+            length_label.clone(),
+            font.clone(),
+            crate::theme::adapt(Color32::from_gray(90)),
+        )
         .size();
     let complete_name_width = painter
-        .layout_no_wrap(contig_name.to_owned(), font.clone(), Color32::from_gray(55))
+        .layout_no_wrap(
+            contig_name.to_owned(),
+            font.clone(),
+            crate::theme::adapt(Color32::from_gray(55)),
+        )
         .size()
         .x;
     let available_width = (right - left).max(0.0);
@@ -209,7 +225,11 @@ fn layout_metadata_text(
     .max(0.0);
     let name = elided_text(painter, contig_name, font, name_available);
     let name_size = painter
-        .layout_no_wrap(name.clone(), font.clone(), Color32::from_gray(55))
+        .layout_no_wrap(
+            name.clone(),
+            font.clone(),
+            crate::theme::adapt(Color32::from_gray(55)),
+        )
         .size();
     let name_rect = Rect::from_min_size(pos2(left, row.center().y - name_size.y * 0.5), name_size);
     let (length, length_rect) = if show_length {
@@ -251,12 +271,16 @@ pub fn paint_genome_context(
         layout.cytobands == CytobandAvailability::Present
     );
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 0.0, Color32::from_gray(250));
+    painter.rect_filled(rect, 0.0, crate::theme::adapt(Color32::from_gray(250)));
     let metadata_font = FontId::proportional(11.0);
     let panel_label = format!("Panel {id_salt}");
     let panel_font = FontId::proportional(10.0);
     let panel_size = painter
-        .layout_no_wrap(panel_label.clone(), panel_font.clone(), Color32::WHITE)
+        .layout_no_wrap(
+            panel_label.clone(),
+            panel_font.clone(),
+            crate::theme::adapt(Color32::WHITE),
+        )
         .size();
     let panel_label_rect = Rect::from_min_size(
         pos2(
@@ -270,7 +294,7 @@ pub fn paint_genome_context(
         Align2::LEFT_CENTER,
         &panel_label,
         panel_font,
-        Color32::from_rgb(45, 92, 175),
+        crate::theme::adapt(Color32::from_rgb(45, 92, 175)),
     );
     let metadata_text_row = Rect::from_min_max(
         pos2(
@@ -293,7 +317,7 @@ pub fn paint_genome_context(
             Align2::LEFT_CENTER,
             &metadata.name,
             metadata_font.clone(),
-            Color32::from_gray(55),
+            crate::theme::adapt(Color32::from_gray(55)),
         );
     }
     if let (Some(length), Some(rect)) = (&metadata.length, metadata.length_rect) {
@@ -302,7 +326,7 @@ pub fn paint_genome_context(
             Align2::RIGHT_CENTER,
             length,
             metadata_font.clone(),
-            Color32::from_gray(90),
+            crate::theme::adapt(Color32::from_gray(90)),
         );
     }
     let metadata_id = egui::Id::new(("genome-context-metadata", id_salt));
@@ -454,7 +478,7 @@ pub fn paint_genome_context(
             painter.rect_stroke(
                 segment_rect,
                 rounding,
-                Stroke::new(0.75, Color32::from_gray(95)),
+                Stroke::new(0.75, crate::theme::adapt(Color32::from_gray(95))),
                 StrokeKind::Inside,
             );
         }
@@ -472,7 +496,7 @@ pub fn paint_genome_context(
                     Align2::CENTER_CENTER,
                     &segment.name,
                     FontId::proportional(9.0),
-                    Color32::from_gray(35),
+                    crate::theme::adapt(Color32::from_gray(35)),
                 );
             }
         }
@@ -484,7 +508,7 @@ pub fn paint_genome_context(
             painter.rect_stroke(
                 segment_rect,
                 1.0,
-                Stroke::new(2.0, Color32::from_rgb(45, 92, 175)),
+                Stroke::new(2.0, crate::theme::adapt(Color32::from_rgb(45, 92, 175))),
                 StrokeKind::Outside,
             );
         }
@@ -496,14 +520,18 @@ pub fn paint_genome_context(
             Align2::LEFT_CENTER,
             "Loading cytobands…",
             FontId::proportional(9.0),
-            Color32::from_gray(105),
+            crate::theme::adapt(Color32::from_gray(105)),
         );
     }
-    painter.rect_filled(overview_rect, 1.0, Color32::from_gray(238));
+    painter.rect_filled(
+        overview_rect,
+        1.0,
+        crate::theme::adapt(Color32::from_gray(238)),
+    );
     painter.rect_stroke(
         overview_rect,
         1.0,
-        Stroke::new(0.75, Color32::from_gray(130)),
+        Stroke::new(0.75, crate::theme::adapt(Color32::from_gray(130))),
         StrokeKind::Inside,
     );
     paint_genome_overview_data(&painter, overview_rect, contig_axis, overview_data);
@@ -514,14 +542,14 @@ pub fn paint_genome_context(
     painter.rect_stroke(
         visible,
         1.0,
-        Stroke::new(2.0, Color32::from_rgb(45, 92, 175)),
+        Stroke::new(2.0, crate::theme::adapt(Color32::from_rgb(45, 92, 175))),
         StrokeKind::Outside,
     );
     if overview_response.has_focus() {
         painter.rect_stroke(
             overview_rect.expand(3.0),
             2.0,
-            Stroke::new(2.0, Color32::BLACK),
+            Stroke::new(2.0, crate::theme::adapt(Color32::BLACK)),
             StrokeKind::Outside,
         );
     }
@@ -535,7 +563,7 @@ pub fn paint_genome_context(
         .layout_no_wrap(
             largest_tick_label,
             ruler_font.clone(),
-            Color32::from_gray(55),
+            crate::theme::adapt(Color32::from_gray(55)),
         )
         .size()
         .x;
@@ -553,14 +581,14 @@ pub fn paint_genome_context(
             pos2(ruler_left, baseline_y),
             pos2(rows.ruler.right(), baseline_y),
         ],
-        Stroke::new(1.0, Color32::from_gray(95)),
+        Stroke::new(1.0, crate::theme::adapt(Color32::from_gray(95))),
     );
     painter.text(
         rows.span.center(),
         Align2::CENTER_CENTER,
         &ruler.span_label,
         FontId::proportional(11.0),
-        Color32::from_gray(45),
+        crate::theme::adapt(Color32::from_gray(45)),
     );
     let mut previous_label_right = f32::NEG_INFINITY;
     for tick in ruler.ticks {
@@ -568,16 +596,24 @@ pub fn paint_genome_context(
         let height = if tick.major { 8.0 } else { 4.0 };
         painter.line_segment(
             [pos2(x, baseline_y), pos2(x, baseline_y - height)],
-            Stroke::new(1.0, Color32::from_gray(100)),
+            Stroke::new(1.0, crate::theme::adapt(Color32::from_gray(100))),
         );
         if let Some(label) = tick.label {
-            let galley = painter.layout_no_wrap(label, ruler_font.clone(), Color32::from_gray(55));
+            let galley = painter.layout_no_wrap(
+                label,
+                ruler_font.clone(),
+                crate::theme::adapt(Color32::from_gray(55)),
+            );
             let label_rect = ruler_tick_label_rect(rows.ruler, x, galley.size());
             if label_rect.left() >= previous_label_right + 6.0
                 && label_rect.right() <= rows.ruler.right()
                 && rows.ruler.contains_rect(label_rect)
             {
-                painter.galley(label_rect.min, galley, Color32::from_gray(55));
+                painter.galley(
+                    label_rect.min,
+                    galley,
+                    crate::theme::adapt(Color32::from_gray(55)),
+                );
                 previous_label_right = label_rect.right();
             }
         }
@@ -659,7 +695,7 @@ fn paint_genome_overview_data(
                 ),
             ),
             0.0,
-            Color32::from_rgba_unmultiplied(85, 101, 108, 105),
+            crate::theme::adapt(Color32::from_rgba_unmultiplied(85, 101, 108, 105)),
         );
     }
     for (index, density) in overview.bins.iter().copied().enumerate() {
@@ -679,7 +715,7 @@ fn paint_genome_overview_data(
                 ),
             ),
             0.0,
-            Color32::from_rgba_unmultiplied(16, 105, 145, 190),
+            crate::theme::adapt(Color32::from_rgba_unmultiplied(16, 105, 145, 190)),
         );
     }
 }
@@ -741,7 +777,7 @@ fn paint_centromere_waist(
     }
     let waist = centromere.waist_x.clamp(left, right);
     let inset = (ideogram_rect.height() * 0.34).max(1.0);
-    let background = Color32::from_gray(250);
+    let background = crate::theme::adapt(Color32::from_gray(250));
     painter.add(Shape::convex_polygon(
         vec![
             pos2(left, ideogram_rect.top() - 1.0),
@@ -760,7 +796,7 @@ fn paint_centromere_waist(
         background,
         Stroke::NONE,
     ));
-    let outline = Stroke::new(0.9, Color32::from_gray(75));
+    let outline = Stroke::new(0.9, crate::theme::adapt(Color32::from_gray(75)));
     painter.add(Shape::line(
         vec![
             pos2(ideogram_rect.left(), ideogram_rect.top()),
@@ -898,7 +934,7 @@ mod tests {
             let galley = ui.painter().layout_no_wrap(
                 "1,000,000".to_owned(),
                 FontId::proportional(10.0),
-                Color32::from_gray(55),
+                crate::theme::adapt(Color32::from_gray(55)),
             );
             let label = ruler_tick_label_rect(ruler, ruler.left() + 100.0, galley.size());
             geometry = Some((ruler, label));

@@ -16,23 +16,22 @@ struct Camera {
 @group(0) @binding(0)
 var<uniform> camera: Camera;
 
+// One sixteen-byte instance (`AlignmentGpuInstance`):
+//   span.x     whole bases from the page start to the primitive's start
+//   span.y     whole bases covered
+//   packed.x   row offset in the page (bits 0..20) | shape (20..24) | palette index (24..32)
+//   packed.y   colour parameter word; see `palette_color`
 struct VertexInput {
     @builtin(vertex_index) vertex_index: u32,
-    @location(0) start_offset: vec2<f32>,
-    @location(1) end_offset: vec2<f32>,
-    @location(2) row_offset: u32,
-    @location(3) shape: u32,
-    @location(4) color: vec4<f32>,
+    @location(0) span: vec2<u32>,
+    @location(1) packed: vec2<u32>,
 };
 
 struct InteractiveVertexInput {
     @builtin(vertex_index) vertex_index: u32,
-    @location(0) start_offset: vec2<f32>,
-    @location(1) end_offset: vec2<f32>,
-    @location(2) row_offset: u32,
-    @location(3) shape: u32,
-    @location(4) color: vec4<f32>,
-    @location(5) interaction_flags: u32,
+    @location(0) span: vec2<u32>,
+    @location(1) packed: vec2<u32>,
+    @location(2) interaction_flags: u32,
 };
 
 struct VertexOutput {
@@ -43,9 +42,10 @@ struct VertexOutput {
     @location(3) @interpolate(flat) shape: u32,
 };
 
-fn project_x(page_offset: vec2<f32>) -> f32 {
+// `page_offset` is a whole number of bases from the page start; see `page_offset_words`.
+fn project_x(page_offset: u32) -> f32 {
     return camera.clip_origin.x + project_genomic_x(
-        page_offset,
+        page_offset_words(page_offset),
         camera.page_start_whole,
         camera.page_start_fraction,
         camera.points_per_base,
@@ -56,32 +56,36 @@ fn interaction_color(color: vec4<f32>, flags: u32) -> vec4<f32> {
     var target_color = color.rgb;
     var amount = 0.0;
     if (flags & 2u) != 0u {
-        target_color = vec3<f32>(0.16, 0.42, 0.92);
+        target_color = palette_slot(TOKEN_INTERACTION_SELECTED).rgb;
         amount = 0.58;
     } else if (flags & 1u) != 0u {
-        target_color = vec3<f32>(0.28, 0.52, 0.94);
+        target_color = palette_slot(TOKEN_INTERACTION_HOVERED).rgb;
         amount = 0.32;
     } else if (flags & 4u) != 0u {
-        target_color = vec3<f32>(0.90, 0.62, 0.16);
+        target_color = palette_slot(TOKEN_INTERACTION_SELECTED_CHAIN).rgb;
         amount = 0.38;
     } else if (flags & 8u) != 0u {
-        target_color = vec3<f32>(0.96, 0.70, 0.12);
+        target_color = palette_slot(TOKEN_INTERACTION_HIGHLIGHTED).rgb;
         amount = 0.46;
     }
     return vec4<f32>(mix(color.rgb, target_color, amount), 1.0);
 }
 
+fn instance_color(packed: vec2<u32>) -> vec4<f32> {
+    return palette_color(packed.x >> 24u, packed.y);
+}
+
 fn project_instance(
     vertex_index: u32,
-    start_offset: vec2<f32>,
-    end_offset: vec2<f32>,
-    row_offset: u32,
-    shape: u32,
+    span: vec2<u32>,
+    packed: vec2<u32>,
     color: vec4<f32>,
 ) -> VertexOutput {
     let corner = quad_corner(vertex_index);
-    var left = project_x(start_offset);
-    var right = project_x(end_offset);
+    let row_offset = packed.x & 0xFFFFFu;
+    let shape = (packed.x >> 20u) & 0xFu;
+    var left = project_x(span.x);
+    var right = project_x(span.x + span.y);
     let row = f32(camera.page_row_start + row_offset);
     let row_top = camera.clip_origin.y
         + (row - camera.row_scroll) * camera.row_height
@@ -123,11 +127,9 @@ fn project_instance(
 fn vertex_main(input: VertexInput) -> VertexOutput {
     return project_instance(
         input.vertex_index,
-        input.start_offset,
-        input.end_offset,
-        input.row_offset,
-        input.shape,
-        input.color,
+        input.span,
+        input.packed,
+        instance_color(input.packed),
     );
 }
 
@@ -135,11 +137,9 @@ fn vertex_main(input: VertexInput) -> VertexOutput {
 fn interaction_vertex_main(input: InteractiveVertexInput) -> VertexOutput {
     return project_instance(
         input.vertex_index,
-        input.start_offset,
-        input.end_offset,
-        input.row_offset,
-        input.shape,
-        interaction_color(input.color, input.interaction_flags),
+        input.span,
+        input.packed,
+        interaction_color(instance_color(input.packed), input.interaction_flags),
     );
 }
 

@@ -1,8 +1,9 @@
 use std::{
+    collections::BTreeMap,
     mem::size_of,
     num::NonZeroUsize,
     sync::{
-        Arc, OnceLock,
+        Arc, OnceLock, Weak,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError},
     },
@@ -12,22 +13,24 @@ use std::{
 use rgv_alignment_scene::{
     AlignmentHandle, AlignmentSourceRevision, AllocationClass, AllocationLedger,
     CanonicalRecordChunk, CapabilityRequirement, ChunkError, CompleteCoverage, ContractFingerprint,
-    CoverageError, EvidenceChunk, EvidenceChunkError, FilteredRecordProvenance, LedgerError,
-    PayloadContract, PayloadSidecar, PayloadSidecarError, RecordContract, ReservationKind,
-    SourceChunkId, TransientResourceClass,
+    CoverageError, EvidenceChunk, EvidenceChunkError, EvidenceStore, FilteredRecordProvenance,
+    LedgerError, PayloadContract, PayloadSidecar, PayloadSidecarError, RecordContract,
+    ReservationKind, SourceChunkId, TransientResourceClass,
 };
 use rgv_core::{GenomicInterval, OverlappingMatePolicy};
 use rgv_hts::{
     AlignmentBatch, AlignmentError, AlignmentPayloadBatch, AlignmentPayloadError, AlignmentSource,
     IndividualReadStatus, PositionedAlignmentBlock, PositionedAlignmentStreamCheckpoint,
-    ProductionAlignmentSource, QueryDetail, QueryOptions, QueryStats, RemoteTransferBudget,
+    PositionedChunkReceipt, ProductionAlignmentSource, QueryDetail, QueryOptions, QueryStats,
+    RemoteTransferBudget,
 };
 use thiserror::Error;
 
 use crate::alignment_scene_coordinator::budget_pressure;
 use crate::{
     AlignmentSourceIntentSpec, CanonicalAlignmentSourceBackend, CanonicalDecodeCheckpoint,
-    SourceWork,
+    SourceIntentKind, SourceWork,
+    decode_allowance::{DecodeAllowance, DecodeClass},
     mailbox::{MailboxWaker, panic_message},
 };
 
@@ -41,17 +44,251 @@ pub enum LocalBamSourceControl {
 
 /// Production adapter from a resumable positioned decoder to canonical immutable evidence.
 ///
-/// Despite its historical name this backend serves every production alignment source: local BAM
-/// through `HTSlib`, and local CRAM, remote BAM and remote CRAM through the positioned pure-Rust
-/// decoders. One instance owns one mutable indexed reader. It never certifies a partial
-/// transaction and it returns to the actor after every physical owner chunk (BGZF block or CRAM
-/// slice), including chunks containing only filtered records.
-pub struct LocalBamCanonicalBackend {
+/// This backend serves every production alignment source: local BAM through `HTSlib`, and
+/// local CRAM, remote BAM and remote CRAM through the positioned pure-Rust decoders. One
+/// instance owns one mutable indexed reader. It never certifies a partial transaction and it
+/// returns to the actor after every physical owner chunk (BGZF block or CRAM slice), including
+/// chunks containing only filtered records.
+///
+/// It keeps the decoder's receipt of every chunk it handed over. A later stream whose target
+/// overlaps chunks the evidence store still holds is started with those receipts, so the
+/// decoder seeks past the chunks instead of reading them again (see
+/// [`CanonicalAlignmentSourceBackend::begin_work_resuming`]).
+pub struct PositionedAlignmentBackend {
     decoder: DecoderThread,
     is_cram: bool,
     source_revision: AlignmentSourceRevision,
     record_contract: ContractFingerprint,
     options: QueryOptions,
+    receipts: ReceiptBook,
+}
+
+/// Former name of [`PositionedAlignmentBackend`], from when it served local BAM only.
+#[deprecated(
+    note = "renamed to `PositionedAlignmentBackend`: it serves local and remote BAM and CRAM"
+)]
+pub type LocalBamCanonicalBackend = PositionedAlignmentBackend;
+
+/// Most bytes of chunk receipts one backend keeps (about 16 bytes per record a stream saw).
+/// Receipts are small next to the evidence they describe, which the allocation ledger bounds;
+/// this caps them on their own so a long session over a filtered-out or evicted region cannot
+/// grow them without limit. The oldest are dropped first, which only costs a later re-decode.
+const RECEIPT_BYTE_LIMIT: usize = 8 << 20;
+
+/// Receipts held between passes that drop the receipts of chunks nobody holds any more.
+const RECEIPT_PRUNE_INTERVAL: u64 = 256;
+
+/// What a backend's decode thread has done, and the chunk receipts the backend holds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentDecodeTelemetry {
+    /// Streams the decode thread began.
+    pub streams_started: u64,
+    /// Source units (BGZF blocks, CRAM slices) the decode thread read, delivered or not.
+    pub blocks_decoded: u64,
+    /// Records retained in those units.
+    pub records_decoded: u64,
+    /// Receipts of resident chunks handed to the decoder when a stream began.
+    pub receipts_offered: u64,
+    /// Receipts the decoder honoured: chunks it did not read again.
+    pub receipts_honoured: u64,
+    /// Receipts currently held.
+    pub receipts_held: usize,
+    /// Bytes those receipts retain; never above the backend's receipt limit.
+    pub receipt_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct DecodeCounters {
+    streams_started: AtomicU64,
+    blocks_decoded: AtomicU64,
+    records_decoded: AtomicU64,
+    receipts_offered: AtomicU64,
+    receipts_honoured: AtomicU64,
+}
+
+/// File identity of an owner chunk as its receipt reports it: the block's compressed offset
+/// and, for CRAM, the slice landmark.
+type ReceiptKey = (u64, Option<u64>);
+
+fn receipt_key(receipt: &PositionedChunkReceipt) -> ReceiptKey {
+    (receipt.compressed_offset(), receipt.cram_slice_landmark())
+}
+
+struct HeldReceipt {
+    receipt: PositionedChunkReceipt,
+    /// The evidence chunk holding the records of the receipt's block. `None` for a block whose
+    /// records were all filtered out: nothing has to be resident for it to be skipped.
+    chunk: Option<Weak<EvidenceChunk>>,
+    /// Smallest start and largest end of the chunk's records.
+    span: (u64, u64),
+    age: u64,
+    bytes: usize,
+}
+
+/// Receipt of the chunk the last checkpoint handed to the actor, until the actor reports which
+/// resident chunk holds its records.
+struct PendingReceipt {
+    receipt: PositionedChunkReceipt,
+    id: SourceChunkId,
+    records: usize,
+    span: (u64, u64),
+}
+
+/// The receipts a backend holds, one per owner chunk (the latest stream's), within
+/// [`RECEIPT_BYTE_LIMIT`]. A receipt is only ever offered to the decoder while the evidence
+/// store still holds the exact chunk it was bound to; the weak reference lets go of the chunk
+/// as soon as the store and every scene do.
+#[derive(Default)]
+struct ReceiptBook {
+    held: BTreeMap<ReceiptKey, HeldReceipt>,
+    bytes: usize,
+    byte_limit: usize,
+    next_age: u64,
+    pending: Option<PendingReceipt>,
+}
+
+impl ReceiptBook {
+    fn new(byte_limit: usize) -> Self {
+        Self {
+            byte_limit,
+            ..Self::default()
+        }
+    }
+
+    fn hold(
+        &mut self,
+        receipt: PositionedChunkReceipt,
+        chunk: Option<Weak<EvidenceChunk>>,
+        span: (u64, u64),
+    ) {
+        let bytes = receipt.estimated_bytes();
+        if bytes > self.byte_limit {
+            self.remove(receipt_key(&receipt));
+            return;
+        }
+        let age = self.next_age;
+        self.next_age += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        let replaced = self.held.insert(
+            receipt_key(&receipt),
+            HeldReceipt {
+                receipt,
+                chunk,
+                span,
+                age,
+                bytes,
+            },
+        );
+        if let Some(replaced) = replaced {
+            self.bytes = self.bytes.saturating_sub(replaced.bytes);
+        }
+        if self.bytes > self.byte_limit {
+            self.shrink();
+        } else if age % RECEIPT_PRUNE_INTERVAL == RECEIPT_PRUNE_INTERVAL - 1 {
+            // Keeps the book in step with the evidence that is actually resident, well
+            // before the byte limit would force it.
+            self.forget_released_chunks();
+        }
+    }
+
+    fn remove(&mut self, key: ReceiptKey) {
+        if let Some(removed) = self.held.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(removed.bytes);
+        }
+    }
+
+    /// Drops the receipts of chunks that the store and every scene have let go of.
+    fn forget_released_chunks(&mut self) {
+        let dead = self
+            .held
+            .iter()
+            .filter(|(_, held)| {
+                held.chunk
+                    .as_ref()
+                    .is_some_and(|chunk| chunk.strong_count() == 0)
+            })
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        for key in dead {
+            self.remove(key);
+        }
+    }
+
+    /// Drops receipts of chunks nobody holds any more, then the oldest, until three quarters
+    /// of the limit is in use (so a full book is not trimmed again on every insertion).
+    fn shrink(&mut self) {
+        self.forget_released_chunks();
+        let target = self.byte_limit / 4 * 3;
+        if self.bytes <= target {
+            return;
+        }
+        let mut by_age = self
+            .held
+            .iter()
+            .map(|(key, held)| (held.age, *key))
+            .collect::<Vec<_>>();
+        by_age.sort_unstable();
+        for (_, key) in by_age {
+            if self.bytes <= target {
+                break;
+            }
+            self.remove(key);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.held.clear();
+        self.bytes = 0;
+        self.pending = None;
+    }
+
+    /// The receipts a stream over `target` may be started with, and the resident chunks that
+    /// hold the skipped blocks' records. A chunk-bound receipt is returned only when `store`
+    /// still holds that exact chunk with a payload satisfying `payload`: the records of an
+    /// evicted chunk are gone, so its block has to be decoded again.
+    fn resumable(
+        &mut self,
+        target: GenomicInterval,
+        options: &QueryOptions,
+        payload: &PayloadContract,
+        store: &EvidenceStore,
+    ) -> (Vec<PositionedChunkReceipt>, Vec<Arc<EvidenceChunk>>) {
+        self.pending = None;
+        let mut receipts = Vec::new();
+        let mut chunks = Vec::new();
+        let mut dead = Vec::new();
+        for (key, held) in &self.held {
+            let Some(bound) = &held.chunk else {
+                if held.receipt.can_resume(target, options) {
+                    receipts.push(held.receipt.clone());
+                }
+                continue;
+            };
+            let Some(chunk) = bound.upgrade() else {
+                dead.push(*key);
+                continue;
+            };
+            // A chunk with no record in the target contributes nothing to its acquisition;
+            // leaving it out keeps the acquisition from pinning evidence it does not need.
+            if held.span.0 >= target.end()
+                || held.span.1 <= target.start()
+                || !held.receipt.can_resume(target, options)
+            {
+                continue;
+            }
+            let resident = store
+                .cached_chunk_fragment(chunk.chunk().id(), chunk.chunk().handles(), payload)
+                .is_some_and(|cached| Arc::ptr_eq(cached, &chunk));
+            if resident {
+                receipts.push(held.receipt.clone());
+                chunks.push(chunk);
+            }
+        }
+        for key in dead {
+            self.remove(key);
+        }
+        (receipts, chunks)
+    }
 }
 
 /// Finished source units a decoder thread may hold ahead of the scene worker. Small on purpose:
@@ -70,12 +307,23 @@ struct DecodeRequest {
     target: GenomicInterval,
     admission_target: GenomicInterval,
     options: QueryOptions,
+    /// Receipts of chunks whose records the caller still holds; the stream skips them.
+    skip: Vec<PositionedChunkReceipt>,
+    class: DecodeClass,
 }
 
 struct DecodeResult {
     generation: u64,
     checkpoint: Result<PositionedAlignmentStreamCheckpoint, DecodeFailure>,
+    /// Receipt of the block in `checkpoint`, when the decoder issued one.
+    receipt: Option<PositionedChunkReceipt>,
 }
+
+/// One finished unit of a stream with the receipt of its block, if it is a block.
+type DecodedUnit = (
+    PositionedAlignmentStreamCheckpoint,
+    Option<PositionedChunkReceipt>,
+);
 
 enum DecodeFailure {
     Source(AlignmentError),
@@ -95,20 +343,28 @@ impl From<DecodeFailure> for LocalBamCanonicalBackendError {
 /// The positioned decoder the decode thread drives. Production uses
 /// [`ProductionAlignmentSource`]; the seam exists so thread-level behaviour (cancellation,
 /// panic containment, wake-ups) can be exercised without a real file.
-trait PositionedDecodeSource: Send + 'static {
+pub(crate) trait PositionedDecodeSource: Send + 'static {
     fn prepare_stream(&mut self, still_wanted: Arc<dyn Fn() -> bool + Send + Sync>);
 
+    /// Starts a stream that does not decode the chunks named by `skip` again, and returns how
+    /// many of those receipts it honoured. A source that cannot resume ignores them all.
     fn begin_stream(
         &mut self,
         target: GenomicInterval,
         admission_target: GenomicInterval,
         options: QueryOptions,
-    ) -> Result<(), AlignmentError>;
+        skip: Vec<PositionedChunkReceipt>,
+    ) -> Result<usize, AlignmentError>;
 
     fn next_checkpoint(
         &mut self,
         still_wanted: &dyn Fn() -> bool,
     ) -> Result<PositionedAlignmentStreamCheckpoint, AlignmentError>;
+
+    /// The receipt of the block the last checkpoint returned, once.
+    fn take_chunk_receipt(&mut self) -> Option<PositionedChunkReceipt> {
+        None
+    }
 
     fn cancel_stream(&mut self);
 }
@@ -126,8 +382,9 @@ impl PositionedDecodeSource for ProductionAlignmentSource {
         target: GenomicInterval,
         admission_target: GenomicInterval,
         options: QueryOptions,
-    ) -> Result<(), AlignmentError> {
-        self.begin_positioned_stream_with_admission(target, admission_target, options)
+        skip: Vec<PositionedChunkReceipt>,
+    ) -> Result<usize, AlignmentError> {
+        self.begin_positioned_stream_resuming(target, admission_target, options, skip)
     }
 
     fn next_checkpoint(
@@ -135,6 +392,10 @@ impl PositionedDecodeSource for ProductionAlignmentSource {
         still_wanted: &dyn Fn() -> bool,
     ) -> Result<PositionedAlignmentStreamCheckpoint, AlignmentError> {
         self.next_positioned_stream_checkpoint(still_wanted)
+    }
+
+    fn take_chunk_receipt(&mut self) -> Option<PositionedChunkReceipt> {
+        self.take_positioned_chunk_receipt()
     }
 
     fn cancel_stream(&mut self) {
@@ -159,17 +420,30 @@ struct DecoderThread {
     /// Called by the decode thread after every hand-over, so a non-waiting driver can sleep
     /// until a unit is ready instead of polling `next`.
     unit_ready: Arc<OnceLock<MailboxWaker>>,
+    /// Bounds how many decode threads of the process read a source unit at the same time.
+    allowance: Arc<DecodeAllowance>,
+    counters: Arc<DecodeCounters>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl DecoderThread {
     fn spawn(source: impl PositionedDecodeSource) -> Self {
+        Self::spawn_with_allowance(source, DecodeAllowance::process())
+    }
+
+    fn spawn_with_allowance(
+        source: impl PositionedDecodeSource,
+        allowance: Arc<DecodeAllowance>,
+    ) -> Self {
         let (requests, request_rx) = mpsc::channel::<DecodeRequest>();
         let (result_tx, results) = mpsc::sync_channel::<DecodeResult>(DECODE_READ_AHEAD);
         let wanted = Arc::new(AtomicU64::new(0));
         let thread_wanted = Arc::clone(&wanted);
         let unit_ready = Arc::new(OnceLock::new());
         let thread_unit_ready = Arc::clone(&unit_ready);
+        let counters = Arc::new(DecodeCounters::default());
+        let thread_counters = Arc::clone(&counters);
+        let thread_allowance = Arc::clone(&allowance);
         let worker = thread::Builder::new()
             .name("rgv-alignment-decode".to_owned())
             .spawn(move || {
@@ -179,6 +453,8 @@ impl DecoderThread {
                     &result_tx,
                     &thread_wanted,
                     &thread_unit_ready,
+                    &thread_allowance,
+                    &thread_counters,
                 );
             })
             .expect("failed to spawn RGV alignment decode thread");
@@ -190,20 +466,44 @@ impl DecoderThread {
             last_generation: 0,
             wait_for_units: true,
             unit_ready,
+            allowance,
+            counters,
             worker: Some(worker),
         }
     }
 
+    /// Starts a fresh foreground stream.
+    #[cfg(test)]
     fn begin(
         &mut self,
         target: GenomicInterval,
         admission_target: GenomicInterval,
         options: QueryOptions,
     ) -> Result<(), LocalBamCanonicalBackendError> {
+        self.begin_resuming(
+            target,
+            admission_target,
+            options,
+            Vec::new(),
+            DecodeClass::Foreground,
+        )
+    }
+
+    /// Starts a stream that skips the chunks named by `skip`, superseding the one in flight.
+    fn begin_resuming(
+        &mut self,
+        target: GenomicInterval,
+        admission_target: GenomicInterval,
+        options: QueryOptions,
+        skip: Vec<PositionedChunkReceipt>,
+        class: DecodeClass,
+    ) -> Result<(), LocalBamCanonicalBackendError> {
         self.last_generation += 1;
         let generation = self.last_generation;
         self.wanted.store(generation, Ordering::Release);
         self.active = Some(generation);
+        // A superseded stream waiting for its turn to decode leaves the line.
+        self.allowance.wake();
         // Results of superseded streams are dropped here; this also unblocks a decoder that
         // was waiting to hand over a block nobody wants any more.
         while self.results.try_recv().is_ok() {}
@@ -216,6 +516,8 @@ impl DecoderThread {
                         target,
                         admission_target,
                         options,
+                        skip,
+                        class,
                     })
                     .ok()
             })
@@ -225,13 +527,12 @@ impl DecoderThread {
     fn cancel(&mut self) {
         self.active = None;
         self.wanted.store(0, Ordering::Release);
+        self.allowance.wake();
         while self.results.try_recv().is_ok() {}
     }
 
     /// The next finished unit of the active stream, or `None` when the decoder is still busy.
-    fn next(
-        &mut self,
-    ) -> Result<Option<PositionedAlignmentStreamCheckpoint>, LocalBamCanonicalBackendError> {
+    fn next(&mut self) -> Result<Option<DecodedUnit>, LocalBamCanonicalBackendError> {
         let Some(active) = self.active else {
             return Err(LocalBamCanonicalBackendError::NoActiveStream);
         };
@@ -247,7 +548,7 @@ impl DecoderThread {
                     if !matches!(checkpoint, PositionedAlignmentStreamCheckpoint::Block(_)) {
                         self.active = None;
                     }
-                    return Ok(Some(checkpoint));
+                    return Ok(Some((checkpoint, result.receipt)));
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => return Ok(None),
@@ -263,6 +564,7 @@ impl Drop for DecoderThread {
     fn drop(&mut self) {
         self.wanted.store(0, Ordering::Release);
         self.requests = None;
+        self.allowance.wake();
         // Unblock a decoder waiting on a full hand-over queue, then let it finish on its own;
         // joining here could wait on a slow remote read.
         while self.results.try_recv().is_ok() {}
@@ -279,6 +581,8 @@ fn decode_loop<S: PositionedDecodeSource>(
     results: &SyncSender<DecodeResult>,
     wanted: &Arc<AtomicU64>,
     unit_ready: &OnceLock<MailboxWaker>,
+    allowance: &DecodeAllowance,
+    counters: &DecodeCounters,
 ) {
     while let Ok(mut request) = requests.recv() {
         while let Ok(newer) = requests.try_recv() {
@@ -294,11 +598,12 @@ fn decode_loop<S: PositionedDecodeSource>(
         }
         // Hands one finished unit (or the stream's terminal result) to the backend and wakes a
         // sleeping driver. `false` means the backend is gone.
-        let deliver = |checkpoint| {
+        let deliver = |checkpoint, receipt| {
             let delivered = results
                 .send(DecodeResult {
                     generation,
                     checkpoint,
+                    receipt,
                 })
                 .is_ok();
             if let Some(wake) = unit_ready.get() {
@@ -307,20 +612,30 @@ fn decode_loop<S: PositionedDecodeSource>(
             delivered
         };
         let stream = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            decode_stream(&mut source, request, &still_wanted, &deliver)
+            decode_stream(
+                &mut source,
+                request,
+                &still_wanted,
+                &deliver,
+                allowance,
+                counters,
+            )
         }));
         match stream {
             Ok(true) => {}
             Ok(false) => return,
             Err(payload) => {
                 let message = panic_message(payload.as_ref());
-                tracing::error!(message, "alignment decoder panicked; the stream was abandoned");
+                tracing::error!(
+                    message,
+                    "alignment decoder panicked; the stream was abandoned"
+                );
                 // Best effort: leave the reader without a half-consumed stream. If this panics
                 // too, the next stream's own containment reports it.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     source.cancel_stream();
                 }));
-                if still_wanted() && !deliver(Err(DecodeFailure::Panicked(message))) {
+                if still_wanted() && !deliver(Err(DecodeFailure::Panicked(message)), None) {
                     return;
                 }
             }
@@ -329,24 +644,72 @@ fn decode_loop<S: PositionedDecodeSource>(
 }
 
 /// Decodes one stream to its terminal result. Returns `false` once the backend is gone.
+///
+/// Each source read (the stream start and every unit) is made under a permit of `allowance`,
+/// taken just before the read and given back before the unit is handed over, so a decoder
+/// waiting for its consumer never keeps another source from decoding.
 fn decode_stream<S: PositionedDecodeSource>(
     source: &mut S,
     request: DecodeRequest,
     still_wanted: &(impl Fn() -> bool + Clone + Send + Sync + 'static),
-    deliver: &impl Fn(Result<PositionedAlignmentStreamCheckpoint, DecodeFailure>) -> bool,
+    deliver: &impl Fn(
+        Result<PositionedAlignmentStreamCheckpoint, DecodeFailure>,
+        Option<PositionedChunkReceipt>,
+    ) -> bool,
+    allowance: &DecodeAllowance,
+    counters: &DecodeCounters,
 ) -> bool {
     source.prepare_stream(Arc::new(still_wanted.clone()));
-    if let Err(error) =
-        source.begin_stream(request.target, request.admission_target, request.options)
-    {
-        return !still_wanted() || deliver(Err(DecodeFailure::Source(error)));
+    let class = request.class;
+    let offered = request.skip.len() as u64;
+    let begun = {
+        let Some(_permit) = allowance.acquire(class, still_wanted) else {
+            return true;
+        };
+        source.begin_stream(
+            request.target,
+            request.admission_target,
+            request.options,
+            request.skip,
+        )
+    };
+    match begun {
+        Ok(honoured) => {
+            counters.streams_started.fetch_add(1, Ordering::Relaxed);
+            counters
+                .receipts_offered
+                .fetch_add(offered, Ordering::Relaxed);
+            counters
+                .receipts_honoured
+                .fetch_add(honoured as u64, Ordering::Relaxed);
+        }
+        Err(error) => {
+            return !still_wanted() || deliver(Err(DecodeFailure::Source(error)), None);
+        }
     }
     loop {
         if !still_wanted() {
             source.cancel_stream();
             return true;
         }
-        let checkpoint = source.next_checkpoint(still_wanted);
+        let (checkpoint, receipt) = {
+            let Some(_permit) = allowance.acquire(class, still_wanted) else {
+                source.cancel_stream();
+                return true;
+            };
+            let checkpoint = source.next_checkpoint(still_wanted);
+            let receipt = match &checkpoint {
+                Ok(PositionedAlignmentStreamCheckpoint::Block(block)) => {
+                    counters.blocks_decoded.fetch_add(1, Ordering::Relaxed);
+                    counters
+                        .records_decoded
+                        .fetch_add(block.records.len() as u64, Ordering::Relaxed);
+                    source.take_chunk_receipt()
+                }
+                _ => None,
+            };
+            (checkpoint, receipt)
+        };
         if !still_wanted() {
             // Cancelled inside the unit; whatever came back belongs to nobody.
             source.cancel_stream();
@@ -356,7 +719,7 @@ fn decode_stream<S: PositionedDecodeSource>(
             checkpoint,
             Ok(PositionedAlignmentStreamCheckpoint::Block(_))
         );
-        if !deliver(checkpoint.map_err(DecodeFailure::Source)) {
+        if !deliver(checkpoint.map_err(DecodeFailure::Source), receipt) {
             return false;
         }
         if finished {
@@ -365,12 +728,21 @@ fn decode_stream<S: PositionedDecodeSource>(
     }
 }
 
-impl LocalBamCanonicalBackend {
+impl PositionedAlignmentBackend {
     pub fn new(
         source: impl Into<ProductionAlignmentSource>,
-        mut options: QueryOptions,
+        options: QueryOptions,
     ) -> Result<Self, LocalBamCanonicalBackendError> {
-        let source = source.into();
+        Self::with_decode_source(source.into(), options, |source| source)
+    }
+
+    /// Builds the backend around `wrap(source)`, so a test can observe or gate what the decode
+    /// thread asks of the production decoder.
+    pub(crate) fn with_decode_source<S: PositionedDecodeSource>(
+        source: ProductionAlignmentSource,
+        mut options: QueryOptions,
+        wrap: impl FnOnce(ProductionAlignmentSource) -> S,
+    ) -> Result<Self, LocalBamCanonicalBackendError> {
         let stamp = source
             .source_stamp()
             .ok_or(LocalBamCanonicalBackendError::MissingSourceRevision)?;
@@ -385,11 +757,27 @@ impl LocalBamCanonicalBackend {
         options.include_reference = false;
         Ok(Self {
             is_cram: source.is_cram(),
-            decoder: DecoderThread::spawn(source),
+            decoder: DecoderThread::spawn(wrap(source)),
             source_revision,
             record_contract,
             options,
+            receipts: ReceiptBook::new(RECEIPT_BYTE_LIMIT),
         })
+    }
+
+    /// What the decode thread has done so far and the chunk receipts held for later streams.
+    #[must_use]
+    pub fn decode_telemetry(&self) -> AlignmentDecodeTelemetry {
+        let counters = &self.decoder.counters;
+        AlignmentDecodeTelemetry {
+            streams_started: counters.streams_started.load(Ordering::Relaxed),
+            blocks_decoded: counters.blocks_decoded.load(Ordering::Relaxed),
+            records_decoded: counters.records_decoded.load(Ordering::Relaxed),
+            receipts_offered: counters.receipts_offered.load(Ordering::Relaxed),
+            receipts_honoured: counters.receipts_honoured.load(Ordering::Relaxed),
+            receipts_held: self.receipts.held.len(),
+            receipt_bytes: self.receipts.bytes,
+        }
     }
 
     /// Makes [`CanonicalAlignmentSourceBackend::next_checkpoint`] return
@@ -450,10 +838,16 @@ impl LocalBamCanonicalBackend {
         Ok(options)
     }
 
+    /// Starts the stream of `work`. With a `store`, the stream skips every chunk whose receipt
+    /// is held, valid for the new target, and whose records `store` still holds with a payload
+    /// that satisfies the work's; those chunks are returned so the caller can make them part
+    /// of the transaction. Without one the stream is fresh.
     fn begin_or_retarget(
         &mut self,
         work: &SourceWork,
-    ) -> Result<(), LocalBamCanonicalBackendError> {
+        store: Option<&EvidenceStore>,
+    ) -> Result<Vec<Arc<EvidenceChunk>>, LocalBamCanonicalBackendError> {
+        self.receipts.pending = None;
         self.validate_work(work)?;
         if self.is_cram {
             // CRAM decoding is reference-based; the decode reference is fixed when the source
@@ -461,12 +855,25 @@ impl LocalBamCanonicalBackend {
         } else if work.intent().spec().payload().decode_reference().is_some() {
             return Err(LocalBamCanonicalBackendError::DecodeReferenceUnsupportedForBam);
         }
-        let options = self.options_for(work.intent().spec().payload())?;
-        self.decoder.begin(
-            work.intent().spec().target(),
-            work.intent().spec().admission_target(),
+        let spec = work.intent().spec();
+        let options = self.options_for(spec.payload())?;
+        let (skip, resident) = match store {
+            Some(store) => self
+                .receipts
+                .resumable(spec.target(), &options, spec.payload(), store),
+            None => (Vec::new(), Vec::new()),
+        };
+        self.decoder.begin_resuming(
+            spec.target(),
+            spec.admission_target(),
             options,
-        )
+            skip,
+            match work.kind() {
+                SourceIntentKind::Foreground => DecodeClass::Foreground,
+                SourceIntentKind::Speculative => DecodeClass::Speculative,
+            },
+        )?;
+        Ok(resident)
     }
 
     fn pack_block(
@@ -589,7 +996,7 @@ impl LocalBamCanonicalBackend {
     }
 }
 
-impl CanonicalAlignmentSourceBackend for LocalBamCanonicalBackend {
+impl CanonicalAlignmentSourceBackend for PositionedAlignmentBackend {
     type Control = LocalBamSourceControl;
     type Error = LocalBamCanonicalBackendError;
 
@@ -621,7 +1028,39 @@ impl CanonicalAlignmentSourceBackend for LocalBamCanonicalBackend {
         work: &SourceWork,
         _ledger: &AllocationLedger,
     ) -> Result<(), Self::Error> {
-        self.begin_or_retarget(work)
+        self.begin_or_retarget(work, None).map(drop)
+    }
+
+    fn begin_work_resuming(
+        &mut self,
+        work: &SourceWork,
+        store: &EvidenceStore,
+    ) -> Result<Vec<Arc<EvidenceChunk>>, Self::Error> {
+        self.begin_or_retarget(work, Some(store))
+    }
+
+    fn retarget_resuming(
+        &mut self,
+        work: &SourceWork,
+        store: &EvidenceStore,
+    ) -> Result<Vec<Arc<EvidenceChunk>>, Self::Error> {
+        self.begin_or_retarget(work, Some(store))
+    }
+
+    fn chunk_admitted(&mut self, _work: &SourceWork, chunk: &Arc<EvidenceChunk>) {
+        let Some(pending) = self.receipts.pending.take() else {
+            return;
+        };
+        // The store answers an admission with the chunk it keeps: the one just packed, or a
+        // resident one holding the same records. Either way the receipt describes it.
+        if chunk.chunk().id() == pending.id && chunk.chunk().handles().len() == pending.records {
+            self.receipts
+                .hold(pending.receipt, Some(Arc::downgrade(chunk)), pending.span);
+        }
+    }
+
+    fn forget_resumable_chunks(&mut self) {
+        self.receipts.clear();
     }
 
     fn next_checkpoint(
@@ -630,17 +1069,36 @@ impl CanonicalAlignmentSourceBackend for LocalBamCanonicalBackend {
         ledger: &AllocationLedger,
     ) -> Result<CanonicalDecodeCheckpoint, Self::Error> {
         self.validate_work(work)?;
-        let Some(checkpoint) = self.decoder.next()? else {
+        let Some((checkpoint, receipt)) = self.decoder.next()? else {
             return Ok(CanonicalDecodeCheckpoint::Pending);
         };
+        self.receipts.pending = None;
         match checkpoint {
             PositionedAlignmentStreamCheckpoint::Block(block) => {
                 let genomic_span = block
                     .genomic_span
                     .unwrap_or_else(|| work.intent().spec().target());
                 if block.records.is_empty() {
+                    // Nothing was retained, so nothing has to stay resident for a later
+                    // stream to skip this block.
+                    if let Some(receipt) = receipt {
+                        self.receipts.hold(receipt, None, (0, 0));
+                    }
                     Ok(CanonicalDecodeCheckpoint::Progress { genomic_span })
                 } else {
+                    let records = block.records.len();
+                    let span =
+                        block
+                            .records
+                            .iter()
+                            .fold((u64::MAX, 0), |(start, end), positioned| {
+                                let record = &positioned.record;
+                                (
+                                    start.min(record.start),
+                                    // A record consuming no reference base occupies one.
+                                    end.max(record.end.max(record.start.saturating_add(1))),
+                                )
+                            });
                     // The returned normalized owner block remains live while we create packed
                     // core, overlap, and optional payload derivatives. Reserve their concurrent
                     // logical capacities before any of those duplicate allocations. HTSlib's
@@ -651,8 +1109,16 @@ impl CanonicalAlignmentSourceBackend for LocalBamCanonicalBackend {
                         block.estimated_bytes().saturating_mul(6),
                         ReservationKind::Normal,
                     )?;
+                    let chunk = self.pack_block(work, block, ledger)?;
+                    // Bound to the chunk the store keeps once the actor reports its admission.
+                    self.receipts.pending = receipt.map(|receipt| PendingReceipt {
+                        receipt,
+                        id: chunk.chunk().id(),
+                        records,
+                        span,
+                    });
                     Ok(CanonicalDecodeCheckpoint::Chunk {
-                        chunk: self.pack_block(work, block, ledger)?,
+                        chunk,
                         genomic_span,
                     })
                 }
@@ -682,10 +1148,11 @@ impl CanonicalAlignmentSourceBackend for LocalBamCanonicalBackend {
     }
 
     fn retarget(&mut self, work: &SourceWork) -> Result<(), Self::Error> {
-        self.begin_or_retarget(work)
+        self.begin_or_retarget(work, None).map(drop)
     }
 
     fn cancel(&mut self, _work: &SourceWork) {
+        self.receipts.pending = None;
         self.decoder.cancel();
     }
 
@@ -772,6 +1239,136 @@ pub enum LocalBamCanonicalBackendError {
     Ledger(#[from] LedgerError),
 }
 
+/// A decode source that records what the production decoder was asked to do and actually
+/// read, so tests can tell a skipped block from a decoded one.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, Mutex};
+
+    use rgv_core::GenomicInterval;
+    use rgv_hts::{
+        AlignmentError, PositionedAlignmentStreamCheckpoint, PositionedChunkReceipt,
+        ProductionAlignmentSource, QueryOptions,
+    };
+
+    use super::PositionedDecodeSource;
+
+    /// One source unit the decoder read.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(crate) struct DecodedBlock {
+        pub(crate) compressed_offset: u64,
+        pub(crate) records: usize,
+        /// Smallest start and largest end of the retained records.
+        pub(crate) span: Option<(u64, u64)>,
+    }
+
+    /// One stream the decoder began.
+    #[derive(Clone, Debug)]
+    pub(crate) struct DecodedStream {
+        pub(crate) target: GenomicInterval,
+        pub(crate) receipts_offered: usize,
+        pub(crate) receipts_honoured: usize,
+        pub(crate) blocks: Vec<DecodedBlock>,
+    }
+
+    impl DecodedStream {
+        pub(crate) fn offsets(&self) -> std::collections::BTreeSet<u64> {
+            self.blocks
+                .iter()
+                .map(|block| block.compressed_offset)
+                .collect()
+        }
+
+        pub(crate) fn records(&self) -> usize {
+            self.blocks.iter().map(|block| block.records).sum()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct DecodeLog(Arc<Mutex<Vec<DecodedStream>>>);
+
+    impl DecodeLog {
+        pub(crate) fn streams(&self) -> Vec<DecodedStream> {
+            self.0.lock().unwrap().clone()
+        }
+
+        pub(crate) fn wrap(&self, inner: ProductionAlignmentSource) -> RecordingDecodeSource {
+            RecordingDecodeSource {
+                inner,
+                log: self.clone(),
+            }
+        }
+    }
+
+    pub(crate) struct RecordingDecodeSource {
+        inner: ProductionAlignmentSource,
+        log: DecodeLog,
+    }
+
+    impl PositionedDecodeSource for RecordingDecodeSource {
+        fn prepare_stream(&mut self, still_wanted: Arc<dyn Fn() -> bool + Send + Sync>) {
+            self.inner.prepare_stream(still_wanted);
+        }
+
+        fn begin_stream(
+            &mut self,
+            target: GenomicInterval,
+            admission_target: GenomicInterval,
+            options: QueryOptions,
+            skip: Vec<PositionedChunkReceipt>,
+        ) -> Result<usize, AlignmentError> {
+            let receipts_offered = skip.len();
+            let receipts_honoured =
+                self.inner
+                    .begin_stream(target, admission_target, options, skip)?;
+            self.log.0.lock().unwrap().push(DecodedStream {
+                target,
+                receipts_offered,
+                receipts_honoured,
+                blocks: Vec::new(),
+            });
+            Ok(receipts_honoured)
+        }
+
+        fn next_checkpoint(
+            &mut self,
+            still_wanted: &dyn Fn() -> bool,
+        ) -> Result<PositionedAlignmentStreamCheckpoint, AlignmentError> {
+            let checkpoint = self.inner.next_checkpoint(still_wanted)?;
+            if let PositionedAlignmentStreamCheckpoint::Block(block) = &checkpoint {
+                let span = block.records.iter().fold(None, |span, positioned| {
+                    let (start, end) = span.unwrap_or((u64::MAX, 0));
+                    Some((
+                        start.min(positioned.record.start),
+                        end.max(positioned.record.end),
+                    ))
+                });
+                self.log
+                    .0
+                    .lock()
+                    .unwrap()
+                    .last_mut()
+                    .expect("a block belongs to a begun stream")
+                    .blocks
+                    .push(DecodedBlock {
+                        compressed_offset: block.compressed_offset,
+                        records: block.records.len(),
+                        span,
+                    });
+            }
+            Ok(checkpoint)
+        }
+
+        fn take_chunk_receipt(&mut self) -> Option<PositionedChunkReceipt> {
+            self.inner.take_chunk_receipt()
+        }
+
+        fn cancel_stream(&mut self) {
+            self.inner.cancel_stream();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -803,7 +1400,8 @@ mod tests {
             _target: GenomicInterval,
             _admission_target: GenomicInterval,
             _options: QueryOptions,
-        ) -> Result<(), AlignmentError> {
+            _skip: Vec<PositionedChunkReceipt>,
+        ) -> Result<usize, AlignmentError> {
             self.streams += 1;
             assert!(self.streams > 1, "scripted decoder failure in stream one");
             Err(AlignmentError::SourceChanged)
@@ -873,10 +1471,12 @@ mod tests {
         )
     }
 
-    fn fixture_backend(complete_read_limit: usize) -> (LocalBamCanonicalBackend, GenomicInterval) {
+    fn fixture_backend(
+        complete_read_limit: usize,
+    ) -> (PositionedAlignmentBackend, GenomicInterval) {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
         let source = LocalAlignmentSource::open(path, &AlignmentOpenOptions::default()).unwrap();
-        let backend = LocalBamCanonicalBackend::new(
+        let backend = PositionedAlignmentBackend::new(
             source,
             QueryOptions {
                 max_records: NonZeroUsize::new(complete_read_limit).unwrap(),
@@ -965,7 +1565,7 @@ mod tests {
             .expect("the CRAM fixture contains mapped records");
 
         let source = rgv_hts::ProductionAlignmentSource::open(&cram, &open_options).unwrap();
-        let backend = LocalBamCanonicalBackend::new(source, QueryOptions::default()).unwrap();
+        let backend = PositionedAlignmentBackend::new(source, QueryOptions::default()).unwrap();
         let revision = backend.source_revision();
         let record_contract = backend.record_contract();
         let intent = backend.intent_spec(contig, no_payload());
@@ -1131,7 +1731,7 @@ mod tests {
         assert!(oracle.individual_reads_complete());
 
         let source = LocalAlignmentSource::open(path, &AlignmentOpenOptions::default()).unwrap();
-        let backend = LocalBamCanonicalBackend::new(source, options.clone()).unwrap();
+        let backend = PositionedAlignmentBackend::new(source, options.clone()).unwrap();
         let revision = backend.source_revision();
         let record_contract = backend.record_contract();
         let payload = PayloadContract::new_all_auxiliary(
@@ -1351,5 +1951,760 @@ mod tests {
         assert!(ledger.snapshot().unwrap().records.iter().any(|allocation| {
             allocation.class == AllocationClass::PayloadSidecar && allocation.charged_capacity > 0
         }));
+    }
+
+    // --- Chunk-level resume -------------------------------------------------------------
+
+    use super::test_support::{DecodeLog, DecodedStream};
+
+    type ResumeActor = AlignmentSourceActor<PositionedAlignmentBackend>;
+
+    fn sequence_payload() -> PayloadContract {
+        PayloadContract::new(
+            CapabilityRequirement::Required,
+            CapabilityRequirement::Required,
+            std::iter::empty(),
+            None,
+        )
+    }
+
+    /// An actor over the multi-megabyte benchmark BAM whose decoder reads are logged.
+    fn mixed_actor() -> (ResumeActor, DecodeLog) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        let source =
+            rgv_hts::ProductionAlignmentSource::open(&path, &AlignmentOpenOptions::default())
+                .unwrap();
+        let log = DecodeLog::default();
+        let backend = PositionedAlignmentBackend::with_decode_source(
+            source,
+            QueryOptions {
+                max_records: NonZeroUsize::new(1_000_000).unwrap(),
+                ..QueryOptions::default()
+            },
+            |source| log.wrap(source),
+        )
+        .unwrap();
+        let store = EvidenceStore::new(
+            backend.source_revision(),
+            backend.record_contract(),
+            AllocationLedger::new(2 << 30, 0),
+        );
+        let actor = AlignmentSourceActor::new(
+            backend,
+            store,
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        (actor, log)
+    }
+
+    fn mixed_interval(start: u64, end: u64) -> GenomicInterval {
+        GenomicInterval::new(ContigId::new(1), start, end).unwrap()
+    }
+
+    /// Pumps the actor until its active transaction is admitted, returning the chunk ids
+    /// admitted on the way.
+    fn pump_to_completion(actor: &mut ResumeActor) -> Vec<SourceChunkId> {
+        let mut admitted = Vec::new();
+        for _ in 0..100_000 {
+            match actor.pump_once().unwrap() {
+                Some(AlignmentSourceActorEvent::ChunkAdmitted { id, .. }) => admitted.push(id),
+                Some(AlignmentSourceActorEvent::AcquisitionCompleted { .. }) => return admitted,
+                Some(AlignmentSourceActorEvent::AcquisitionRefused { .. }) => {
+                    panic!("the fixture target was refused")
+                }
+                Some(_) => {}
+                None => panic!("the actor went idle before completing"),
+            }
+        }
+        panic!("the transaction did not complete");
+    }
+
+    fn acquire(
+        actor: &mut ResumeActor,
+        target: GenomicInterval,
+        payload: &PayloadContract,
+    ) -> Vec<SourceChunkId> {
+        let spec = actor.backend().intent_spec(target, payload.clone());
+        actor.submit_foreground(spec).unwrap();
+        pump_to_completion(actor)
+    }
+
+    /// Every record the store's evidence holds for `target`, by physical position.
+    fn population(
+        actor: &mut ResumeActor,
+        target: GenomicInterval,
+        payload: &PayloadContract,
+    ) -> Vec<(rgv_hts::AlignmentSourcePosition, rgv_hts::AlignmentRecord)> {
+        let candidate = actor
+            .store_mut()
+            .prepare(target, payload.clone(), ReservationKind::Normal)
+            .unwrap();
+        assert!(candidate.root().coverage().covers(target));
+        let selection = candidate.root().select(target).unwrap();
+        let mut records = (0..selection.len())
+            .map(|index| {
+                (
+                    selection.records()[index].handle.source_position(),
+                    selection.materialize_retained_record(index).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        records.sort_unstable_by_key(|(position, _)| *position);
+        records
+    }
+
+    /// What one fresh request for `target` decodes and holds.
+    fn fresh(
+        target: GenomicInterval,
+        payload: &PayloadContract,
+    ) -> (
+        DecodedStream,
+        Vec<(rgv_hts::AlignmentSourcePosition, rgv_hts::AlignmentRecord)>,
+    ) {
+        let (mut actor, log) = mixed_actor();
+        acquire(&mut actor, target, payload);
+        let streams = log.streams();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].receipts_offered, 0);
+        let records = population(&mut actor, target, payload);
+        (streams.into_iter().next().unwrap(), records)
+    }
+
+    const HELD: (u64, u64) = (400_000, 1_200_000);
+    const PANNED: (u64, u64) = (800_000, 1_600_000);
+
+    #[test]
+    fn a_pan_beyond_the_acquired_window_decodes_only_the_blocks_it_does_not_hold() {
+        let payload = no_payload();
+        let held = mixed_interval(HELD.0, HELD.1);
+        let panned = mixed_interval(PANNED.0, PANNED.1);
+        let (mut actor, log) = mixed_actor();
+        acquire(&mut actor, held, &payload);
+        let first = log.streams().pop().unwrap();
+        assert!(
+            first.blocks.len() > 20,
+            "the fixture window must span many BGZF blocks, not {}",
+            first.blocks.len()
+        );
+        let held_receipts = actor.backend().decode_telemetry();
+        assert_eq!(held_receipts.receipts_held, first.blocks.len());
+        assert!(held_receipts.receipt_bytes > 0);
+        assert!(held_receipts.receipt_bytes <= RECEIPT_BYTE_LIMIT);
+
+        acquire(&mut actor, panned, &payload);
+        let streams = log.streams();
+        assert_eq!(streams.len(), 2);
+        let resumed = &streams[1];
+        assert_eq!((streams[0].target, resumed.target), (held, panned));
+        let (fresh_stream, fresh_records) = fresh(panned, &payload);
+
+        // The resumed stream read a strict subset of what a fresh one reads, and what it left
+        // out is exactly the blocks whose receipts it honoured, all of them held.
+        let resumed_offsets = resumed.offsets();
+        let fresh_offsets = fresh_stream.offsets();
+        let held_offsets = first.offsets();
+        assert!(resumed_offsets.is_subset(&fresh_offsets));
+        let skipped = fresh_offsets
+            .difference(&resumed_offsets)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(skipped.is_subset(&held_offsets));
+        assert_eq!(resumed.receipts_offered, resumed.receipts_honoured);
+        assert_eq!(skipped.len(), resumed.receipts_honoured);
+        // Of the held blocks the new target needs, at most the one at the old right edge is
+        // read again: the old stream could not prove it held no record beyond its target.
+        let shared = fresh_offsets
+            .intersection(&held_offsets)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(shared.len() > 10, "the pan must overlap many held blocks");
+        let reread = shared.intersection(&resumed_offsets).count();
+        assert!(reread <= 1, "{reread} held blocks were decoded again");
+        assert!(resumed.records() < fresh_stream.records());
+        let telemetry = actor.backend().decode_telemetry();
+        assert_eq!(telemetry.streams_started, 2);
+        assert_eq!(telemetry.receipts_honoured, skipped.len() as u64);
+        assert_eq!(
+            telemetry.blocks_decoded,
+            (first.blocks.len() + resumed.blocks.len()) as u64
+        );
+
+        // And the evidence for the panned target is what one fresh request for it holds.
+        assert_eq!(actor.store().acquisition_count(), 2);
+        assert_eq!(population(&mut actor, panned, &payload), fresh_records);
+    }
+
+    fn positions(
+        records: &[(rgv_hts::AlignmentSourcePosition, rgv_hts::AlignmentRecord)],
+    ) -> Vec<rgv_hts::AlignmentSourcePosition> {
+        records.iter().map(|(position, _)| *position).collect()
+    }
+
+    #[test]
+    fn a_receipt_for_an_evicted_chunk_is_not_used_and_the_result_is_still_complete() {
+        let payload = no_payload();
+        let held = mixed_interval(HELD.0, HELD.1);
+        let panned = mixed_interval(PANNED.0, PANNED.1);
+        let (fresh_stream, fresh_records) = fresh(panned, &payload);
+        let fresh_offsets = fresh_stream.offsets();
+
+        // Everything evicted: no receipt is offered, every block is decoded, and the receipts
+        // of the chunks that are gone are let go of.
+        let (mut actor, log) = mixed_actor();
+        acquire(&mut actor, held, &payload);
+        let elsewhere = GenomicInterval::new(ContigId::new(0), 0, 1).unwrap();
+        assert!(actor.store_mut().discard_disjoint_cache(elsewhere) > 0);
+        assert_eq!(actor.store().chunk_count(), 0);
+        acquire(&mut actor, panned, &payload);
+        let resumed = log.streams().pop().unwrap();
+        assert_eq!(resumed.receipts_offered, 0);
+        assert_eq!(resumed.offsets(), fresh_offsets);
+        assert_eq!(resumed.records(), fresh_stream.records());
+        assert_eq!(
+            actor.backend().decode_telemetry().receipts_held,
+            resumed.blocks.len()
+        );
+        assert_eq!(population(&mut actor, panned, &payload), fresh_records);
+
+        // Part of the window evicted: the store keeps only chunks reaching into `kept`. The
+        // blocks of the others are decoded again; the blocks still resident are skipped.
+        let (mut actor, log) = mixed_actor();
+        acquire(&mut actor, held, &payload);
+        let first = log.streams().pop().unwrap();
+        let kept = mixed_interval(HELD.0, 1_000_000);
+        let chunks_before = actor.store().chunk_count();
+        actor.store_mut().discard_disjoint_cache(kept);
+        let evicted = first
+            .blocks
+            .iter()
+            .filter(|block| {
+                block
+                    .span
+                    .is_some_and(|(start, end)| start >= kept.end() || end <= kept.start())
+            })
+            .map(|block| block.compressed_offset)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(evicted.len() > 10, "the eviction must remove many chunks");
+        assert_eq!(
+            actor.store().chunk_count(),
+            chunks_before - evicted.len(),
+            "exactly the chunks outside the kept interval were evicted"
+        );
+        acquire(&mut actor, panned, &payload);
+        let resumed = log.streams().pop().unwrap();
+        let resumed_offsets = resumed.offsets();
+        let needed_evicted = evicted
+            .intersection(&fresh_offsets)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(needed_evicted.len() > 10);
+        assert!(
+            needed_evicted.is_subset(&resumed_offsets),
+            "a block whose chunk was evicted was skipped"
+        );
+        assert!(
+            resumed.receipts_honoured > 10,
+            "resident chunks were skipped"
+        );
+        assert_eq!(
+            resumed.blocks.len() + resumed.receipts_honoured,
+            fresh_stream.blocks.len()
+        );
+        assert_eq!(population(&mut actor, panned, &payload), fresh_records);
+    }
+
+    #[test]
+    fn a_retarget_to_a_payload_the_resident_chunks_cannot_serve_ignores_their_receipts() {
+        let held = mixed_interval(HELD.0, HELD.1);
+        let panned = mixed_interval(PANNED.0, PANNED.1);
+
+        // Chunks decoded without sequence cannot stand in for chunks that need it.
+        let (mut actor, log) = mixed_actor();
+        acquire(&mut actor, held, &no_payload());
+        acquire(&mut actor, panned, &sequence_payload());
+        let resumed = log.streams().pop().unwrap();
+        let (fresh_stream, fresh_records) = fresh(panned, &sequence_payload());
+        assert_eq!(resumed.receipts_offered, 0);
+        assert_eq!(resumed.offsets(), fresh_stream.offsets());
+        assert_eq!(resumed.records(), fresh_stream.records());
+        let records = population(&mut actor, panned, &sequence_payload());
+        assert!(records.iter().all(|(_, record)| {
+            matches!(record.sequence, rgv_hts::SequenceData::Present { .. })
+        }));
+        assert_eq!(records, fresh_records);
+
+        // The other way round the resident chunks hold more than is asked for, and are used.
+        let (mut actor, log) = mixed_actor();
+        acquire(&mut actor, held, &sequence_payload());
+        acquire(&mut actor, panned, &no_payload());
+        let resumed = log.streams().pop().unwrap();
+        let (fresh_stream, fresh_records) = fresh(panned, &no_payload());
+        assert!(resumed.receipts_honoured > 10);
+        assert_eq!(
+            resumed.blocks.len() + resumed.receipts_honoured,
+            fresh_stream.blocks.len()
+        );
+        assert_eq!(
+            positions(&population(&mut actor, panned, &no_payload())),
+            positions(&fresh_records)
+        );
+    }
+
+    /// Starts a stream for the held window and returns once `chunks` of its chunks are
+    /// admitted, with their block offsets.
+    fn start_held_stream(actor: &mut ResumeActor, chunks: usize) -> Vec<u64> {
+        let spec = actor
+            .backend()
+            .intent_spec(mixed_interval(HELD.0, HELD.1), no_payload());
+        actor.submit_foreground(spec).unwrap();
+        let mut delivered = Vec::new();
+        while delivered.len() < chunks {
+            match actor.pump_once().unwrap() {
+                Some(AlignmentSourceActorEvent::ChunkAdmitted {
+                    id: SourceChunkId::BamBlock { compressed_offset },
+                    ..
+                }) => delivered.push(compressed_offset),
+                Some(AlignmentSourceActorEvent::AcquisitionCompleted { .. }) | None => {
+                    panic!("the held window finished before {chunks} chunks")
+                }
+                Some(_) => {}
+            }
+        }
+        delivered
+    }
+
+    /// The delivered blocks that hold a record of `target`, from a complete log of the window.
+    fn delivered_in(
+        delivered: &[u64],
+        window: &DecodedStream,
+        target: GenomicInterval,
+    ) -> std::collections::BTreeSet<u64> {
+        window
+            .blocks
+            .iter()
+            .filter(|block| delivered.contains(&block.compressed_offset))
+            .filter(|block| {
+                block
+                    .span
+                    .is_some_and(|(start, end)| start < target.end() && end > target.start())
+            })
+            .map(|block| block.compressed_offset)
+            .collect()
+    }
+
+    #[test]
+    fn a_retarget_of_the_running_stream_does_not_decode_its_delivered_chunks_again() {
+        let payload = no_payload();
+        let (window, _) = fresh(mixed_interval(HELD.0, HELD.1), &payload);
+
+        // Overlapping the chunk being decoded: the running work is retargeted in place.
+        let (mut actor, log) = mixed_actor();
+        let delivered = start_held_stream(&mut actor, 100);
+        let target = mixed_interval(HELD.0 + 1_000, PANNED.1);
+        let spec = actor.backend().intent_spec(target, payload.clone());
+        actor.submit_foreground(spec).unwrap();
+        assert!(matches!(
+            actor.pump_once().unwrap(),
+            Some(AlignmentSourceActorEvent::WorkRetargeted { .. })
+        ));
+        pump_to_completion(&mut actor);
+        let resumed = log.streams().pop().unwrap();
+        let expected_skipped = delivered_in(&delivered, &window, target);
+        assert!(expected_skipped.len() > 50);
+        assert!(
+            expected_skipped.is_disjoint(&resumed.offsets()),
+            "a chunk the superseded stream delivered was decoded again"
+        );
+        assert!(resumed.receipts_honoured >= expected_skipped.len());
+        let (fresh_stream, fresh_records) = fresh(target, &payload);
+        assert!(resumed.blocks.len() + expected_skipped.len() <= fresh_stream.blocks.len());
+        assert_eq!(population(&mut actor, target, &payload), fresh_records);
+
+        // Not overlapping the chunk being decoded: the work yields and a new one starts. It
+        // lies inside what was delivered, so nothing it needs is decoded again.
+        let (mut actor, log) = mixed_actor();
+        let delivered = start_held_stream(&mut actor, 100);
+        let inner = window
+            .blocks
+            .iter()
+            .filter(|block| delivered[10..40].contains(&block.compressed_offset))
+            .filter_map(|block| block.span)
+            .fold((u64::MAX, 0), |(start, end), span| {
+                (start.min(span.0), end.max(span.1))
+            });
+        // Clear of the first delivered blocks' reach, so no record of the target lies in a
+        // block the yielded stream had not reached.
+        let target = mixed_interval(inner.0, inner.0 + (inner.1 - inner.0) / 4);
+        let spec = actor.backend().intent_spec(target, payload.clone());
+        actor.submit_foreground(spec).unwrap();
+        let mut yielded = false;
+        let mut started = false;
+        for _ in 0..8 {
+            match actor.pump_once().unwrap() {
+                Some(AlignmentSourceActorEvent::WorkYielded { .. }) => yielded = true,
+                Some(AlignmentSourceActorEvent::WorkStarted(_)) => {
+                    started = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(yielded && started, "the disjoint target replaces the work");
+        pump_to_completion(&mut actor);
+        let resumed = log.streams().pop().unwrap();
+        let expected_skipped = delivered_in(&delivered, &window, target);
+        assert!(!expected_skipped.is_empty());
+        assert!(expected_skipped.is_disjoint(&resumed.offsets()));
+        assert!(resumed.receipts_honoured >= expected_skipped.len());
+        let (_, fresh_records) = fresh(target, &payload);
+        assert!(!fresh_records.is_empty());
+        assert_eq!(population(&mut actor, target, &payload), fresh_records);
+    }
+
+    #[test]
+    fn held_receipts_stay_within_their_byte_limit_and_the_oldest_go_first() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+        let mut source =
+            rgv_hts::ProductionAlignmentSource::open(&path, &AlignmentOpenOptions::default())
+                .unwrap();
+        let target = mixed_interval(HELD.0, HELD.1);
+        source
+            .begin_positioned_stream_resuming(target, target, QueryOptions::default(), Vec::new())
+            .unwrap();
+        let mut receipts = Vec::new();
+        while let PositionedAlignmentStreamCheckpoint::Block(_) =
+            source.next_positioned_stream_checkpoint(&|| true).unwrap()
+        {
+            receipts.extend(source.take_positioned_chunk_receipt());
+        }
+        assert!(receipts.len() > 40);
+        let limit = receipts[..8]
+            .iter()
+            .map(PositionedChunkReceipt::estimated_bytes)
+            .sum::<usize>();
+
+        let mut book = ReceiptBook::new(limit);
+        for receipt in &receipts {
+            book.hold(receipt.clone(), None, (0, 0));
+            assert!(book.bytes <= limit, "{} > {limit}", book.bytes);
+            assert_eq!(
+                book.bytes,
+                book.held.values().map(|held| held.bytes).sum::<usize>()
+            );
+            // The receipt just held is never the one dropped.
+            assert!(book.held.contains_key(&receipt_key(receipt)));
+        }
+        assert!(!book.held.is_empty() && book.held.len() < receipts.len());
+        assert!(!book.held.contains_key(&receipt_key(&receipts[0])));
+        let oldest_held = book.held.values().map(|held| held.age).min().unwrap();
+        assert_eq!(
+            oldest_held as usize,
+            receipts.len() - book.held.len(),
+            "exactly the oldest receipts were dropped"
+        );
+
+        // Holding a chunk's receipt again replaces it rather than counting it twice.
+        let bytes = book.bytes;
+        let last = receipts.last().unwrap();
+        book.hold(last.clone(), None, (0, 0));
+        assert_eq!(book.bytes, bytes);
+
+        // The receipt of a chunk that nobody holds any more is dropped as holding goes on
+        // (at every `RECEIPT_PRUNE_INTERVAL`th receipt), long before the byte limit is reached.
+        let mut book = ReceiptBook::new(usize::MAX);
+        book.hold(receipts[0].clone(), Some(Weak::new()), (0, 0));
+        for receipt in receipts[1..]
+            .iter()
+            .cycle()
+            .take(usize::try_from(RECEIPT_PRUNE_INTERVAL).unwrap() - 1)
+        {
+            assert!(book.held.contains_key(&receipt_key(&receipts[0])));
+            book.hold(receipt.clone(), None, (0, 0));
+        }
+        assert!(!book.held.contains_key(&receipt_key(&receipts[0])));
+        assert_eq!(book.held.len(), receipts.len() - 1);
+        assert_eq!(
+            book.bytes,
+            book.held.values().map(|held| held.bytes).sum::<usize>()
+        );
+
+        // A receipt that could never fit is not held at all.
+        let mut tiny = ReceiptBook::new(1);
+        tiny.hold(receipts[0].clone(), None, (0, 0));
+        assert!(tiny.held.is_empty());
+        assert_eq!(tiny.bytes, 0);
+    }
+
+    // --- Process-wide decode allowance --------------------------------------------------
+
+    use std::sync::{Condvar, Mutex, atomic::AtomicUsize};
+
+    /// Where gated decoders stand: how many are inside a unit, and whether they may leave.
+    #[derive(Default)]
+    struct DecodeGate {
+        inside: AtomicUsize,
+        peak: AtomicUsize,
+        open: Mutex<bool>,
+        opened: Condvar,
+    }
+
+    impl DecodeGate {
+        fn pass(&self) {
+            let inside = self.inside.fetch_add(1, Ordering::AcqRel) + 1;
+            self.peak.fetch_max(inside, Ordering::AcqRel);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+            drop(open);
+            self.inside.fetch_sub(1, Ordering::AcqRel);
+        }
+
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    /// A decoder of `blocks` empty units, each of which waits at the gate, ending in an error.
+    struct GatedDecodeSource {
+        name: usize,
+        gate: Arc<DecodeGate>,
+        begun: Arc<Mutex<Vec<usize>>>,
+        blocks: u64,
+    }
+
+    impl PositionedDecodeSource for GatedDecodeSource {
+        fn prepare_stream(&mut self, _still_wanted: Arc<dyn Fn() -> bool + Send + Sync>) {}
+
+        fn begin_stream(
+            &mut self,
+            _target: GenomicInterval,
+            _admission_target: GenomicInterval,
+            _options: QueryOptions,
+            _skip: Vec<PositionedChunkReceipt>,
+        ) -> Result<usize, AlignmentError> {
+            self.begun.lock().unwrap().push(self.name);
+            Ok(0)
+        }
+
+        fn next_checkpoint(
+            &mut self,
+            _still_wanted: &dyn Fn() -> bool,
+        ) -> Result<PositionedAlignmentStreamCheckpoint, AlignmentError> {
+            self.gate.pass();
+            if self.blocks == 0 {
+                return Err(AlignmentError::SourceChanged);
+            }
+            self.blocks -= 1;
+            Ok(PositionedAlignmentStreamCheckpoint::Block(
+                PositionedAlignmentBlock {
+                    compressed_offset: self.blocks,
+                    records: Vec::new(),
+                    genomic_span: None,
+                },
+            ))
+        }
+
+        fn cancel_stream(&mut self) {}
+    }
+
+    fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            thread::yield_now();
+        }
+    }
+
+    /// Reads a gated decoder to the end of its stream, returning how many units it delivered.
+    fn drain_gated(decoder: &mut DecoderThread) -> u64 {
+        let mut blocks = 0;
+        loop {
+            match decoder.next() {
+                Ok(Some((PositionedAlignmentStreamCheckpoint::Block(_), _))) => blocks += 1,
+                Err(LocalBamCanonicalBackendError::Alignment(AlignmentError::SourceChanged)) => {
+                    return blocks;
+                }
+                other => panic!("unexpected gated decoder result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_more_sources_decode_at_once_than_the_allowance_and_every_stream_is_served() {
+        const SOURCES: usize = 6;
+        const LIMIT: usize = 2;
+        const BLOCKS: u64 = 5;
+        let allowance = Arc::new(DecodeAllowance::new(NonZeroUsize::new(LIMIT).unwrap()));
+        let gate = Arc::new(DecodeGate::default());
+        let begun = Arc::new(Mutex::new(Vec::new()));
+        let target = GenomicInterval::new(ContigId::new(0), 10, 20).unwrap();
+        let mut decoders = (0..SOURCES)
+            .map(|name| {
+                DecoderThread::spawn_with_allowance(
+                    GatedDecodeSource {
+                        name,
+                        gate: Arc::clone(&gate),
+                        begun: Arc::clone(&begun),
+                        blocks: BLOCKS,
+                    },
+                    Arc::clone(&allowance),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, decoder) in decoders.iter_mut().enumerate() {
+            let class = if index % 2 == 0 {
+                DecodeClass::Foreground
+            } else {
+                DecodeClass::Speculative
+            };
+            decoder
+                .begin_resuming(target, target, QueryOptions::default(), Vec::new(), class)
+                .unwrap();
+        }
+
+        // Every source wants to decode. Exactly the allowance are inside a unit; the rest wait
+        // for a permit and stay outside, however long the units take.
+        wait_until("the allowance fills and the other sources queue", || {
+            let snapshot = allowance.snapshot();
+            snapshot.active == LIMIT
+                && snapshot.waiting == SOURCES - LIMIT
+                && gate.inside.load(Ordering::Acquire) == LIMIT
+        });
+        assert_eq!(gate.peak.load(Ordering::Acquire), LIMIT);
+
+        gate.open();
+        for decoder in &mut decoders {
+            assert_eq!(drain_gated(decoder), BLOCKS);
+        }
+        assert_eq!(begun.lock().unwrap().len(), SOURCES);
+        // The gate counted for itself: the bound held for every unit, not only the first.
+        assert_eq!(gate.peak.load(Ordering::Acquire), LIMIT);
+        let snapshot = allowance.snapshot();
+        assert_eq!(snapshot.peak_active, LIMIT);
+        assert_eq!((snapshot.active, snapshot.waiting), (0, 0));
+        let units = SOURCES as u64 * (BLOCKS + 2);
+        assert_eq!(
+            snapshot.foreground_grants + snapshot.speculative_grants,
+            units
+        );
+        assert_eq!(snapshot.foreground_grants, snapshot.speculative_grants);
+    }
+
+    #[test]
+    fn a_foreground_stream_is_served_ahead_of_read_ahead_that_queued_first() {
+        let allowance = Arc::new(DecodeAllowance::new(NonZeroUsize::new(1).unwrap()));
+        let gate = Arc::new(DecodeGate::default());
+        let begun = Arc::new(Mutex::new(Vec::new()));
+        let target = GenomicInterval::new(ContigId::new(0), 10, 20).unwrap();
+        let spawn = |name| {
+            DecoderThread::spawn_with_allowance(
+                GatedDecodeSource {
+                    name,
+                    gate: Arc::clone(&gate),
+                    begun: Arc::clone(&begun),
+                    blocks: 3,
+                },
+                Arc::clone(&allowance),
+            )
+        };
+        let (mut holder, mut read_ahead, mut foreground) = (spawn(0), spawn(1), spawn(2));
+
+        // One source holds the only permit inside a unit.
+        holder
+            .begin_resuming(
+                target,
+                target,
+                QueryOptions::default(),
+                Vec::new(),
+                DecodeClass::Speculative,
+            )
+            .unwrap();
+        wait_until("the holder is inside a unit", || {
+            gate.inside.load(Ordering::Acquire) == 1
+        });
+        // Read-ahead queues first, a foreground stream second.
+        read_ahead
+            .begin_resuming(
+                target,
+                target,
+                QueryOptions::default(),
+                Vec::new(),
+                DecodeClass::Speculative,
+            )
+            .unwrap();
+        wait_until("read-ahead queues", || allowance.snapshot().waiting == 1);
+        foreground
+            .begin_resuming(
+                target,
+                target,
+                QueryOptions::default(),
+                Vec::new(),
+                DecodeClass::Foreground,
+            )
+            .unwrap();
+        wait_until("the foreground stream queues", || {
+            allowance.snapshot().waiting == 2
+        });
+        assert_eq!(*begun.lock().unwrap(), vec![0]);
+
+        gate.open();
+        // The permit the holder gives back goes to the foreground stream, although the
+        // read-ahead stream asked first; every stream is then served to its end.
+        assert_eq!(drain_gated(&mut foreground), 3);
+        assert_eq!(drain_gated(&mut holder), 3);
+        assert_eq!(drain_gated(&mut read_ahead), 3);
+        assert_eq!(*begun.lock().unwrap(), vec![0, 2, 1]);
+        assert_eq!(allowance.snapshot().peak_active, 1);
+    }
+
+    #[test]
+    fn a_stream_cancelled_while_waiting_for_its_turn_leaves_the_line() {
+        let allowance = Arc::new(DecodeAllowance::new(NonZeroUsize::new(1).unwrap()));
+        let gate = Arc::new(DecodeGate::default());
+        let begun = Arc::new(Mutex::new(Vec::new()));
+        let target = GenomicInterval::new(ContigId::new(0), 10, 20).unwrap();
+        let spawn = |name| {
+            DecoderThread::spawn_with_allowance(
+                GatedDecodeSource {
+                    name,
+                    gate: Arc::clone(&gate),
+                    begun: Arc::clone(&begun),
+                    blocks: 2,
+                },
+                Arc::clone(&allowance),
+            )
+        };
+        let (mut holder, mut waiting) = (spawn(0), spawn(1));
+        holder
+            .begin(target, target, QueryOptions::default())
+            .unwrap();
+        wait_until("the holder is inside a unit", || {
+            gate.inside.load(Ordering::Acquire) == 1
+        });
+        waiting
+            .begin(target, target, QueryOptions::default())
+            .unwrap();
+        wait_until("the second stream queues", || {
+            allowance.snapshot().waiting == 1
+        });
+
+        waiting.cancel();
+        wait_until("the cancelled stream leaves the line", || {
+            allowance.snapshot().waiting == 0
+        });
+        assert_eq!(allowance.snapshot().withdrawn_waits, 1);
+        assert_eq!(*begun.lock().unwrap(), vec![0]);
+
+        // Its decode thread is free to serve the next stream once a permit is.
+        waiting
+            .begin(target, target, QueryOptions::default())
+            .unwrap();
+        gate.open();
+        assert_eq!(drain_gated(&mut holder), 2);
+        assert_eq!(drain_gated(&mut waiting), 2);
+        assert_eq!(*begun.lock().unwrap(), vec![0, 1]);
     }
 }

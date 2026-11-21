@@ -247,7 +247,7 @@ pub(crate) fn sample_association_ui(
         }
         (Some(metadata), Some(key)) if metadata.row(key).is_none() => {
             ui.colored_label(
-                egui::Color32::DARK_RED,
+                crate::theme::adapt(egui::Color32::DARK_RED),
                 "This sample key is not present in the loaded metadata table.",
             );
         }

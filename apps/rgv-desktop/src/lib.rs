@@ -30,6 +30,7 @@ mod inspection;
 mod launch;
 mod runtime;
 mod sources;
+mod theme;
 mod ui;
 mod workspace;
 mod workspace_lists;
@@ -110,30 +111,41 @@ const AUTOMATION_SOURCE_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_AUTOMATION_FULL_PANEL_HEIGHT: u32 = 16_384;
 const MAX_AUTOMATION_FRAME_SAMPLES: usize = 4_096;
 
-#[allow(clippy::too_many_lines)]
 fn apply_accessibility_preferences(context: &egui::Context, settings: &DesktopSettings) {
-    context.set_theme(egui::Theme::Light);
+    // The theme setting drives egui's visuals, the chrome painted by `ui/` and (through
+    // `Viewer::apply_theme_to_renderers`) the alignment palette and canvas colour.
+    theme::set_active(settings.theme);
+    let active = theme::active();
+    context.set_theme(active.egui_theme());
     context.set_zoom_factor(f32::from(settings.interface_scale_percent) / 100.0);
-    let mut visuals = egui::Visuals::light();
-    if settings.high_contrast {
-        visuals.override_text_color = Some(egui::Color32::BLACK);
-        visuals.faint_bg_color = egui::Color32::WHITE;
-        visuals.extreme_bg_color = egui::Color32::WHITE;
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.25, egui::Color32::BLACK);
-        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.5, egui::Color32::BLACK);
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(2.0, egui::Color32::BLACK);
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0, egui::Color32::BLACK);
-        visuals.widgets.open.bg_stroke = egui::Stroke::new(2.0, egui::Color32::BLACK);
-        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 64, 160);
-        visuals.selection.stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
-    }
-    context.set_visuals(visuals);
-    context.style_mut_of(egui::Theme::Light, |style| {
+    context.set_visuals(themed_visuals(&active, settings.high_contrast));
+    context.style_mut_of(active.egui_theme(), |style| {
         style.animation_time = if settings.reduced_motion { 0.0 } else { 0.2 };
     });
     if settings.reduced_motion {
         context.clear_animations();
     }
+}
+
+/// The egui visuals of `active`, with the high-contrast adjustments applied on top.
+fn themed_visuals(active: &theme::DesktopTheme, high_contrast: bool) -> egui::Visuals {
+    let mut visuals = active.visuals();
+    if high_contrast {
+        // Authored for the light theme (black on white); `adapt` mirrors it for a dark one.
+        let ink = active.adapt(egui::Color32::BLACK);
+        let paper = active.adapt(egui::Color32::WHITE);
+        visuals.override_text_color = Some(ink);
+        visuals.faint_bg_color = paper;
+        visuals.extreme_bg_color = paper;
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.25, ink);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.5, ink);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(2.0, ink);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0, ink);
+        visuals.widgets.open.bg_stroke = egui::Stroke::new(2.0, ink);
+        visuals.selection.bg_fill = active.adapt(egui::Color32::from_rgb(0, 64, 160));
+        visuals.selection.stroke = egui::Stroke::new(2.0, paper);
+    }
+    visuals
 }
 
 static DESKTOP_UI_WAKER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> =
@@ -1297,6 +1309,12 @@ struct Viewer {
     /// Most recent typed aggregate GPU admission pressure. Retained after recovery or
     /// `BudgetLimited` settlement so diagnostics do not depend on parsing status text.
     alignment_last_gpu_budget_pressure: Option<GpuBudgetPressure>,
+    /// Set while the presented read frame leaves visible pages out for lack of GPU budget.
+    alignment_gpu_partial_top_up:
+        Option<workspace::alignment_management::gpu_publication::AlignmentGpuPartialTopUp>,
+    /// True only inside a top-up attempt, where a camera-only capture must not settle for the
+    /// pages already known to be deferred.
+    alignment_gpu_top_up_in_progress: bool,
     alignment_capacity_reclaim: Option<AlignmentCapacityReclaimCycle>,
     alignment_capacity_reclaim_clock: u64,
     alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate,

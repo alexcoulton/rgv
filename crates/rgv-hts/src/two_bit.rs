@@ -3,7 +3,10 @@
 //! The file is a small header, a name-to-offset index, and one record per sequence holding its
 //! length, the runs of unknown bases, the soft-mask runs, and the bases packed four to a byte.
 //! Only the header and index are read at open; a sequence's run tables are read the first time
-//! that sequence is fetched. Soft-masking is not reported: bases are always upper case.
+//! that sequence is fetched. Soft-masking is reported only by a reference opened with
+//! [`TwoBitReference::open_soft_masked`], which returns masked bases in lower case as a
+//! soft-masked FASTA does; otherwise bases are always upper case and the mask tables are
+//! never read.
 
 use std::{
     collections::HashMap,
@@ -31,6 +34,8 @@ struct SequenceLayout {
     length: u64,
     /// Sorted, non-overlapping half-open runs of unknown (`N`) bases.
     unknown_runs: Vec<(u64, u64)>,
+    /// Sorted half-open runs of soft-masked bases; empty unless soft-masking is reported.
+    masked_runs: Vec<(u64, u64)>,
     packed_offset: u64,
 }
 
@@ -48,6 +53,8 @@ pub(crate) struct TwoBitReference {
     entries: Vec<SequenceEntry>,
     by_name: HashMap<String, usize>,
     swapped: bool,
+    /// Whether masked bases are returned in lower case.
+    soft_masking: bool,
     /// Total size of the file. Every count read from the file is checked against it before
     /// memory is reserved, so a hostile header cannot demand more than the file could hold.
     file_length: u64,
@@ -98,7 +105,20 @@ fn read_u32_table(
 }
 
 impl TwoBitReference {
-    pub(crate) fn open(mut reader: Box<dyn ReadSeek>) -> Result<Self, AlignmentError> {
+    /// Opens a reference whose bases are always upper case.
+    pub(crate) fn open(reader: Box<dyn ReadSeek>) -> Result<Self, AlignmentError> {
+        Self::open_with(reader, false)
+    }
+
+    /// Opens a reference that returns soft-masked bases in lower case (`acgtn`).
+    pub(crate) fn open_soft_masked(reader: Box<dyn ReadSeek>) -> Result<Self, AlignmentError> {
+        Self::open_with(reader, true)
+    }
+
+    fn open_with(
+        mut reader: Box<dyn ReadSeek>,
+        soft_masking: bool,
+    ) -> Result<Self, AlignmentError> {
         let file_length = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
         let mut signature = [0_u8; 4];
@@ -161,6 +181,7 @@ impl TwoBitReference {
             entries,
             by_name,
             swapped,
+            soft_masking,
             file_length,
         })
     }
@@ -214,7 +235,25 @@ impl TwoBitReference {
         if mask_count > MAX_RUNS || u64::from(mask_count) * 8 > remaining {
             return Err(invalid("soft-mask run table is implausibly large"));
         }
-        // Skip the soft-mask tables without downloading them, then the reserved word.
+        // Unless soft-masking is reported, the mask tables are skipped without being read (or
+        // downloaded). The reserved word follows them.
+        let masked_runs = if self.soft_masking {
+            let starts = read_u32_table(reader, mask_count as usize, swapped)?;
+            let sizes = read_u32_table(reader, mask_count as usize, swapped)?;
+            let mut runs = starts
+                .into_iter()
+                .zip(sizes)
+                .map(|(start, size)| {
+                    let start = u64::from(start);
+                    (start, start.saturating_add(u64::from(size)).min(length))
+                })
+                .filter(|(start, end)| start < end)
+                .collect::<Vec<_>>();
+            runs.sort_unstable();
+            runs
+        } else {
+            Vec::new()
+        };
         let packed_offset = record_offset
             .checked_add(4 + 4)
             .and_then(|offset| offset.checked_add(u64::from(unknown_count) * 8))
@@ -243,6 +282,7 @@ impl TwoBitReference {
         let layout = SequenceLayout {
             length,
             unknown_runs,
+            masked_runs,
             packed_offset,
         };
         state.layouts.insert(index, layout.clone());
@@ -303,6 +343,20 @@ impl TwoBitReference {
             let from = (run_start.max(&start) - start) as usize;
             let to = (run_end.min(&end) - start) as usize;
             bases[from..to].fill(b'N');
+        }
+        // Soft-masked runs may overlap each other; lower-casing twice is harmless. A run that
+        // starts before the request can still reach into it, so every run starting before the
+        // request's end is considered.
+        let masked_before_end = layout
+            .masked_runs
+            .partition_point(|(run_start, _)| *run_start < end);
+        for (run_start, run_end) in &layout.masked_runs[..masked_before_end] {
+            if *run_end <= start {
+                continue;
+            }
+            let from = (run_start.max(&start) - start) as usize;
+            let to = (run_end.min(&end) - start) as usize;
+            bases[from..to].make_ascii_lowercase();
         }
         Ok(bases)
     }
@@ -482,6 +536,49 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+
+    /// Soft-masking is reported on request: every subrange then equals the FASTA text the
+    /// file was encoded from, lower-case runs (including masked `n`) preserved.
+    #[test]
+    fn soft_masking_is_reported_in_lower_case_when_asked_for() {
+        const MASKED: &str = "acgtACGTnnNNacgtNNnnACGTTTGACCAgattacaGATTACAnnnnCa";
+        for big_endian in [false, true] {
+            let file = encode_two_bit(&[("chrA", MASKED), ("chrB", SECOND)], big_endian);
+            let masked =
+                TwoBitReference::open_soft_masked(Box::new(Cursor::new(file.clone()))).unwrap();
+            let plain = TwoBitReference::open(Box::new(Cursor::new(file))).unwrap();
+            for (name, sequence) in [("chrA", MASKED), ("chrB", SECOND)] {
+                for start in 0..sequence.len() {
+                    for end in start + 1..=sequence.len() {
+                        let fetched = masked.fetch(name, start as u64, end as u64).unwrap();
+                        assert_eq!(
+                            fetched,
+                            sequence.as_bytes()[start..end],
+                            "{name}:{start}-{end}"
+                        );
+                        // The default is unchanged: the same bases, upper case.
+                        assert_eq!(
+                            plain.fetch(name, start as u64, end as u64).unwrap(),
+                            fetched.to_ascii_uppercase(),
+                            "{name}:{start}-{end}"
+                        );
+                    }
+                }
+            }
+        }
+        // A forged mask count is rejected before its tables are reserved.
+        let mut forged = encode_two_bit(&[("chrA", "ACGTACGT")], false);
+        // Record at byte 25: length, unknown-run count (0), then the mask-run count.
+        forged[25 + 8..25 + 12].copy_from_slice(&60_000_000_u32.to_le_bytes());
+        let reference = TwoBitReference::open_soft_masked(Box::new(Cursor::new(forged))).unwrap();
+        assert!(
+            reference
+                .fetch("chrA", 0, 4)
+                .unwrap_err()
+                .to_string()
+                .contains("soft-mask run table")
+        );
     }
 
     #[test]

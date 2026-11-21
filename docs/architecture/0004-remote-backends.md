@@ -39,6 +39,32 @@ seekable reader that the pure-Rust `bigtools` library can consume.
   `LocalAlignmentSource::open` refuses every URL, so `HTSlib` never opens one. Positioned streams
   can resume past chunks the caller already holds (`begin_positioned_stream_resuming`); for remote
   BAM the skipped byte ranges are left out of the range plan and are not requested.
+- **Amended 21 November 2026 (later).** Three more readers use the range reader, each held to
+  its local counterpart by tests that compare region results:
+  - Local BAM can be opened through the `noodles` decoder on request
+    (`AlignmentOpenOptions::local_bam_backend`, default `HTSlib`); it is the remote BAM decoder
+    over a file. See ADR 0002, "Step 1 as built", for the measurements and for what has to hold
+    before the default changes.
+  - A remote bgzip-compressed BED, GFF, GTF or other tabix-format text annotation with a `.csi`
+    or `.tbi` beside it (or an explicit index URL) is read on demand
+    (`crates/rgv-hts/src/tracks/remote_tabix.rs`): the index is held in memory and only the BGZF
+    blocks of a region are requested. Line selection follows `HTSlib`'s tabix iterator, including
+    its refusal of a region whose chunk holds a line without coordinates (a `###` separator in
+    GFF3), so remote and local agree on that too. A remote text annotation without an index is
+    still downloaded whole (256 MiB cap). Building the name-search index of a remote indexed
+    file streams it through the same reader, up to 64 MiB of transfer, after which the search
+    index is reported as truncated.
+  - A remote bgzip-compressed FASTA (`.fa.gz` with `.fai` and `.gzi`) is read through its `.gzi`
+    block index; bases come back as stored, soft-masking included, as for an uncompressed FASTA.
+    A `.2bit` reference reports soft-masking in lower case when
+    `FastaOpenOptions::two_bit_soft_masking` is set (off by default, in which case the mask
+    tables are not read).
+  - `HTSlib` is never given a URL: a reference or variant location with a scheme other than
+    `http`, `https` or `file` (`s3://`, `gs://`, `ftp://`) is refused by name before any open.
+    Nothing in the product crates needs the `curl` feature of `rust-htslib` any more; only the
+    `rust-htslib-http` comparison workload in `benchmarks/alignment-io` does, and it enables
+    the feature itself. The workspace dependency (and `fuzz/Cargo.toml`) still name the
+    feature at the time of writing.
 - Keep all callers behind RGV source traits so backend selection does not affect layout or
   rendering.
 - Use RGV's `HttpRangeReader` for BigWig and BigBed. It performs bounded chunk coalescing, maintains

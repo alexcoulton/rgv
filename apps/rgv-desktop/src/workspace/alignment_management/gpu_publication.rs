@@ -269,6 +269,85 @@ impl AllocationRetirementToken for AlignmentGpuCompositeRetirement {
     }
 }
 
+/// A partially resident read presentation that may be completed later ("draw what fits").
+///
+/// Under the bounded memory policy a visible page set larger than the GPU share is published
+/// with its most central pages and the rest deferred. This records what that publication left
+/// out so the event loop can try again when it could plausibly do better, and only then.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AlignmentGpuPartialTopUp {
+    pub(crate) target_revision: u64,
+    /// Visible pages the presented frame does not draw.
+    pub(crate) deferred_pages: usize,
+    /// GPU ledger occupancy (charged plus reserved) right after the publication.
+    pub(crate) occupied_bytes: usize,
+    /// Consecutive top-up attempts for this target that admitted nothing new.
+    pub(crate) fruitless_attempts: u32,
+}
+
+/// The page allowance for the next, smaller candidate after the ledger refused one that planned
+/// `planned_page_bytes` of new read pages, or `None` when no read page is left to shed and the
+/// refusal therefore cannot be answered by drawing less.
+pub(crate) fn alignment_gpu_degraded_read_page_allowance(
+    planned_page_bytes: usize,
+    pressure: GpuBudgetPressure,
+) -> Option<usize> {
+    (planned_page_bytes > 0)
+        .then(|| planned_page_bytes.saturating_sub(pressure.required_reclaim_bytes().max(1)))
+}
+
+/// The top-up record to keep after publishing a frame with `deferred_pages` visible pages left
+/// out; `None` once the presentation is complete.
+pub(crate) fn alignment_gpu_partial_top_up_after_publication(
+    previous: Option<AlignmentGpuPartialTopUp>,
+    target_revision: u64,
+    deferred_pages: usize,
+    occupied_bytes: usize,
+) -> Option<AlignmentGpuPartialTopUp> {
+    if deferred_pages == 0 {
+        return None;
+    }
+    // Publishing retires the previous epoch's pages, so the first attempt after any
+    // publication that made progress is always worth making. One that admitted nothing new is
+    // counted, and the record then waits for capacity to be released.
+    let fruitless_attempts = previous
+        .filter(|previous| {
+            previous.target_revision == target_revision && deferred_pages >= previous.deferred_pages
+        })
+        .map_or(0, |previous| previous.fruitless_attempts.saturating_add(1));
+    Some(AlignmentGpuPartialTopUp {
+        target_revision,
+        deferred_pages,
+        occupied_bytes,
+        fruitless_attempts,
+    })
+}
+
+/// Whether another attempt to admit the deferred pages should run now: once straight after a
+/// publication that made progress, and afterwards only when GPU occupancy has fallen below what
+/// that publication left, which is the only way a retry can end differently. This keeps a
+/// presentation that simply does not fit from re-planning on every frame.
+pub(crate) fn alignment_gpu_partial_top_up_is_due(
+    top_up: AlignmentGpuPartialTopUp,
+    desired_target_revision: u64,
+    occupied_bytes: usize,
+) -> bool {
+    top_up.target_revision == desired_target_revision
+        && (top_up.fruitless_attempts == 0 || occupied_bytes < top_up.occupied_bytes)
+}
+
+/// What a read lane says while its picture is only partially resident: the same "updating"
+/// wording used for other pending lane state, never a claim of completeness. `None` when every
+/// visible page is drawn.
+pub(crate) fn alignment_partial_residency_status(deferred_pages: usize) -> Option<String> {
+    (deferred_pages > 0).then(|| {
+        format!(
+            "Updating: {deferred_pages} visible page{} waiting for GPU memory",
+            if deferred_pages == 1 { "" } else { "s" }
+        )
+    })
+}
+
 pub(super) struct AlignmentGpuBundleFailure {
     pub(super) message: String,
     pub(super) pressure: Option<GpuBudgetPressure>,
@@ -681,5 +760,91 @@ impl AlignmentGpuReclaimOutcome {
                 pinned_bytes,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod partial_residency_tests {
+    use super::*;
+
+    #[test]
+    fn a_partially_resident_lane_reports_updating_and_never_claims_completeness() {
+        assert_eq!(alignment_partial_residency_status(0), None);
+        assert_eq!(
+            alignment_partial_residency_status(1).as_deref(),
+            Some("Updating: 1 visible page waiting for GPU memory")
+        );
+        let several = alignment_partial_residency_status(12).unwrap();
+        assert_eq!(several, "Updating: 12 visible pages waiting for GPU memory");
+        // The same pending wording the lane title uses for filters and highlights.
+        assert!(several.starts_with("Updating"));
+        assert!(!several.to_lowercase().contains("complete"));
+    }
+
+    #[test]
+    fn each_refusal_sheds_at_least_its_shortfall_until_no_read_page_is_left() {
+        // 1,000 bytes over a 4,000-byte limit while planning 3,000 bytes of new read pages.
+        let pressure = GpuBudgetPressure::from_steady_replacement_failure(3_500, 1_500, 0, 4_000);
+        assert_eq!(pressure.required_reclaim_bytes(), 1_000);
+        assert_eq!(
+            alignment_gpu_degraded_read_page_allowance(3_000, pressure),
+            Some(2_000)
+        );
+        // A shortfall larger than everything planned leaves an allowance of zero: the next
+        // candidate draws only what is already resident.
+        assert_eq!(
+            alignment_gpu_degraded_read_page_allowance(600, pressure),
+            Some(0)
+        );
+        // A refusal that reports no shortfall still makes progress.
+        let exact = GpuBudgetPressure::from_steady_replacement_failure(1_000, 3_000, 0, 4_000);
+        assert_eq!(exact.required_reclaim_bytes(), 0);
+        assert_eq!(
+            alignment_gpu_degraded_read_page_allowance(500, exact),
+            Some(499)
+        );
+        // With no new read page in the candidate, drawing less cannot help.
+        assert_eq!(
+            alignment_gpu_degraded_read_page_allowance(0, pressure),
+            None
+        );
+    }
+
+    #[test]
+    fn top_up_runs_after_progress_and_then_waits_for_released_capacity() {
+        // A complete publication keeps no record.
+        assert_eq!(
+            alignment_gpu_partial_top_up_after_publication(None, 7, 0, 1_000),
+            None
+        );
+        // The first partial publication is retried at once: publishing retired the old epoch.
+        let first = alignment_gpu_partial_top_up_after_publication(None, 7, 5, 1_000).unwrap();
+        assert_eq!(first.fruitless_attempts, 0);
+        assert!(alignment_gpu_partial_top_up_is_due(first, 7, 1_000));
+        // Not for another target.
+        assert!(!alignment_gpu_partial_top_up_is_due(first, 8, 0));
+
+        // The retry admitted two more pages: progress, so one more immediate attempt.
+        let progressed =
+            alignment_gpu_partial_top_up_after_publication(Some(first), 7, 3, 1_400).unwrap();
+        assert_eq!(progressed.fruitless_attempts, 0);
+        assert!(alignment_gpu_partial_top_up_is_due(progressed, 7, 1_400));
+
+        // The next one admitted nothing: stop until occupancy falls below what it left.
+        let stalled =
+            alignment_gpu_partial_top_up_after_publication(Some(progressed), 7, 3, 1_400).unwrap();
+        assert_eq!(stalled.fruitless_attempts, 1);
+        assert!(!alignment_gpu_partial_top_up_is_due(stalled, 7, 1_400));
+        assert!(!alignment_gpu_partial_top_up_is_due(stalled, 7, 1_900));
+        assert!(alignment_gpu_partial_top_up_is_due(stalled, 7, 1_399));
+
+        // Completing the presentation clears the record; a new target starts afresh.
+        assert_eq!(
+            alignment_gpu_partial_top_up_after_publication(Some(stalled), 7, 0, 1_800),
+            None
+        );
+        let retargeted =
+            alignment_gpu_partial_top_up_after_publication(Some(stalled), 8, 4, 1_400).unwrap();
+        assert_eq!(retargeted.fruitless_attempts, 0);
     }
 }

@@ -1,3 +1,4 @@
+use crate::workspace::alignment_management::gpu_publication::alignment_gpu_degraded_read_page_allowance;
 use crate::workspace::alignment_management::gpu_publication::{
     AlignmentGpuBundleFailure, AlignmentGpuCameraCaptureOutcome, AlignmentGpuCompositeRetirement,
     OwnedAlignmentGpuRequest, OwnedAlignmentSummaryGpuRequest,
@@ -22,9 +23,10 @@ use rgv_core::PanelId;
 use rgv_engine::AlignmentIndividualReadCapability;
 use rgv_render::{
     AlignmentGpuCameraCaptureError, AlignmentGpuFrame, AlignmentGpuRetirement,
-    AlignmentGpuSceneRequest, AlignmentSummaryFrameOverlays, AlignmentSummaryGpuCameraCaptureError,
-    AlignmentSummaryGpuFrame, AlignmentSummaryGpuLaneOptions, AlignmentSummaryGpuRetirement,
-    AlignmentSummaryGpuSceneRequest, AlignmentSummaryJunctionInteraction,
+    AlignmentGpuSceneRequest, AlignmentGpuVisibleAdmission, AlignmentSummaryFrameOverlays,
+    AlignmentSummaryGpuCameraCaptureError, AlignmentSummaryGpuFrame,
+    AlignmentSummaryGpuLaneOptions, AlignmentSummaryGpuRetirement, AlignmentSummaryGpuSceneRequest,
+    AlignmentSummaryJunctionInteraction, GpuBudgetPressure,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -222,13 +224,26 @@ impl Viewer {
             }
         };
 
+        // A partially resident presentation stays a camera-only capture for hover, selection
+        // and scrolling inside the same pages: the pages it is known to be missing are left out
+        // again. A top-up attempt tolerates nothing, so it reaches the replacement path.
+        let tolerated_missing = if self.alignment_gpu_top_up_in_progress {
+            Vec::new()
+        } else {
+            previous
+                .reads
+                .as_ref()
+                .map(|frame| frame.deferred_page_keys().to_vec())
+                .unwrap_or_default()
+        };
         let reads = match read_authority {
-            Some(authority) => match self.alignment_gpu_renderer.capture_camera_frame(
+            Some(authority) => match self.alignment_gpu_renderer.capture_camera_frame_tolerating(
                 &self.device,
                 &self.queue,
                 &authority,
                 read_requests,
                 &self.alignment_gpu_ledger,
+                &tolerated_missing,
             ) {
                 Ok((frame, stats)) => {
                     self.alignment_gpu_last_prepare_stats = stats;
@@ -361,6 +376,7 @@ impl Viewer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn try_publish_alignment_gpu_bundle(
         &mut self,
         target_revision: u64,
@@ -369,7 +385,10 @@ impl Viewer {
         summary_requests: &[AlignmentSummaryGpuSceneRequest<'_>],
         lane_authorities: Vec<AlignmentCommittedLaneAuthority>,
         read_authorities: Vec<AlignmentNativeReadAuthority>,
+        read_admission: AlignmentGpuVisibleAdmission,
+        planned_read_page_bytes: &mut usize,
     ) -> std::result::Result<AlignmentGpuFrameBundle, AlignmentGpuBundleFailure> {
+        *planned_read_page_bytes = 0;
         let progress = self
             .alignment_gpu_ledger
             .progress()
@@ -380,8 +399,9 @@ impl Viewer {
         } else {
             let plan = self
                 .alignment_gpu_renderer
-                .plan_replacement(read_requests, &progress, next_slot)
+                .plan_replacement_within(read_requests, &progress, next_slot, read_admission)
                 .map_err(AlignmentGpuBundleFailure::read_replacement)?;
+            *planned_read_page_bytes = plan.missing_page_bytes();
             next_slot = plan.next_bundle_slot();
             Some(plan)
         };
@@ -702,6 +722,65 @@ impl Viewer {
             lane_authorities,
             read_authorities,
         })
+    }
+
+    /// Draw what fits (bounded memory policy only). Called when the complete candidate was
+    /// refused for GPU budget and reclaim could not make room: publishes the most central
+    /// visible read pages that do fit and defers the rest, instead of ending the navigation
+    /// with the previous picture kept. Each refusal reports its shortfall, and the next
+    /// candidate sheds at least that much from the least central pages.
+    ///
+    /// Returns `None` when this policy does not degrade (the strict `Complete` policy shares
+    /// one ledger with the source engines and keeps its all-or-nothing behaviour), or when even
+    /// a candidate with no new read page is refused; the caller then settles as before.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn publish_alignment_gpu_bundle_drawing_what_fits(
+        &mut self,
+        target_revision: u64,
+        publication_attempt_sequence: u64,
+        read_requests: &[AlignmentGpuSceneRequest<'_>],
+        summary_requests: &[AlignmentSummaryGpuSceneRequest<'_>],
+        lane_authorities: &[AlignmentCommittedLaneAuthority],
+        read_authorities: &[AlignmentNativeReadAuthority],
+        mut pressure: GpuBudgetPressure,
+        mut planned_read_page_bytes: usize,
+    ) -> Option<AlignmentGpuFrameBundle> {
+        /// Each pass sheds at least one page, so this bounds work, not correctness.
+        const MAXIMUM_DEGRADED_CANDIDATES: usize = 8;
+        if !self.alignment_gpu_ledger_is_private() || read_requests.is_empty() {
+            return None;
+        }
+        for _ in 0..MAXIMUM_DEGRADED_CANDIDATES {
+            let allowance =
+                alignment_gpu_degraded_read_page_allowance(planned_read_page_bytes, pressure)?;
+            match self.try_publish_alignment_gpu_bundle(
+                target_revision,
+                publication_attempt_sequence,
+                read_requests,
+                summary_requests,
+                lane_authorities.to_vec(),
+                read_authorities.to_vec(),
+                AlignmentGpuVisibleAdmission::WithinPageBytes(allowance),
+                &mut planned_read_page_bytes,
+            ) {
+                Ok(bundle) => {
+                    tracing::debug!(
+                        allowance,
+                        deferred_pages = bundle
+                            .reads
+                            .as_ref()
+                            .map_or(0, |frame| frame.deferred_page_keys().len()),
+                        "published a partially resident alignment presentation"
+                    );
+                    return Some(bundle);
+                }
+                Err(failure) => match (failure.blocker, failure.pressure) {
+                    (None, Some(next)) => pressure = next,
+                    _ => return None,
+                },
+            }
+        }
+        None
     }
 
     pub(super) fn restore_alignment_gpu_composite(

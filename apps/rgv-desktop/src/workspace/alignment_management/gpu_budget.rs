@@ -1,9 +1,10 @@
 use crate::workspace::alignment_management::gpu_publication::{
-    AlignmentGpuPublicationRetryPoll, AlignmentGpuReclaimOutcome,
+    AlignmentGpuPartialTopUp, AlignmentGpuPublicationRetryPoll, AlignmentGpuReclaimOutcome,
     alignment_capacity_reclaim_allows_retry, alignment_gpu_budget_pressure_blocker,
+    alignment_gpu_partial_top_up_after_publication, alignment_gpu_partial_top_up_is_due,
     alignment_gpu_pressure_target_charged, alignment_gpu_publication_blocker_remains,
     alignment_gpu_publication_retry_gate, alignment_gpu_publication_retry_poll,
-    alignment_source_pressure_gpu_budget,
+    alignment_partial_residency_status, alignment_source_pressure_gpu_budget,
 };
 use crate::workspace::alignments::AlignmentSceneBudgetSnapshot;
 use crate::{
@@ -244,6 +245,79 @@ impl Viewer {
         self.settle_alignment_navigation_gpu_budget_limited(&message);
         self.report_warning(message);
         self.mark_display_dirty("explicit display invalidation");
+    }
+
+    /// Visible read pages the presented frame leaves out for lack of GPU budget.
+    pub(crate) fn alignment_gpu_deferred_read_pages(&self) -> usize {
+        self.alignment_presented_epoch
+            .as_ref()
+            .and_then(|epoch| epoch.gpu_bundle.as_ref())
+            .and_then(|bundle| bundle.reads.as_ref())
+            .map_or(0, |frame| frame.deferred_page_keys().len())
+    }
+
+    /// Records, after a publication, whether the presented read frame is partially resident,
+    /// and says so in the status line. Returns the number of deferred visible pages.
+    pub(super) fn record_alignment_gpu_partial_residency(&mut self) -> usize {
+        let deferred_pages = self.alignment_gpu_deferred_read_pages();
+        let occupied_bytes = self
+            .alignment_gpu_ledger
+            .progress()
+            .map_or(usize::MAX, |progress| {
+                progress.charged.saturating_add(progress.reserved)
+            });
+        let target_revision = self
+            .alignment_scene_publication_authority
+            .desired_target_revision();
+        self.alignment_gpu_partial_top_up = alignment_gpu_partial_top_up_after_publication(
+            self.alignment_gpu_partial_top_up,
+            target_revision,
+            deferred_pages,
+            occupied_bytes,
+        );
+        if let Some(status) = alignment_partial_residency_status(deferred_pages) {
+            self.data_status = status;
+        }
+        deferred_pages
+    }
+
+    /// Tries again to admit the visible pages a partially resident presentation left out.
+    /// Runs once after each publication that made progress and then only when GPU occupancy
+    /// has fallen, so a presentation that does not fit is not re-planned on every frame.
+    pub(crate) fn top_up_partial_alignment_gpu_residency(&mut self) {
+        let Some(top_up) = self.alignment_gpu_partial_top_up else {
+            return;
+        };
+        if self.alignment_gpu_deferred_read_pages() == 0 {
+            self.alignment_gpu_partial_top_up = None;
+            return;
+        }
+        if self.alignment_gpu_publication_retry.is_some()
+            || self.alignment_capacity_reclaim.is_some()
+        {
+            return;
+        }
+        let Ok(progress) = self.alignment_gpu_ledger.progress() else {
+            return;
+        };
+        if !alignment_gpu_partial_top_up_is_due(
+            top_up,
+            self.alignment_scene_publication_authority
+                .desired_target_revision(),
+            progress.charged.saturating_add(progress.reserved),
+        ) {
+            return;
+        }
+        // Whatever this attempt publishes re-arms the record (or clears it when complete). If
+        // it publishes nothing, the unchanged record below must not fire again at once.
+        self.alignment_gpu_partial_top_up = Some(AlignmentGpuPartialTopUp {
+            fruitless_attempts: top_up.fruitless_attempts.saturating_add(1),
+            occupied_bytes: progress.charged.saturating_add(progress.reserved),
+            ..top_up
+        });
+        self.alignment_gpu_top_up_in_progress = true;
+        self.prepare_alignment_scene_frame_atomic();
+        self.alignment_gpu_top_up_in_progress = false;
     }
 
     /// Polls a typed foreground refusal without converting the render loop into a retry clock.

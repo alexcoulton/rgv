@@ -179,13 +179,16 @@ Run after Wave 1 is green. Each item is one reviewable change.
 - [~] ARCH-3 charge-actual-after-build with per-owner soft budgets and LRU; exact ledger only in
       Complete mode; GPU pages outside the ledger
       — `AlignmentMemoryPolicy::Bounded` is the default; `Complete` keeps the strict path.
-        GPU has a private budget but no "draw what fits"; no settings UI for the policy
-- [ ] SCENE-9 / REND-8 compact handles, primitives and 16-byte GPU instances with a palette
+        Read pages draw what fits; summary pages still strict; no settings UI for the policy
+- [~] SCENE-9 / REND-8 compact handles, primitives and 16-byte GPU instances with a palette
       uniform (unlocks REND-10 theming and PROD-17)
+      — read instance 40 → 16 B, depth 32 → 12 B, primitive 184 → 152 B; palette uniform with
+        Light, Dark and Okabe–Ito variants; `AlignmentHandle` unchanged (design noted in
+        `identity.rs`); rgv-layout track colours not themed
 - [~] SCENE-10 fused single-pass summary tiles; generic `SummaryTile<Family>`
       — one selection per tile and tile-clipped walks; six tile types remain
-- [~] ENG-2 decoder stream continuation and chunk-level resume
-      — continuation and hysteresis done; rgv-hts resume API added, engine adoption pending
+- [x] ENG-2 decoder stream continuation and chunk-level resume
+      — done, including chunk-level resume; CRAM/remote resume covered only by rgv-hts tests
 - [x] ENG-7 resumable/cancellable scene builds
       — desktop keeps the incumbent scene on screen during a staged build
 - [x] ENG-15 coordinator split into modules; pressure classification on error types
@@ -194,15 +197,15 @@ Run after Wave 1 is green. Each item is one reviewable change.
         REND-7 confirmed on Metal and fixed with integer cancellation
 - [~] REND-9 GPU offscreen export at Nx; vector export from semantic primitives
       — GPU PNG export done with tiling; vector SVG/PDF not started
-- [~] HTS-2 remote VCF/BCF over `HttpRangeReader`; drop htslib `curl`
-      — VCF and BCF done; `curl` still used by `LocalAlignmentSource::open` URL fallback
+- [x] HTS-2 remote VCF/BCF over `HttpRangeReader`; drop htslib `curl`
+      — done
 - [x] HTS-8 index-chunk-driven read-ahead; HTS-12 shared decompression pool
       — HTS-12 as a process-wide thread allowance (rust-htslib pools cannot be shared);
         CRAM read-ahead unchanged
 - [~] HTS-15 / OPS-10 converge on one alignment backend
-      — shared `BackendRecord` logic and a differential suite (four divergences fixed);
-        benchmark and recommendation in ADR 0002; no backend removed; htslib `curl` no longer
-        used for alignments but still reached by faidx/bcf path strings
+      — shared `BackendRecord` logic, three-way differential suite, opt-in local noodles BAM
+        reader; default stays htslib until the ADR 0002 qualification criteria are met on
+        real data. htslib `curl` dropped; the desktop no longer links curl or OpenSSL
 - [x] UI-13 / APP-16 split `ui/tracks.rs`, remove glob preludes, diagnostics behind a facade
       — boundary violations found are listed for Wave 3; per-frame paint step still ~1,100 lines
 - [x] OPS-6 derive MCP schemas from core types

@@ -233,6 +233,17 @@ impl Viewer {
         }
     }
 
+    /// Hands the active theme's palette to the alignment renderers. This is two 2 KiB uniform
+    /// writes: resident GPU pages carry palette indices and are not re-uploaded, so a theme
+    /// change costs no GPU budget and needs no scene replacement.
+    pub(crate) fn apply_theme_to_renderers(&mut self) {
+        let theme = crate::theme::active();
+        self.alignment_gpu_renderer
+            .set_palette(&self.queue, theme.palette());
+        self.alignment_summary_gpu_renderer
+            .set_palette(&self.queue, theme.palette());
+    }
+
     pub(super) fn apply_settings_changes(&mut self, st: &mut ShellFrame) {
         let autosave_schedule_changed = self.settings.autosave_enabled
             != st.commands.autosave_enabled
@@ -240,6 +251,7 @@ impl Viewer {
         let accessibility_changed = self.settings.interface_scale_percent
             != st.commands.interface_scale_percent
             || self.settings.high_contrast != st.commands.high_contrast
+            || self.settings.theme != st.commands.interface_theme
             || self.settings.reduced_motion != st.commands.reduced_motion;
         let read_browsing_buffer_changed =
             self.settings.read_browsing_buffer_percent != st.commands.read_browsing_buffer_percent;
@@ -258,9 +270,11 @@ impl Viewer {
         self.settings.autosave_retention = st.commands.autosave_retention;
         self.settings.interface_scale_percent = st.commands.interface_scale_percent;
         self.settings.high_contrast = st.commands.high_contrast;
+        self.settings.theme = st.commands.interface_theme;
         self.settings.reduced_motion = st.commands.reduced_motion;
         if accessibility_changed {
             apply_accessibility_preferences(&self.egui_context, &self.settings);
+            self.apply_theme_to_renderers();
             self.mark_display_dirty("explicit display invalidation");
         }
         if autosave_schedule_changed {

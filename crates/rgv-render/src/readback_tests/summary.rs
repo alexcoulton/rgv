@@ -190,6 +190,89 @@ fn summary_depth_pixels_match_the_cpu_oracle_for_both_scale_transforms() {
     }
 }
 
+/// The summary pipeline takes its colours from the same palette uniform: a theme switch
+/// recolours resident depth pages with no page upload.
+#[test]
+fn switching_palette_recolours_resident_summary_pages_without_any_geometry_upload() {
+    use crate::palette::{AlignmentPalette, PaletteToken, ThemeId};
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let scene = test_snapshot(&ledger);
+    let mut renderer = AlignmentSummaryGpuRenderer::new(&gpu.device, FORMAT);
+    let mut options = lane_options(false);
+    options.depth.scale_maximum = Some(2);
+    options.depth.transform = CoverageScaleTransform::Linear;
+    let render = |renderer: &mut AlignmentSummaryGpuRenderer, sequence: u64| {
+        let requests = [AlignmentSummaryGpuSceneRequest {
+            scene: &scene,
+            coherence_scope: 1,
+            lane_identity: 1,
+            camera_sequence: sequence,
+            camera: camera(),
+            screen_size_points: [TARGET[0] as f32, TARGET[1] as f32],
+            scissor: SCISSOR,
+            options: options.into(),
+            overlays: AlignmentSummaryFrameOverlays::default(),
+        }];
+        let (frame, stats, _) = renderer
+            .prepare_with_admission(&gpu.device, &gpu.queue, &requests, &ledger, sequence)
+            .unwrap();
+        (
+            render_image(&gpu, TARGET, |pass| renderer.render(pass, &frame)),
+            stats,
+        )
+    };
+    let (light_image, light_stats) = render(&mut renderer, 1);
+    assert!(light_stats.geometry_uploaded_bytes > 0);
+    let mut previous = light_image.clone();
+    for (index, theme) in [ThemeId::Dark, ThemeId::Light].into_iter().enumerate() {
+        let palette = AlignmentPalette::for_theme(theme);
+        assert!(renderer.set_palette(&gpu.queue, &palette));
+        assert_eq!(renderer.palette_uploads(), index as u64 + 1);
+        let (image, stats) = render(&mut renderer, index as u64 + 2);
+        assert_eq!(stats.geometry_uploaded_bytes, 0, "{theme:?}");
+        assert_eq!(stats.page_cache_misses, 0, "{theme:?}");
+        assert_eq!(stats.resident_gpu_bytes, light_stats.resident_gpu_bytes);
+        assert_ne!(image, previous, "{theme:?} did not change any pixel");
+        let mut oracle = Oracle::new(TARGET);
+        let mut painted = 0;
+        for page in pages(&scene, SummaryPageFamily::Depth) {
+            let PackedAlignmentSummaryPage::Depth { instances, .. } =
+                PackedAlignmentSummaryPage::from_request(AlignmentSummaryGpuPageRequest::depth(
+                    page,
+                ))
+                .unwrap()
+            else {
+                unreachable!();
+            };
+            for instance in instances {
+                if let Some(bounds) = project_alignment_summary_depth_instance(
+                    instance,
+                    page.interval().start(),
+                    camera(),
+                    2,
+                    CoverageScaleTransform::Linear,
+                ) {
+                    paint_solid(
+                        &mut oracle,
+                        quad(bounds),
+                        palette.color(PaletteToken::SUMMARY_DEPTH),
+                    );
+                    painted += 1;
+                }
+            }
+        }
+        assert!(painted > 0);
+        let label = format!("summary depth under the {theme:?} palette");
+        let comparison = oracle.assert_matches(&image, &label);
+        report(&label, &gpu, painted, &comparison);
+        previous = image;
+    }
+    assert_eq!(previous, light_image);
+}
+
 #[test]
 fn summary_allele_pixels_match_the_cpu_oracle_over_depth() {
     let Some(gpu) = test_gpu() else {
@@ -304,11 +387,15 @@ fn summary_modification_pixels_match_the_cpu_oracle_by_type_and_against_unmodifi
                     if instance.later_code_mask == 0 {
                         continue;
                     }
-                    let mut band =
-                        <AlignmentSummaryGpuDepthInstance as bytemuck::Zeroable>::zeroed();
-                    band.start_offset = instance.start_offset;
-                    band.end_offset = instance.end_offset;
-                    band.depth = 1;
+                    let whole =
+                        |words: [f32; 2]| (f64::from(words[0]) + f64::from(words[1])) as u64;
+                    let band = AlignmentSummaryGpuDepthInstance::new(
+                        page.key(),
+                        whole(instance.start_offset),
+                        whole(instance.end_offset),
+                        1,
+                    )
+                    .unwrap();
                     let bounds = project_alignment_summary_depth_instance(
                         band,
                         page_start,

@@ -9,6 +9,9 @@ const COMMON: &str = include_str!("shaders/common.wgsl");
 /// Instance layout, varyings and fragment shape rules of the two rectangle pipelines.
 const RECTANGLE_SHAPES: &str = include_str!("shaders/rectangle_shapes.wgsl");
 
+/// The semantic palette uniform and `palette_color`, shared by the alignment pipelines.
+const PALETTE: &str = include_str!("shaders/palette.wgsl");
+
 /// One pipeline's complete shader: a label and the chunks concatenated to form its source.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ComposedShader {
@@ -26,11 +29,11 @@ pub(crate) const CONTEXT_SCENE: ComposedShader = ComposedShader {
 };
 pub(crate) const ALIGNMENT_SCENE: ComposedShader = ComposedShader {
     label: "RGV alignment semantic page shader",
-    chunks: &[COMMON, include_str!("alignment_scene.wgsl")],
+    chunks: &[COMMON, PALETTE, include_str!("alignment_scene.wgsl")],
 };
 pub(crate) const ALIGNMENT_SUMMARY: ComposedShader = ComposedShader {
     label: "RGV alignment summary semantic page shader",
-    chunks: &[COMMON, include_str!("alignment_summary.wgsl")],
+    chunks: &[COMMON, PALETTE, include_str!("alignment_summary.wgsl")],
 };
 
 /// Every shader this crate compiles, for validation tests.

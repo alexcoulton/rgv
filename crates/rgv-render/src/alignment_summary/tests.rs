@@ -690,6 +690,49 @@ fn assert_near(left: f64, right: f64) {
     assert!((left - right).abs() < 1.0e-4, "{left} != {right}");
 }
 
+/// REND-8, summary side. Depth runs are twelve bytes (they were thirty-two) and refuse spans
+/// they cannot hold; the other summary instance types are unchanged and pinned here so a later
+/// change is deliberate.
+#[test]
+fn summary_instance_sizes_are_pinned_and_depth_spans_are_validated() {
+    assert_eq!(size_of::<AlignmentSummaryGpuDepthInstance>(), 12);
+    assert_eq!(size_of::<AlignmentSummaryGpuAlleleInstance>(), 64);
+    assert_eq!(size_of::<AlignmentSummaryGpuModificationInstance>(), 72);
+    assert_eq!(size_of::<AlignmentSummaryGpuJunctionInstance>(), 48);
+    assert_eq!(size_of::<AlignmentSummaryGpuOverlayInstance>(), 24);
+    assert_eq!(
+        size_of::<AlignmentSummaryGpuDepthInstance>() % wgpu::COPY_BUFFER_ALIGNMENT as usize,
+        0
+    );
+
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let scene = test_snapshot(&ledger);
+    let key = scene
+        .summary_pages()
+        .iter()
+        .find(|page| page.key().family() == SummaryPageFamily::Depth)
+        .unwrap()
+        .key();
+    let limit = crate::MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET;
+    let run = AlignmentSummaryGpuDepthInstance::new(key, limit - 3, limit, 9).unwrap();
+    assert_eq!(
+        (run.start_offset(), run.end_offset(), run.depth),
+        (limit - 3, limit, 9)
+    );
+    assert!(matches!(
+        AlignmentSummaryGpuDepthInstance::new(key, 4, limit + 1, 1),
+        Err(AlignmentSummaryGpuPageError::SemanticOffsetOutOfRange { start: 4, .. })
+    ));
+    assert!(matches!(
+        AlignmentSummaryGpuDepthInstance::new(key, u64::from(u32::MAX) + 2, u64::MAX, 1),
+        Err(AlignmentSummaryGpuPageError::SemanticOffsetOutOfRange { .. })
+    ));
+    assert!(matches!(
+        AlignmentSummaryGpuDepthInstance::new(key, 5, 5, 1),
+        Err(AlignmentSummaryGpuPageError::InvalidSemanticSpan { .. })
+    ));
+}
+
 #[test]
 fn packed_depth_and_reference_aware_alleles_match_the_cpu_oracle() {
     let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
@@ -831,6 +874,7 @@ fn packed_depth_and_reference_aware_alleles_match_the_cpu_oracle() {
 
 #[test]
 fn semantic_export_contains_committed_read_and_depth_geometry_and_pins_its_capture() {
+    use crate::palette::{AlignmentPalette, PaletteToken};
     use rgv_alignment_scene::{
         AlignmentCamera, AlignmentDerivedLaneCapture, AlignmentDerivedLaneOptions,
         AlignmentPanelLaneFrame, AlignmentPanelSceneFrame, CpuClipRect, CpuPrimitiveShape,
@@ -888,6 +932,7 @@ fn semantic_export_contains_committed_read_and_depth_geometry_and_pins_its_captu
         std::slice::from_ref(&frame),
         &ledger,
         &std::collections::HashMap::new(),
+        &crate::palette::AlignmentPalette::light(),
     )
     .unwrap();
     for body in expected
@@ -925,17 +970,102 @@ fn semantic_export_contains_committed_read_and_depth_geometry_and_pins_its_captu
         crate::project_semantic_alignment_export(
             &[next],
             &ledger,
-            &std::collections::HashMap::new()
+            &std::collections::HashMap::new(),
+            &crate::palette::AlignmentPalette::light(),
         )
         .is_err()
     );
+    let themed_frame = frame.clone();
     let retained = crate::project_semantic_alignment_export(
         &[frame],
         &ledger,
         &std::collections::HashMap::new(),
+        &crate::palette::AlignmentPalette::light(),
     )
     .unwrap();
     assert_eq!(retained.display, export.display);
+
+    // The export honours the active palette: the same geometry, recoloured by the palette that
+    // is passed in, for summary and read primitives alike.
+    for palette in [
+        AlignmentPalette::dark(),
+        AlignmentPalette::light_color_blind(),
+        AlignmentPalette::dark_color_blind(),
+    ] {
+        let themed = crate::project_semantic_alignment_export(
+            std::slice::from_ref(&themed_frame),
+            &ledger,
+            &std::collections::HashMap::new(),
+            &palette,
+        )
+        .unwrap();
+        assert_eq!(
+            themed.display.rectangles.len(),
+            export.display.rectangles.len()
+        );
+        let mut recoloured = 0_usize;
+        for (themed, light) in themed
+            .display
+            .rectangles
+            .iter()
+            .zip(&export.display.rectangles)
+        {
+            assert_eq!(
+                (
+                    themed.x,
+                    themed.y,
+                    themed.width,
+                    themed.height,
+                    themed.shape
+                ),
+                (light.x, light.y, light.width, light.height, light.shape)
+            );
+            recoloured += usize::from(themed.color != light.color);
+        }
+        assert!(recoloured > 0);
+        let [r, g, b, a] = palette.color(PaletteToken::SUMMARY_DEPTH);
+        let depth_is_themed = themed
+            .display
+            .rectangles
+            .iter()
+            .any(|rectangle| rectangle.y < 96.0 && rectangle.color == Rgba::new(r, g, b, a));
+        assert!(depth_is_themed);
+        // Every rectangle whose Light colour is a palette slot shows that slot's colour in the
+        // palette that was passed in (several slots can share one Light colour).
+        let slot_color = |palette: &AlignmentPalette, slot: u8| {
+            palette.resolve(crate::palette::PaletteColor::decode(slot, 0))
+        };
+        let light_palette = AlignmentPalette::light();
+        for (themed, light) in themed
+            .display
+            .rectangles
+            .iter()
+            .zip(&export.display.rectangles)
+        {
+            let light = [
+                light.color.red,
+                light.color.green,
+                light.color.blue,
+                light.color.alpha,
+            ];
+            let candidates = (1..PaletteToken::END.index())
+                .filter(|slot| {
+                    slot_color(&light_palette, *slot).map(f32::to_bits) == light.map(f32::to_bits)
+                })
+                .map(|slot| slot_color(&palette, slot))
+                .collect::<Vec<_>>();
+            let actual = [
+                themed.color.red,
+                themed.color.green,
+                themed.color.blue,
+                themed.color.alpha,
+            ];
+            assert!(
+                candidates.is_empty() || candidates.contains(&actual),
+                "{actual:?} not in {candidates:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1753,9 +1883,9 @@ fn canonical_gpu_pages_are_clipped_to_the_snapshot_prepared_interval() {
     let mut gpu = instances
         .iter()
         .filter_map(|instance| {
-            projected_horizontal_in_clip(
-                instance.start_offset,
-                instance.end_offset,
+            projected_horizontal_exact(
+                instance.start_offset() as f64,
+                instance.end_offset() as f64,
                 depth_page.interval().start(),
                 camera,
                 [f64::from(clip[0]), f64::from(clip[1])],

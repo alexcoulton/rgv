@@ -379,11 +379,21 @@ impl Viewer {
         let rectangle_renderer = RectangleRenderer::new(&device, surface_config.format);
         let context_scene_gpu_renderer =
             ContextSceneGpuRenderer::new(&device, surface_config.format);
-        let alignment_gpu_renderer = AlignmentGpuRenderer::new(&device, surface_config.format);
-        let alignment_summary_gpu_renderer =
-            AlignmentSummaryGpuRenderer::new(&device, surface_config.format);
+        // The palette is part of renderer construction, so the first frame is already themed.
+        let initial_theme =
+            crate::theme::DesktopTheme::new(crate::theme::theme_id(options.loaded_settings.theme));
+        let alignment_gpu_renderer = AlignmentGpuRenderer::with_palette(
+            &device,
+            surface_config.format,
+            initial_theme.palette(),
+        );
+        let alignment_summary_gpu_renderer = AlignmentSummaryGpuRenderer::with_palette(
+            &device,
+            surface_config.format,
+            initial_theme.palette(),
+        );
         let egui_context = egui::Context::default();
-        egui_context.set_visuals(egui::Visuals::light());
+        egui_context.set_visuals(initial_theme.visuals());
         let egui_state = egui_winit::State::new(
             egui_context.clone(),
             egui::ViewportId::ROOT,
@@ -692,6 +702,10 @@ impl Viewer {
                 &panel_ids,
             )?);
         }
+        crate::workspace::alignments::connect_reference_slice_sinks(
+            reference_engine.as_ref(),
+            &alignment_tracks,
+        );
         let scene_track_ids = alignment_tracks
             .iter()
             .filter(|track| track.scene_engine.is_some())
@@ -856,6 +870,8 @@ impl Viewer {
             alignment_gpu_prefetch: AlignmentGpuPrefetchState::default(),
             alignment_gpu_publication_retry: None,
             alignment_last_gpu_budget_pressure: None,
+            alignment_gpu_partial_top_up: None,
+            alignment_gpu_top_up_in_progress: false,
             alignment_capacity_reclaim: None,
             alignment_capacity_reclaim_clock: 0,
             alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate::default(),
@@ -1242,12 +1258,7 @@ impl Viewer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 1.0,
-                            g: 1.0,
-                            b: 1.0,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(crate::theme::active().canvas_clear()),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

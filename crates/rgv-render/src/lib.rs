@@ -47,7 +47,8 @@ pub use alignment_scene::{
     AlignmentGpuRenderer, AlignmentGpuRendererOperationCounters, AlignmentGpuReplacementError,
     AlignmentGpuReplacementPlan, AlignmentGpuResidencyError, AlignmentGpuResidencyLease,
     AlignmentGpuRetirement, AlignmentGpuSceneRequest, AlignmentGpuScissor, AlignmentGpuShape,
-    AlignmentGpuStagedReplacement, PackedAlignmentPage, project_alignment_gpu_instance,
+    AlignmentGpuStagedReplacement, AlignmentGpuVisibleAdmission, MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET,
+    MAXIMUM_ALIGNMENT_GPU_PAGE_ROWS, PackedAlignmentPage, project_alignment_gpu_instance,
 };
 pub use alignment_summary::{
     AlignmentSummaryAlleleToken, AlignmentSummaryDepthRangeIndex, AlignmentSummaryFrameOverlays,

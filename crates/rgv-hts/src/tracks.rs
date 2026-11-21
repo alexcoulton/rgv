@@ -563,6 +563,7 @@ pub struct InteractionQuery {
     pub provenance: InteractionQueryProvenance,
 }
 
+mod remote_tabix;
 mod text_feature;
 #[cfg(test)]
 use text_feature::FeatureIndex;

@@ -53,11 +53,11 @@ pub use junction::{
     RecordJunctionCollector,
 };
 pub use local::{
-    AlignmentDerivationMetrics, AlignmentDerivationPhase, AlignmentError, AlignmentOpenOptions,
-    AlignmentQuery, AlignmentSource, IndividualReadStatus, LocalAlignmentSource,
-    PositionedAlignmentBlock, PositionedAlignmentRecord, PositionedAlignmentStreamCheckpoint,
-    PositionedAlignmentStreamCompletion, QueryDetail, QueryOptions, QueryStats,
-    derive_alignment_query, derive_alignment_query_with_metrics,
+    AlignmentBackendPreference, AlignmentDerivationMetrics, AlignmentDerivationPhase,
+    AlignmentError, AlignmentOpenOptions, AlignmentQuery, AlignmentSource, IndividualReadStatus,
+    LocalAlignmentSource, PositionedAlignmentBlock, PositionedAlignmentRecord,
+    PositionedAlignmentStreamCheckpoint, PositionedAlignmentStreamCompletion, QueryDetail,
+    QueryOptions, QueryStats, derive_alignment_query, derive_alignment_query_with_metrics,
     derive_alignment_query_with_metrics_and_phase,
     derive_alignment_query_with_summary_index_and_phase,
 };
@@ -92,8 +92,8 @@ pub use remote::{
     read_remote_object_bounded, redact_url, remote_url_with_extension,
 };
 pub use remote_alignment::{
-    LocalCramAlignmentSource, ProductionAlignmentSource, RemoteBamAlignmentSource,
-    RemoteCramAlignmentSource,
+    LocalBamAlignmentSource, LocalCramAlignmentSource, MAX_IN_MEMORY_ALIGNMENT_BYTES,
+    ProductionAlignmentSource, RemoteBamAlignmentSource, RemoteCramAlignmentSource,
 };
 pub use sbx::{
     SbxEvidenceError, SbxInsertionState, SbxSummary, SbxTailBounds, classify_sbx_insertion,

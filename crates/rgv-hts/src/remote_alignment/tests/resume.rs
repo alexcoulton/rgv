@@ -277,6 +277,16 @@ fn a_resumed_local_bam_stream_equals_a_fresh_stream_minus_the_skipped_chunks() {
 }
 
 #[test]
+fn a_resumed_local_noodles_bam_stream_equals_a_fresh_stream_minus_the_skipped_chunks() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, _) = dense_bam(directory.path());
+    for threads in [0, 3] {
+        let mut source = super::differential::open_local_noodles(&path, threads);
+        assert_bam_resume_scenarios(&mut source);
+    }
+}
+
+#[test]
 fn a_resumed_remote_bam_stream_equals_a_fresh_stream_minus_the_skipped_chunks() {
     let directory = tempfile::tempdir().unwrap();
     let (path, index) = dense_bam(directory.path());
@@ -558,7 +568,8 @@ fn resumed_streams_equal_fresh_streams_on_the_benchmark_corpus() {
         max_records: NonZeroUsize::new(1_000_000).unwrap(),
         ..options()
     };
-    for source in [&mut local, &mut remote] {
+    let mut local_noodles = super::differential::open_local_noodles(&path, 4);
+    for source in [&mut local, &mut remote, &mut local_noodles] {
         for (contig, held_target, targets) in [
             (
                 0,

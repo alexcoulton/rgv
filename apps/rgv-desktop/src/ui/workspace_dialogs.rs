@@ -170,7 +170,7 @@ pub(crate) fn show_workspace_dialogs(ui: &mut egui::Ui, draft: &mut WorkspaceDia
                             });
                             if values.len() > MAX_METADATA_FILTER_VALUES {
                                 ui.colored_label(
-                                    egui::Color32::from_rgb(150, 88, 20),
+                                    crate::theme::adapt(egui::Color32::from_rgb(150, 88, 20)),
                                     format!(
                                         "Showing the first {MAX_METADATA_FILTER_VALUES} of {} distinct filter values",
                                         values.len()
@@ -206,7 +206,7 @@ pub(crate) fn show_workspace_dialogs(ui: &mut egui::Ui, draft: &mut WorkspaceDia
                                     .is_some_and(|key| table.row(key).is_none())
                                 {
                                     ui.colored_label(
-                                        egui::Color32::DARK_RED,
+                                        crate::theme::adapt(egui::Color32::DARK_RED),
                                         "unresolved sample key",
                                     );
                                 }

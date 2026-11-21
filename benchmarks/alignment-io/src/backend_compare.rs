@@ -5,11 +5,23 @@
 //! Unlike the `run` digest, the full-detail level materialises what RGV's `QueryDetail::Full`
 //! normalisation reads: every base, every quality, every CIGAR operation and every auxiliary
 //! value. Both backends must produce the same digest before a timing is accepted.
+//!
+//! A second section times RGV's own path: `rgv_hts::ProductionAlignmentSource` opened on the
+//! local BAM with each `AlignmentBackendPreference`, running the one-shot regional query and
+//! draining a positioned stream. That includes normalisation, eligibility, packing and pileup
+//! (the same code for both backends), so it shows what a backend switch changes end to end.
+//! Both backends must return equal results before a timing is accepted.
 
 use std::{fs, num::NonZero, path::Path, time::Instant};
 
 use anyhow::{Context, Result, bail};
 use noodles::{bam as noodles_bam, bgzf, core::Region, sam};
+use rgv_core::{ContigId, GenomicInterval};
+use rgv_hts::{
+    AlignmentBackendPreference, AlignmentOpenOptions, AlignmentSource as _,
+    PositionedAlignmentBlock, PositionedAlignmentStreamCheckpoint, ProductionAlignmentSource,
+    QueryDetail, QueryOptions,
+};
 use rust_htslib::bam::{self as hts_bam, Read as _};
 use serde::Serialize;
 
@@ -117,6 +129,22 @@ struct Measurement {
     megabases_per_second: f64,
 }
 
+/// One timing of RGV's production path (`ProductionAlignmentSource`).
+#[derive(Debug, Serialize)]
+struct ProductionMeasurement {
+    workload: &'static str,
+    detail: Detail,
+    /// `query`: the one-shot regional query. `stream`: a positioned stream drained to its end.
+    mode: &'static str,
+    backend: &'static str,
+    /// Decompression threads the source was granted.
+    threads: u32,
+    ms: Vec<f64>,
+    median_ms: f64,
+    min_ms: f64,
+    records: usize,
+}
+
 #[derive(Debug, Serialize)]
 struct Report {
     input: String,
@@ -124,6 +152,7 @@ struct Report {
     iterations: usize,
     machine: String,
     measurements: Vec<Measurement>,
+    production: Vec<ProductionMeasurement>,
 }
 
 pub fn run(input: &Path, iterations: usize, output: &Path) -> Result<()> {
@@ -184,6 +213,7 @@ pub fn run(input: &Path, iterations: usize, output: &Path) -> Result<()> {
             }
         }
     }
+    let production = run_production(input, iterations)?;
     let report = Report {
         input: input.display().to_string(),
         input_bytes: fs::metadata(input)?.len(),
@@ -195,6 +225,7 @@ pub fn run(input: &Path, iterations: usize, output: &Path) -> Result<()> {
             std::thread::available_parallelism().map_or(0, NonZero::get)
         ),
         measurements,
+        production,
     };
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -454,4 +485,160 @@ fn parse_region(region: &str) -> Result<(&str, i64, i64)> {
         .split_once('-')
         .context("region is missing '-'")?;
     Ok((contig, start.parse::<i64>()? - 1, end.parse()?))
+}
+
+const PRODUCTION_BACKENDS: &[(&str, AlignmentBackendPreference, u32)] = &[
+    (
+        "production-htslib-1t",
+        AlignmentBackendPreference::Htslib,
+        1,
+    ),
+    (
+        "production-noodles-1t",
+        AlignmentBackendPreference::Noodles,
+        1,
+    ),
+    (
+        "production-htslib-4t",
+        AlignmentBackendPreference::Htslib,
+        4,
+    ),
+    (
+        "production-noodles-4t",
+        AlignmentBackendPreference::Noodles,
+        4,
+    ),
+];
+
+fn production_options(detail: Detail) -> QueryOptions {
+    let limit = NonZero::new(2_000_000).expect("nonzero");
+    match detail {
+        Detail::Layout => QueryOptions {
+            max_records: limit,
+            ..QueryOptions::default()
+        },
+        // What a base-level view asks for: every field, allele and modification pileups.
+        Detail::Full => QueryOptions {
+            detail: QueryDetail::Full,
+            collect_alleles: true,
+            collect_modifications: true,
+            max_records: limit,
+            ..QueryOptions::default()
+        },
+    }
+}
+
+fn production_interval(
+    source: &ProductionAlignmentSource,
+    region: &str,
+) -> Result<GenomicInterval> {
+    let (contig, start, end) = parse_region(region)?;
+    let index = source
+        .reference_dictionary()
+        .iter()
+        .position(|candidate| candidate.name() == contig)
+        .with_context(|| format!("{contig} is not in the header"))?;
+    GenomicInterval::new(
+        ContigId::new(u32::try_from(index)?),
+        u64::try_from(start)?,
+        u64::try_from(end)?,
+    )
+    .context("invalid benchmark interval")
+}
+
+fn drain_stream(
+    source: &mut ProductionAlignmentSource,
+    interval: GenomicInterval,
+    options: &QueryOptions,
+) -> Result<Vec<PositionedAlignmentBlock>> {
+    source.begin_positioned_stream_with_admission(interval, interval, options.clone())?;
+    let mut blocks = Vec::new();
+    loop {
+        match source.next_positioned_stream_checkpoint(&|| true)? {
+            PositionedAlignmentStreamCheckpoint::Block(block) => blocks.push(block),
+            PositionedAlignmentStreamCheckpoint::Complete(_) => return Ok(blocks),
+            PositionedAlignmentStreamCheckpoint::Cancelled(_) => bail!("stream was cancelled"),
+        }
+    }
+}
+
+/// Times `ProductionAlignmentSource` with each local BAM backend. A source is opened once per
+/// backend (open time excluded) and asked the same query `iterations` times.
+fn run_production(input: &Path, iterations: usize) -> Result<Vec<ProductionMeasurement>> {
+    let mut measurements = Vec::new();
+    for workload in WORKLOADS {
+        let Some(region) = workload.region else {
+            continue;
+        };
+        for detail in [Detail::Layout, Detail::Full] {
+            let options = production_options(detail);
+            let mut expected = None;
+            for &(label, backend, threads) in PRODUCTION_BACKENDS {
+                let mut source = ProductionAlignmentSource::open(
+                    input,
+                    &AlignmentOpenOptions {
+                        local_bam_backend: backend,
+                        decompression_threads: NonZero::new(threads).expect("nonzero"),
+                        ..AlignmentOpenOptions::default()
+                    },
+                )?;
+                let granted = match &source {
+                    ProductionAlignmentSource::Htslib(source) => source.decompression_threads(),
+                    ProductionAlignmentSource::LocalBam(source) => source.decompression_threads(),
+                    _ => bail!("{} did not open as a local BAM", input.display()),
+                };
+                let interval = production_interval(&source, region)?;
+                let mut query_ms = Vec::with_capacity(iterations);
+                let mut stream_ms = Vec::with_capacity(iterations);
+                let mut records = 0;
+                for _ in 0..iterations {
+                    let started = Instant::now();
+                    let query = source.query(interval, options.clone(), &|| true)?;
+                    query_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                    let started = Instant::now();
+                    let blocks = drain_stream(&mut source, interval, &options)?;
+                    stream_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                    records = query.batch.len();
+                    match &expected {
+                        None => expected = Some((query, blocks)),
+                        Some((expected_query, expected_blocks)) => {
+                            if *expected_query != query {
+                                bail!("{label}: query differs for {} / {detail:?}", workload.name);
+                            }
+                            if *expected_blocks != blocks {
+                                bail!("{label}: stream differs for {} / {detail:?}", workload.name);
+                            }
+                        }
+                    }
+                }
+                for (mode, mut ms) in [("query", query_ms), ("stream", stream_ms)] {
+                    ms.sort_by(f64::total_cmp);
+                    let measurement = ProductionMeasurement {
+                        workload: workload.name,
+                        detail,
+                        mode,
+                        backend: label,
+                        threads: granted,
+                        median_ms: ms[ms.len() / 2],
+                        min_ms: ms[0],
+                        ms,
+                        records,
+                    };
+                    println!(
+                        "{:20} {:6} {:22} {:6} {:9.2} ms (min {:9.2})  {} records, {} threads",
+                        measurement.workload,
+                        format!("{detail:?}").to_lowercase(),
+                        measurement.backend,
+                        measurement.mode,
+                        measurement.median_ms,
+                        measurement.min_ms,
+                        measurement.records,
+                        measurement.threads,
+                    );
+                    measurements.push(measurement);
+                }
+            }
+        }
+    }
+    Ok(measurements)
 }

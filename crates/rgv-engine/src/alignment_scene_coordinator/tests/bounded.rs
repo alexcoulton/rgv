@@ -18,7 +18,7 @@ fn a_budget_which_refuses_the_strict_ledger_still_publishes_under_bounded() {
     let refused = (0..256).find_map(|_| match strict.pump_once() {
         Ok(pump) => pump.pressure.map(|pressure| pressure.pressure),
         Err(error) => Some(
-            source_allocation_pressure::<LocalBamCanonicalBackend>(&error)
+            source_allocation_pressure::<PositionedAlignmentBackend>(&error)
                 .expect("the strict ledger refuses with allocation pressure"),
         ),
     });
@@ -329,4 +329,99 @@ fn optional_row_warming_stops_at_the_presentation_share_and_resumes_with_a_large
         coordinator.frame().unwrap().vertical_residency,
         AlignmentVerticalResidency::Complete { .. }
     ));
+}
+
+#[test]
+fn trim_quanta_between_turns_starve_neither_the_trim_nor_visible_work() {
+    const QUANTUM: usize = 2;
+    let (mut coordinator, camera, _) =
+        wide_coordinator_with_ledger(800_000, bounded_ledger(512 << 20));
+    let owner = coordinator.owner();
+    // Fill the caches at three loci.
+    for start in [800_000, 900_000, 1_000_000] {
+        let camera = camera_at(&coordinator, camera, start);
+        coordinator.update_camera(camera).unwrap();
+        pump_until_idle(&mut coordinator);
+        assert!(coordinator.frame().unwrap().visible_complete());
+    }
+    let ledger = coordinator.actor().store().ledger();
+    let owners = [
+        AllocationOwner::Evidence,
+        AllocationOwner::Summary,
+        AllocationOwner::Presentation,
+    ];
+    // A budget the caches of three loci exceed, with room for one more request.
+    ledger
+        .set_budget(ledger.progress().unwrap().pinned * 4)
+        .unwrap();
+    assert!(
+        owners.iter().any(|owner| {
+            let usage = ledger.owner_usage(*owner).unwrap();
+            usage.charged > usage.soft_budget
+        }),
+        "the fixture left nothing to trim"
+    );
+
+    // The worker's `Bounded` loop: one trim quantum, then one turn of the most urgent work,
+    // for a request to a locus that is not cached.
+    let next = camera_at(&coordinator, camera, 1_100_000);
+    coordinator.update_camera(next).unwrap();
+    let (mut trims_with_evictions, mut turns, mut evicted) = (0_usize, 0_usize, 0_usize);
+    let mut turns_between_evictions = 0_usize;
+    let mut settled = false;
+    for _ in 0..4_096 {
+        let trim = coordinator.trim_bounded_caches(QUANTUM).unwrap();
+        assert_eq!(trim.pressure.map(|pressure| pressure.pressure), None);
+        assert!(!trim.speculation_aborted);
+        // A quantum is bounded, so a turn is never behind more than one of them.
+        assert!(
+            trim.evicted_entries <= QUANTUM + 1,
+            "one trim quantum evicted {} entries",
+            trim.evicted_entries
+        );
+        evicted += trim.evicted_entries;
+        trims_with_evictions += usize::from(trim.evicted_entries > 0);
+        let turn_runnable = coordinator.source.scene_build_stage(owner).is_some()
+            || coordinator.source.has_pending_source_work();
+        if trim.evicted_entries > 0 && turn_runnable {
+            turns_between_evictions += 1;
+        }
+        if coordinator.source.scene_build_stage(owner).is_some() {
+            coordinator.source.pump_scene_build_once().unwrap().unwrap();
+            turns += 1;
+        } else if coordinator.source.has_pending_source_work() {
+            let pump = coordinator.pump_once().unwrap();
+            assert!(pump.pressure.is_none());
+            turns += 1;
+        } else if trim.complete && trim.evicted_entries == 0 {
+            settled = true;
+            break;
+        }
+    }
+    assert!(
+        settled,
+        "the trim and the request did not both come to rest"
+    );
+
+    // Visible work finished although a trim ran before every one of its turns...
+    let frame = coordinator.frame().unwrap();
+    assert_eq!(frame.camera.interval(), next.interval());
+    assert!(frame.visible_complete());
+    assert!(turns > 0);
+    // ...and the trim finished although visible work was runnable: it took many quanta, some
+    // of them between turns of the request.
+    assert!(
+        trims_with_evictions > 4 && evicted > QUANTUM * 4,
+        "{evicted} entries in {trims_with_evictions} quanta"
+    );
+    assert!(turns_between_evictions > 0);
+    for owner in owners {
+        let usage = ledger.owner_usage(owner).unwrap();
+        assert!(
+            usage.charged <= usage.soft_budget.max(usage.pinned),
+            "{usage:?}"
+        );
+    }
+    let progress = ledger.progress().unwrap();
+    assert_eq!((progress.reserved, progress.transient), (0, 0));
 }

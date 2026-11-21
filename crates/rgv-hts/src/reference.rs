@@ -16,6 +16,9 @@ use crate::{
 const MAX_REMOTE_FASTA_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REMOTE_FASTA_INDEX_ENTRIES: usize = 1_000_000;
 const MAX_REMOTE_FASTA_INDEX_LINE_BYTES: usize = 1024 * 1024;
+/// Largest `.gzi` (BGZF block offset table) read for a remote bgzip-compressed FASTA: sixteen
+/// bytes per block, so enough for a FASTA of several hundred gigabases.
+const MAX_REMOTE_GZI_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct FastaOpenOptions {
@@ -25,6 +28,14 @@ pub struct FastaOpenOptions {
     /// every sequence length in one read; without it each length is read from its own record,
     /// which is slow for a remote file with many sequences.
     pub chrom_sizes: Option<String>,
+    /// URL of the `.gzi` block index of a remote bgzip-compressed FASTA. Without it the index
+    /// is expected at `<url>.gzi`, where `samtools faidx` writes it.
+    pub remote_gzi_url: Option<String>,
+    /// Report the soft-masking of a `.2bit` reference: masked bases are returned in lower
+    /// case, as a soft-masked FASTA returns them. Off by default, in which case every base of
+    /// a `.2bit` reference is upper case. It costs reading each fetched sequence's mask table
+    /// once. FASTA references always return the bases as the file stores them.
+    pub two_bit_soft_masking: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,9 +75,58 @@ pub(crate) struct FastaIndexEntry {
 }
 
 struct RemoteFastaReference {
-    reader: Mutex<HttpRangeReader>,
+    reader: Mutex<RemoteFastaStream>,
     entries: Vec<FastaIndexEntry>,
     index_stats: RemoteIoStats,
+}
+
+/// The bytes of a remote FASTA, addressed by offset in the uncompressed text.
+enum RemoteFastaStream {
+    Plain(HttpRangeReader),
+    /// bgzip-compressed (`.fa.gz` with `.fai` and `.gzi`): the `.gzi` maps an uncompressed
+    /// offset to the BGZF block holding it.
+    Bgzf {
+        reader: noodles::bgzf::io::Reader<HttpRangeReader>,
+        index: noodles::bgzf::gzi::Index,
+    },
+}
+
+impl RemoteFastaStream {
+    fn http(&self) -> &HttpRangeReader {
+        match self {
+            Self::Plain(reader) => reader,
+            Self::Bgzf { reader, .. } => reader.get_ref(),
+        }
+    }
+
+    fn http_mut(&mut self) -> &mut HttpRangeReader {
+        match self {
+            Self::Plain(reader) => reader,
+            Self::Bgzf { reader, .. } => reader.get_mut(),
+        }
+    }
+
+    fn seek_to(&mut self, offset: u64) -> std::io::Result<()> {
+        match self {
+            Self::Plain(reader) => reader.seek(SeekFrom::Start(offset)).map(|_| ()),
+            Self::Bgzf { reader, index } => reader
+                .seek_by_uncompressed_position(index, offset)
+                .map(|_| ()),
+        }
+    }
+
+    fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(reader) => reader.read_exact(buffer),
+            Self::Bgzf { reader, .. } => reader.read_exact(buffer),
+        }
+    }
+
+    /// Whether skipping a few bytes is better done by reading them than by seeking: a seek in
+    /// a BGZF stream inflates the target block again.
+    const fn reads_through_gaps(&self) -> bool {
+        matches!(self, Self::Bgzf { .. })
+    }
 }
 
 impl FastaReference {
@@ -81,6 +141,10 @@ impl FastaReference {
         let path = path.as_ref();
         let raw = path.to_string_lossy();
         let is_remote = raw.starts_with("http://") || raw.starts_with("https://");
+        if let Some(scheme) = crate::local::unsupported_url_scheme(&raw) {
+            // Refused by name: `HTSlib` would hand `s3://`, `gs://` or `ftp://` to libcurl.
+            return Err(crate::RemoteError::UnsupportedScheme(scheme.to_owned()).into());
+        }
         if location_has_extension(&raw, is_remote, "2bit") {
             return Self::open_two_bit(&raw, is_remote, options);
         }
@@ -128,7 +192,11 @@ impl FastaReference {
         } else {
             Box::new(std::io::BufReader::new(std::fs::File::open(location)?))
         };
-        let two_bit = TwoBitReference::open(reader)?;
+        let two_bit = if options.two_bit_soft_masking {
+            TwoBitReference::open_soft_masked(reader)?
+        } else {
+            TwoBitReference::open(reader)?
+        };
         // The reference's companion slot (the FASTA index for a FASTA) carries the sizes table
         // for a 2bit, so sessions and launch options need no separate setting.
         let known_sizes = options
@@ -219,7 +287,7 @@ impl FastaReference {
         if let FastaReader::Remote(remote) = &self.reader
             && let Ok(mut reader) = remote.reader.lock()
         {
-            reader.set_cancellation(cancellation);
+            reader.http_mut().set_cancellation(cancellation);
         }
     }
 
@@ -227,7 +295,7 @@ impl FastaReference {
         if let FastaReader::Remote(remote) = &self.reader
             && let Ok(mut reader) = remote.reader.lock()
         {
-            reader.set_transfer_budget(budget);
+            reader.http_mut().set_transfer_budget(budget);
         }
     }
 
@@ -275,6 +343,40 @@ impl RemoteFastaReference {
             MAX_REMOTE_FASTA_INDEX_BYTES,
         )?;
         let entries = parse_fasta_index(&index)?;
+        let block_compressed = options.remote_gzi_url.is_some()
+            || location_has_extension(url, true, "gz")
+            || location_has_extension(url, true, "bgz");
+        if block_compressed {
+            let gzi_url = options
+                .remote_gzi_url
+                .clone()
+                .map_or_else(|| associated_remote_url(url, ".gzi"), Ok)?;
+            let (gzi, gzi_stats) = read_remote_object_bounded(
+                &gzi_url,
+                options.remote_range.clone(),
+                MAX_REMOTE_GZI_BYTES,
+            )
+            .map_err(|error| {
+                AlignmentError::InvalidFastaIndex(format!(
+                    "a remote bgzip-compressed FASTA needs its .gzi block index beside the \
+                     .fai (`samtools faidx` writes both): {error}"
+                ))
+            })?;
+            let block_index = noodles::bgzf::gzi::io::Reader::new(gzi.as_slice())
+                .read_index()
+                .map_err(|error| {
+                    AlignmentError::InvalidFastaIndex(format!("invalid .gzi block index: {error}"))
+                })?;
+            let reader = HttpRangeReader::open(url, options.remote_range.clone())?;
+            return Ok(Self {
+                reader: Mutex::new(RemoteFastaStream::Bgzf {
+                    reader: noodles::bgzf::io::Reader::new(reader),
+                    index: block_index,
+                }),
+                entries,
+                index_stats: combine_remote_stats(index_stats, gzi_stats),
+            });
+        }
         let reader = HttpRangeReader::open(url, options.remote_range.clone())?;
         for entry in &entries {
             if entry.length > 0 && entry.offset >= reader.len() {
@@ -285,7 +387,7 @@ impl RemoteFastaReference {
             }
         }
         Ok(Self {
-            reader: Mutex::new(reader),
+            reader: Mutex::new(RemoteFastaStream::Plain(reader)),
             entries,
             index_stats,
         })
@@ -312,27 +414,39 @@ impl RemoteFastaReference {
         let mut reader = self.reader.lock().map_err(|_| {
             AlignmentError::InvalidFastaIndex("remote FASTA cache lock was poisoned".to_owned())
         })?;
+        // Line terminators between two lines of a fetch are read through rather than seeked
+        // over where a seek is expensive.
+        let terminator = entry.line_width - entry.line_bases;
+        let mut skipped = [0_u8; 2];
+        let read_through = reader.reads_through_gaps() && terminator as usize <= skipped.len();
+        let mut positioned = false;
         while position < end {
             let line = position / entry.line_bases;
             let column = position % entry.line_bases;
             let count = (entry.line_bases - column).min(end - position);
-            let byte_offset = entry
-                .offset
-                .checked_add(line.saturating_mul(entry.line_width))
-                .and_then(|offset| offset.checked_add(column))
-                .ok_or(AlignmentError::CoordinateOverflow)?;
-            reader.seek(SeekFrom::Start(byte_offset))?;
+            if !(positioned && read_through) {
+                let byte_offset = entry
+                    .offset
+                    .checked_add(line.saturating_mul(entry.line_width))
+                    .and_then(|offset| offset.checked_add(column))
+                    .ok_or(AlignmentError::CoordinateOverflow)?;
+                reader.seek_to(byte_offset)?;
+                positioned = true;
+            }
             let old_len = bases.len();
             bases.resize(old_len.saturating_add(count as usize), 0);
             reader.read_exact(&mut bases[old_len..])?;
             position = position.saturating_add(count);
+            if read_through && position < end {
+                reader.read_exact(&mut skipped[..terminator as usize])?;
+            }
         }
         Ok(bases)
     }
 
     fn remote_io_stats(&self) -> RemoteIoStats {
         self.reader.lock().map_or(self.index_stats, |reader| {
-            combine_remote_stats(self.index_stats, reader.stats())
+            combine_remote_stats(self.index_stats, reader.http().stats())
         })
     }
 }
@@ -587,6 +701,262 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         worker.join().unwrap();
+    }
+
+    /// Serves byte ranges of named objects until dropped.
+    struct ObjectServer {
+        base: String,
+        stop: Arc<AtomicBool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ObjectServer {
+        fn start(objects: Vec<(&'static str, Vec<u8>)>) -> Self {
+            let server = Server::http("127.0.0.1:0").unwrap();
+            let address = server.server_addr().to_ip().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let worker_stop = Arc::clone(&stop);
+            let worker = thread::spawn(move || {
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let Ok(Some(request)) = server.recv_timeout(Duration::from_millis(20)) else {
+                        continue;
+                    };
+                    let path = request.url().split('?').next().unwrap_or_default();
+                    let found = objects.iter().find(|(name, _)| *name == path);
+                    let range = found.and_then(|(_, data)| {
+                        request
+                            .headers()
+                            .iter()
+                            .find(|header| header.field.equiv("Range"))
+                            .and_then(|header| test_range(header.value.as_str(), data.len()))
+                    });
+                    let (Some((_, data)), Some(range)) = (found, range) else {
+                        request.respond(Response::empty(StatusCode(404))).unwrap();
+                        continue;
+                    };
+                    request
+                        .respond(
+                            Response::from_data(data[range.0..=range.1].to_vec())
+                                .with_status_code(StatusCode(206))
+                                .with_header(test_header(
+                                    "Content-Range",
+                                    format!("bytes {}-{}/{}", range.0, range.1, data.len()),
+                                ))
+                                .with_header(test_header("ETag", "\"bgzip-fasta\"")),
+                        )
+                        .unwrap();
+                }
+            });
+            Self {
+                base: format!("http://{address}"),
+                stop,
+                worker: Some(worker),
+            }
+        }
+    }
+
+    impl Drop for ObjectServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    /// A FASTA of three sequences with 60-base lines, soft-masked runs and a run of `N`: one
+    /// long, one ending in a partial line, one that is exactly one line.
+    fn soft_masked_fasta() -> (Vec<u8>, Vec<(&'static str, usize)>) {
+        let contigs = vec![("chr1", 25_000), ("chr2", 3_217), ("chrM", 60)];
+        let mut text = Vec::new();
+        for (name, length) in &contigs {
+            text.extend_from_slice(format!(">{name} test sequence\n").as_bytes());
+            for index in 0..*length {
+                let mut base = b"ACGT"[(index * 7 + index / 13) % 4];
+                if (2_000..2_100).contains(&index) {
+                    base = b'N';
+                }
+                if (index / 500) % 3 == 1 {
+                    base = base.to_ascii_lowercase();
+                }
+                text.push(base);
+                if index % 60 == 59 || index + 1 == *length {
+                    text.push(b'\n');
+                }
+            }
+        }
+        (text, contigs)
+    }
+
+    /// bgzip-compressed FASTA (`.fa.gz` + `.fai` + `.gzi`), local and remote, returns exactly
+    /// what the uncompressed FASTA does, soft-masking included, for intervals that span line
+    /// ends and BGZF blocks.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bgzip_compressed_fasta_equals_the_uncompressed_fasta_locally_and_remotely() {
+        use std::io::Write as _;
+
+        let directory = tempdir().unwrap();
+        let (text, contigs) = soft_masked_fasta();
+        let plain_path = directory.path().join("genome.fa");
+        fs::write(&plain_path, &text).unwrap();
+        faidx::build(&plain_path).unwrap();
+
+        // BGZF blocks of 1,999 uncompressed bytes: block edges fall inside lines.
+        let compressed_path = directory.path().join("genome.fa.gz");
+        let mut writer =
+            noodles::bgzf::io::Writer::new(fs::File::create(&compressed_path).unwrap());
+        for block in text.chunks(1_999) {
+            writer.write_all(block).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.finish().unwrap();
+        // `HTSlib` writes the `.fai` and the `.gzi` block index, as `samtools faidx` does.
+        faidx::build(&compressed_path).unwrap();
+        let fai = fs::read(format!("{}.fai", compressed_path.display())).unwrap();
+        let gzi = fs::read(format!("{}.gzi", compressed_path.display())).unwrap();
+        assert_eq!(
+            fai,
+            fs::read(format!("{}.fai", plain_path.display())).unwrap(),
+            "the index of a bgzip-compressed FASTA addresses the uncompressed text"
+        );
+        // Twelve blocks beyond the first are indexed.
+        assert!(gzi.len() >= 8 + 16 * 12, "{}", gzi.len());
+
+        let server = ObjectServer::start(vec![
+            ("/genome.fa.gz", fs::read(&compressed_path).unwrap()),
+            ("/genome.fa.gz.fai", fai.clone()),
+            ("/genome.fa.gz.gzi", gzi.clone()),
+            (
+                "/elsewhere/genome.fasta",
+                fs::read(&compressed_path).unwrap(),
+            ),
+            ("/elsewhere/genome.fasta.fai", fai),
+            ("/indexes/blocks.gzi", gzi),
+            ("/orphan/genome.fa.gz", fs::read(&compressed_path).unwrap()),
+            (
+                "/orphan/genome.fa.gz.fai",
+                fs::read(format!("{}.fai", plain_path.display())).unwrap(),
+            ),
+        ]);
+        let mut options = FastaOpenOptions::default();
+        options.remote_range.chunk_size = std::num::NonZeroUsize::new(1_024).unwrap();
+        options.remote_range.maximum_cache_bytes = std::num::NonZeroUsize::new(8 * 1_024).unwrap();
+        options.remote_range.maximum_retries = 0;
+
+        let plain = FastaReference::open(&plain_path).unwrap();
+        let local = FastaReference::open(&compressed_path).unwrap();
+        let remote =
+            FastaReference::open_with_options(format!("{}/genome.fa.gz", server.base), &options)
+                .unwrap();
+        // The block index somewhere else, named explicitly.
+        let explicit = FastaReference::open_with_options(
+            format!("{}/elsewhere/genome.fasta", server.base),
+            &FastaOpenOptions {
+                remote_gzi_url: Some(format!("{}/indexes/blocks.gzi", server.base)),
+                ..options.clone()
+            },
+        )
+        .unwrap();
+        for reference in [&local, &remote, &explicit] {
+            assert_eq!(
+                reference.reference_dictionary(),
+                plain.reference_dictionary()
+            );
+        }
+        assert!(local.remote_io_stats().is_none());
+
+        let mut compared = 0;
+        let mut lower_case_seen = false;
+        for (contig, (_, length)) in contigs.iter().enumerate() {
+            let length = *length as u64;
+            let starts = [
+                0, 1, 59, 60, 61, 499, 500, 1_938, 1_998, 1_999, 2_050, 12_345,
+            ];
+            let lengths = [1, 2, 59, 60, 61, 120, 1_999, 2_000, 4_100, 25_000];
+            for start in starts.into_iter().filter(|start| *start < length) {
+                for span in lengths {
+                    let end = (start + span).min(length);
+                    let interval =
+                        GenomicInterval::new(ContigId::new(contig as u32), start, end).unwrap();
+                    let expected = plain.fetch(interval).unwrap();
+                    assert_eq!(expected.len() as u64, end - start);
+                    lower_case_seen |= expected.iter().any(u8::is_ascii_lowercase);
+                    for (name, reference) in [
+                        ("local", &local),
+                        ("remote", &remote),
+                        ("explicit", &explicit),
+                    ] {
+                        assert!(
+                            reference.fetch(interval).unwrap() == expected,
+                            "{name} bgzip FASTA differs at {interval:?}"
+                        );
+                    }
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 200);
+        assert!(lower_case_seen, "the fixture has no soft-masked base");
+        // Soft-masking survives: this stretch is lower case in the file.
+        let masked = GenomicInterval::new(ContigId::new(0), 500, 510).unwrap();
+        let bases = remote.fetch(masked).unwrap();
+        assert!(bases.iter().all(u8::is_ascii_lowercase), "{bases:?}");
+
+        // Ranges were read, not the whole object, and the transfer budget is honoured.
+        let stats = remote.remote_io_stats().unwrap();
+        assert!(stats.requests > 3);
+        let fresh =
+            FastaReference::open_with_options(format!("{}/genome.fa.gz", server.base), &options)
+                .unwrap();
+        fresh.set_remote_transfer_budget(Some(RemoteTransferBudget {
+            maximum_requests: 0,
+            maximum_response_bytes: 0,
+        }));
+        let far = GenomicInterval::new(ContigId::new(0), 20_000, 20_100).unwrap();
+        assert!(fresh.fetch(far).is_err());
+        fresh.set_remote_transfer_budget(None);
+        assert_eq!(fresh.fetch(far).unwrap(), plain.fetch(far).unwrap());
+
+        // Without the block index the open fails and says what is missing.
+        let Err(error) = FastaReference::open_with_options(
+            format!("{}/orphan/genome.fa.gz", server.base),
+            &options,
+        ) else {
+            panic!("a bgzip-compressed FASTA opened without its .gzi");
+        };
+        assert!(error.to_string().contains(".gzi"), "{error}");
+    }
+
+    #[test]
+    fn references_at_unsupported_url_schemes_are_refused_by_name() {
+        for location in [
+            "s3://bucket/genome.fa",
+            "gs://bucket/genome.fa.gz",
+            "ftp://ftp.example.org/pub/genome.fa",
+            "S3://bucket/genome.2bit",
+        ] {
+            let Err(error) = FastaReference::open(location) else {
+                panic!("{location} opened");
+            };
+            assert!(
+                matches!(
+                    &error,
+                    AlignmentError::Remote(crate::RemoteError::UnsupportedScheme(scheme))
+                        if location.to_ascii_lowercase().starts_with(&scheme.to_ascii_lowercase())
+                ),
+                "{location}: {error}"
+            );
+            assert!(
+                error.to_string().contains("unsupported remote URL scheme"),
+                "{error}"
+            );
+        }
+        // A path that merely contains a colon is still a path.
+        let Err(error) = FastaReference::open("/nonexistent/odd:name/genome.fa") else {
+            panic!("a missing file opened");
+        };
+        assert!(!error.to_string().contains("scheme"), "{error}");
     }
 
     #[test]

@@ -15,15 +15,33 @@ pub struct TextFeatureSource {
 
 /// On-demand access to a tabix-indexed annotation file of any size.
 pub(super) struct IndexedTextFeatures {
-    path: PathBuf,
     format: FeatureFormat,
     contigs: Vec<String>,
-    reader: Mutex<rust_htslib::tbx::Reader>,
+    backend: IndexedTextBackend,
     /// Unparseable lines skipped by region queries (a line re-read by a later query counts
     /// again).
     malformed_lines: std::sync::atomic::AtomicUsize,
     /// Built by one bounded streaming pass the first time a name search is submitted.
     search: OnceLock<IndexedFeatureSearch>,
+}
+
+/// Where the lines of an indexed annotation come from.
+enum IndexedTextBackend {
+    /// A local file, read by `HTSlib`.
+    Local {
+        path: PathBuf,
+        reader: Mutex<rust_htslib::tbx::Reader>,
+    },
+    /// A remote file, read over the HTTP range reader.
+    Remote(Box<Mutex<super::remote_tabix::RemoteTabixText>>),
+}
+
+/// Compressed bytes one remote name-search index build may transfer before the index is
+/// reported as truncated. A region query never needs the whole file; name search does.
+const MAX_REMOTE_FEATURE_SEARCH_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
+fn poisoned() -> TrackError {
+    TrackError::Backend("indexed annotation reader is poisoned".to_owned())
 }
 
 #[derive(Default)]
@@ -82,13 +100,25 @@ impl IndexedTextFeatures {
             .map_err(|error| TrackError::Backend(error.to_string()))?;
         let contigs = reader.seqnames();
         Ok(Self {
-            path: path.to_owned(),
             format,
             contigs,
-            reader: Mutex::new(reader),
+            backend: IndexedTextBackend::Local {
+                path: path.to_owned(),
+                reader: Mutex::new(reader),
+            },
             malformed_lines: std::sync::atomic::AtomicUsize::new(0),
             search: OnceLock::new(),
         })
+    }
+
+    fn remote(remote: super::remote_tabix::RemoteTabixText, format: FeatureFormat) -> Self {
+        Self {
+            format,
+            contigs: remote.sequence_names(),
+            backend: IndexedTextBackend::Remote(Box::new(Mutex::new(remote))),
+            malformed_lines: std::sync::atomic::AtomicUsize::new(0),
+            search: OnceLock::new(),
+        }
     }
 
     /// Visits every record overlapping `[start, end)` in file order until `visit` returns false.
@@ -103,40 +133,57 @@ impl IndexedTextFeatures {
         if start >= end || !self.contigs.iter().any(|name| name == contig) {
             return Ok(());
         }
-        let mut reader = self
-            .reader
-            .lock()
-            .map_err(|_| TrackError::Backend("indexed annotation reader is poisoned".to_owned()))?;
-        let tid = reader
-            .tid(contig)
-            .map_err(|error| TrackError::Backend(error.to_string()))?;
-        reader
-            .fetch(tid, start, end)
-            .map_err(|error| TrackError::Backend(error.to_string()))?;
-        let mut line = Vec::new();
-        while reader
-            .read(&mut line)
-            .map_err(|error| TrackError::Backend(error.to_string()))?
-        {
+        // Whether to go on to the next line.
+        let mut accept = |line: &[u8]| -> Result<bool, TrackError> {
             if line.len() > MAX_FEATURE_LINE_BYTES {
                 return Err(TrackError::ResourceLimit(format!(
                     "indexed feature line exceeds {MAX_FEATURE_LINE_BYTES} bytes"
                 )));
             }
-            let text = std::str::from_utf8(&line)
+            let text = std::str::from_utf8(line)
                 .map_err(|_| TrackError::Backend("indexed feature line is not UTF-8".to_owned()))?;
             // One unparseable line must not blank the whole region; it is skipped and counted.
             let feature = match parse_feature_line(self.format, text) {
                 Ok(Some(feature)) => feature,
-                Ok(None) => continue,
+                Ok(None) => return Ok(true),
                 Err(_) => {
                     self.malformed_lines
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    continue;
+                    return Ok(true);
                 }
             };
-            if feature.start < end && feature.end > start && !visit(feature)? {
-                break;
+            if feature.start < end && feature.end > start {
+                return visit(feature);
+            }
+            Ok(true)
+        };
+        let mut line = Vec::new();
+        match &self.backend {
+            IndexedTextBackend::Local { reader, .. } => {
+                let mut reader = reader.lock().map_err(|_| poisoned())?;
+                let tid = reader
+                    .tid(contig)
+                    .map_err(|error| TrackError::Backend(error.to_string()))?;
+                reader
+                    .fetch(tid, start, end)
+                    .map_err(|error| TrackError::Backend(error.to_string()))?;
+                while reader
+                    .read(&mut line)
+                    .map_err(|error| TrackError::Backend(error.to_string()))?
+                {
+                    if !accept(&line)? {
+                        break;
+                    }
+                }
+            }
+            IndexedTextBackend::Remote(remote) => {
+                let mut remote = remote.lock().map_err(|_| poisoned())?;
+                let mut cursor = remote.region(contig, start, end)?;
+                while remote.next_region_line(&mut cursor, &mut line)? {
+                    if !accept(&line)? {
+                        break;
+                    }
+                }
             }
         }
         Ok(())
@@ -205,30 +252,16 @@ impl IndexedTextFeatures {
     }
 
     /// Streams the whole file once, retaining only one slim record per search term and contig.
+    /// A remote file is streamed through the range reader until
+    /// [`MAX_REMOTE_FEATURE_SEARCH_SCAN_BYTES`] have been transferred (or its transfer budget
+    /// or cancellation stops it); the index is then reported as truncated.
     fn build_search(&self) -> IndexedFeatureSearch {
         let mut search = IndexedFeatureSearch::default();
-        let Ok(file) = File::open(&self.path) else {
-            search.truncated = true;
-            return search;
-        };
-        let mut reader = BufReader::new(MultiGzDecoder::new(file));
         let mut associations = 0_usize;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match (&mut reader)
-                .take((MAX_FEATURE_LINE_BYTES + 1) as u64)
-                .read_line(&mut line)
-            {
-                Ok(0) => break,
-                Ok(bytes) if bytes <= MAX_FEATURE_LINE_BYTES => {}
-                _ => {
-                    search.truncated = true;
-                    break;
-                }
-            }
-            let Ok(Some(record)) = parse_feature_line(self.format, &line) else {
-                continue;
+        // Whether to go on to the next line.
+        let mut add = |search: &mut IndexedFeatureSearch, line: &str| -> bool {
+            let Ok(Some(record)) = parse_feature_line(self.format, line) else {
+                return true;
             };
             for term in feature_search_terms(&record) {
                 let hits = search.terms.entry(term).or_default();
@@ -240,10 +273,71 @@ impl IndexedTextFeatures {
                 }
                 if associations == MAX_FEATURE_SEARCH_ASSOCIATIONS {
                     search.truncated = true;
-                    return search;
+                    return false;
                 }
                 associations += 1;
                 hits.push(slim_search_record(&record));
+            }
+            true
+        };
+        match &self.backend {
+            IndexedTextBackend::Local { path, .. } => {
+                let Ok(file) = File::open(path) else {
+                    search.truncated = true;
+                    return search;
+                };
+                let mut reader = BufReader::new(MultiGzDecoder::new(file));
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match (&mut reader)
+                        .take((MAX_FEATURE_LINE_BYTES + 1) as u64)
+                        .read_line(&mut line)
+                    {
+                        Ok(0) => break,
+                        Ok(bytes) if bytes <= MAX_FEATURE_LINE_BYTES => {}
+                        _ => {
+                            search.truncated = true;
+                            break;
+                        }
+                    }
+                    if !add(&mut search, &line) {
+                        break;
+                    }
+                }
+            }
+            IndexedTextBackend::Remote(remote) => {
+                let Ok(mut remote) = remote.lock() else {
+                    search.truncated = true;
+                    return search;
+                };
+                let Ok(baseline) = remote.start_scan() else {
+                    search.truncated = true;
+                    return search;
+                };
+                let mut line = Vec::new();
+                loop {
+                    if remote.response_bytes().saturating_sub(baseline)
+                        > MAX_REMOTE_FEATURE_SEARCH_SCAN_BYTES
+                    {
+                        search.truncated = true;
+                        break;
+                    }
+                    match remote.next_scan_line(&mut line) {
+                        Ok(true) if line.len() <= MAX_FEATURE_LINE_BYTES => {}
+                        Ok(false) => break,
+                        _ => {
+                            search.truncated = true;
+                            break;
+                        }
+                    }
+                    let Ok(text) = std::str::from_utf8(&line) else {
+                        continue;
+                    };
+                    if !add(&mut search, text) {
+                        break;
+                    }
+                }
             }
         }
         search
@@ -368,20 +462,53 @@ impl TextFeatureSource {
         Self::open_with_remote_config(path, format, &crate::HttpRangeConfig::default())
     }
 
-    /// Opens a text annotation; a remote URL is downloaded with `remote` (authentication,
-    /// timeouts and retries) instead of the anonymous defaults. `remote` is unused for a file.
+    /// Opens a text annotation; a remote URL is read with `remote` (authentication, timeouts
+    /// and retries) instead of the anonymous defaults. `remote` is unused for a file.
+    ///
+    /// A remote bgzip-compressed file (`.gz` or `.bgz`) with a tabix or CSI index beside it
+    /// (`<url>.csi` or `<url>.tbi`) is read on demand over HTTP range requests, like a local
+    /// indexed file: only the index and the blocks a query needs are transferred. A remote
+    /// file without an index is downloaded whole (up to 256 MiB) and read like a local file.
     pub fn open_with_remote_config(
         path: impl AsRef<Path>,
         format: FeatureFormat,
         remote: &crate::HttpRangeConfig,
     ) -> Result<Self, TrackError> {
+        Self::open_with_remote_index_and_config(path, format, None, remote)
+    }
+
+    /// As [`Self::open_with_remote_config`], with an explicit tabix or CSI index URL for a
+    /// remote file whose index is not at `<url>.csi` or `<url>.tbi`. With an explicit index
+    /// the file is never downloaded whole: a missing or unreadable index is an error.
+    pub fn open_with_remote_index_and_config(
+        path: impl AsRef<Path>,
+        format: FeatureFormat,
+        remote_index_url: Option<&str>,
+        remote: &crate::HttpRangeConfig,
+    ) -> Result<Self, TrackError> {
         let path = path.as_ref();
         let location = path.to_string_lossy();
         if location.starts_with("http://") || location.starts_with("https://") {
-            // Text annotations have no remote random access here: a bounded copy is downloaded
-            // and read like a local file. The server is asked first so an updated file is seen;
-            // the previous copy is used when the server cannot be reached.
             let name = rgv_core_file_name(&location);
+            let block_compressed = Path::new(name).extension().is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("gz") || extension.eq_ignore_ascii_case("bgz")
+            });
+            if (block_compressed || remote_index_url.is_some())
+                && let Some(indexed) =
+                    super::remote_tabix::RemoteTabixText::open(&location, remote_index_url, remote)?
+            {
+                return Ok(Self {
+                    features: HashMap::new(),
+                    search_terms: BTreeMap::new(),
+                    search_index_truncated: false,
+                    indexed: Some(IndexedTextFeatures::remote(indexed, format)),
+                    malformed_lines: 0,
+                    first_malformed_line: None,
+                });
+            }
+            // No index: a bounded copy is downloaded and read like a local file. The server is
+            // asked first so an updated file is seen; the previous copy is used when the
+            // server cannot be reached.
             let local = crate::igv_genome::local_copy(
                 &location,
                 name,
@@ -529,6 +656,36 @@ impl TextFeatureSource {
     #[must_use]
     pub const fn is_indexed(&self) -> bool {
         self.indexed.is_some()
+    }
+
+    fn remote_backend(&self) -> Option<&Mutex<super::remote_tabix::RemoteTabixText>> {
+        match &self.indexed.as_ref()?.backend {
+            IndexedTextBackend::Remote(remote) => Some(remote.as_ref()),
+            IndexedTextBackend::Local { .. } => None,
+        }
+    }
+
+    /// Installs (or clears) the check that abandons remote reads once the view has moved on.
+    /// It has no effect on a local file or on a remote file that was downloaded whole.
+    pub fn set_remote_cancellation(&mut self, cancellation: Option<crate::RemoteCancellation>) {
+        if let Some(Ok(mut remote)) = self.remote_backend().map(Mutex::lock) {
+            remote.set_cancellation(cancellation);
+        }
+    }
+
+    /// Bounds the requests and bytes the following remote reads may spend, or lifts the bound.
+    pub fn set_remote_transfer_budget(&mut self, budget: Option<crate::RemoteTransferBudget>) {
+        if let Some(Ok(mut remote)) = self.remote_backend().map(Mutex::lock) {
+            remote.set_transfer_budget(budget);
+        }
+    }
+
+    /// Transfer statistics (index and data) of a remote indexed source; `None` for a local
+    /// file and for a remote file that was downloaded whole.
+    #[must_use]
+    pub fn remote_io_stats(&self) -> Option<crate::RemoteIoStats> {
+        let remote = self.remote_backend()?.lock().ok()?;
+        Some(remote.stats())
     }
 
     pub fn contigs(&self) -> impl Iterator<Item = &str> {
@@ -689,3 +846,7 @@ pub(super) fn feature_search_terms(record: &FeatureRecord) -> Vec<String> {
 pub(super) fn normalized_feature_search_term(value: &str) -> String {
     value.trim().to_lowercase().chars().take(256).collect()
 }
+
+#[cfg(test)]
+#[path = "text_feature_remote_tests.rs"]
+mod remote_tests;

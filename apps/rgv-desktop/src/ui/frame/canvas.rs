@@ -64,14 +64,14 @@ impl Viewer {
             ui.painter().rect_filled(
                 workspace_layout.genome_context,
                 0.0,
-                egui::Color32::from_gray(250),
+                crate::theme::adapt(egui::Color32::from_gray(250)),
             );
             ui.painter().line_segment(
                 [
                     workspace_layout.context_gutter.right_top(),
                     workspace_layout.context_gutter.right_bottom(),
                 ],
-                egui::Stroke::new(1.0, egui::Color32::from_gray(190)),
+                egui::Stroke::new(1.0, crate::theme::adapt(egui::Color32::from_gray(190))),
             );
             for (index, ((id, name, length, viewport, genome_overview), panel_layout)) in st
                 .panel_contexts
@@ -105,7 +105,7 @@ impl Viewer {
                             panel_layout.header.left_top(),
                             panel_layout.header.left_bottom(),
                         ],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
+                        egui::Stroke::new(1.0, crate::theme::adapt(egui::Color32::from_gray(180))),
                     );
                 }
             }
@@ -173,7 +173,7 @@ impl Viewer {
                             egui::pos2(x, geometry.viewport.top()),
                             egui::pos2(x, geometry.viewport.bottom()),
                         ],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(175)),
+                        egui::Stroke::new(1.0, crate::theme::adapt(egui::Color32::from_gray(175))),
                     );
                 }
                 if let Some(active_index) = st
@@ -185,7 +185,10 @@ impl Viewer {
                     ui.painter().rect_stroke(
                         workspace_layout.panels[active_index].track_column,
                         0.0,
-                        egui::Stroke::new(1.5, egui::Color32::from_rgb(45, 92, 175)),
+                        egui::Stroke::new(
+                            1.5,
+                            crate::theme::adapt(egui::Color32::from_rgb(45, 92, 175)),
+                        ),
                         egui::StrokeKind::Inside,
                     );
                 }
@@ -225,7 +228,7 @@ impl Viewer {
                     egui::pos2(full.left(), split_y),
                     egui::pos2(full.right(), split_y),
                 ],
-                egui::Stroke::new(1.0, egui::Color32::from_gray(125)),
+                egui::Stroke::new(1.0, crate::theme::adapt(egui::Color32::from_gray(125))),
             );
             let read_top = workspace.read_clip_top.clamp(split_y, full.bottom());
             let read_scrollbar_left =
@@ -246,7 +249,7 @@ impl Viewer {
                             egui::pos2(full.center().x, read_top),
                             egui::pos2(full.center().x, full.bottom()),
                         ],
-                        egui::Stroke::new(0.75, egui::Color32::from_gray(150)),
+                        egui::Stroke::new(0.75, crate::theme::adapt(egui::Color32::from_gray(150))),
                     );
                     full.center().x
                 } else {
@@ -273,7 +276,7 @@ impl Viewer {
                         egui::pos2(rect.left(), rect.top()),
                         egui::pos2(rect.right(), rect.top()),
                     ],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(125)),
+                    egui::Stroke::new(1.0, crate::theme::adapt(egui::Color32::from_gray(125))),
                 );
             }
         }

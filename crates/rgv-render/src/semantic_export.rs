@@ -11,6 +11,8 @@ use rgv_core::ModifiedBaseColorMode;
 use rgv_layout::{DisplayList, RectPrimitive, RectShape, Rgba, modification_code_color};
 use std::{collections::HashMap, io};
 
+use crate::palette::{AlignmentPalette, PaletteToken};
+
 pub struct SemanticAlignmentExport {
     pub display: DisplayList,
     // Charge the retained adapter output through encoding, including a cropped copy.
@@ -49,7 +51,8 @@ impl SemanticAlignmentExport {
 }
 
 /// Call from an export worker with captured, committed panel frames. Capturing
-/// those frames pins the source/reference/style authority for the job lifetime.
+/// those frames pins the source/reference/style authority for the job lifetime. Colours come
+/// from `palette`, the same table the GPU renderers resolve their instances against.
 #[allow(clippy::too_many_lines)]
 pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
     panels: &[AlignmentPanelSceneFrame],
@@ -59,6 +62,7 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
         rgv_alignment_scene::AlignmentInteractionState,
         S,
     >,
+    palette: &AlignmentPalette,
 ) -> io::Result<SemanticAlignmentExport> {
     let mut output = SemanticAlignmentExport {
         display: DisplayList::default(),
@@ -187,7 +191,9 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                                 y: camera.clip().y as f32,
                                 width: primitive.width as f32,
                                 height: camera.clip().height as f32,
-                                color: Rgba::new(0.14, 0.44, 0.82, 0.20),
+                                color: rgba(
+                                    palette.color(PaletteToken::SUMMARY_MODIFICATION_BACKGROUND),
+                                ),
                                 object_id: 0,
                                 shape: RectShape::Rectangle,
                             });
@@ -203,7 +209,7 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                                 &mut output.display.rectangles,
                                 primitive,
                                 clip,
-                                summary_color(primitive.component, &derived.options),
+                                summary_color(primitive.component, &derived.options, palette),
                             );
                             continue;
                         }
@@ -212,7 +218,7 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                             y: primitive.y as f32,
                             width: primitive.width as f32,
                             height: primitive.height as f32,
-                            color: summary_color(primitive.component, &derived.options),
+                            color: summary_color(primitive.component, &derived.options, palette),
                             object_id: 0,
                             shape: match primitive.shape {
                                 CpuSummaryPrimitiveShape::JunctionArcUp => RectShape::JunctionArcUp,
@@ -242,14 +248,11 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                     .iter()
                     .filter(|p| p.shape != CpuPrimitiveShape::TextLabel)
                 {
-                    let color = crate::alignment_scene::semantic_alignment_color(
+                    let color = palette.resolve(crate::alignment_scene::semantic_alignment_color(
                         primitive.component,
                         primitive.style,
-                    );
-                    let [r, g, b, a] = crate::alignment_scene::reference_interaction_color(
-                        color,
-                        primitive.interaction,
-                    );
+                    ));
+                    let [r, g, b, a] = palette.interaction_color(color, primitive.interaction);
                     output.display.rectangles.push(RectPrimitive {
                         x: primitive.x as f32,
                         y: primitive.y as f32,
@@ -331,7 +334,9 @@ fn push_clipped_arc_slices(
         return;
     };
     let upward = primitive.shape == CpuSummaryPrimitiveShape::JunctionArcUp;
-    let stroke = f64::from(rgv_layout::junction_arc_stroke_width(primitive.height as f32));
+    let stroke = f64::from(rgv_layout::junction_arc_stroke_width(
+        primitive.height as f32,
+    ));
     let inner_height = (primitive.height - stroke).max(0.0);
     let centre_line = |x: f64| {
         let centred = ((x - primitive.x) / primitive.width).clamp(0.0, 1.0) - 0.5;
@@ -361,51 +366,55 @@ fn push_clipped_arc_slices(
     }
 }
 
-// Reference palette for alignment_summary.wgsl, kept alongside renderer code.
+fn rgba([red, green, blue, alpha]: [f32; 4]) -> Rgba {
+    Rgba::new(red, green, blue, alpha)
+}
+
+/// CPU mirror of the colour rules in `alignment_summary.wgsl`.
 fn summary_color(
     component: CpuSummaryProjectedComponent,
     options: &AlignmentDerivedLaneOptions,
+    palette: &AlignmentPalette,
 ) -> Rgba {
     use CpuSummaryProjectedComponent as C;
-    match component {
-        C::Depth { .. } => Rgba::new(0.48, 0.48, 0.48, 1.0),
-        C::CoverageCenterLine => Rgba::new(0.72, 0.75, 0.82, 0.72),
-        C::CoverageSelectedPosition { .. } => Rgba::new(1.0, 0.78, 0.18, 0.92),
-        C::Allele { allele, .. } => {
-            let [r, g, b, a] = crate::palette::BASE_COLORS[match allele {
-                CpuAlleleToken::A => crate::palette::BASE_A,
-                CpuAlleleToken::C => crate::palette::BASE_C,
-                CpuAlleleToken::G => crate::palette::BASE_G,
-                CpuAlleleToken::T => crate::palette::BASE_T,
-                _ => crate::palette::BASE_N,
-            }];
-            Rgba::new(r, g, b, a)
-        }
-        C::Bisulfite { observation, .. } => match observation {
-            BisulfiteObservationToken::Protected => Rgba::new(0.86, 0.46, 0.12, 1.0),
-            BisulfiteObservationToken::Converted => Rgba::new(0.18, 0.62, 0.78, 1.0),
+    use PaletteToken as T;
+    rgba(palette.color(match component {
+        C::Depth { .. } => T::SUMMARY_DEPTH,
+        C::CoverageCenterLine => T::COVERAGE_CENTER_LINE,
+        C::CoverageSelectedPosition { .. } => T::COVERAGE_SELECTED_POSITION,
+        C::Allele { allele, .. } => match allele {
+            CpuAlleleToken::A => T::BASE_A,
+            CpuAlleleToken::C => T::BASE_C,
+            CpuAlleleToken::G => T::BASE_G,
+            CpuAlleleToken::T => T::BASE_T,
+            _ => T::BASE_N,
         },
-        C::JunctionBaseline { .. } => Rgba::new(0.36, 0.38, 0.42, 0.24),
+        C::Bisulfite { observation, .. } => match observation {
+            BisulfiteObservationToken::Protected => T::BISULFITE_PROTECTED,
+            BisulfiteObservationToken::Converted => T::BISULFITE_CONVERTED,
+        },
+        C::JunctionBaseline { .. } => T::JUNCTION_BASELINE,
         C::Junction { strand, .. } => match strand {
-            CpuJunctionStrandToken::Positive => Rgba::new(0.84, 0.30, 0.38, 0.82),
-            CpuJunctionStrandToken::Negative => Rgba::new(0.25, 0.45, 0.82, 0.82),
-            CpuJunctionStrandToken::Unknown => Rgba::new(0.42, 0.45, 0.50, 0.76),
+            CpuJunctionStrandToken::Positive => T::JUNCTION_POSITIVE,
+            CpuJunctionStrandToken::Negative => T::JUNCTION_NEGATIVE,
+            CpuJunctionStrandToken::Unknown => T::JUNCTION_UNKNOWN,
         },
         C::JunctionAnnotation { status, .. } => match status {
-            JunctionAnnotationStatus::Annotated => Rgba::new(0.16, 0.58, 0.28, 1.0),
-            JunctionAnnotationStatus::Novel => Rgba::new(0.92, 0.48, 0.10, 1.0),
-            JunctionAnnotationStatus::Unknown => Rgba::new(0.46, 0.48, 0.52, 0.92),
+            JunctionAnnotationStatus::Annotated => T::JUNCTION_ANNOTATED,
+            JunctionAnnotationStatus::Novel => T::JUNCTION_NOVEL,
+            JunctionAnnotationStatus::Unknown => T::SUMMARY_NEUTRAL,
         },
         C::Modification { series, .. } => match options {
+            // Open-ended: one colour per modification code, the same under every theme.
             AlignmentDerivedLaneOptions::Modifications(options)
                 if options.color_mode == ModifiedBaseColorMode::ByType =>
             {
-                modification_code_color(series.code)
+                return modification_code_color(series.code);
             }
-            _ => Rgba::new(0.90, 0.24, 0.92, 0.92),
+            _ => T::SUMMARY_MODIFICATION,
         },
-        _ => Rgba::new(0.46, 0.48, 0.52, 0.92),
-    }
+        _ => T::SUMMARY_NEUTRAL,
+    }))
 }
 
 #[cfg(test)]

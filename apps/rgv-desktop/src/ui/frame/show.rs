@@ -162,6 +162,7 @@ impl Viewer {
             autosave_retention: st.commands.autosave_retention,
             interface_scale_percent: st.commands.interface_scale_percent,
             high_contrast: st.commands.high_contrast,
+            interface_theme: st.commands.interface_theme,
             reduced_motion: st.commands.reduced_motion,
             clear_recent_requested: st.commands.clear_recent_requested,
             recent_alignment_requested: st.commands.recent_alignment_requested.clone(),
@@ -192,6 +193,7 @@ impl Viewer {
         st.commands.autosave_retention = system_dialogs.autosave_retention;
         st.commands.interface_scale_percent = system_dialogs.interface_scale_percent;
         st.commands.high_contrast = system_dialogs.high_contrast;
+        st.commands.interface_theme = system_dialogs.interface_theme;
         st.commands.reduced_motion = system_dialogs.reduced_motion;
         st.commands.clear_recent_requested = system_dialogs.clear_recent_requested;
         st.commands.recent_alignment_requested = system_dialogs.recent_alignment_requested;

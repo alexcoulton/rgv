@@ -13,6 +13,9 @@ noodles.workspace = true
 noodles-bgzf.workspace = true
 noodles110.workspace = true
 reqwest.workspace = true
+# The production alignment path itself, for the `compare-backends` production section.
+rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
+rgv-hts = { version = "0.1.0", path = "../../crates/rgv-hts" }
 rsomics-bamio.workspace = true
 # `curl` only for the `rust-htslib-http` comparison workload; nothing else in the workspace lets
 # HTSlib open a URL, so the workspace dependency itself no longer needs the feature.
@@ -24,5 +27,3 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-rgv-core = { version = "0.1.0", path = "../../crates/rgv-core" }
-rgv-hts = { version = "0.1.0", path = "../../crates/rgv-hts" }

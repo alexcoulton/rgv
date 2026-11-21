@@ -49,3 +49,11 @@ fn project_genomic_x(
     let bases = f32(whole) + origin_fraction;
     return bases * points_per_base.x + bases * points_per_base.y;
 }
+
+// The two integer-valued f32 words `project_genomic_x` takes, for an instance that stores its
+// page offset as a whole number of bases in a u32 (at most 7e8, enforced when a page is packed):
+// the bits above 4096 and the bits below. Each word has at most 18 significant bits, so both
+// conversions are exact and the integer cancellation sees the offset unchanged.
+fn page_offset_words(page_offset: u32) -> vec2<f32> {
+    return vec2<f32>(f32(page_offset & 0xFFFFF000u), f32(page_offset & 0xFFFu));
+}

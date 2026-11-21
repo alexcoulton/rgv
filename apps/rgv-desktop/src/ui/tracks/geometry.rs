@@ -86,12 +86,12 @@ pub(super) fn subtrack_screen_bounds(
 pub fn paint_genomic_text(ui: &Ui, clip_rect: Rect, texts: &[TextPrimitive]) {
     let painter = ui.painter().with_clip_rect(clip_rect);
     for text in texts {
-        let color = Color32::from_rgba_unmultiplied(
+        let color = crate::theme::adapt(Color32::from_rgba_unmultiplied(
             (text.color.red.clamp(0.0, 1.0) * 255.0).round() as u8,
             (text.color.green.clamp(0.0, 1.0) * 255.0).round() as u8,
             (text.color.blue.clamp(0.0, 1.0) * 255.0).round() as u8,
             (text.color.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-        );
+        ));
         painter.text(
             pos2(text.x, text.y),
             Align2::CENTER_CENTER,

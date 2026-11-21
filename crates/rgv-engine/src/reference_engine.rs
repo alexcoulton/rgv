@@ -1,7 +1,7 @@
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
@@ -116,12 +116,55 @@ pub enum ReferenceEngineEvent {
     },
 }
 
+/// One completed reference query, as handed to a [`ReferenceSliceSink`] on the reference thread.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReferenceSliceDelivery {
+    /// Identity of the query the slice answers, including the panel that asked.
+    pub query: ReferenceQueryIdentity,
+    /// The bases; the same allocation the UI receives in
+    /// [`ReferenceEngineEvent::QueryCompleted`].
+    pub slice: Arc<ReferenceSlice>,
+}
+
+/// A consumer that receives completed reference slices directly from the reference thread,
+/// without a hop through the UI thread. Obtain one from the consumer (for an alignment scene
+/// engine, [`crate::AlignmentSceneEngine::reference_slice_sink`]) and connect it once with
+/// [`ReferenceEngine::connect_slice_sink`].
+///
+/// The sink is called on the reference actor's thread for every completed, still-current
+/// query, before the UI is told about it. It must not block.
+#[derive(Clone)]
+pub struct ReferenceSliceSink {
+    deliver: Arc<dyn Fn(&ReferenceSliceDelivery) -> bool + Send + Sync>,
+}
+
+impl ReferenceSliceSink {
+    /// `deliver` returns `false` once its consumer is gone; the sink is then disconnected.
+    #[must_use]
+    pub fn new(deliver: impl Fn(&ReferenceSliceDelivery) -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            deliver: Arc::new(deliver),
+        }
+    }
+}
+
+impl std::fmt::Debug for ReferenceSliceSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReferenceSliceSink")
+            .finish_non_exhaustive()
+    }
+}
+
+type ReferenceSliceSinks = Arc<Mutex<Vec<ReferenceSliceSink>>>;
+
 /// Single-owner FASTA actor. Opening an index and fetching sequence never blocks the UI thread.
 pub struct ReferenceEngine {
     input: Option<Sender<ReferenceEngineRequest>>,
     output: CoalescingReceiver<ReferenceEngineEvent>,
     worker: Option<JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    slice_sinks: ReferenceSliceSinks,
 }
 
 impl ReferenceEngine {
@@ -132,11 +175,13 @@ impl ReferenceEngine {
         let (output_tx, output_rx) = bounded_coalescing_to_ui(capacity);
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutdown);
+        let slice_sinks = ReferenceSliceSinks::default();
+        let worker_sinks = Arc::clone(&slice_sinks);
         let worker = thread::Builder::new()
             .name("rgv-reference-actor".to_owned())
             .spawn(move || {
                 run_thread_root(
-                    || worker_loop(&input_rx, &output_tx, &worker_shutdown),
+                    || worker_loop(&input_rx, &output_tx, &worker_shutdown, &worker_sinks),
                     |message| {
                         tracing::error!(message, "reference actor panicked");
                         // `query: None` is this actor's terminal failure form: the reference is
@@ -160,7 +205,31 @@ impl ReferenceEngine {
             output: output_rx,
             worker: Some(worker),
             shutdown,
+            slice_sinks,
         }
+    }
+
+    /// Connects a consumer that receives every completed reference slice directly from the
+    /// reference thread (reference thread to consumer thread, with no UI hop), from the next
+    /// completed query on. Connect each consumer once; it is disconnected by itself when it
+    /// reports that it is gone, and all of them when this engine is retired or dropped.
+    ///
+    /// [`ReferenceEngineEvent::QueryCompleted`] is still sent to the UI for every query, so a
+    /// caller that relays slices itself keeps working, with or without sinks connected.
+    pub fn connect_slice_sink(&self, sink: ReferenceSliceSink) {
+        self.slice_sinks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(sink);
+    }
+
+    /// Sinks currently connected.
+    #[must_use]
+    pub fn slice_sink_count(&self) -> usize {
+        self.slice_sinks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     pub fn try_open(&self, path: PathBuf) -> Result<(), EngineQueueError> {
@@ -200,9 +269,17 @@ impl ReferenceEngine {
     #[must_use]
     pub fn retire(mut self) -> Option<JoinHandle<()>> {
         self.shutdown.store(true, Ordering::Release);
+        self.disconnect_slice_sinks();
         self.input.take();
         self.output.close();
         self.worker.take()
+    }
+
+    fn disconnect_slice_sinks(&self) {
+        self.slice_sinks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     fn try_send(&self, request: ReferenceEngineRequest) -> Result<(), EngineQueueError> {
@@ -222,6 +299,7 @@ impl Drop for ReferenceEngine {
     /// A reaper thread waits for the actor instead.
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        self.disconnect_slice_sinks();
         self.input.take();
         self.output.close();
         if let Some(worker) = self.worker.take() {
@@ -234,10 +312,31 @@ impl Drop for ReferenceEngine {
     }
 }
 
+/// Hands a completed slice to every connected sink and forgets the sinks whose consumer is gone.
+fn deliver_to_sinks(sinks: &ReferenceSliceSinks, delivery: &ReferenceSliceDelivery) {
+    // Called outside the lock: a sink must not be able to stall `connect_slice_sink`.
+    let connected = sinks.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    if connected.is_empty() {
+        return;
+    }
+    let gone = connected
+        .iter()
+        .filter(|sink| !(sink.deliver)(delivery))
+        .map(|sink| Arc::as_ptr(&sink.deliver).cast::<()>())
+        .collect::<Vec<_>>();
+    if !gone.is_empty() {
+        sinks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|sink| !gone.contains(&Arc::as_ptr(&sink.deliver).cast::<()>()));
+    }
+}
+
 fn worker_loop(
     input: &Receiver<ReferenceEngineRequest>,
     output: &CoalescingSender<ReferenceEngineEvent>,
     shutdown: &Arc<AtomicBool>,
+    slice_sinks: &ReferenceSliceSinks,
 ) {
     let mut reference: Option<(FastaReference, ReferenceRevision)> = None;
     while let Ok(request) = input.recv() {
@@ -307,9 +406,19 @@ fn worker_loop(
                     ReferenceQueryFetch::Completed(slice)
                         if clock.is_current(query.request.generation()) =>
                     {
+                        let slice = Arc::new(slice);
+                        // Engine to engine first: by the time the UI hears of the slice, every
+                        // connected consumer already has it queued.
+                        deliver_to_sinks(
+                            slice_sinks,
+                            &ReferenceSliceDelivery {
+                                query,
+                                slice: Arc::clone(&slice),
+                            },
+                        );
                         ReferenceEngineEvent::QueryCompleted {
                             query,
-                            slice: Arc::new(slice),
+                            slice,
                             remote_io_stats: reference.remote_io_stats(),
                         }
                     }
@@ -458,6 +567,97 @@ mod tests {
     use rgv_core::{ContigId, PanelId, ViewportGeneration};
 
     use super::*;
+
+    fn wait_for_event(engine: &ReferenceEngine) -> ReferenceEngineEvent {
+        loop {
+            if let Some(event) = engine
+                .output
+                .receive_timeout(Duration::from_secs(2))
+                .unwrap()
+            {
+                return event;
+            }
+        }
+    }
+
+    #[test]
+    fn connected_sinks_receive_each_completed_slice_and_leave_when_their_consumer_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genome.fa");
+        fs::write(&path, b">chr1\nACGTACGT\n").unwrap();
+        fs::write(path.with_extension("fa.fai"), b"chr1\t8\t6\t8\t9\n").unwrap();
+        let engine = ReferenceEngine::spawn(4);
+        engine.try_open(path).unwrap();
+        let ReferenceEngineEvent::Opened { revision, .. } = wait_for_event(&engine) else {
+            panic!("reference did not open");
+        };
+
+        let delivered = Arc::new(Mutex::new(Vec::<ReferenceSliceDelivery>::new()));
+        let recording = {
+            let delivered = Arc::clone(&delivered);
+            ReferenceSliceSink::new(move |delivery| {
+                delivered.lock().unwrap().push(delivery.clone());
+                true
+            })
+        };
+        // A consumer that goes away after its first slice.
+        let once = {
+            let accepted = AtomicBool::new(false);
+            ReferenceSliceSink::new(move |_| !accepted.swap(true, Ordering::AcqRel))
+        };
+        engine.connect_slice_sink(recording);
+        engine.connect_slice_sink(once);
+        assert_eq!(engine.slice_sink_count(), 2);
+
+        let clock = GenerationClock::default();
+        let mut completions = Vec::new();
+        for (panel, start) in [(7, 0), (8, 2), (9, 4)] {
+            let request = PanelGeneration::new(PanelId::new(panel), ViewportGeneration::new(0));
+            let interval = GenomicInterval::new(ContigId::new(0), start, start + 4).unwrap();
+            let query = ReferenceQueryIdentity::new(request, revision, interval);
+            engine
+                .try_query(query, clock.clone(), "chr1".to_owned())
+                .unwrap();
+            let ReferenceEngineEvent::QueryCompleted {
+                query: completed,
+                slice,
+                ..
+            } = wait_for_event(&engine)
+            else {
+                panic!("reference query did not complete");
+            };
+            assert_eq!(completed, query);
+            completions.push((query, slice));
+            // By the time the UI hears of a slice, every sink has been handed it.
+            assert_eq!(delivered.lock().unwrap().len(), completions.len());
+        }
+        // The sink got exactly what the UI got: same identity, same allocation.
+        let delivered = delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 3);
+        for (delivery, (query, slice)) in delivered.iter().zip(&completions) {
+            assert_eq!(delivery.query, *query);
+            assert!(Arc::ptr_eq(&delivery.slice, slice));
+        }
+        assert_eq!(delivered[1].slice.bases, b"GTAC");
+        // The consumer that reported itself gone at the second slice was disconnected then.
+        assert_eq!(engine.slice_sink_count(), 1);
+
+        // A query that fails is not delivered.
+        let request = PanelGeneration::new(PanelId::new(7), ViewportGeneration::new(0));
+        let interval = GenomicInterval::new(ContigId::new(0), 0, 4).unwrap();
+        engine
+            .try_query(
+                ReferenceQueryIdentity::new(request, revision, interval),
+                clock,
+                "missing".to_owned(),
+            )
+            .unwrap();
+        assert!(matches!(
+            wait_for_event(&engine),
+            ReferenceEngineEvent::Error { query: Some(_), .. }
+        ));
+        assert_eq!(delivered.len(), 3);
+    }
 
     #[test]
     fn standalone_reference_opens_and_fetches_by_panel_generation() {
@@ -784,7 +984,10 @@ mod tests {
                 panic!("an oversized reference query must fail with its identity");
             };
             assert_eq!(failed, refused);
-            assert!(message.contains("slice limit"), "unexpected message {message}");
+            assert!(
+                message.contains("slice limit"),
+                "unexpected message {message}"
+            );
         }
 
         // The limit itself is not a behaviour change for ordinary queries.

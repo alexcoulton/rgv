@@ -17,7 +17,10 @@ use super::{
 use crate::{
     AlignmentGpuInstance, AlignmentGpuRenderer, AlignmentGpuSceneRequest, AlignmentGpuScissor,
     AlignmentGpuShape, PackedAlignmentPage,
-    alignment_scene::tests::{TestRead, test_scene_over},
+    alignment_scene::tests::{
+        TestRead, legacy_semantic_alignment_color, test_scene_colored, test_scene_over,
+    },
+    palette::{AlignmentPalette, ThemeId},
     project_alignment_gpu_instance,
 };
 
@@ -87,23 +90,22 @@ fn unclipped_quad(
     page_row_start: u32,
     camera: AlignmentCamera,
 ) -> Quad {
-    let offset = |value: [f32; 2]| f64::from(value[0]) + f64::from(value[1]);
-    let project = |value: [f32; 2]| {
+    let project = |offset: u64| {
         camera.clip().x
-            + (page_start as f64 + offset(value) - camera.exact_start()) / camera.bases_per_pixel()
+            + (page_start as f64 + offset as f64 - camera.exact_start()) / camera.bases_per_pixel()
     };
-    let mut left = project(instance.start_offset);
-    let mut right = project(instance.end_offset);
-    let row = f64::from(page_row_start + instance.row_offset);
+    let mut left = project(instance.start_offset());
+    let mut right = project(instance.end_offset());
+    let row = f64::from(page_row_start + instance.row_offset());
     let row_top = camera.clip().y
         + (row - camera.row_scroll()) * camera.row_height()
         + (camera.row_height() - camera.read_height()) * 0.5;
     let (mut top, mut height) = (row_top, camera.read_height().max(1.0));
-    if instance.shape == AlignmentGpuShape::EventLine as u32 {
+    if instance.shape() == AlignmentGpuShape::EventLine as u32 {
         top = row_top + camera.read_height() * 0.45;
         height = (camera.read_height() * 0.10).max(1.0);
     }
-    if instance.shape == AlignmentGpuShape::PointMarker as u32 {
+    if instance.shape() == AlignmentGpuShape::PointMarker as u32 {
         let width = (right - left).max(1.5);
         left -= (width - (right - left)) * 0.5;
         right = left + width;
@@ -150,6 +152,16 @@ fn oracle_for(
     scene: &Arc<AlignmentPresentationScene>,
     camera: AlignmentCamera,
 ) -> (Oracle, Vec<ExpectedInstance>) {
+    oracle_with_palette(scene, camera, None)
+}
+
+/// `palette` of `None` is the golden path: colours come from the legacy baked-colour rules, not
+/// from any palette, so the Light theme is checked against what RGV drew before palettes.
+fn oracle_with_palette(
+    scene: &Arc<AlignmentPresentationScene>,
+    camera: AlignmentCamera,
+    palette: Option<&AlignmentPalette>,
+) -> (Oracle, Vec<ExpectedInstance>) {
     let scissor = [SCISSOR.x, SCISSOR.y, SCISSOR.width, SCISSOR.height];
     let mut oracle = Oracle::new(TARGET);
     let mut expected = Vec::new();
@@ -157,7 +169,8 @@ fn oracle_for(
         let Ok(packed) = PackedAlignmentPage::from_semantic(page) else {
             continue;
         };
-        for instance in packed.instances {
+        for (instance, semantic_index) in packed.instances.into_iter().zip(packed.semantic_indices)
+        {
             let page_start = page.interval().start();
             let page_row_start = page.row_range().start;
             let quad = unclipped_quad(instance, page_start, page_row_start, camera);
@@ -177,8 +190,14 @@ fn oracle_for(
                 }
                 None => assert!(clipped_right <= clipped_left || clipped_bottom <= clipped_top),
             }
-            let colour = instance.color.map(f64::from);
-            let shape = instance.shape;
+            let colour = if let Some(palette) = palette {
+                palette.resolve(instance.palette_color())
+            } else {
+                let primitive = page.primitives()[semantic_index as usize];
+                legacy_semantic_alignment_color(primitive.component, primitive.style)
+            }
+            .map(f64::from);
+            let shape = instance.shape();
             oracle.paint(quad, scissor, |x, y| match quad.classify(x, y) {
                 Some(false) => Shade::Outside,
                 None => Shade::Uncertain,
@@ -286,6 +305,187 @@ fn alignment_scene_pixels_match_the_cpu_oracle() {
             comparison.compared,
             comparison.painted,
             comparison.uncertain
+        );
+    }
+}
+
+/// REND-10 / PROD-17. Recolouring is a palette uniform write: with the pages already resident,
+/// switching theme changes the pixels while no page byte is uploaded again, and under every
+/// palette the GPU resolves each instance's token exactly as `AlignmentPalette::resolve` does.
+#[test]
+fn switching_palette_recolours_resident_pages_without_any_geometry_upload() {
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+    let scene = test_scene_over(
+        &ledger,
+        interval,
+        100,
+        NonZeroU64::new(8).unwrap(),
+        &fixture_reads(4),
+        NonZeroU32::new(2).unwrap(),
+    );
+    let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    let camera = AlignmentCamera::new(
+        GenomicInterval::new(ContigId::new(0), 2, 18).unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        CLIP,
+    )
+    .unwrap();
+    let interaction = AlignmentInteractionState::default();
+    let render = |renderer: &mut AlignmentGpuRenderer, sequence: u64| {
+        let requests = [AlignmentGpuSceneRequest {
+            scene: &scene,
+            camera_sequence: sequence,
+            camera,
+            screen_size_points: [TARGET[0] as f32, TARGET[1] as f32],
+            scissor: SCISSOR,
+            interaction: &interaction,
+        }];
+        let (frame, stats, admission) = renderer
+            .prepare_with_admission(&gpu.device, &gpu.queue, &requests, &ledger, sequence)
+            .unwrap();
+        let image = render_image(&gpu, TARGET, |pass| renderer.render(pass, &frame));
+        (image, stats, admission)
+    };
+
+    assert_eq!(*renderer.palette(), AlignmentPalette::light());
+    let (light_image, first_stats, first_admission) = render(&mut renderer, 1);
+    assert!(first_admission.uploaded_bytes > 0);
+    // Sixteen bytes per instance, charged exactly (REND-8); the same pages were forty bytes per
+    // instance before colours became palette indices.
+    assert_eq!(
+        first_admission.uploaded_bytes,
+        first_admission.instances * size_of::<AlignmentGpuInstance>()
+    );
+    eprintln!(
+        "{} pages, {} instances: {} bytes resident (was {} at forty bytes per instance)",
+        first_admission.admitted_pages,
+        first_admission.instances,
+        first_admission.uploaded_bytes,
+        first_admission.instances * 40
+    );
+    assert_eq!(renderer.palette_uploads(), 0);
+    let resident_bytes = first_stats.resident_gpu_bytes;
+    let charged = ledger.snapshot().unwrap().charged;
+    // The default palette is Light, and Light is the legacy colours.
+    oracle_for(&scene, camera)
+        .0
+        .assert_matches(&light_image, "light palette against the legacy goldens");
+    // Setting the palette already in force uploads nothing at all.
+    assert!(!renderer.set_palette(&gpu.queue, &AlignmentPalette::light()));
+    assert_eq!(renderer.palette_uploads(), 0);
+
+    let mut previous = light_image.clone();
+    for (index, theme) in [
+        ThemeId::Dark,
+        ThemeId::LightColorBlind,
+        ThemeId::DarkColorBlind,
+        ThemeId::Light,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let palette = AlignmentPalette::for_theme(theme);
+        assert!(renderer.set_palette(&gpu.queue, &palette));
+        assert_eq!(renderer.palette_uploads(), index as u64 + 1);
+        let (image, stats, admission) = render(&mut renderer, index as u64 + 2);
+        // No page was admitted, re-packed or re-uploaded; residency and the ledger are as before.
+        assert_eq!(admission.uploaded_bytes, 0, "{theme:?}");
+        assert_eq!(admission.admitted_pages, 0, "{theme:?}");
+        assert_eq!(stats.geometry_uploaded_bytes, 0, "{theme:?}");
+        assert_eq!(stats.page_cache_misses, 0, "{theme:?}");
+        assert_eq!(stats.resident_gpu_bytes, resident_bytes, "{theme:?}");
+        assert_eq!(ledger.snapshot().unwrap().charged, charged, "{theme:?}");
+        assert_ne!(image, previous, "{theme:?} did not change any pixel");
+        let (oracle, expected) = oracle_with_palette(&scene, camera, Some(&palette));
+        assert!(!expected.is_empty());
+        let comparison = oracle.assert_matches(&image, &format!("{theme:?} palette"));
+        eprintln!(
+            "{theme:?} palette on {}: {} pixels compared, {} painted, 0 geometry bytes uploaded",
+            gpu.description, comparison.compared, comparison.painted
+        );
+        previous = image;
+    }
+    // Back on Light the frame is pixel-identical to the first one.
+    assert_eq!(previous, light_image);
+}
+
+/// The two non-table colour forms on the GPU: the mapping-quality ramp (a position between two
+/// palette slots, carried as f32 bits) and the inline RGBA8 escape hatch used by hashed
+/// categories. Under Light both must reproduce the legacy baked colours; under Dark the ramp
+/// follows the palette while inline colours are, by design, unchanged.
+#[test]
+fn ramp_and_inline_colours_match_the_cpu_oracle_under_light_and_dark() {
+    use crate::palette::PaletteColor;
+    use rgv_core::AlignmentColorMode;
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+    let camera = AlignmentCamera::new(
+        GenomicInterval::new(ContigId::new(0), 2, 18).unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        CLIP,
+    )
+    .unwrap();
+    for mode in [
+        AlignmentColorMode::MappingQuality,
+        AlignmentColorMode::MateContig,
+    ] {
+        let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+        let scene = test_scene_colored(
+            &ledger,
+            interval,
+            100,
+            NonZeroU64::new(8).unwrap(),
+            &fixture_reads(4),
+            NonZeroU32::new(2).unwrap(),
+            Some(mode),
+        );
+        // The fixture really exercises the form under test, with several distinct values.
+        let mut forms = std::collections::BTreeSet::new();
+        for page in scene.pages() {
+            let Ok(packed) = PackedAlignmentPage::from_semantic(page) else {
+                continue;
+            };
+            for instance in packed.instances {
+                match (mode, instance.palette_color()) {
+                    (AlignmentColorMode::MappingQuality, PaletteColor::Ramp { position, .. }) => {
+                        forms.insert(position.to_bits());
+                    }
+                    (AlignmentColorMode::MateContig, PaletteColor::Inline(rgba)) => {
+                        forms.insert(u32::from_le_bytes(rgba));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(forms.len() >= 3, "{mode:?} produced only {forms:?}");
+
+        let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+        let light = render_scene(&gpu, &mut renderer, &scene, camera, &ledger, 1);
+        oracle_for(&scene, camera)
+            .0
+            .assert_matches(&light, &format!("{mode:?} against the legacy goldens"));
+        let dark_palette = AlignmentPalette::dark();
+        renderer.set_palette(&gpu.queue, &dark_palette);
+        let dark = render_scene(&gpu, &mut renderer, &scene, camera, &ledger, 2);
+        let comparison = oracle_with_palette(&scene, camera, Some(&dark_palette))
+            .0
+            .assert_matches(&dark, &format!("{mode:?} under the dark palette"));
+        assert_ne!(light, dark);
+        eprintln!(
+            "{mode:?} colours on {}: {} distinct values, {} pixels compared",
+            gpu.description,
+            forms.len(),
+            comparison.compared
         );
     }
 }

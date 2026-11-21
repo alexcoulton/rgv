@@ -153,6 +153,10 @@ impl Viewer {
                     interval.end()
                 ));
                 self.panels.active().generation_clock.advance();
+                crate::workspace::alignments::connect_reference_slice_sinks(
+                    self.reference_engine.as_ref(),
+                    [&controller],
+                );
                 if self.alignment_tracks.is_empty() {
                     self.alignment_tracks.push(controller);
                 } else {
@@ -205,6 +209,11 @@ impl Viewer {
         self.reference_revision = None;
         self.reference_remote_io_stats = None;
         self.retire_reference_engine();
+        // The retired engine took its slice sinks with it: reconnect every scene engine.
+        crate::workspace::alignments::connect_reference_slice_sinks(
+            Some(&engine),
+            &self.alignment_tracks,
+        );
         self.reference_engine = Some(engine);
         let ids = self.panels.iter().map(|panel| panel.id).collect::<Vec<_>>();
         for id in ids {
@@ -304,6 +313,11 @@ impl Viewer {
         &mut self,
         controllers: Vec<AlignmentTrackController>,
     ) {
+        // Covers a session load too: its new reference engine is installed before this call.
+        crate::workspace::alignments::connect_reference_slice_sinks(
+            self.reference_engine.as_ref(),
+            &controllers,
+        );
         let replaced = std::mem::replace(&mut self.alignment_tracks, controllers);
         for controller in replaced {
             self.retire_alignment_track_controller(controller);

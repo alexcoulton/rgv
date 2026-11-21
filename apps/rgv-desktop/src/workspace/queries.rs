@@ -1311,6 +1311,7 @@ impl Viewer {
         if ledger_progressed || immediate_gpu_retry {
             self.retry_deferred_alignment_gpu_publication();
         }
+        self.top_up_partial_alignment_gpu_residency();
         self.poll_track_events();
         self.synchronize_alignment_contextual_product_states();
         self.poll_alignment_retirement_tasks();

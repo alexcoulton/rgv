@@ -172,3 +172,108 @@ fn a_refusal_counted_for_an_older_camera_is_asked_again_for_the_live_camera_once
     );
     assert!(!coordinator.source.has_pending_source_work());
 }
+
+#[test]
+fn a_pan_outside_the_covered_window_decodes_only_what_is_not_resident() {
+    const START: u64 = 800_000;
+    let (mut coordinator, camera, log) = wide_coordinator(START);
+    coordinator.update_camera(camera).unwrap();
+    pump_until_idle(&mut coordinator);
+    assert!(coordinator.frame().unwrap().visible_complete());
+    let covered = coordinator.desired_prepared_interval().unwrap();
+    let streams_before = log.streams();
+    let resident = streams_before
+        .iter()
+        .flat_map(crate::local_bam_source::test_support::DecodedStream::offsets)
+        .collect::<BTreeSet<_>>();
+    assert!(
+        resident.len() > 8,
+        "the first window must span several BGZF blocks, not {}",
+        resident.len()
+    );
+
+    // Far enough that the camera leaves the covered window, near enough that the new
+    // acquisition overlaps evidence which is still resident.
+    let panned = camera_at(
+        &coordinator,
+        camera,
+        START + camera.interval().len() + camera.interval().len() / 2,
+    );
+    assert!(!covered.contains_interval(panned.interval()));
+    let update = coordinator.update_camera(panned).unwrap();
+    assert!(update.foreground_submitted.is_some());
+    pump_until_idle(&mut coordinator);
+    let frame = coordinator.frame().unwrap();
+    assert_eq!(frame.camera.interval(), panned.interval());
+    assert!(frame.visible_complete());
+
+    // One fresh request for the panned camera: what it decodes and what it shows.
+    let (mut single, _, single_log) = wide_coordinator(panned.interval().start());
+    single.update_camera(panned).unwrap();
+    pump_until_idle(&mut single);
+    let fresh_offsets = single_log
+        .streams()
+        .iter()
+        .flat_map(crate::local_bam_source::test_support::DecodedStream::offsets)
+        .collect::<BTreeSet<_>>();
+
+    let after_pan = &log.streams()[streams_before.len()..];
+    assert!(!after_pan.is_empty());
+    let decoded_after_pan = after_pan
+        .iter()
+        .flat_map(crate::local_bam_source::test_support::DecodedStream::offsets)
+        .collect::<BTreeSet<_>>();
+    let honoured = after_pan
+        .iter()
+        .map(|stream| stream.receipts_honoured)
+        .sum::<usize>();
+    let needed_and_resident = fresh_offsets.intersection(&resident).count();
+    assert!(
+        needed_and_resident > 4,
+        "the pan must need blocks which are already resident"
+    );
+    assert!(honoured > 0, "no resident chunk was skipped");
+    // Of the resident blocks the panned camera needs, at most the one at the old right edge
+    // is read again per stream; everything else decoded is new.
+    let reread = decoded_after_pan.intersection(&resident).count();
+    assert!(
+        reread <= after_pan.len(),
+        "{reread} resident blocks were decoded again by {} streams",
+        after_pan.len()
+    );
+    assert!(decoded_after_pan.len() < fresh_offsets.len());
+
+    // The final scene is the one a single fresh request builds.
+    let single_frame = single.frame().unwrap();
+    assert!(single_frame.visible_complete());
+    assert_eq!(single_frame.camera.interval(), panned.interval());
+    let scene = frame.snapshot.as_ref().unwrap();
+    let single_scene = single_frame.snapshot.as_ref().unwrap();
+    assert_eq!(scene.prepared_interval(), single_scene.prepared_interval());
+    assert!(!scene_population(scene).is_empty());
+    assert_eq!(scene_population(scene), scene_population(single_scene));
+    assert_eq!(
+        visible_population(&coordinator),
+        visible_population(&single)
+    );
+    assert_eq!(
+        scene.reads().atlas().row_count(),
+        single_scene.reads().atlas().row_count()
+    );
+    assert_eq!(
+        scene.reads().prepared_rows(),
+        single_scene.reads().prepared_rows()
+    );
+    assert_eq!(
+        scene.reads().pages().len(),
+        single_scene.reads().pages().len()
+    );
+    assert_eq!(
+        scene.summary_pages().len(),
+        single_scene.summary_pages().len()
+    );
+    assert_eq!(
+        frame.row_activity.unwrap().visible_record_count(),
+        single_frame.row_activity.unwrap().visible_record_count()
+    );
+}

@@ -389,7 +389,10 @@ pub(crate) fn alignment_style_controls(
             ui.end_row();
         });
     if parse_style_tag(style_tag).is_none() {
-        ui.colored_label(egui::Color32::DARK_RED, "Use two ASCII SAM-tag characters");
+        ui.colored_label(
+            crate::theme::adapt(egui::Color32::DARK_RED),
+            "Use two ASCII SAM-tag characters",
+        );
     }
     if let AlignmentColorMode::Bisulfite(context) = *color_mode {
         ui.horizontal_wrapped(|ui| {

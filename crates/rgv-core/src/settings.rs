@@ -37,6 +37,20 @@ pub enum AlignmentMemoryPolicy {
     Complete,
 }
 
+/// Colour theme of the interface and the genomic canvas.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceTheme {
+    #[default]
+    Light,
+    Dark,
+    /// Light, with categories recoloured to stay distinguishable under protanopia and
+    /// deuteranopia.
+    LightColorBlind,
+    /// Dark, with the same colour-blind-safe categories.
+    DarkColorBlind,
+}
+
 /// User-controlled desktop preferences. Diagnostics are disabled unless the
 /// user explicitly opts in.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -61,6 +75,8 @@ pub struct DesktopSettings {
     pub interface_scale_percent: u16,
     pub high_contrast: bool,
     pub reduced_motion: bool,
+    /// Absent in files written before themes existed, which therefore load as Light.
+    pub theme: InterfaceTheme,
 }
 
 impl Default for DesktopSettings {
@@ -80,6 +96,7 @@ impl Default for DesktopSettings {
             interface_scale_percent: DEFAULT_INTERFACE_SCALE_PERCENT,
             high_contrast: false,
             reduced_motion: false,
+            theme: InterfaceTheme::default(),
         }
     }
 }
@@ -417,6 +434,37 @@ mod tests {
             invalid.to_json(),
             Err(SettingsError::InvalidAutosaveRetention(_))
         ));
+    }
+
+    #[test]
+    fn theme_defaults_to_light_for_older_files_and_round_trips() {
+        let mut older: serde_json::Value =
+            serde_json::from_str(&DesktopSettings::default().to_json().unwrap()).unwrap();
+        older.as_object_mut().unwrap().remove("theme").unwrap();
+        let loaded = DesktopSettings::from_json(&older.to_string()).unwrap();
+        assert_eq!(loaded.theme, InterfaceTheme::Light);
+        for theme in [
+            InterfaceTheme::Light,
+            InterfaceTheme::Dark,
+            InterfaceTheme::LightColorBlind,
+            InterfaceTheme::DarkColorBlind,
+        ] {
+            let settings = DesktopSettings {
+                theme,
+                ..DesktopSettings::default()
+            };
+            let json = settings.to_json().unwrap();
+            assert_eq!(DesktopSettings::from_json(&json).unwrap(), settings);
+        }
+        assert!(
+            DesktopSettings {
+                theme: InterfaceTheme::DarkColorBlind,
+                ..DesktopSettings::default()
+            }
+            .to_json()
+            .unwrap()
+            .contains("\"theme\": \"dark_color_blind\"")
+        );
     }
 
     #[test]

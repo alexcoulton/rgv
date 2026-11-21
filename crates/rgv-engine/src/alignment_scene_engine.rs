@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     error::Error,
     num::NonZeroUsize,
     path::PathBuf,
@@ -25,12 +25,13 @@ use crate::{
     AlignmentCoordinatorUpdate, AlignmentReferenceAuthority, AlignmentSceneBuildContract,
     AlignmentSceneCoordinatorConfigError, AlignmentSceneCoordinatorTelemetry,
     AlignmentScenePreparationPolicy, AlignmentSceneSourceCoordinator, AlignmentSourceActor,
-    CanonicalAlignmentSourceBackend, EngineQueueError, LocalBamCanonicalBackend, SourceIntentKind,
-    SourceOwnerId,
+    CanonicalAlignmentSourceBackend, EngineQueueError, PositionedAlignmentBackend,
+    ReferenceSliceSink, SourceIntentKind, SourceOwnerId,
     mailbox::{
         CoalescingReceiver, CoalescingSender, TryMailboxSendError, bounded_coalescing,
         bounded_coalescing_to_ui, reap_worker, run_thread_root,
     },
+    reference_engine::MAX_REFERENCE_QUERY_BASES,
 };
 
 /// Safety timeout for a worker with nothing runnable. Every request arrives through the mailbox
@@ -50,6 +51,14 @@ const MAXIMUM_RECLAIM_DEFERRALS: u32 = 4;
 /// checkpoint; it is not a memory-policy constant and does not change which exact data is kept.
 const MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM: usize = 256;
 const SLOW_WORKER_PHASE: Duration = Duration::from_millis(25);
+/// Mailbox namespace of reference slices offered engine to engine; one unread slot per panel.
+const REFERENCE_OFFER_NAMESPACE: u64 = 4;
+/// Reference slices the worker keeps from engine-to-engine offers, for a lane whose requirement
+/// appears or widens after the slice arrived.
+const MAXIMUM_RETAINED_REFERENCE_OFFERS: usize = 4;
+/// Most bases those retained slices may hold together. A wider offer is still installed into
+/// every lane waiting for it when it arrives; it is only not kept afterwards.
+const MAXIMUM_RETAINED_REFERENCE_OFFER_BASES: u64 = 8 * MAX_REFERENCE_QUERY_BASES;
 
 /// Identity of one desktop request transaction for an alignment-scene lane.
 ///
@@ -326,6 +335,11 @@ enum AlignmentSceneEngineRequest<C> {
         owner: SourceOwnerId,
         authority: AlignmentReferenceAuthority,
     },
+    /// A reference slice handed over by the reference engine itself, for whichever lanes it
+    /// satisfies now or comes to satisfy.
+    OfferReferenceAuthority {
+        authority: AlignmentReferenceAuthority,
+    },
     SetPreparationPolicy {
         owner: SourceOwnerId,
         request_token: AlignmentSceneRequestToken,
@@ -520,6 +534,52 @@ where
         })
     }
 
+    /// A sink through which a [`crate::ReferenceEngine`] hands completed reference slices
+    /// straight to this engine's worker (reference thread to alignment thread), instead of the
+    /// UI receiving each slice and forwarding it with
+    /// [`Self::try_install_reference_authority`]. Connect it once per engine:
+    ///
+    /// ```ignore
+    /// reference_engine.connect_slice_sink(scene_engine.reference_slice_sink());
+    /// ```
+    ///
+    /// The worker installs an offered slice into every lane whose live requirement it
+    /// satisfies (same reference revision and contig, covering the lane's required horizon),
+    /// exactly as the forwarded form does for one lane, and reports it with the same
+    /// `FrameUpdated` event. A slice no lane needs yet is kept, within a small bound, and
+    /// installed when a camera, contract or completed acquisition makes a lane need it, so
+    /// the caller has nothing to re-send. Contig identities are compared as given: every
+    /// query of one reference revision must use the contig numbering of the lanes it serves,
+    /// which the forwarded form requires too.
+    ///
+    /// The forwarded form keeps working alongside: forwarding a slice the worker already
+    /// installed is a no-op. The sink stops accepting (and the reference engine drops it)
+    /// once this engine is retired or dropped.
+    #[must_use]
+    pub fn reference_slice_sink(&self) -> ReferenceSliceSink {
+        let input = self.input.as_ref().map(CoalescingSender::side_sender);
+        ReferenceSliceSink::new(move |delivery| {
+            let Some(input) = &input else {
+                return false;
+            };
+            // Replaceable per asking panel, like the reference engine's own completion event:
+            // an unread older slice for the same panel is superseded, and the offer can never
+            // fill this engine's control queue.
+            input
+                .send_latest_system_for(
+                    REFERENCE_OFFER_NAMESPACE,
+                    delivery.query.request().panel_id().get(),
+                    AlignmentSceneEngineRequest::OfferReferenceAuthority {
+                        authority: AlignmentReferenceAuthority::new(
+                            delivery.query.revision(),
+                            Arc::clone(&delivery.slice),
+                        ),
+                    },
+                )
+                .is_ok()
+        })
+    }
+
     pub fn try_set_preparation_policy(
         &self,
         owner: SourceOwnerId,
@@ -687,7 +747,7 @@ where
     }
 }
 
-impl AlignmentSceneEngine<LocalBamCanonicalBackend> {
+impl AlignmentSceneEngine<PositionedAlignmentBackend> {
     /// Opens and owns one alignment source entirely on the unified scene source thread. The
     /// path may name a local BAM or CRAM, or an `http(s)` BAM or CRAM URL. The caller can
     /// immediately retain the enforcing ledger and mailbox; source metadata arrives through
@@ -765,7 +825,7 @@ fn local_bam_worker(
     let index_overview = source.index_overview().cloned().map(Arc::new);
     let header = Arc::clone(source.header_metadata());
     let normalization_mapped_records = source.normalization_mapped_records();
-    let backend = match LocalBamCanonicalBackend::new(source, config.query_options) {
+    let backend = match PositionedAlignmentBackend::new(source, config.query_options) {
         Ok(backend) => backend.with_nonblocking_checkpoints(),
         Err(error) => {
             send_error(
@@ -1009,6 +1069,29 @@ struct WorkerDemand {
 /// optional work. The one
 /// exception keeps the order from becoming starvation: a reclaim passed over
 /// `MAXIMUM_RECLAIM_DEFERRALS` times in a row gets a single quantum.
+///
+/// What this guarantees, with [`next_reclaim_deferrals`] keeping the count:
+///
+/// - Visible work is never behind more than one reclaim quantum (at most
+///   `MAXIMUM_RECLAIM_ENTRIES_PER_QUANTUM` evictions), and gets `MAXIMUM_RECLAIM_DEFERRALS`
+///   turns for every quantum while both are runnable.
+/// - A reclaim is never behind more than `MAXIMUM_RECLAIM_DEFERRALS` visible turns, so it
+///   finishes however long visible work goes on.
+/// - Optional work (read-ahead, off-screen rows) runs only when no visible work and no reclaim
+///   is runnable. It can be delayed for as long as the user keeps giving the worker visible
+///   work, which is the intent; a reclaim is finite, so it alone cannot hold optional work back
+///   for ever.
+///
+/// The two memory policies differ only in where cache maintenance sits, not in this order:
+///
+/// - `Complete` (strict ledger): maintenance is the `Reclaim` turn above, a transaction that a
+///   refused allocation or the desktop starts, interleaved as described.
+/// - `Bounded`: every owner trims itself in a bounded quantum at the top of every loop
+///   iteration (`run_bounded_trim`), before the turn is chosen and whatever the turn is. The
+///   trim therefore cannot be starved by any class of work, and it cannot starve one either:
+///   each iteration still runs exactly one turn, and an unfinished trim only replaces the
+///   `Wait` turn. A `Reclaim` turn still exists under `Bounded` for an eviction the desktop
+///   asks for explicitly, with the same deferral rule.
 fn next_worker_turn(demand: WorkerDemand, reclaim_deferrals: u32) -> WorkerTurn {
     if demand.reclaim && reclaim_deferrals >= MAXIMUM_RECLAIM_DEFERRALS {
         WorkerTurn::Reclaim
@@ -1026,6 +1109,21 @@ fn next_worker_turn(demand: WorkerDemand, reclaim_deferrals: u32) -> WorkerTurn 
         WorkerTurn::OptionalPresentation
     } else {
         WorkerTurn::Wait
+    }
+}
+
+/// How many visible turns in a row have now been taken ahead of a pending reclaim. Any other
+/// turn, including the reclaim quantum itself, starts the count again.
+fn next_reclaim_deferrals(turn: WorkerTurn, demand: WorkerDemand, reclaim_deferrals: u32) -> u32 {
+    match turn {
+        WorkerTurn::ForegroundPresentation
+        | WorkerTurn::SceneBuild
+        | WorkerTurn::ForegroundSource
+            if demand.reclaim =>
+        {
+            reclaim_deferrals.saturating_add(1)
+        }
+        _ => 0,
     }
 }
 
@@ -1050,6 +1148,7 @@ fn scene_worker_loop<B>(
 {
     let mut request_tokens = BTreeMap::new();
     let mut pending_eviction = None;
+    let mut reference_offers = ReferenceOffers::default();
     // Scene builds from cached evidence run one stage per turn, so every request below is
     // serviced within one stage instead of behind a whole build.
     coordinator.set_staged_scene_builds(true);
@@ -1076,6 +1175,7 @@ fn scene_worker_loop<B>(
                         &mut coordinator,
                         &mut request_tokens,
                         &mut pending_eviction,
+                        &mut reference_offers,
                         output,
                         request,
                     ) {
@@ -1085,6 +1185,20 @@ fn scene_worker_loop<B>(
                 Ok(None) => break,
                 Err(_) => return,
             }
+        }
+        // A lane whose reference requirement appeared or widened since a slice was offered
+        // (a camera, a contract, a completed acquisition) takes it from the retained offers.
+        if !reference_offers.is_empty()
+            && !install_offered_references(
+                &mut coordinator,
+                &request_tokens,
+                &mut pending_eviction,
+                &mut reference_offers,
+                None,
+                output,
+            )
+        {
+            return;
         }
 
         // 2. Bounded-policy maintenance: every owner trims its own caches back to its share.
@@ -1118,16 +1232,7 @@ fn scene_worker_loop<B>(
                 && coordinator.has_pending_presentation_work(),
         };
         let turn = next_worker_turn(demand, reclaim_deferrals);
-        reclaim_deferrals = match turn {
-            WorkerTurn::ForegroundPresentation
-            | WorkerTurn::SceneBuild
-            | WorkerTurn::ForegroundSource
-                if demand.reclaim =>
-            {
-                reclaim_deferrals.saturating_add(1)
-            }
-            _ => 0,
-        };
+        reclaim_deferrals = next_reclaim_deferrals(turn, demand, reclaim_deferrals);
         match turn {
             WorkerTurn::ForegroundPresentation | WorkerTurn::OptionalPresentation => {
                 if !run_presentation_turn(
@@ -1182,6 +1287,7 @@ fn scene_worker_loop<B>(
                             &mut coordinator,
                             &mut request_tokens,
                             &mut pending_eviction,
+                            &mut reference_offers,
                             output,
                             request,
                         ) {
@@ -1963,6 +2069,7 @@ fn apply_request<B>(
     coordinator: &mut AlignmentSceneSourceCoordinator<B>,
     request_tokens: &mut BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
     pending_eviction: &mut Option<PendingInactiveEviction>,
+    reference_offers: &mut ReferenceOffers,
     output: &CoalescingSender<AlignmentSceneEngineEvent>,
     request: AlignmentSceneEngineRequest<B::Control>,
 ) -> bool
@@ -2099,30 +2206,33 @@ where
                 ),
             }
         }
+        AlignmentSceneEngineRequest::OfferReferenceAuthority { authority } => {
+            let retained = reference_offers.retain(authority.clone());
+            install_offered_references(
+                coordinator,
+                request_tokens,
+                pending_eviction,
+                reference_offers,
+                // Too wide to keep: the lanes waiting now still get it.
+                (!retained).then_some(&authority),
+                output,
+            )
+        }
         AlignmentSceneEngineRequest::InstallReferenceAuthority { owner, authority } => {
-            let request_token = current_request_token(request_tokens, owner);
-            match coordinator.install_reference_authority(owner, authority) {
-                Ok(outcome) if outcome.installed => send_frame(
-                    coordinator,
-                    output,
-                    owner,
-                    request_token,
-                    AlignmentSceneFrameCause::ReferenceAuthority,
-                    None,
-                    outcome.published_scene,
-                ),
-                Ok(_) => true,
-                Err(error) => send_owner_operation_error(
-                    coordinator,
-                    pending_eviction,
-                    output,
-                    owner,
-                    request_token,
-                    AlignmentSceneEngineOperation::InstallReferenceAuthority,
-                    SourceIntentKind::Foreground,
-                    error,
-                ),
+            // The reference engine may already have handed this very slice to the worker; a
+            // forwarded copy of it must not rebuild the lane a second time.
+            if coordinator.reference_authority_is_current(owner, &authority) {
+                return true;
             }
+            install_reference_authority(
+                coordinator,
+                request_tokens,
+                pending_eviction,
+                output,
+                owner,
+                authority,
+            )
+            .is_some()
         }
         AlignmentSceneEngineRequest::SetPreparationPolicy {
             owner,
@@ -2348,6 +2458,156 @@ where
     }
 }
 
+/// Reference slices offered engine to engine, newest last, kept within
+/// [`MAXIMUM_RETAINED_REFERENCE_OFFERS`] and [`MAXIMUM_RETAINED_REFERENCE_OFFER_BASES`]. All of
+/// them belong to one reference revision: an offer of another revision replaces the lot.
+#[derive(Default)]
+struct ReferenceOffers {
+    offers: VecDeque<AlignmentReferenceAuthority>,
+}
+
+fn reference_authority_covers(
+    authority: &AlignmentReferenceAuthority,
+    revision: rgv_alignment_scene::ReferenceRevision,
+    horizon: rgv_core::GenomicInterval,
+) -> bool {
+    authority.revision() == revision && authority.slice().interval.contains_interval(horizon)
+}
+
+impl ReferenceOffers {
+    fn is_empty(&self) -> bool {
+        self.offers.is_empty()
+    }
+
+    fn bases(&self) -> u64 {
+        self.offers
+            .iter()
+            .map(|offer| offer.slice().interval.len())
+            .fold(0, u64::saturating_add)
+    }
+
+    /// Keeps `authority` for lanes that come to need it. Returns `false` when it is too wide
+    /// to keep.
+    fn retain(&mut self, authority: AlignmentReferenceAuthority) -> bool {
+        let interval = authority.slice().interval;
+        // Slices of an older revision can satisfy no lane; a slice the new one contains adds
+        // nothing.
+        self.offers.retain(|held| {
+            held.revision() == authority.revision()
+                && !interval.contains_interval(held.slice().interval)
+        });
+        if interval.len() > MAXIMUM_RETAINED_REFERENCE_OFFER_BASES {
+            return false;
+        }
+        self.offers.push_back(authority);
+        while self.offers.len() > MAXIMUM_RETAINED_REFERENCE_OFFERS
+            || self.bases() > MAXIMUM_RETAINED_REFERENCE_OFFER_BASES
+        {
+            self.offers.pop_front();
+        }
+        true
+    }
+
+    /// The newest retained slice that satisfies a requirement.
+    fn covering(
+        &self,
+        revision: rgv_alignment_scene::ReferenceRevision,
+        horizon: rgv_core::GenomicInterval,
+    ) -> Option<&AlignmentReferenceAuthority> {
+        self.offers
+            .iter()
+            .rev()
+            .find(|offer| reference_authority_covers(offer, revision, horizon))
+    }
+
+    fn forget(&mut self, authority: &AlignmentReferenceAuthority) {
+        self.offers.retain(|held| held != authority);
+    }
+}
+
+/// Installs `authority` into `owner`'s lane and reports the outcome as a forwarded install is
+/// reported. Returns whether the lane took it, or `None` once the event receiver is gone.
+fn install_reference_authority<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    request_tokens: &BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+    owner: SourceOwnerId,
+    authority: AlignmentReferenceAuthority,
+) -> Option<bool>
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + Send + Sync + 'static,
+{
+    let request_token = current_request_token(request_tokens, owner);
+    match coordinator.install_reference_authority(owner, authority) {
+        Ok(outcome) if outcome.installed => send_frame(
+            coordinator,
+            output,
+            owner,
+            request_token,
+            AlignmentSceneFrameCause::ReferenceAuthority,
+            None,
+            outcome.published_scene,
+        )
+        .then_some(true),
+        Ok(_) => Some(false),
+        // The lane holds the authority; it was the scene built from it that failed.
+        Err(error) => send_owner_operation_error(
+            coordinator,
+            pending_eviction,
+            output,
+            owner,
+            request_token,
+            AlignmentSceneEngineOperation::InstallReferenceAuthority,
+            SourceIntentKind::Foreground,
+            error,
+        )
+        .then_some(true),
+    }
+}
+
+/// Gives every lane whose reference requirement is unmet the offered slice that satisfies it:
+/// `unretained` if it does, otherwise the newest retained offer. A lane with nothing offered
+/// for it is left pending. Returns `false` once the event receiver is gone.
+fn install_offered_references<B>(
+    coordinator: &mut AlignmentSceneSourceCoordinator<B>,
+    request_tokens: &BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+    pending_eviction: &mut Option<PendingInactiveEviction>,
+    offers: &mut ReferenceOffers,
+    unretained: Option<&AlignmentReferenceAuthority>,
+    output: &CoalescingSender<AlignmentSceneEngineEvent>,
+) -> bool
+where
+    B: CanonicalAlignmentSourceBackend,
+    B::Error: Error + Send + Sync + 'static,
+{
+    for (owner, revision, horizon) in coordinator.pending_reference_requirements() {
+        let Some(authority) = unretained
+            .filter(|authority| reference_authority_covers(authority, revision, horizon))
+            .or_else(|| offers.covering(revision, horizon))
+            .cloned()
+        else {
+            continue;
+        };
+        match install_reference_authority(
+            coordinator,
+            request_tokens,
+            pending_eviction,
+            output,
+            owner,
+            authority.clone(),
+        ) {
+            None => return false,
+            Some(true) => {}
+            // The lane refused what its own requirement asked for. Never offer it again, so
+            // this cannot repeat on every worker turn.
+            Some(false) => offers.forget(&authority),
+        }
+    }
+    true
+}
+
 fn send_frame<B>(
     coordinator: &AlignmentSceneSourceCoordinator<B>,
     output: &CoalescingSender<AlignmentSceneEngineEvent>,
@@ -2478,8 +2738,8 @@ mod tests {
     use crate::alignment_scene_coordinator::AlignmentVerticalResidencyPumpOutcome;
     use crate::{
         AlignmentSceneCoordinatorError, AlignmentSourceActor, AlignmentSourceActorError,
-        AlignmentSourceIntentSpec, CanonicalDecodeCheckpoint, LocalBamCanonicalBackend,
-        LocalBamCanonicalBackendError, LocalBamSourceControl, SourceWork,
+        AlignmentSourceIntentSpec, CanonicalDecodeCheckpoint, LocalBamCanonicalBackendError,
+        LocalBamSourceControl, PositionedAlignmentBackend, SourceWork,
     };
 
     #[test]
@@ -2664,6 +2924,137 @@ mod tests {
         );
     }
 
+    /// Runs the worker's turn selection for `turns` iterations over a demand that never
+    /// changes, exactly as the loop does, and returns the turns taken.
+    fn simulate_turns(demand: WorkerDemand, turns: usize) -> Vec<WorkerTurn> {
+        let mut deferrals = 0;
+        (0..turns)
+            .map(|_| {
+                let turn = next_worker_turn(demand, deferrals);
+                deferrals = next_reclaim_deferrals(turn, demand, deferrals);
+                turn
+            })
+            .collect()
+    }
+
+    #[test]
+    fn visible_work_and_a_reclaim_share_the_worker_and_neither_waits_without_bound() {
+        let visible_classes = [
+            (
+                WorkerDemand {
+                    foreground_presentation: true,
+                    ..WorkerDemand::default()
+                },
+                WorkerTurn::ForegroundPresentation,
+            ),
+            (
+                WorkerDemand {
+                    scene_build: true,
+                    ..WorkerDemand::default()
+                },
+                WorkerTurn::SceneBuild,
+            ),
+            (
+                WorkerDemand {
+                    foreground_source: true,
+                    ..WorkerDemand::default()
+                },
+                WorkerTurn::ForegroundSource,
+            ),
+        ];
+        for (visible, visible_turn) in visible_classes {
+            // Visible work that never ends, with a reclaim and optional work also runnable.
+            let demand = WorkerDemand {
+                reclaim: true,
+                speculative_source: true,
+                optional_presentation: true,
+                ..visible
+            };
+            let turns = simulate_turns(demand, 1_000);
+            let period = MAXIMUM_RECLAIM_DEFERRALS as usize + 1;
+            for (index, turn) in turns.iter().enumerate() {
+                // Four visible turns, then one reclaim quantum, for ever.
+                let expected = if index % period == period - 1 {
+                    WorkerTurn::Reclaim
+                } else {
+                    visible_turn
+                };
+                assert_eq!(*turn, expected, "turn {index} of {visible_turn:?}");
+            }
+            // Neither direction starves: the longest run of either is bounded.
+            let longest_run = |of: WorkerTurn| {
+                turns
+                    .split(|turn| *turn != of)
+                    .map(<[WorkerTurn]>::len)
+                    .max()
+                    .unwrap_or(0)
+            };
+            assert_eq!(
+                longest_run(visible_turn),
+                MAXIMUM_RECLAIM_DEFERRALS as usize
+            );
+            assert_eq!(longest_run(WorkerTurn::Reclaim), 1);
+        }
+    }
+
+    #[test]
+    fn a_reclaim_runs_uninterrupted_once_visible_work_is_idle_and_optional_work_follows_it() {
+        let reclaim_and_optional = WorkerDemand {
+            reclaim: true,
+            speculative_source: true,
+            optional_presentation: true,
+            ..WorkerDemand::default()
+        };
+        // Optional work never takes a turn from a pending reclaim.
+        assert!(
+            simulate_turns(reclaim_and_optional, 64)
+                .iter()
+                .all(|turn| *turn == WorkerTurn::Reclaim)
+        );
+        // Visible turns taken ahead of a reclaim are forgotten when the reclaim gets its
+        // quantum, and when it ends.
+        let visible = WorkerDemand {
+            foreground_source: true,
+            reclaim: true,
+            ..WorkerDemand::default()
+        };
+        let deferred = next_reclaim_deferrals(WorkerTurn::ForegroundSource, visible, 2);
+        assert_eq!(deferred, 3);
+        assert_eq!(
+            next_reclaim_deferrals(WorkerTurn::Reclaim, visible, deferred),
+            0
+        );
+        let without_reclaim = WorkerDemand {
+            reclaim: false,
+            ..visible
+        };
+        assert_eq!(
+            next_reclaim_deferrals(WorkerTurn::ForegroundSource, without_reclaim, deferred),
+            0
+        );
+        // The reclaim is finite. With it gone the optional classes run in their own order, and
+        // each of them runs when the one above it has nothing to do.
+        let optional = WorkerDemand {
+            reclaim: false,
+            ..reclaim_and_optional
+        };
+        assert!(
+            simulate_turns(optional, 64)
+                .iter()
+                .all(|turn| *turn == WorkerTurn::SpeculativeSource)
+        );
+        assert_eq!(
+            simulate_turns(
+                WorkerDemand {
+                    speculative_source: false,
+                    ..optional
+                },
+                1
+            ),
+            [WorkerTurn::OptionalPresentation]
+        );
+    }
+
     fn idle_coordinator() -> AlignmentSceneSourceCoordinator<LedgerPressureBackend> {
         let source_revision = AlignmentSourceRevision::new(
             SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
@@ -2699,6 +3090,7 @@ mod tests {
                 &mut coordinator,
                 &mut request_tokens,
                 &mut pending,
+                &mut ReferenceOffers::default(),
                 &output,
                 AlignmentSceneEngineRequest::EvictInactive {
                     request_id,
@@ -3178,7 +3570,7 @@ mod tests {
         type Error = LocalBamCanonicalBackendError;
 
         fn allocation_pressure(error: &Self::Error) -> Option<LedgerError> {
-            LocalBamCanonicalBackend::allocation_pressure(error)
+            PositionedAlignmentBackend::allocation_pressure(error)
         }
 
         fn apply_control(&mut self, _control: Self::Control) -> Result<(), Self::Error> {
@@ -3408,7 +3800,7 @@ mod tests {
     }
 
     struct ThreadRecordingBackend {
-        inner: LocalBamCanonicalBackend,
+        inner: PositionedAlignmentBackend,
         threads: Arc<Mutex<Vec<ThreadId>>>,
         completion_gate: Option<Arc<AtomicBool>>,
         pending_completion: Option<CanonicalDecodeCheckpoint>,
@@ -3428,11 +3820,11 @@ mod tests {
         type Error = LocalBamCanonicalBackendError;
 
         fn allocation_pressure(error: &Self::Error) -> Option<LedgerError> {
-            LocalBamCanonicalBackend::allocation_pressure(error)
+            PositionedAlignmentBackend::allocation_pressure(error)
         }
 
         fn control_invalidates_read_refusals(control: &Self::Control) -> bool {
-            LocalBamCanonicalBackend::control_invalidates_read_refusals(control)
+            PositionedAlignmentBackend::control_invalidates_read_refusals(control)
         }
 
         fn apply_control(&mut self, control: Self::Control) -> Result<(), Self::Error> {
@@ -3515,11 +3907,35 @@ mod tests {
         completion_gate: Option<Arc<AtomicBool>>,
         ledger: AllocationLedger,
     ) -> TestEngineFixture {
+        let (coordinator, contract, policy, camera, threads) =
+            test_source_coordinator(completion_gate, ledger);
+        (
+            AlignmentSceneEngine::spawn(coordinator, 8),
+            contract,
+            policy,
+            camera,
+            threads,
+        )
+    }
+
+    type TestCoordinatorFixture = (
+        AlignmentSceneSourceCoordinator<ThreadRecordingBackend>,
+        AlignmentSceneBuildContract,
+        AlignmentScenePreparationPolicy,
+        AlignmentCamera,
+        Arc<Mutex<Vec<ThreadId>>>,
+    );
+
+    /// The fixture source coordinator before a worker owns it, for driving requests directly.
+    fn test_source_coordinator(
+        completion_gate: Option<Arc<AtomicBool>>,
+        ledger: AllocationLedger,
+    ) -> TestCoordinatorFixture {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
         let source = LocalAlignmentSource::open(path, &AlignmentOpenOptions::default()).unwrap();
         let contig = ContigId::new(0);
         let contig_length = source.reference_dictionary().get(contig).unwrap().length();
-        let backend = LocalBamCanonicalBackend::new(
+        let backend = PositionedAlignmentBackend::new(
             source,
             QueryOptions {
                 max_records: NonZeroUsize::new(1_000).unwrap(),
@@ -3607,7 +4023,7 @@ mod tests {
         )
         .unwrap();
         (
-            AlignmentSceneEngine::spawn(AlignmentSceneSourceCoordinator::new(actor), 8),
+            AlignmentSceneSourceCoordinator::new(actor),
             contract,
             policy,
             camera,
@@ -3617,6 +4033,437 @@ mod tests {
 
     fn test_engine() -> TestEngineFixture {
         test_engine_with_completion_gate(None)
+    }
+
+    // --- Reference slices delivered engine to engine ----------------------------------------
+
+    /// Makes the fixture contract draw bases against `revision`, so its lane needs a slice.
+    fn require_reference(contract: &mut AlignmentSceneBuildContract, revision: ReferenceRevision) {
+        contract.payload = PayloadContract::new(
+            CapabilityRequirement::Required,
+            CapabilityRequirement::Required,
+            [*b"XS"],
+            None,
+        );
+        contract.presentation.geometry_lod = GeometryLod::Base;
+        contract.presentation.reference = Some(revision);
+    }
+
+    fn reference_slice(interval: GenomicInterval) -> Arc<ReferenceSlice> {
+        Arc::new(ReferenceSlice {
+            interval,
+            bases: vec![b'A'; usize::try_from(interval.len()).unwrap()],
+        })
+    }
+
+    fn drain_events(
+        events: &CoalescingReceiver<AlignmentSceneEngineEvent>,
+    ) -> Vec<AlignmentSceneEngineEvent> {
+        let mut drained = Vec::new();
+        while let Some(event) = events.try_receive().unwrap() {
+            drained.push(event);
+        }
+        drained
+    }
+
+    /// The reference requirement of every `FrameUpdated` for `owner` with `cause`.
+    fn reference_frames(
+        events: &[AlignmentSceneEngineEvent],
+        owner: SourceOwnerId,
+        cause: AlignmentSceneFrameCause,
+    ) -> Vec<crate::AlignmentReferenceRequirement> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AlignmentSceneEngineEvent::FrameUpdated {
+                    owner: seen,
+                    cause: seen_cause,
+                    frame,
+                    ..
+                } if *seen == owner && *seen_cause == cause => Some(frame.reference_requirement),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The worker's request handling without its thread: requests are applied one at a time
+    /// and every event they emit can be read back at once.
+    struct DirectWorker {
+        coordinator: AlignmentSceneSourceCoordinator<ThreadRecordingBackend>,
+        request_tokens: BTreeMap<SourceOwnerId, AlignmentSceneRequestToken>,
+        pending: Option<PendingInactiveEviction>,
+        offers: ReferenceOffers,
+        output: CoalescingSender<AlignmentSceneEngineEvent>,
+        events: CoalescingReceiver<AlignmentSceneEngineEvent>,
+    }
+
+    impl DirectWorker {
+        fn new(coordinator: AlignmentSceneSourceCoordinator<ThreadRecordingBackend>) -> Self {
+            let (output, events) = bounded_coalescing(64);
+            Self {
+                coordinator,
+                request_tokens: BTreeMap::new(),
+                pending: None,
+                offers: ReferenceOffers::default(),
+                output,
+                events,
+            }
+        }
+
+        /// Applies one request and returns the events it emitted.
+        fn apply(
+            &mut self,
+            request: AlignmentSceneEngineRequest<LocalBamSourceControl>,
+        ) -> Vec<AlignmentSceneEngineEvent> {
+            assert!(apply_request(
+                &mut self.coordinator,
+                &mut self.request_tokens,
+                &mut self.pending,
+                &mut self.offers,
+                &self.output,
+                request,
+            ));
+            drain_events(&self.events)
+        }
+
+        /// What the worker loop does with its retained offers after draining its mailbox.
+        fn offer_turn(&mut self) -> Vec<AlignmentSceneEngineEvent> {
+            assert!(install_offered_references(
+                &mut self.coordinator,
+                &self.request_tokens,
+                &mut self.pending,
+                &mut self.offers,
+                None,
+                &self.output,
+            ));
+            drain_events(&self.events)
+        }
+
+        /// Opens a lane with a camera and returns the reference requirement of its frame.
+        fn open_lane(
+            &mut self,
+            owner: SourceOwnerId,
+            contract: &AlignmentSceneBuildContract,
+            policy: AlignmentScenePreparationPolicy,
+            camera: AlignmentCamera,
+        ) -> crate::AlignmentReferenceRequirement {
+            self.apply(AlignmentSceneEngineRequest::InsertLane {
+                owner,
+                request_token: AlignmentSceneRequestToken::default(),
+                contract: contract.clone(),
+                policy,
+            });
+            let events = self.apply(AlignmentSceneEngineRequest::UpdateCamera {
+                owner,
+                request_token: AlignmentSceneRequestToken::default(),
+                camera: camera.into(),
+            });
+            let frames = reference_frames(&events, owner, AlignmentSceneFrameCause::Camera);
+            assert_eq!(frames.len(), 1, "one camera frame per update: {frames:?}");
+            frames[0]
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn an_offered_slice_is_installed_once_kept_for_later_lanes_and_not_rebuilt_by_a_forwarded_copy()
+    {
+        let revision = ReferenceRevision::new(RevisionFingerprint::new(0x5245_4645, 1));
+        let (coordinator, mut contract, policy, camera, _) = test_source_coordinator(
+            None,
+            AllocationLedger::new_with_transient_budget(64 << 20, 32 << 20, 64 << 20),
+        );
+        require_reference(&mut contract, revision);
+        let mut worker = DirectWorker::new(coordinator);
+
+        // A lane that needs the reference and has not been given it.
+        let first = SourceOwnerId::new(61);
+        let crate::AlignmentReferenceRequirement::Pending { horizon, .. } =
+            worker.open_lane(first, &contract, policy, camera)
+        else {
+            panic!("the fixture lane must need a reference slice");
+        };
+        assert_eq!(
+            worker.coordinator.pending_reference_requirements(),
+            [(first, revision, horizon)]
+        );
+
+        // The reference engine's offer names no lane; the worker finds the one it satisfies.
+        let whole_contig =
+            GenomicInterval::new(contract.contig, 0, contract.contig_length).unwrap();
+        let authority = AlignmentReferenceAuthority::new(revision, reference_slice(whole_contig));
+        let events = worker.apply(AlignmentSceneEngineRequest::OfferReferenceAuthority {
+            authority: authority.clone(),
+        });
+        assert_eq!(
+            reference_frames(&events, first, AlignmentSceneFrameCause::ReferenceAuthority),
+            [crate::AlignmentReferenceRequirement::Ready { revision, horizon }]
+        );
+        assert!(
+            worker
+                .coordinator
+                .pending_reference_requirements()
+                .is_empty()
+        );
+        assert!(
+            worker
+                .coordinator
+                .reference_authority_is_current(first, &authority)
+        );
+
+        // The desktop relay forwarding the very same slice afterwards changes nothing...
+        let events = worker.apply(AlignmentSceneEngineRequest::InstallReferenceAuthority {
+            owner: first,
+            authority: authority.clone(),
+        });
+        assert!(events.is_empty(), "{events:?}");
+        // ...and neither does another worker turn with the offer still retained.
+        assert!(worker.offer_turn().is_empty());
+        // A different slice forwarded for the lane is installed as it always was.
+        let forwarded = AlignmentReferenceAuthority::new(revision, reference_slice(horizon));
+        assert!(
+            !worker
+                .coordinator
+                .reference_authority_is_current(first, &forwarded)
+        );
+        let events = worker.apply(AlignmentSceneEngineRequest::InstallReferenceAuthority {
+            owner: first,
+            authority: forwarded,
+        });
+        assert_eq!(
+            reference_frames(&events, first, AlignmentSceneFrameCause::ReferenceAuthority),
+            [crate::AlignmentReferenceRequirement::Ready { revision, horizon }]
+        );
+
+        // A lane opened after the slice arrived takes it from the retained offers on the
+        // worker's next turn, with nothing sent again by anyone.
+        let second = SourceOwnerId::new(62);
+        assert_eq!(
+            worker.open_lane(second, &contract, policy, camera),
+            crate::AlignmentReferenceRequirement::Pending { revision, horizon }
+        );
+        let events = worker.offer_turn();
+        assert_eq!(
+            reference_frames(
+                &events,
+                second,
+                AlignmentSceneFrameCause::ReferenceAuthority
+            ),
+            [crate::AlignmentReferenceRequirement::Ready { revision, horizon }]
+        );
+        assert!(
+            worker
+                .coordinator
+                .reference_authority_is_current(second, &authority)
+        );
+        assert!(worker.offer_turn().is_empty());
+
+        // A slice of another revision, or one too short, is installed nowhere. (A fresh
+        // worker: an offer of another revision would discard the retained slice above.)
+        let (coordinator, mut contract, policy, camera, _) = test_source_coordinator(
+            None,
+            AllocationLedger::new_with_transient_budget(64 << 20, 32 << 20, 64 << 20),
+        );
+        require_reference(&mut contract, revision);
+        let mut worker = DirectWorker::new(coordinator);
+        let third = SourceOwnerId::new(63);
+        worker.open_lane(third, &contract, policy, camera);
+        let other_revision = ReferenceRevision::new(RevisionFingerprint::new(0x5245_4645, 2));
+        let short =
+            GenomicInterval::new(contract.contig, horizon.start() + 1, horizon.end()).unwrap();
+        for authority in [
+            AlignmentReferenceAuthority::new(revision, reference_slice(short)),
+            AlignmentReferenceAuthority::new(other_revision, reference_slice(whole_contig)),
+        ] {
+            let events =
+                worker.apply(AlignmentSceneEngineRequest::OfferReferenceAuthority { authority });
+            assert!(events.is_empty(), "{events:?}");
+            assert!(worker.offer_turn().is_empty());
+        }
+        assert_eq!(
+            worker.coordinator.pending_reference_requirements(),
+            [(third, revision, horizon)]
+        );
+    }
+
+    #[test]
+    fn retained_reference_offers_are_bounded_in_number_and_in_bases() {
+        let contig = ContigId::new(0);
+        let revision = ReferenceRevision::new(RevisionFingerprint::new(0x5245_4645, 1));
+        let offer = |revision, start: u64, bases: u64| {
+            AlignmentReferenceAuthority::new(
+                revision,
+                reference_slice(GenomicInterval::new(contig, start, start + bases).unwrap()),
+            )
+        };
+        let mut offers = ReferenceOffers::default();
+        for index in 0..10_u64 {
+            assert!(offers.retain(offer(revision, index * 1_000, 100)));
+            assert!(offers.offers.len() <= MAXIMUM_RETAINED_REFERENCE_OFFERS);
+        }
+        assert_eq!(offers.offers.len(), MAXIMUM_RETAINED_REFERENCE_OFFERS);
+        // The newest are kept, and the newest covering slice is the one handed out.
+        let needed = GenomicInterval::new(contig, 9_010, 9_020).unwrap();
+        assert_eq!(
+            offers
+                .covering(revision, needed)
+                .unwrap()
+                .slice()
+                .interval
+                .start(),
+            9_000
+        );
+        assert!(
+            offers
+                .covering(revision, GenomicInterval::new(contig, 10, 20).unwrap())
+                .is_none()
+        );
+
+        // A slice containing retained ones replaces them instead of sitting beside them.
+        assert!(offers.retain(offer(revision, 0, 20_000)));
+        assert_eq!(offers.offers.len(), 1);
+
+        // Too wide to keep: refused, and nothing it would have superseded is kept either.
+        assert!(!offers.retain(offer(
+            revision,
+            0,
+            MAXIMUM_RETAINED_REFERENCE_OFFER_BASES + 1
+        )));
+        assert!(offers.is_empty());
+
+        // The byte bound holds for slices that each fit.
+        let half = MAXIMUM_RETAINED_REFERENCE_OFFER_BASES / 2 + 1;
+        assert!(offers.retain(offer(revision, 0, half)));
+        assert!(offers.retain(offer(revision, half, half)));
+        assert_eq!(offers.offers.len(), 1);
+        assert!(offers.bases() <= MAXIMUM_RETAINED_REFERENCE_OFFER_BASES);
+
+        // A reopened reference makes every older slice useless.
+        let reopened = ReferenceRevision::new(RevisionFingerprint::new(0x5245_4645, 2));
+        assert!(offers.retain(offer(reopened, 0, 100)));
+        assert_eq!(offers.offers.len(), 1);
+        assert!(offers.covering(revision, needed).is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_reference_slice_reaches_the_alignment_worker_straight_from_the_reference_engine() {
+        let fasta = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.fa");
+        let reference = crate::ReferenceEngine::spawn(4);
+        reference.try_open(fasta).unwrap();
+        let receive_reference = |what: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(event) = reference.try_receive().unwrap() {
+                    return event;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                thread::yield_now();
+            }
+        };
+        let crate::ReferenceEngineEvent::Opened {
+            revision,
+            dictionary,
+            ..
+        } = receive_reference("the reference to open")
+        else {
+            panic!("the fixture reference did not open");
+        };
+
+        // The source is held before completion, so the only frames this lane emits are the
+        // camera's and the reference's: neither can be superseded before it is read.
+        let completion_gate = Arc::new(AtomicBool::new(false));
+        let (engine, mut contract, policy, camera, _) =
+            test_engine_with_completion_gate(Some(completion_gate));
+        require_reference(&mut contract, revision);
+        let contig_name = dictionary.get(contract.contig).unwrap().name().to_owned();
+        // The one connection the desktop makes; nothing below forwards a slice.
+        reference.connect_slice_sink(engine.reference_slice_sink());
+        assert_eq!(reference.slice_sink_count(), 1);
+
+        let owner = SourceOwnerId::new(64);
+        engine.try_insert_lane(owner, contract, policy).unwrap();
+        engine.try_update_camera(owner, camera).unwrap();
+        let AlignmentSceneEngineEvent::FrameUpdated { frame, .. } =
+            receive_matching(&engine, |event| {
+                matches!(
+                    event,
+                    AlignmentSceneEngineEvent::FrameUpdated { owner: seen, frame, .. }
+                        if *seen == owner
+                            && matches!(
+                                frame.reference_requirement,
+                                crate::AlignmentReferenceRequirement::Pending { .. }
+                            )
+                )
+            })
+        else {
+            unreachable!("the predicate admits only frame updates");
+        };
+        let crate::AlignmentReferenceRequirement::Pending { horizon, .. } =
+            frame.reference_requirement
+        else {
+            unreachable!("the predicate admits only a pending requirement");
+        };
+
+        // The UI's only part is asking the reference engine for what the frame says is needed.
+        let request = rgv_core::PanelGeneration::new(
+            rgv_core::PanelId::new(3),
+            rgv_core::ViewportGeneration::new(0),
+        );
+        reference
+            .try_query(
+                crate::ReferenceQueryIdentity::new(request, revision, horizon),
+                rgv_core::GenerationClock::default(),
+                contig_name,
+            )
+            .unwrap();
+        let AlignmentSceneEngineEvent::FrameUpdated { frame, .. } =
+            receive_matching(&engine, |event| {
+                matches!(
+                    event,
+                    AlignmentSceneEngineEvent::FrameUpdated {
+                        owner: seen,
+                        cause: AlignmentSceneFrameCause::ReferenceAuthority,
+                        ..
+                    } if *seen == owner
+                )
+            })
+        else {
+            unreachable!("the predicate admits only frame updates");
+        };
+        assert_eq!(
+            frame.reference_requirement,
+            crate::AlignmentReferenceRequirement::Ready { revision, horizon }
+        );
+
+        // The UI is still told, as before, with the slice the worker was handed.
+        let crate::ReferenceEngineEvent::QueryCompleted { query, slice, .. } =
+            receive_reference("the query completion")
+        else {
+            panic!("the reference query did not complete");
+        };
+        assert_eq!((query.interval(), slice.interval), (horizon, horizon));
+        assert!(
+            slice
+                .bases
+                .iter()
+                .all(|base| b"ACGTN".contains(&base.to_ascii_uppercase()))
+        );
+
+        // A retired alignment engine is dropped by the reference engine at its next delivery.
+        drop(engine.retire());
+        reference
+            .try_query(
+                crate::ReferenceQueryIdentity::new(request, revision, horizon),
+                rgv_core::GenerationClock::default(),
+                dictionary.get(ContigId::new(0)).unwrap().name().to_owned(),
+            )
+            .unwrap();
+        assert!(matches!(
+            receive_reference("the second completion"),
+            crate::ReferenceEngineEvent::QueryCompleted { .. }
+        ));
+        assert_eq!(reference.slice_sink_count(), 0);
     }
 
     #[test]

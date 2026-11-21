@@ -720,6 +720,7 @@ impl Viewer {
         let autosave_retention = self.settings.autosave_retention;
         let interface_scale_percent = self.settings.interface_scale_percent;
         let high_contrast = self.settings.high_contrast;
+        let interface_theme = self.settings.theme;
         let reduced_motion = self.settings.reduced_motion;
         let recent_loci = self.settings.recent_loci.clone();
         let current_session_path = self.current_session_path.clone();
@@ -776,6 +777,7 @@ impl Viewer {
             autosave_retention,
             interface_scale_percent,
             high_contrast,
+            interface_theme,
             reduced_motion,
             recent_loci,
             current_session_path,

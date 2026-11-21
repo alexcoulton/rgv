@@ -33,9 +33,9 @@ use rgv_hts::{
 };
 
 use super::*;
-use crate::{LocalBamCanonicalBackend, LocalBamSourceControl};
+use crate::{LocalBamSourceControl, PositionedAlignmentBackend};
 
-type TestCoordinator = AlignmentSceneCoordinator<LocalBamCanonicalBackend>;
+type TestCoordinator = AlignmentSceneCoordinator<PositionedAlignmentBackend>;
 
 fn no_payload() -> PayloadContract {
     PayloadContract::new(
@@ -51,7 +51,7 @@ fn test_coordinator_with_ledger(ledger: AllocationLedger) -> (TestCoordinator, A
     let source = LocalAlignmentSource::open(path, &AlignmentOpenOptions::default()).unwrap();
     let contig = ContigId::new(0);
     let contig_length = source.reference_dictionary().get(contig).unwrap().length();
-    let backend = LocalBamCanonicalBackend::new(
+    let backend = PositionedAlignmentBackend::new(
         source,
         QueryOptions {
             max_records: NonZeroUsize::new(1_000).unwrap(),
@@ -59,6 +59,25 @@ fn test_coordinator_with_ledger(ledger: AllocationLedger) -> (TestCoordinator, A
         },
     )
     .unwrap();
+    test_coordinator_over(
+        backend,
+        GenomicInterval::new(contig, 9_999, 10_001).unwrap(),
+        contig_length,
+        NonZeroU64::new(1).unwrap(),
+        ledger,
+    )
+}
+
+/// A single-lane coordinator over `backend` with a camera on `interval`. `tile_bases` sizes
+/// both geometry and summary tiles; the Complete read limit is 1,000.
+fn test_coordinator_over(
+    backend: PositionedAlignmentBackend,
+    interval: GenomicInterval,
+    contig_length: u64,
+    tile_bases: NonZeroU64,
+    ledger: AllocationLedger,
+) -> (TestCoordinator, AlignmentCamera) {
+    let contig = interval.contig();
     let source_revision = backend.source_revision();
     let record_contract = backend.record_contract();
     let store = EvidenceStore::new(source_revision, record_contract, ledger);
@@ -106,8 +125,8 @@ fn test_coordinator_with_ledger(ledger: AllocationLedger) -> (TestCoordinator, A
             reference: None,
             annotation: None,
         },
-        geometry_tile_bases: NonZeroU64::new(1).unwrap(),
-        summary_tile_bases: NonZeroU64::new(1).unwrap(),
+        geometry_tile_bases: tile_bases,
+        summary_tile_bases: tile_bases,
         row_block_rows: NonZeroU32::new(8).unwrap(),
         normalization_mapped_records: None,
         reference: None,
@@ -116,7 +135,6 @@ fn test_coordinator_with_ledger(ledger: AllocationLedger) -> (TestCoordinator, A
     let policy = AlignmentScenePreparationPolicy::new(1.0, 1.0, 0.25, 4, 1).unwrap();
     let coordinator =
         AlignmentSceneCoordinator::new(actor, contract, policy, SourceOwnerId::new(7)).unwrap();
-    let interval = GenomicInterval::new(contig, 9_999, 10_001).unwrap();
     let camera = AlignmentCamera::new(
         interval,
         0.0,
@@ -133,6 +151,55 @@ fn test_coordinator_with_ledger(ledger: AllocationLedger) -> (TestCoordinator, A
     (coordinator, camera)
 }
 
+/// A coordinator over the multi-megabyte benchmark BAM with a 20 kb camera at `camera_start`
+/// on its second contig, and a log of every block its decoder reads.
+fn wide_coordinator_with_ledger(
+    camera_start: u64,
+    ledger: AllocationLedger,
+) -> (
+    TestCoordinator,
+    AlignmentCamera,
+    crate::local_bam_source::test_support::DecodeLog,
+) {
+    const CAMERA_BASES: u64 = 20_000;
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/mixed.bam");
+    let source =
+        rgv_hts::ProductionAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+    let contig = ContigId::new(1);
+    let contig_length = source.reference_dictionary().get(contig).unwrap().length();
+    let log = crate::local_bam_source::test_support::DecodeLog::default();
+    let backend = PositionedAlignmentBackend::with_decode_source(
+        source,
+        QueryOptions {
+            max_records: NonZeroUsize::new(1_000).unwrap(),
+            ..QueryOptions::default()
+        },
+        |source| log.wrap(source),
+    )
+    .unwrap();
+    let (coordinator, camera) = test_coordinator_over(
+        backend,
+        GenomicInterval::new(contig, camera_start, camera_start + CAMERA_BASES).unwrap(),
+        contig_length,
+        NonZeroU64::new(4_096).unwrap(),
+        ledger,
+    );
+    (coordinator, camera, log)
+}
+
+fn wide_coordinator(
+    camera_start: u64,
+) -> (
+    TestCoordinator,
+    AlignmentCamera,
+    crate::local_bam_source::test_support::DecodeLog,
+) {
+    wide_coordinator_with_ledger(
+        camera_start,
+        AllocationLedger::new_with_transient_budget(512 << 20, 64 << 20, 256 << 20),
+    )
+}
+
 fn test_coordinator() -> (TestCoordinator, AlignmentCamera) {
     test_coordinator_with_ledger(AllocationLedger::new_with_transient_budget(
         64 << 20,
@@ -142,7 +209,7 @@ fn test_coordinator() -> (TestCoordinator, AlignmentCamera) {
 }
 
 fn test_source_coordinator() -> (
-    AlignmentSceneSourceCoordinator<LocalBamCanonicalBackend>,
+    AlignmentSceneSourceCoordinator<PositionedAlignmentBackend>,
     AlignmentSceneBuildContract,
     AlignmentScenePreparationPolicy,
     AlignmentCamera,
@@ -157,7 +224,7 @@ fn test_source_coordinator() -> (
 fn test_source_coordinator_with_ledger(
     ledger: AllocationLedger,
 ) -> (
-    AlignmentSceneSourceCoordinator<LocalBamCanonicalBackend>,
+    AlignmentSceneSourceCoordinator<PositionedAlignmentBackend>,
     AlignmentSceneBuildContract,
     AlignmentScenePreparationPolicy,
     AlignmentCamera,
@@ -305,7 +372,7 @@ fn scrolled_camera(camera: AlignmentCamera, row_offset: f64) -> AlignmentCamera 
 /// One published lane whose row blocks are a single row tall, so a vertical scroll always
 /// needs a new foreground row block and nothing else.
 fn published_single_row_block_lane() -> (
-    AlignmentSceneSourceCoordinator<LocalBamCanonicalBackend>,
+    AlignmentSceneSourceCoordinator<PositionedAlignmentBackend>,
     SourceOwnerId,
     AlignmentCamera,
 ) {

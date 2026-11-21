@@ -250,7 +250,11 @@ pub enum AlignmentComponent {
     DirectionTerminal,
     PairConnector {
         template: u64,
-        mate: Option<AlignmentHandle>,
+        /// Source position of the mate record. A connector joins two records of one source, so
+        /// the mate's source revision is the primitive's own and is not repeated here; storing
+        /// a whole [`AlignmentHandle`] made this the widest variant and every primitive 32
+        /// bytes larger. Use [`AlignmentComponent::pair_connector_mate`] for the handle.
+        mate: Option<rgv_hts::AlignmentSourcePosition>,
     },
     Label {
         kind: AlignmentLabelKind,
@@ -297,6 +301,22 @@ pub enum AlignmentComponent {
         quality: Option<u8>,
         classification: AlignedBaseClassification,
     },
+}
+
+impl AlignmentComponent {
+    /// The mate record of a pair connector drawn for `own`, the handle of the primitive (or
+    /// hit) that carries this component. `None` for any other component and for a connector
+    /// whose mate is unknown.
+    #[must_use]
+    pub const fn pair_connector_mate(self, own: AlignmentHandle) -> Option<AlignmentHandle> {
+        match self {
+            Self::PairConnector {
+                mate: Some(position),
+                ..
+            } => Some(AlignmentHandle::new(own.source_revision(), position)),
+            _ => None,
+        }
+    }
 }
 
 /// Camera-independent shape carried by semantic geometry.
@@ -439,6 +459,12 @@ impl AlignmentSemanticPrimitive {
     #[must_use]
     pub const fn contains_offset(self, offset: u64) -> bool {
         self.start_offset <= offset && offset < self.end_offset
+    }
+
+    /// The mate record when this primitive is a pair connector with a known mate.
+    #[must_use]
+    pub const fn pair_connector_mate(self) -> Option<AlignmentHandle> {
+        self.component.pair_connector_mate(self.handle)
     }
 }
 
@@ -899,7 +925,14 @@ impl AlignmentSemanticPage {
                 tile_start,
                 AlignmentComponent::PairConnector {
                     template: connector.template(),
-                    mate: connector.right(),
+                    mate: connector.right().map(|mate| {
+                        // One atlas lays out one source: both ends share its revision.
+                        debug_assert_eq!(
+                            mate.source_revision(),
+                            connector.left().source_revision()
+                        );
+                        mate.source_position()
+                    }),
                 },
                 AlignmentStyleToken {
                     flags: 0,
@@ -4900,9 +4933,13 @@ mod tests {
             .iter()
             .flat_map(|page| {
                 page.primitives().iter().filter_map(move |primitive| {
-                    let AlignmentComponent::PairConnector { mate, .. } = primitive.component else {
+                    if !matches!(
+                        primitive.component,
+                        AlignmentComponent::PairConnector { .. }
+                    ) {
                         return None;
-                    };
+                    }
+                    let mate = primitive.pair_connector_mate();
                     (primitive.handle == pair_first && mate == Some(pair_last)).then_some((
                         page.interval().start() + primitive.start_offset,
                         page.interval().start() + primitive.end_offset,
@@ -4953,11 +4990,12 @@ mod tests {
         assert_eq!(hit.handle, pair_first);
         assert!(matches!(
             hit.component,
-            AlignmentComponent::PairConnector {
-                mate: Some(handle),
-                ..
-            } if handle == pair_last
+            AlignmentComponent::PairConnector { mate: Some(_), .. }
         ));
+        assert_eq!(
+            hit.component.pair_connector_mate(hit.handle),
+            Some(pair_last)
+        );
         assert_eq!(scene.mate_handles(pair_first), vec![pair_last]);
         assert_eq!(scene.mate_handles(pair_last), vec![pair_first]);
 
@@ -5295,5 +5333,21 @@ mod tests {
         assert!(ledger.snapshot().unwrap().transient > 0);
         drop(cloned);
         assert_eq!(ledger.snapshot().unwrap().transient, 0);
+    }
+
+    /// SCENE-9. Pins the in-memory size of one semantic primitive and of its parts, so a field
+    /// that widens every primitive is a deliberate decision. The primitive was 184 bytes while
+    /// `PairConnector` carried a whole mate handle (which made the component 64 bytes); the
+    /// connector now stores only the mate's source position. What remains is dominated by the
+    /// 56-byte `AlignmentHandle`; see the design note on that type.
+    #[test]
+    fn semantic_primitive_size_is_pinned() {
+        assert_eq!(size_of::<AlignmentHandle>(), 56);
+        assert_eq!(size_of::<rgv_hts::AlignmentSourcePosition>(), 24);
+        assert_eq!(size_of::<AlignmentStyleToken>(), 32);
+        assert_eq!(size_of::<AlignmentComponent>(), 32);
+        assert_eq!(size_of::<AlignmentSemanticPrimitive>(), 152);
+        // The page ledger charge is derived from the same `size_of`, so it shrank with it.
+        assert_eq!(size_of::<SemanticPageHit>(), 96);
     }
 }

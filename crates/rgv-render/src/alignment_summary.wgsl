@@ -32,11 +32,12 @@ struct SummaryUniform {
 @group(0) @binding(0)
 var<uniform> frame: SummaryUniform;
 
+// Twelve bytes (`AlignmentSummaryGpuDepthInstance`): `span` is the whole-base start offset from
+// the page start and the length.
 struct DepthInput {
     @builtin(vertex_index) vertex_index: u32,
-    @location(0) start_offset: vec2<f32>,
-    @location(1) end_offset: vec2<f32>,
-    @location(2) depth: u32,
+    @location(0) span: vec2<u32>,
+    @location(1) depth: u32,
 };
 
 struct AlleleInput {
@@ -72,7 +73,8 @@ struct OverlayInput {
     @builtin(vertex_index) vertex_index: u32,
     @location(0) origin: vec2<f32>,
     @location(1) size: vec2<f32>,
-    @location(2) color: vec4<f32>,
+    @location(2) palette_index: u32,
+    @location(3) color_parameter: u32,
 };
 
 struct VertexOutput {
@@ -142,8 +144,11 @@ fn junction_output(
 
 @vertex
 fn depth_vertex(input: DepthInput) -> VertexOutput {
-    let left = max(project_x(input.start_offset), frame.covered_clip_x.x);
-    let semantic_right = min(project_x(input.end_offset), frame.covered_clip_x.y);
+    let left = max(project_x(page_offset_words(input.span.x)), frame.covered_clip_x.x);
+    let semantic_right = min(
+        project_x(page_offset_words(input.span.x + input.span.y)),
+        frame.covered_clip_x.y,
+    );
     let visible = select(0u, 1u, semantic_right > left);
     let right = max(semantic_right, left + 1.0);
     let height = max(transformed_depth_fraction(input.depth) * frame.clip_size.y, 1.0);
@@ -154,25 +159,14 @@ fn depth_vertex(input: DepthInput) -> VertexOutput {
         vec2<f32>(right - left, height),
         // Opaque: bars narrower than one point are widened to one point and then overlap their
         // neighbours, and a translucent colour would blend twice in the overlap.
-        vec4<f32>(0.48, 0.48, 0.48, 1.0),
+        palette_slot(TOKEN_SUMMARY_DEPTH),
         visible,
     );
 }
 
+// Allele tokens 0..3 are A, C, G, T; anything else is the unknown-base colour.
 fn allele_color(allele: u32) -> vec4<f32> {
-    if allele == 0u {
-        return vec4<f32>(0.24, 0.78, 0.38, 1.0);
-    }
-    if allele == 1u {
-        return vec4<f32>(0.22, 0.52, 0.96, 1.0);
-    }
-    if allele == 2u {
-        return vec4<f32>(0.96, 0.65, 0.18, 1.0);
-    }
-    if allele == 3u {
-        return vec4<f32>(0.94, 0.28, 0.28, 1.0);
-    }
-    return vec4<f32>(0.60, 0.64, 0.70, 1.0);
+    return palette_slot(TOKEN_BASE_A + min(allele, TOKEN_BASE_N - TOKEN_BASE_A));
 }
 
 @vertex
@@ -210,8 +204,8 @@ fn allele_vertex(input: AlleleInput) -> VertexOutput {
     var color = allele_color(input.allele);
     if bisulfite {
         color = select(
-            vec4<f32>(0.86, 0.46, 0.12, 1.0),
-            vec4<f32>(0.18, 0.62, 0.78, 1.0),
+            palette_slot(TOKEN_BISULFITE_PROTECTED),
+            palette_slot(TOKEN_BISULFITE_CONVERTED),
             input.interpretation.w == 1u,
         );
     }
@@ -240,6 +234,7 @@ fn modification_vertex(input: ModificationInput) -> VertexOutput {
             1u,
             frame.modification_color_mode == 2u && (input.identity.y & unhidden_mask) != 0u,
         );
+        color = palette_slot(TOKEN_SUMMARY_MODIFICATION_BACKGROUND);
         height = frame.clip_size.y;
     } else {
         let code_bit = 1u << input.identity.x;
@@ -251,7 +246,7 @@ fn modification_vertex(input: ModificationInput) -> VertexOutput {
                 && (input.identity.y & unhidden_mask) == 0u,
         );
         if frame.modification_color_mode != 0u {
-            color = vec4<f32>(0.90, 0.24, 0.92, 0.92);
+            color = palette_slot(TOKEN_SUMMARY_MODIFICATION);
         }
     }
     let left = max(project_x(input.start_offset), frame.covered_clip_x.x);
@@ -270,12 +265,12 @@ fn modification_vertex(input: ModificationInput) -> VertexOutput {
 
 fn junction_annotation_color(annotation: u32) -> vec4<f32> {
     if annotation == 1u {
-        return vec4<f32>(0.16, 0.58, 0.28, 1.0);
+        return palette_slot(TOKEN_JUNCTION_ANNOTATED);
     }
     if annotation == 2u {
-        return vec4<f32>(0.92, 0.48, 0.10, 1.0);
+        return palette_slot(TOKEN_JUNCTION_NOVEL);
     }
-    return vec4<f32>(0.46, 0.48, 0.52, 0.92);
+    return palette_slot(TOKEN_SUMMARY_NEUTRAL);
 }
 
 fn junction_interaction_matches(
@@ -341,11 +336,11 @@ fn junction_vertex(input: JunctionInput) -> VertexOutput {
     let height = max(band_height * 0.45 * (0.18 + 0.82 * fraction), 3.0);
     let downward = component == 1u;
     let top = select(baseline - height, baseline, downward);
-    var color = vec4<f32>(0.42, 0.45, 0.50, 0.76);
+    var color = palette_slot(TOKEN_JUNCTION_UNKNOWN);
     if component == 0u {
-        color = vec4<f32>(0.84, 0.30, 0.38, 0.82);
+        color = palette_slot(TOKEN_JUNCTION_POSITIVE);
     } else if component == 1u {
-        color = vec4<f32>(0.25, 0.45, 0.82, 0.82);
+        color = palette_slot(TOKEN_JUNCTION_NEGATIVE);
     }
     let hovered = junction_interaction_matches(
         input,
@@ -361,10 +356,10 @@ fn junction_vertex(input: JunctionInput) -> VertexOutput {
     );
     var stroke = clamp(1.0 + height * 0.075, 1.25, 4.5);
     if selected {
-        color = mix(color, vec4<f32>(0.16, 0.42, 0.92, 1.0), 0.38);
+        color = mix(color, palette_slot(TOKEN_JUNCTION_INTERACTION), 0.38);
         stroke = min(stroke + 2.0, 6.5);
     } else if hovered {
-        color = mix(color, vec4<f32>(0.16, 0.42, 0.92, 1.0), 0.22);
+        color = mix(color, palette_slot(TOKEN_JUNCTION_INTERACTION), 0.22);
         stroke = min(stroke + 1.25, 5.75);
     }
     var output = junction_output(
@@ -394,7 +389,7 @@ fn overlay_vertex(input: OverlayInput) -> VertexOutput {
         input.vertex_index,
         input.origin,
         input.size,
-        input.color,
+        palette_color(input.palette_index, input.color_parameter),
         1u,
     );
 }

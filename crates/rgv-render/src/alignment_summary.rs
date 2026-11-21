@@ -9,6 +9,7 @@ use std::{
     },
 };
 
+use crate::palette::PaletteToken;
 use bytemuck::{Pod, Zeroable};
 use rgv_alignment_scene::{
     AlignmentCoverageLaneOptions, AlignmentModificationLaneOptions, AlignmentSashimiLaneOptions,
@@ -210,15 +211,27 @@ impl<'a> AlignmentSummaryGpuPageRequest<'a> {
 struct AlignmentSummaryGpuOverlayInstance {
     origin: [f32; 2],
     size: [f32; 2],
-    color: [f32; 4],
+    /// Palette index and colour parameter; see [`crate::palette::PaletteColor::encode`].
+    palette_index: u32,
+    color_parameter: u32,
 }
 
 impl AlignmentSummaryGpuOverlayInstance {
+    fn new(origin: [f32; 2], size: [f32; 2], token: PaletteToken) -> Self {
+        Self {
+            origin,
+            size,
+            palette_index: u32::from(token.index()),
+            color_parameter: 0,
+        }
+    }
+
     fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+        const ATTRIBUTES: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
             0 => Float32x2,
             1 => Float32x2,
-            2 => Float32x4
+            2 => Uint32,
+            3 => Uint32
         ];
         wgpu::VertexBufferLayout {
             array_stride: size_of::<Self>() as wgpu::BufferAddress,
@@ -259,8 +272,23 @@ fn projected_horizontal_in_clip(
     camera: CpuSummaryCamera,
     covered_clip_x: [f64; 2],
 ) -> Option<(f64, f64)> {
-    let start_offset = f64::from(start_offset[0]) + f64::from(start_offset[1]);
-    let end_offset = f64::from(end_offset[0]) + f64::from(end_offset[1]);
+    projected_horizontal_exact(
+        f64::from(start_offset[0]) + f64::from(start_offset[1]),
+        f64::from(end_offset[0]) + f64::from(end_offset[1]),
+        page_start,
+        camera,
+        covered_clip_x,
+    )
+}
+
+/// Horizontal extent of a span given as exact page-local base offsets.
+fn projected_horizontal_exact(
+    start_offset: f64,
+    end_offset: f64,
+    page_start: u64,
+    camera: CpuSummaryCamera,
+    covered_clip_x: [f64; 2],
+) -> Option<(f64, f64)> {
     let clip = camera.clip();
     let mut x = clip.x
         + (page_start as f64 + start_offset - camera.exact_start()) / camera.bases_per_pixel();
@@ -1104,6 +1132,8 @@ pub struct AlignmentSummaryGpuRenderer {
     overlay_pipeline: wgpu::RenderPipeline,
     uniform_layout: wgpu::BindGroupLayout,
     uniform_stride: usize,
+    /// Semantic palette uniform (bind group 1); see `AlignmentGpuRenderer`.
+    palette: crate::palette::PaletteBinding,
     frame_buffers: Vec<Arc<GpuSummaryFrameBuffers>>,
     /// Sorted device-page table, its ledger charge and the incrementally maintained LRU
     /// authority used to produce bounded pressure-time reclaim results.
@@ -1120,7 +1150,45 @@ pub struct AlignmentSummaryGpuRenderer {
 impl AlignmentSummaryGpuRenderer {
     #[must_use]
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        Self::with_palette(
+            device,
+            target_format,
+            &crate::palette::AlignmentPalette::light(),
+        )
+    }
+
+    /// The palette summary colours are currently resolved against.
+    #[must_use]
+    pub const fn palette(&self) -> &crate::palette::AlignmentPalette {
+        self.palette.palette()
+    }
+
+    /// Recolours every resident and future summary page by writing the 2 KiB palette uniform;
+    /// no page buffer is re-uploaded. Returns whether the palette changed.
+    pub fn set_palette(
+        &mut self,
+        queue: &wgpu::Queue,
+        palette: &crate::palette::AlignmentPalette,
+    ) -> bool {
+        self.palette.set(queue, palette)
+    }
+
+    /// Number of palette uniform uploads since this renderer was created.
+    #[must_use]
+    pub const fn palette_uploads(&self) -> u64 {
+        self.palette.uploads()
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn with_palette(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        palette: &crate::palette::AlignmentPalette,
+    ) -> Self {
         let shader = crate::shaders::ALIGNMENT_SUMMARY.create_module(device);
+        let palette_layout = crate::palette::PaletteBinding::layout(device);
+        let palette = crate::palette::PaletteBinding::new(device, &palette_layout, palette);
         let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("RGV alignment summary uniform layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -1138,7 +1206,7 @@ impl AlignmentSummaryGpuRenderer {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("RGV alignment summary pipeline layout"),
-            bind_group_layouts: &[Some(&uniform_layout)],
+            bind_group_layouts: &[Some(&uniform_layout), Some(&palette_layout)],
             immediate_size: 0,
         });
         let target = || {
@@ -1204,6 +1272,7 @@ impl AlignmentSummaryGpuRenderer {
             ),
             uniform_layout,
             uniform_stride: aligned_uniform_stride(device),
+            palette,
             frame_buffers: Vec::new(),
             cache: PagedGpuCache::default(),
             revision: 0,
@@ -3778,6 +3847,7 @@ impl AlignmentSummaryGpuRenderer {
             .uniform_bind_group
             .as_ref()
             .ok_or(AlignmentSummaryGpuRenderError::MissingUniformBuffer)?;
+        let mut palette_bound = false;
         for draw in frame.draws.iter() {
             let page = self
                 .page(draw.page)
@@ -3804,6 +3874,10 @@ impl AlignmentSummaryGpuRenderer {
             };
             pass.set_scissor_rect(x, y, width, height);
             pass.set_bind_group(0, bind_group, &[draw.uniform_offset]);
+            if !palette_bound {
+                pass.set_bind_group(1, self.palette.bind_group(), &[]);
+                palette_bound = true;
+            }
             if let Some(buffer) = &page.buffer
                 && page.instance_count > 0
             {
@@ -3823,6 +3897,7 @@ impl AlignmentSummaryGpuRenderer {
                 .as_ref()
                 .ok_or(AlignmentSummaryGpuRenderError::MissingOverlayBuffer)?;
             pass.set_pipeline(&self.overlay_pipeline);
+            pass.set_bind_group(1, self.palette.bind_group(), &[]);
             pass.set_vertex_buffer(0, overlay.slice(..));
             for draw in frame.overlay_draws.iter() {
                 let Some([x, y, width, height]) = crate::clamp_scissor_to_target(
@@ -4128,7 +4203,7 @@ impl AlignmentSummaryGpuRenderer {
         target_format: wgpu::TextureFormat,
     ) {
         self.discard_device_resources();
-        let mut rebuilt = Self::new(device, target_format);
+        let mut rebuilt = Self::with_palette(device, target_format, self.palette.palette());
         rebuilt.device_generation = self.device_generation;
         rebuilt.revision = self.revision;
         for (rebuilt, previous) in [
@@ -5478,51 +5553,57 @@ fn append_summary_overlays(
         };
         let band_height = clip.height / f64::from(row_count);
         for row in 0..row_count {
-            overlays.push(AlignmentSummaryGpuOverlayInstance {
-                origin: [
+            overlays.push(AlignmentSummaryGpuOverlayInstance::new(
+                [
                     clip.x as f32,
                     (clip.y + (f64::from(row) + 0.5) * band_height) as f32,
                 ],
-                size: [clip.width as f32, 1.0],
-                color: [0.36, 0.38, 0.42, 0.24],
-            });
+                [clip.width as f32, 1.0],
+                PaletteToken::JUNCTION_BASELINE,
+            ));
         }
     }
     if matches!(
         &request.options,
         AlignmentSummaryGpuLaneOptions::Coverage(options) if options.depth.show_center_line
     ) {
-        overlays.push(AlignmentSummaryGpuOverlayInstance {
-            origin: [(clip.x + clip.width * 0.5) as f32, clip.y as f32],
-            size: [1.0, clip.height as f32],
-            color: [0.72, 0.75, 0.82, 0.72],
-        });
+        overlays.push(AlignmentSummaryGpuOverlayInstance::new(
+            [(clip.x + clip.width * 0.5) as f32, clip.y as f32],
+            [1.0, clip.height as f32],
+            PaletteToken::COVERAGE_CENTER_LINE,
+        ));
     }
     let option_selected = match &request.options {
         AlignmentSummaryGpuLaneOptions::Coverage(options) => options.depth.selected_position,
         AlignmentSummaryGpuLaneOptions::Modifications(options) => options.selected_position,
         AlignmentSummaryGpuLaneOptions::Sashimi(_) => None,
     };
-    if let Some(position) = request.overlays.selected_position.or(option_selected) {
-        if request.camera.interval().contains(position) {
-            let exact_start = request.camera.exact_start();
-            overlays.push(AlignmentSummaryGpuOverlayInstance {
-                origin: [
-                    (clip.x + (position as f64 - exact_start) / request.camera.bases_per_pixel())
-                        as f32,
-                    clip.y as f32,
-                ],
-                size: [
-                    (1.0 / request.camera.bases_per_pixel()).clamp(2.0, 12.0) as f32,
-                    clip.height as f32,
-                ],
-                color: match request.options {
-                    AlignmentSummaryGpuLaneOptions::Coverage(_) => [1.0, 0.78, 0.18, 0.92],
-                    AlignmentSummaryGpuLaneOptions::Modifications(_) => [0.08, 0.08, 0.08, 0.34],
-                    AlignmentSummaryGpuLaneOptions::Sashimi(_) => [0.16, 0.42, 0.92, 0.40],
-                },
-            });
-        }
+    if let Some(position) = request.overlays.selected_position.or(option_selected)
+        && request.camera.interval().contains(position)
+    {
+        let exact_start = request.camera.exact_start();
+        overlays.push(AlignmentSummaryGpuOverlayInstance::new(
+            [
+                (clip.x + (position as f64 - exact_start) / request.camera.bases_per_pixel())
+                    as f32,
+                clip.y as f32,
+            ],
+            [
+                (1.0 / request.camera.bases_per_pixel()).clamp(2.0, 12.0) as f32,
+                clip.height as f32,
+            ],
+            match request.options {
+                AlignmentSummaryGpuLaneOptions::Coverage(_) => {
+                    PaletteToken::COVERAGE_SELECTED_POSITION
+                }
+                AlignmentSummaryGpuLaneOptions::Modifications(_) => {
+                    PaletteToken::MODIFICATION_SELECTED_POSITION
+                }
+                AlignmentSummaryGpuLaneOptions::Sashimi(_) => {
+                    PaletteToken::SASHIMI_SELECTED_POSITION
+                }
+            },
+        ));
     }
 }
 
@@ -5692,6 +5773,16 @@ pub enum AlignmentSummaryGpuPageError {
         page: SummaryPageKey,
         start: u64,
         end: u64,
+    },
+    #[error(
+        "summary page {page:?} spans page offsets {start}..{end}, beyond the {limit}-base range \
+         a GPU page can address"
+    )]
+    SemanticOffsetOutOfRange {
+        page: SummaryPageKey,
+        start: u64,
+        end: u64,
+        limit: u64,
     },
     #[error("depth summary page {0:?} has overlapping ranges and cannot be indexed exactly")]
     OverlappingDepthSpans(SummaryPageKey),

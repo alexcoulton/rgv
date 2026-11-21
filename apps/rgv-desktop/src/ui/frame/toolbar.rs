@@ -335,7 +335,7 @@ impl Viewer {
                             0.0,
                             egui::TextFormat::simple(
                                 egui::FontId::proportional(12.0),
-                                egui::Color32::from_gray(30),
+                                crate::theme::adapt(egui::Color32::from_gray(30)),
                             ),
                         );
                         label.append(
@@ -343,7 +343,7 @@ impl Viewer {
                             0.0,
                             egui::TextFormat::simple(
                                 egui::FontId::proportional(10.5),
-                                egui::Color32::from_gray(105),
+                                crate::theme::adapt(egui::Color32::from_gray(105)),
                             ),
                         );
                         if ui

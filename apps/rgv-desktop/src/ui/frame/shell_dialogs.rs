@@ -71,10 +71,10 @@ pub(super) fn show_shell_dialogs(ui: &mut egui::Ui, draft: &mut ShellUiDraft) {
                                 }
                                 let colour = match entry.severity {
                                     NotificationSeverity::Error => {
-                                        egui::Color32::from_rgb(170, 30, 30)
+                                        crate::theme::adapt(egui::Color32::from_rgb(170, 30, 30))
                                     }
                                     NotificationSeverity::Warning => {
-                                        egui::Color32::from_rgb(140, 95, 0)
+                                        crate::theme::adapt(egui::Color32::from_rgb(140, 95, 0))
                                     }
                                 };
                                 ui.colored_label(colour, severity_label(entry.severity));

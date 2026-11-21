@@ -812,3 +812,22 @@ fn remote_vcf_accepts_an_explicit_index_url_and_reports_a_missing_index() {
         local.query("chr2", 0, 5_000_000, 1_000).unwrap()
     );
 }
+
+#[test]
+fn variant_files_at_unsupported_url_schemes_are_refused_by_name() {
+    for location in [
+        "s3://bucket/calls.vcf.gz",
+        "gs://bucket/calls.bcf",
+        "ftp://ftp.example.org/calls.vcf.gz",
+    ] {
+        let Err(error) = LocalVariantSource::open(location) else {
+            panic!("{location} opened");
+        };
+        let message = error.to_string();
+        assert!(message.contains("unsupported URL scheme"), "{message}");
+        assert!(
+            message.contains(location.split_once("://").unwrap().0),
+            "{message}"
+        );
+    }
+}

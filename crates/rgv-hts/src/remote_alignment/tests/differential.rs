@@ -1,6 +1,7 @@
-//! Differential suite: the same alignment bytes decoded by `rust-htslib` (local path) and by
-//! `noodles` (served over the local HTTP fixture) must normalise to identical records and
-//! derive identical statistics, pileups, junctions, pairs and modification summaries.
+//! Differential suite: the same alignment bytes decoded by `rust-htslib` (local path), by
+//! `noodles` over the local file (with and without BGZF worker threads) and by `noodles` over
+//! the local HTTP fixture must normalise to identical records and derive identical statistics,
+//! pileups, junctions, pairs and modification summaries.
 
 use std::{
     fmt::Write as _,
@@ -19,9 +20,9 @@ use rust_htslib::bam::{
 use super::BamFixture;
 use crate::{
     AlignmentFilter, AlignmentOpenOptions, AlignmentQuery, AlignmentRecord, AlignmentSource,
-    AuxValue, LocalAlignmentSource, LocalCramAlignmentSource, PositionedAlignmentBlock,
-    PositionedAlignmentStreamCheckpoint, ProductionAlignmentSource, QueryDetail, QueryOptions,
-    QueryStats, RemoteBamAlignmentSource,
+    AuxValue, LocalAlignmentSource, LocalBamAlignmentSource, LocalCramAlignmentSource,
+    PositionedAlignmentBlock, PositionedAlignmentStreamCheckpoint, ProductionAlignmentSource,
+    QueryDetail, QueryOptions, QueryStats, RemoteBamAlignmentSource,
 };
 
 /// The one `H`-typed field of the fixture; see `assert_records_identical`.
@@ -122,7 +123,7 @@ fn with_mate(
 /// Records every backend must agree on. `cram_safe` leaves out what `HTSlib`'s CRAM writer
 /// rewrites or cannot store unchanged.
 #[allow(clippy::too_many_lines)]
-fn fixture_records(cram_safe: bool) -> Vec<Record> {
+pub(super) fn fixture_records(cram_safe: bool) -> Vec<Record> {
     let mut records = Vec::new();
 
     // Reads at the contig ends.
@@ -412,7 +413,12 @@ fn fixture_records(cram_safe: bool) -> Vec<Record> {
     records
 }
 
-fn write_alignment(path: &Path, format: Format, reference: Option<&Path>, records: &[Record]) {
+pub(super) fn write_alignment(
+    path: &Path,
+    format: Format,
+    reference: Option<&Path>,
+    records: &[Record],
+) {
     let mut writer = Writer::from_path(path, &header(), format).unwrap();
     if let Some(reference) = reference {
         writer.set_reference(reference).unwrap();
@@ -435,7 +441,7 @@ pub(super) fn interval(contig: u32, start: u64, end: u64) -> GenomicInterval {
     GenomicInterval::new(ContigId::new(contig), start, end).unwrap()
 }
 
-fn intervals() -> Vec<GenomicInterval> {
+pub(super) fn intervals() -> Vec<GenomicInterval> {
     vec![
         interval(0, 0, CHR1_LENGTH),
         interval(0, 0, 1),
@@ -541,7 +547,11 @@ pub(super) fn option_variants() -> Vec<(&'static str, QueryOptions)> {
 
 /// Field-wise record comparison, so a failure names the field instead of printing a 70,000
 /// operation CIGAR twice.
-fn assert_records_identical(expected: &AlignmentRecord, actual: &AlignmentRecord, context: &str) {
+pub(super) fn assert_records_identical(
+    expected: &AlignmentRecord,
+    actual: &AlignmentRecord,
+    context: &str,
+) {
     let name = String::from_utf8_lossy(&expected.read_name).into_owned();
     assert_eq!(expected.read_name, actual.read_name, "read name: {context}");
     assert_eq!(
@@ -706,9 +716,25 @@ fn drain_stream(
     }
 }
 
+/// The `noodles` local-file BAM front end with `threads` BGZF workers; none means the plain
+/// single-threaded BGZF reader. The lease comes from an allowance of the test's own, so the
+/// thread count does not depend on what other tests hold.
+pub(super) fn open_local_noodles(path: &Path, threads: u32) -> ProductionAlignmentSource {
+    static ALLOWANCE: crate::local::DecompressionThreadAllowance =
+        crate::local::DecompressionThreadAllowance::new();
+    let source = LocalBamAlignmentSource::open_with_lease(
+        path,
+        &AlignmentOpenOptions::default(),
+        ALLOWANCE.lease(threads, u32::MAX),
+    )
+    .unwrap();
+    assert_eq!(source.decompression_threads(), threads);
+    ProductionAlignmentSource::LocalBam(Box::new(source))
+}
+
 fn assert_backends_identical(
-    local: &mut LocalAlignmentSource,
-    remote: &mut RemoteBamAlignmentSource,
+    local: &mut dyn AlignmentSource,
+    remote: &mut dyn AlignmentSource,
     intervals: &[GenomicInterval],
     variants: usize,
 ) {
@@ -807,6 +833,145 @@ fn htslib_and_noodles_agree_on_every_edge_case_record() {
     assert_eq!(whole.stats.records_filtered_unmapped, 1);
 
     assert_backends_identical(&mut local, &mut remote, &intervals(), usize::MAX);
+
+    // The noodles decoder over the local file, with and without BGZF worker threads.
+    let production = ProductionAlignmentSource::open(&path, &AlignmentOpenOptions::default());
+    let production = production.unwrap();
+    for threads in [0, 1, 4] {
+        let mut local_noodles = open_local_noodles(&path, threads);
+        assert_eq!(
+            local.reference_dictionary(),
+            local_noodles.reference_dictionary()
+        );
+        assert_eq!(
+            local.normalization_mapped_records(),
+            local_noodles.normalization_mapped_records()
+        );
+        assert_eq!(production.source_stamp(), local_noodles.source_stamp());
+        assert_eq!(production.index_overview(), local_noodles.index_overview());
+        assert!(local_noodles.index_overview().is_some());
+        assert_eq!(
+            production.header_metadata(),
+            local_noodles.header_metadata()
+        );
+        assert_backends_identical(&mut local, &mut local_noodles, &intervals(), usize::MAX);
+        assert_whole_queries_identical(&mut local_noodles, &mut remote, &intervals());
+    }
+}
+
+/// Two front ends of the one noodles decoder: nothing may differ, the `H` field included.
+fn assert_whole_queries_identical(
+    left: &mut dyn AlignmentSource,
+    right: &mut dyn AlignmentSource,
+    intervals: &[GenomicInterval],
+) {
+    for (name, options) in option_variants() {
+        for interval in intervals {
+            let expected = left.query(*interval, options.clone(), &|| true).unwrap();
+            let actual = right.query(*interval, options.clone(), &|| true).unwrap();
+            assert!(
+                expected == actual,
+                "noodles front ends: {name}, {interval:?}"
+            );
+        }
+    }
+}
+
+/// The open option routes a local `.bam` to the noodles front end, and only when asked.
+#[test]
+fn the_local_bam_backend_is_htslib_unless_noodles_is_requested() {
+    let directory = tempfile::tempdir().unwrap();
+    let (path, _) = write_bam_fixture(directory.path());
+    assert_eq!(
+        AlignmentOpenOptions::default().local_bam_backend,
+        crate::AlignmentBackendPreference::Htslib
+    );
+    let default = ProductionAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+    assert!(matches!(default, ProductionAlignmentSource::Htslib(_)));
+    let options = AlignmentOpenOptions {
+        local_bam_backend: crate::AlignmentBackendPreference::Noodles,
+        ..AlignmentOpenOptions::default()
+    };
+    let mut noodles = ProductionAlignmentSource::open(&path, &options).unwrap();
+    assert!(matches!(noodles, ProductionAlignmentSource::LocalBam(_)));
+    assert!(!noodles.is_remote() && !noodles.is_cram());
+    assert!(noodles.remote_io_stats().is_none());
+    let mut htslib = default;
+    assert_backends_identical(&mut htslib, &mut noodles, &intervals(), usize::MAX);
+
+    // An explicit index path, BAI or CSI, is honoured.
+    let csi = directory.path().join("elsewhere.csi");
+    rust_htslib::bam::index::build(&path, Some(&csi), rust_htslib::bam::index::Type::Csi(14), 1)
+        .unwrap();
+    let mut with_csi = ProductionAlignmentSource::open(
+        &path,
+        &AlignmentOpenOptions {
+            index_path: Some(csi),
+            ..options.clone()
+        },
+    )
+    .unwrap();
+    assert_backends_identical(&mut htslib, &mut with_csi, &intervals(), 2);
+
+    // Without an index the open fails; it does not scan the file.
+    let unindexed = directory.path().join("unindexed.bam");
+    fs::copy(&path, &unindexed).unwrap();
+    assert!(matches!(
+        ProductionAlignmentSource::open(&unindexed, &options),
+        Err(crate::AlignmentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+}
+
+/// A file cut short inside a BGZF block is an error for either BGZF reader, never a silently
+/// shorter result (the multithreaded reader alone would report the end of the stream).
+#[test]
+fn a_truncated_local_bam_is_an_error_not_a_short_result() {
+    let Some(corpus) = corpus_path("mixed.bam") else {
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("truncated.bam");
+    let bytes = fs::read(&corpus).unwrap();
+    fs::write(&path, &bytes[..bytes.len() / 2 + 1_234]).unwrap();
+    fs::copy(
+        format!("{}.bai", corpus.display()),
+        directory.path().join("truncated.bam.bai"),
+    )
+    .unwrap();
+    let whole = |source: &mut ProductionAlignmentSource| {
+        let contig = source.reference_dictionary().iter().next().unwrap();
+        let target = interval(0, 0, contig.length());
+        source.query(target, QueryOptions::default(), &|| true)
+    };
+    for threads in [0, 4] {
+        let mut source = open_local_noodles(&path, threads);
+        assert!(whole(&mut source).is_err(), "{threads} threads");
+        let contig_length = source
+            .reference_dictionary()
+            .iter()
+            .next()
+            .unwrap()
+            .length();
+        let target = interval(0, 0, contig_length);
+        source
+            .begin_positioned_stream_with_admission(target, target, QueryOptions::default())
+            .unwrap();
+        let failed = loop {
+            match source.next_positioned_stream_checkpoint(&|| true) {
+                Ok(PositionedAlignmentStreamCheckpoint::Block(_)) => {}
+                Ok(_) => break false,
+                Err(_) => break true,
+            }
+        };
+        assert!(failed, "{threads} threads: the stream completed");
+    }
+}
+
+fn corpus_path(name: &str) -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmark-data")
+        .join(name);
+    path.exists().then_some(path)
 }
 
 #[test]
@@ -827,6 +992,11 @@ fn htslib_and_noodles_positioned_streams_agree_on_every_edge_case_record() {
     assert!(matches!(local, ProductionAlignmentSource::Htslib(_)));
     assert!(matches!(remote, ProductionAlignmentSource::RemoteBam(_)));
     assert_streams_identical(&mut local, &mut remote, &intervals(), usize::MAX);
+    for threads in [0, 4] {
+        let mut local_noodles = open_local_noodles(&path, threads);
+        assert_streams_identical(&mut local, &mut local_noodles, &intervals(), usize::MAX);
+        assert_streams_identical(&mut local_noodles, &mut remote, &intervals(), usize::MAX);
+    }
 }
 
 /// The corpora run the first variants only (layout defaults and everything), which is where
@@ -885,6 +1055,14 @@ fn htslib_and_noodles_agree_on_the_benchmark_corpora() {
         )
         .unwrap();
         assert_streams_identical(&mut local, &mut remote, &intervals, CORPUS_VARIANTS);
+        for threads in [0, 4] {
+            let mut local_noodles = open_local_noodles(&path, threads);
+            assert_backends_identical(&mut local, &mut local_noodles, &intervals, CORPUS_VARIANTS);
+            assert_streams_identical(&mut local, &mut local_noodles, &intervals, CORPUS_VARIANTS);
+            // A one-shot query between two checkpoints moves the reader; the stream must
+            // not depend on where it was left.
+            assert_stream_survives_interleaved_queries(&mut local_noodles, &intervals);
+        }
     }
 }
 
@@ -958,4 +1136,30 @@ fn htslib_and_noodles_agree_on_cram() {
             assert_eq!(expected.pileup, actual.pileup, "pileup: {context}");
         }
     }
+}
+
+/// Runs a positioned stream with a one-shot query of another region between every two
+/// checkpoints, and requires the blocks of an undisturbed stream.
+fn assert_stream_survives_interleaved_queries(
+    source: &mut ProductionAlignmentSource,
+    intervals: &[GenomicInterval],
+) {
+    let options = QueryOptions::default();
+    let target = intervals[0];
+    let elsewhere = *intervals.last().unwrap();
+    let (expected, expected_stats) = drain_stream(source, target, target, &options);
+    source
+        .begin_positioned_stream_with_admission(target, target, options.clone())
+        .unwrap();
+    let mut blocks = Vec::new();
+    let stats = loop {
+        match source.next_positioned_stream_checkpoint(&|| true).unwrap() {
+            PositionedAlignmentStreamCheckpoint::Block(block) => blocks.push(block),
+            PositionedAlignmentStreamCheckpoint::Complete(completion) => break completion.stats,
+            PositionedAlignmentStreamCheckpoint::Cancelled(_) => panic!("cancelled"),
+        }
+        source.query(elsewhere, options.clone(), &|| true).unwrap();
+    };
+    assert_eq!(expected_stats, stats);
+    assert!(expected == blocks, "blocks of an interleaved stream");
 }

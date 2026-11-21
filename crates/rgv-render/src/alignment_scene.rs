@@ -22,6 +22,7 @@ use rgv_alignment_scene::{
 use thiserror::Error;
 
 use crate::paged_cache::{self, CachedFrameSlot, CachedGpuPage, PageTableError, PagedGpuCache};
+use crate::palette::{AlignmentPalette, PaletteBinding, PaletteColor, PaletteToken};
 use crate::{AlignmentLedgerPolicyView, GpuBudgetPressure, GpuReclaimGoal, GpuReclaimReport};
 
 /// Two slots are sufficient for a strict present-next/drop-previous frame boundary: the
@@ -29,21 +30,116 @@ use crate::{AlignmentLedgerPolicyView, GpuBudgetPressure, GpuReclaimGoal, GpuRec
 /// other. A third concurrently retained candidate is a coordinator bug/back-pressure condition,
 /// not a reason to grow the shared GPU ledger during interaction.
 const ALIGNMENT_CAMERA_FRAME_SLOT_COUNT: usize = 2;
-/// Persistent GPU representation of one non-text semantic primitive. Coordinates remain a
-/// double-single page-local value; camera and page origins are supplied independently.
+/// Largest page-local offset, in bases, an instance may carry: the bound within which the
+/// shaders' integer cancellation (`project_genomic_x`) cannot overflow. Pages are canonical
+/// tiles a few kilobases wide, so real offsets are five orders of magnitude below it.
+pub const MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET: u64 = 700_000_000;
+/// Rows addressable inside one page (row block): twenty bits.
+pub const MAXIMUM_ALIGNMENT_GPU_PAGE_ROWS: u32 = 1 << ROW_BITS;
+
+const ROW_BITS: u32 = 20;
+const ROW_MASK: u32 = (1 << ROW_BITS) - 1;
+const SHAPE_SHIFT: u32 = ROW_BITS;
+const SHAPE_MASK: u32 = 0xF;
+const PALETTE_SHIFT: u32 = 24;
+
+/// Persistent GPU representation of one non-text semantic primitive: sixteen bytes.
+///
+/// Offsets are whole bases from the page start, so the shader can cancel them against the
+/// camera origin in integer arithmetic (the REND-7 contract); camera and page origins are
+/// supplied independently. The colour is a palette index plus a parameter word, never a colour.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
 pub struct AlignmentGpuInstance {
-    pub start_offset: [f32; 2],
-    pub end_offset: [f32; 2],
-    pub row_offset: u32,
-    pub shape: u32,
-    pub color: [f32; 4],
+    /// Whole bases from the page start to the primitive's start.
+    start: u32,
+    /// Whole bases covered; never zero.
+    length: u32,
+    /// Row offset inside the page (bits 0..20), shape (bits 20..24) and the eight-bit palette
+    /// index of [`PaletteColor::encode`] (bits 24..32).
+    row_shape_palette: u32,
+    /// Colour parameter word of [`PaletteColor::encode`].
+    color_parameter: u32,
+}
+
+impl AlignmentGpuInstance {
+    /// Packs one instance, refusing any value its fields cannot hold exactly.
+    // The page-admission error type every packing path already returns.
+    #[allow(clippy::result_large_err)]
+    pub fn new(
+        start_offset: u64,
+        end_offset: u64,
+        row_offset: u32,
+        shape: AlignmentGpuShape,
+        color: PaletteColor,
+    ) -> Result<Self, AlignmentGpuPageAdmissionError> {
+        if start_offset >= end_offset {
+            return Err(AlignmentGpuPageAdmissionError::InvalidSemanticSpan {
+                start: start_offset,
+                end: end_offset,
+            });
+        }
+        if end_offset > MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET {
+            return Err(AlignmentGpuPageAdmissionError::SemanticOffsetOutOfRange {
+                start: start_offset,
+                end: end_offset,
+                limit: MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET,
+            });
+        }
+        if row_offset >= MAXIMUM_ALIGNMENT_GPU_PAGE_ROWS {
+            return Err(AlignmentGpuPageAdmissionError::RowOffsetOutOfRange {
+                row_offset,
+                limit: MAXIMUM_ALIGNMENT_GPU_PAGE_ROWS,
+            });
+        }
+        let (palette_index, color_parameter) = color.encode();
+        Ok(Self {
+            // Both fit: `end_offset` is at most 7e8.
+            start: start_offset as u32,
+            length: (end_offset - start_offset) as u32,
+            row_shape_palette: row_offset
+                | ((shape as u32) << SHAPE_SHIFT)
+                | (u32::from(palette_index) << PALETTE_SHIFT),
+            color_parameter,
+        })
+    }
+
+    /// Whole bases from the page start to the primitive's start.
+    #[must_use]
+    pub const fn start_offset(&self) -> u64 {
+        self.start as u64
+    }
+
+    /// Whole bases from the page start to the primitive's end (exclusive).
+    #[must_use]
+    pub const fn end_offset(&self) -> u64 {
+        self.start as u64 + self.length as u64
+    }
+
+    #[must_use]
+    pub const fn row_offset(&self) -> u32 {
+        self.row_shape_palette & ROW_MASK
+    }
+
+    /// The [`AlignmentGpuShape`] discriminant.
+    #[must_use]
+    pub const fn shape(&self) -> u32 {
+        (self.row_shape_palette >> SHAPE_SHIFT) & SHAPE_MASK
+    }
+
+    /// The instance's colour before a palette is applied.
+    #[must_use]
+    pub const fn palette_color(&self) -> PaletteColor {
+        PaletteColor::decode(
+            (self.row_shape_palette >> PALETTE_SHIFT) as u8,
+            self.color_parameter,
+        )
+    }
 }
 
 /// Camera-frame-local interaction state for one immutable alignment primitive. Geometry stays in
 /// its canonical page buffer; this four-byte companion tells the interactive shader how to tint
-/// that instance without copying its forty-byte geometry into a second global overlay buffer.
+/// that instance without copying its sixteen-byte geometry into a second global overlay buffer.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]
 struct AlignmentGpuInteractionInstance {
@@ -52,7 +148,7 @@ struct AlignmentGpuInteractionInstance {
 
 impl AlignmentGpuInteractionInstance {
     fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![5 => Uint32];
+        const ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![2 => Uint32];
         wgpu::VertexBufferLayout {
             array_stride: size_of::<Self>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -63,13 +159,9 @@ impl AlignmentGpuInteractionInstance {
 
 impl AlignmentGpuInstance {
     fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-            0 => Float32x2,
-            1 => Float32x2,
-            2 => Uint32,
-            3 => Uint32,
-            4 => Float32x4
-        ];
+        // `[start, length]` and `[row | shape | palette, colour parameter]`.
+        const ATTRIBUTES: [wgpu::VertexAttribute; 2] =
+            wgpu::vertex_attr_array![0 => Uint32x2, 1 => Uint32x2];
         wgpu::VertexBufferLayout {
             array_stride: size_of::<Self>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Instance,
@@ -112,24 +204,24 @@ pub fn project_alignment_gpu_instance(
     page_row_start: u32,
     camera: AlignmentCamera,
 ) -> Option<AlignmentGpuProjectedBounds> {
-    let start_offset = f64::from(instance.start_offset[0]) + f64::from(instance.start_offset[1]);
-    let end_offset = f64::from(instance.end_offset[0]) + f64::from(instance.end_offset[1]);
+    let start_offset = instance.start_offset() as f64;
+    let end_offset = instance.end_offset() as f64;
     let mut x = camera.clip().x
         + (page_start as f64 + start_offset - camera.exact_start()) / camera.bases_per_pixel();
     let mut right = camera.clip().x
         + (page_start as f64 + end_offset - camera.exact_start()) / camera.bases_per_pixel();
-    let row = f64::from(page_row_start.saturating_add(instance.row_offset));
+    let row = f64::from(page_row_start.saturating_add(instance.row_offset()));
     let row_top = camera.clip().y
         + (row - camera.row_scroll()) * camera.row_height()
         + (camera.row_height() - camera.read_height()) * 0.5;
     // Minimum-size policy shared with `alignment_scene.wgsl` and the CPU projector: at least one
     // point (>= one physical pixel) in both axes for every shape.
     let (mut y, mut height) = (row_top, camera.read_height().max(1.0));
-    if instance.shape == AlignmentGpuShape::EventLine as u32 {
+    if instance.shape() == AlignmentGpuShape::EventLine as u32 {
         y = row_top + camera.read_height() * 0.45;
         height = (camera.read_height() * 0.10).max(1.0);
     }
-    if instance.shape == AlignmentGpuShape::PointMarker as u32 {
+    if instance.shape() == AlignmentGpuShape::PointMarker as u32 {
         let original_width = right - x;
         let marker_width = original_width.max(1.5);
         x -= (marker_width - original_width) * 0.5;
@@ -515,10 +607,27 @@ impl PartialEq for AlignmentGpuContentAuthority {
 
 impl Eq for AlignmentGpuContentAuthority {}
 
+/// How a foreground replacement treats visible pages that are not yet resident.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AlignmentGpuVisibleAdmission {
+    /// Every visible page is admitted or the replacement is refused. This is the strict
+    /// behaviour of the `Complete` memory policy.
+    #[default]
+    Complete,
+    /// Draw what fits. Missing visible pages are admitted in priority order (centre of the
+    /// viewport outward, then by row block) while their buffers fit in this many bytes; the rest
+    /// are deferred and the frame is marked partially resident. Pages that are already resident
+    /// cost nothing and are always drawn, so nothing visible is ever given up to admit a less
+    /// central page.
+    WithinPageBytes(usize),
+}
+
 /// Immutable lease for one fully prepared multi-scene GPU submission. All mandatory page
 /// allocations and renderer-owned frame buffers remain pinned through command encoding.
 #[derive(Debug)]
 pub struct AlignmentGpuFrame {
+    /// Visible pages this frame does not draw because they were not resident; sorted by key.
+    deferred_pages: Arc<[AlignmentPageKey]>,
     revision: u64,
     device_generation: u64,
     pub scene_revisions: Arc<[SceneRevision]>,
@@ -540,6 +649,20 @@ impl AlignmentGpuFrame {
     #[must_use]
     pub fn draw_count(&self) -> usize {
         self.draws.len()
+    }
+
+    /// Visible pages this frame does not draw because the GPU budget could not hold them when it
+    /// was prepared, sorted by key. Empty for a complete frame.
+    #[must_use]
+    pub fn deferred_page_keys(&self) -> &[AlignmentPageKey] {
+        &self.deferred_pages
+    }
+
+    /// Whether some visible page is missing from this frame. A partially resident frame is a
+    /// truthful picture of the pages it has, but it is not the complete presentation.
+    #[must_use]
+    pub fn is_partially_resident(&self) -> bool {
+        !self.deferred_pages.is_empty()
     }
 
     /// Returns the camera-independent authority which may be retained while this presentation
@@ -622,7 +745,10 @@ pub struct AlignmentGpuReplacementPlan {
     device_generation: u64,
     scene_revisions: Arc<[SceneRevision]>,
     scene_allocations: Arc<[AllocationId]>,
+    /// Visible pages the frame draws: every resident one plus the admitted missing ones.
     mandatory_pages: Vec<Arc<AlignmentSemanticPage>>,
+    /// Visible pages left out by [`AlignmentGpuVisibleAdmission::WithinPageBytes`]; sorted.
+    deferred_pages: Arc<[AlignmentPageKey]>,
     prepared_page_keys: Arc<[AlignmentPageKey]>,
     missing_pages: Vec<PlannedAlignmentPage>,
     demands: Vec<AllocationBundleDemand>,
@@ -668,6 +794,29 @@ impl AlignmentGpuReplacementPlan {
     #[must_use]
     pub fn prepared_page_keys(&self) -> &Arc<[AlignmentPageKey]> {
         &self.prepared_page_keys
+    }
+
+    /// Bytes of page buffers this plan will create (the admitted missing pages).
+    #[must_use]
+    pub fn missing_page_bytes(&self) -> usize {
+        self.missing_pages
+            .iter()
+            .fold(0, |total, page| total.saturating_add(page.maximum_bytes))
+    }
+
+    /// Keys of the missing pages this plan admits, in page-key order.
+    #[must_use]
+    pub fn admitted_page_keys(&self) -> Vec<AlignmentPageKey> {
+        self.missing_pages
+            .iter()
+            .map(|page| page.page.key())
+            .collect()
+    }
+
+    /// Visible pages this plan leaves out, sorted by key. Empty for a complete plan.
+    #[must_use]
+    pub fn deferred_page_keys(&self) -> &[AlignmentPageKey] {
+        &self.deferred_pages
     }
 }
 
@@ -795,6 +944,9 @@ pub struct AlignmentGpuRenderer {
     interaction_pipeline: wgpu::RenderPipeline,
     camera_layout: wgpu::BindGroupLayout,
     camera_stride: usize,
+    /// Semantic palette uniform (bind group 1). Outside the page ledger: it is one fixed 2 KiB
+    /// buffer per renderer, like the pipelines.
+    palette: PaletteBinding,
     frame_buffers: Vec<Arc<GpuAlignmentFrameBuffers>>,
     /// Sorted device-page table, its ledger charge and the online LRU reclaim authority.
     cache: PagedGpuCache<GpuAlignmentPage>,
@@ -810,7 +962,37 @@ pub struct AlignmentGpuRenderer {
 impl AlignmentGpuRenderer {
     #[must_use]
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        Self::with_palette(device, target_format, &AlignmentPalette::light())
+    }
+
+    /// The palette instances are currently resolved against.
+    #[must_use]
+    pub const fn palette(&self) -> &AlignmentPalette {
+        self.palette.palette()
+    }
+
+    /// Recolours every resident and future page. This writes the 2 KiB palette uniform and
+    /// nothing else: page buffers hold palette indices, so none is re-uploaded. Returns whether
+    /// the palette changed.
+    pub fn set_palette(&mut self, queue: &wgpu::Queue, palette: &AlignmentPalette) -> bool {
+        self.palette.set(queue, palette)
+    }
+
+    /// Number of palette uniform uploads since this renderer was created.
+    #[must_use]
+    pub const fn palette_uploads(&self) -> u64 {
+        self.palette.uploads()
+    }
+
+    #[must_use]
+    pub fn with_palette(
+        device: &wgpu::Device,
+        target_format: wgpu::TextureFormat,
+        palette: &AlignmentPalette,
+    ) -> Self {
         let shader = crate::shaders::ALIGNMENT_SCENE.create_module(device);
+        let palette_layout = PaletteBinding::layout(device);
+        let palette = PaletteBinding::new(device, &palette_layout, palette);
         let camera_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("RGV alignment semantic camera layout"),
@@ -829,7 +1011,7 @@ impl AlignmentGpuRenderer {
             });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("RGV alignment semantic pipeline layout"),
-            bind_group_layouts: &[Some(&camera_layout)],
+            bind_group_layouts: &[Some(&camera_layout), Some(&palette_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -890,6 +1072,7 @@ impl AlignmentGpuRenderer {
             interaction_pipeline,
             camera_layout,
             camera_stride: aligned_uniform_stride(device),
+            palette,
             frame_buffers: Vec::new(),
             cache: PagedGpuCache::default(),
             revision: 0,
@@ -933,7 +1116,60 @@ impl AlignmentGpuRenderer {
         ledger: &impl AlignmentLedgerPolicyView,
         first_bundle_slot: AllocationBundleSlot,
     ) -> Result<AlignmentGpuReplacementPlan, AlignmentGpuReplacementError> {
-        let mandatory_pages = mandatory_alignment_pages(requests)?;
+        self.plan_replacement_within(
+            requests,
+            ledger,
+            first_bundle_slot,
+            AlignmentGpuVisibleAdmission::Complete,
+        )
+    }
+
+    /// [`Self::plan_replacement`] with an explicit rule for visible pages that are not yet
+    /// resident. Under [`AlignmentGpuVisibleAdmission::WithinPageBytes`] the plan admits the
+    /// highest-priority missing pages that fit, defers the rest, and the frame it publishes
+    /// reports them through [`AlignmentGpuFrame::deferred_page_keys`]. Planning the same requests
+    /// again once capacity has been released admits more, until nothing is deferred.
+    // Same error type as `plan_replacement`, which this generalises.
+    #[allow(clippy::too_many_lines, clippy::result_large_err)]
+    pub fn plan_replacement_within(
+        &self,
+        requests: &[AlignmentGpuSceneRequest<'_>],
+        ledger: &impl AlignmentLedgerPolicyView,
+        first_bundle_slot: AllocationBundleSlot,
+        admission: AlignmentGpuVisibleAdmission,
+    ) -> Result<AlignmentGpuReplacementPlan, AlignmentGpuReplacementError> {
+        let mut mandatory_pages = mandatory_alignment_pages(requests)?;
+        let deferred_pages: Arc<[AlignmentPageKey]> = match admission {
+            AlignmentGpuVisibleAdmission::Complete => Arc::from([]),
+            AlignmentGpuVisibleAdmission::WithinPageBytes(page_bytes) => {
+                let mut deferred = Vec::new();
+                let mut admitted_bytes = 0_usize;
+                let mut exhausted = false;
+                for key in visible_page_admission_order(requests) {
+                    if self.page_index(key).is_some() {
+                        continue;
+                    }
+                    let page = mandatory_pages
+                        .iter()
+                        .find(|page| page.key() == key)
+                        .expect("the admission order enumerates the mandatory pages");
+                    let bytes = gpu_buffer_capacity::<AlignmentGpuInstance>(
+                        non_text_primitive_count(page),
+                    )?;
+                    // A strict prefix of the priority order: once one page does not fit, no
+                    // less central page is admitted in its place.
+                    if exhausted || admitted_bytes.saturating_add(bytes) > page_bytes {
+                        exhausted = true;
+                        deferred.push(key);
+                    } else {
+                        admitted_bytes = admitted_bytes.saturating_add(bytes);
+                    }
+                }
+                deferred.sort_unstable();
+                deferred.into()
+            }
+        };
+        mandatory_pages.retain(|page| !is_deferred(&deferred_pages, page.key()));
         let prepared_page_keys = prepared_scene_page_key_authority(requests);
         if requests.len() > 1 {
             self.record_content_manifest_build(prepared_page_keys.len());
@@ -960,6 +1196,7 @@ impl AlignmentGpuRenderer {
                 .visible_pages(interval, rows)
                 .into_iter()
                 .filter(|page| alignment_page_has_gpu_geometry(page))
+                .filter(|page| !is_deferred(&deferred_pages, page.key()))
             {
                 mandatory_draws = mandatory_draws.saturating_add(1);
                 if self.page_index(page.key()).is_some() {
@@ -1136,6 +1373,7 @@ impl AlignmentGpuRenderer {
             scene_revisions,
             scene_allocations,
             mandatory_pages,
+            deferred_pages,
             prepared_page_keys,
             missing_pages,
             demands,
@@ -1426,7 +1664,8 @@ impl AlignmentGpuRenderer {
                 reserved: bundle.policy_revision(),
             });
         }
-        let mandatory_pages = mandatory_alignment_pages(requests)?;
+        let mut mandatory_pages = mandatory_alignment_pages(requests)?;
+        mandatory_pages.retain(|page| !is_deferred(&plan.deferred_pages, page.key()));
         if requests.len() != plan.request_count
             || requests
                 .iter()
@@ -1467,6 +1706,7 @@ impl AlignmentGpuRenderer {
                     .visible_pages(request.camera.interval(), request.camera.visible_rows())
             })
             .filter(|page| alignment_page_has_gpu_geometry(page))
+            .filter(|page| !is_deferred(&plan.deferred_pages, page.key()))
             .fold(0_usize, |total, page| {
                 total.saturating_add(non_text_primitive_count(page))
             });
@@ -1615,6 +1855,7 @@ impl AlignmentGpuRenderer {
                 .visible_pages(interval, rows)
                 .into_iter()
                 .filter(|page| alignment_page_has_gpu_geometry(page))
+                .filter(|page| !is_deferred(&plan.deferred_pages, page.key()))
             {
                 let instance_count = self
                     .page(page.key())
@@ -1995,6 +2236,7 @@ impl AlignmentGpuRenderer {
             .map(|frame| frame.anchors_examined)
             .sum();
         let frame = AlignmentGpuFrame {
+            deferred_pages: Arc::clone(&staged.plan.deferred_pages),
             revision: next_revision,
             device_generation: self.device_generation,
             scene_revisions: staged.scene_revisions.into(),
@@ -2347,13 +2589,14 @@ impl AlignmentGpuRenderer {
                 .into(),
             page_manifest.into(),
         );
-        self.capture_resident_camera_frame(device, queue, requests, ledger, &authority, true)
+        self.capture_resident_camera_frame(device, queue, requests, ledger, &authority, true, &[])
     }
 
     /// Builds only a camera-dependent frame over a previously minted immutable content
     /// authority. This function cannot enumerate the prepared scene, admit/retire pages, create a
     /// content identity, or reserve a replacement bundle. The `allow_slot_growth` flag is true
     /// only for the initial content publication; production camera capture always supplies false.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn capture_resident_camera_frame(
         &mut self,
         device: &wgpu::Device,
@@ -2362,9 +2605,13 @@ impl AlignmentGpuRenderer {
         ledger: &AllocationLedger,
         content_authority: &AlignmentGpuContentAuthority,
         allow_slot_growth: bool,
+        tolerated_missing: &[AlignmentPageKey],
     ) -> Result<(AlignmentGpuFrame, AlignmentGpuPrepareStats), AlignmentGpuPrepareError> {
         // First pass is allocation-free. It proves the complete mandatory set is resident and
         // derives conservative capacities before any frame candidate memory or GPU buffer grows.
+        // A visible page the caller already knows to be deferred (a partially resident
+        // presentation) is left out of the frame instead of failing the capture.
+        let mut deferred_pages = Vec::new();
         let visible_pages = requests
             .iter()
             .map(|request| {
@@ -2376,10 +2623,20 @@ impl AlignmentGpuRenderer {
                     pages
                         .into_iter()
                         .filter(|page| alignment_page_has_gpu_geometry(page))
+                        .filter(|page| {
+                            let deferred = self.page_index(page.key()).is_none()
+                                && is_deferred(tolerated_missing, page.key());
+                            if deferred {
+                                deferred_pages.push(page.key());
+                            }
+                            !deferred
+                        })
                         .collect::<Vec<_>>()
                 })
             })
             .collect::<Result<Vec<_>, AlignmentGpuPrepareError>>()?;
+        deferred_pages.sort_unstable();
+        deferred_pages.dedup();
         let mut mandatory_pages = 0_usize;
         let mut maximum_page_instances = 0_usize;
         let mut page_cache_hits = 0_usize;
@@ -2608,6 +2865,7 @@ impl AlignmentGpuRenderer {
         }
         pins.push(frame_buffers.frame_allocation.pin()?);
         let frame = AlignmentGpuFrame {
+            deferred_pages: deferred_pages.into(),
             revision: next_revision,
             device_generation: self.device_generation,
             scene_revisions: scene_revisions.into(),
@@ -2656,6 +2914,7 @@ impl AlignmentGpuRenderer {
     /// table, reserves a replacement bundle, or uploads base geometry. A typed
     /// [`AlignmentGpuCameraCaptureError::ContentReplacementRequired`] tells the coordinator to use
     /// the existing replacement transaction instead.
+    #[allow(clippy::result_large_err)]
     pub fn capture_camera_frame(
         &mut self,
         device: &wgpu::Device,
@@ -2663,6 +2922,27 @@ impl AlignmentGpuRenderer {
         authority: &AlignmentGpuContentAuthority,
         requests: &[AlignmentGpuSceneRequest<'_>],
         ledger: &AllocationLedger,
+    ) -> Result<(AlignmentGpuFrame, AlignmentGpuPrepareStats), AlignmentGpuCameraCaptureError> {
+        self.capture_camera_frame_tolerating(device, queue, authority, requests, ledger, &[])
+    }
+
+    /// [`Self::capture_camera_frame`] over a partially resident presentation.
+    ///
+    /// `tolerated_missing` (sorted by key) names visible pages the caller already knows are
+    /// deferred, normally [`AlignmentGpuFrame::deferred_page_keys`] of the frame being replaced.
+    /// A missing visible page on that list is left out of the captured frame, which then reports
+    /// it as deferred in turn; any other missing page still asks for a content replacement. A
+    /// hover or selection change over a partial picture therefore stays a camera-only capture.
+    // Same error type as `capture_camera_frame`, which this generalises.
+    #[allow(clippy::result_large_err)]
+    pub fn capture_camera_frame_tolerating(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        authority: &AlignmentGpuContentAuthority,
+        requests: &[AlignmentGpuSceneRequest<'_>],
+        ledger: &AllocationLedger,
+        tolerated_missing: &[AlignmentPageKey],
     ) -> Result<(AlignmentGpuFrame, AlignmentGpuPrepareStats), AlignmentGpuCameraCaptureError> {
         if authority.device_generation != self.device_generation {
             return Err(AlignmentGpuCameraCaptureError::ContentReplacementRequired {
@@ -2703,6 +2983,7 @@ impl AlignmentGpuRenderer {
         let mut missing = mandatory
             .iter()
             .filter(|page| self.page_index(page.key()).is_none())
+            .filter(|page| !is_deferred(tolerated_missing, page.key()))
             .map(|page| page.key());
         if let Some(first_missing) = missing.next() {
             let missing_pages = 1_usize.saturating_add(missing.count());
@@ -2717,8 +2998,15 @@ impl AlignmentGpuRenderer {
         // CPU packing/projection scratch remains transient-budget accounted. The important
         // single-flight invariant is that this path never creates a retained GPU/frame
         // reservation; transient reservations are independent of an active replacement bundle.
-        let result =
-            self.capture_resident_camera_frame(device, queue, requests, ledger, authority, false);
+        let result = self.capture_resident_camera_frame(
+            device,
+            queue,
+            requests,
+            ledger,
+            authority,
+            false,
+            tolerated_missing,
+        );
         let (mut frame, stats) = match result {
             Ok(prepared) => prepared,
             Err(AlignmentGpuPrepareError::FrameSlotBusy { slots }) => {
@@ -3076,6 +3364,7 @@ impl AlignmentGpuRenderer {
             .camera_bind_group
             .as_ref()
             .ok_or(AlignmentGpuRenderError::MissingCameraBuffer)?;
+        pass.set_bind_group(1, self.palette.bind_group(), &[]);
         for draw in frame.draws.iter() {
             let page = self
                 .page(draw.page)
@@ -3123,7 +3412,7 @@ impl AlignmentGpuRenderer {
         target_format: wgpu::TextureFormat,
     ) {
         self.discard_device_resources();
-        let mut rebuilt = Self::new(device, target_format);
+        let mut rebuilt = Self::with_palette(device, target_format, self.palette.palette());
         rebuilt.device_generation = self.device_generation;
         rebuilt.revision = self.revision;
         for (rebuilt, previous) in [
@@ -3598,19 +3887,14 @@ fn pack_primitive(
     if matches!(primitive.component, AlignmentComponent::Label { .. }) {
         return Ok(None);
     }
-    if primitive.start_offset >= primitive.end_offset {
-        return Err(AlignmentGpuPageAdmissionError::InvalidSemanticSpan {
-            start: primitive.start_offset,
-            end: primitive.end_offset,
-        });
-    }
-    Ok(Some(AlignmentGpuInstance {
-        start_offset: split_f64(primitive.start_offset as f64),
-        end_offset: split_f64(primitive.end_offset as f64),
-        row_offset: primitive.row_offset,
-        shape: shape_for(primitive.geometry) as u32,
-        color: color_for(primitive),
-    }))
+    AlignmentGpuInstance::new(
+        primitive.start_offset,
+        primitive.end_offset,
+        primitive.row_offset,
+        shape_for(primitive.geometry),
+        color_for(primitive),
+    )
+    .map(Some)
 }
 
 const fn shape_for(geometry: AlignmentGeometryToken) -> AlignmentGpuShape {
@@ -3625,83 +3909,79 @@ const fn shape_for(geometry: AlignmentGeometryToken) -> AlignmentGpuShape {
     }
 }
 
-fn color_for(primitive: AlignmentSemanticPrimitive) -> [f32; 4] {
+fn color_for(primitive: AlignmentSemanticPrimitive) -> PaletteColor {
     semantic_alignment_color(primitive.component, primitive.style)
 }
 
+/// The semantic colour of one read component. Closed categories are palette tokens; only
+/// hashed open-ended categories carry an inline colour.
 pub(crate) fn semantic_alignment_color(
     component: AlignmentComponent,
     style: AlignmentStyleToken,
-) -> [f32; 4] {
-    match component {
-        AlignmentComponent::Base { base, .. } => crate::palette::base_color(base),
+) -> PaletteColor {
+    use PaletteToken as T;
+    PaletteColor::Token(match component {
+        AlignmentComponent::Base { base, .. } => T::base(base),
         AlignmentComponent::ModifiedBase { state, .. } => match state {
-            rgv_alignment_scene::ModificationState::Modified => [0.58, 0.24, 0.78, 1.0],
-            rgv_alignment_scene::ModificationState::Canonical => [0.42, 0.42, 0.48, 1.0],
+            rgv_alignment_scene::ModificationState::Modified => T::MODIFIED_BASE,
+            rgv_alignment_scene::ModificationState::Canonical => T::CANONICAL_BASE,
         },
         AlignmentComponent::BisulfiteBase { observation, .. } => match observation {
-            rgv_alignment_scene::BisulfiteObservationToken::Protected => [0.86, 0.46, 0.12, 1.0],
-            rgv_alignment_scene::BisulfiteObservationToken::Converted => [0.18, 0.62, 0.78, 1.0],
+            rgv_alignment_scene::BisulfiteObservationToken::Protected => T::BISULFITE_PROTECTED,
+            rgv_alignment_scene::BisulfiteObservationToken::Converted => T::BISULFITE_CONVERTED,
         },
         AlignmentComponent::Insertion { .. }
         | AlignmentComponent::SoftClip { .. }
         | AlignmentComponent::HardClip { .. }
         | AlignmentComponent::Padding { .. }
         | AlignmentComponent::UltimaIndel { .. }
-        | AlignmentComponent::SbxInsertion { .. } => [0.55, 0.20, 0.70, 1.0],
-        AlignmentComponent::Deletion { .. } => [0.18, 0.18, 0.20, 1.0],
+        | AlignmentComponent::SbxInsertion { .. } => T::INSERTION,
+        AlignmentComponent::Deletion { .. } => T::DELETION,
         AlignmentComponent::ReferenceSkip { .. } | AlignmentComponent::PairConnector { .. } => {
-            [0.38, 0.40, 0.46, 1.0]
+            T::SKIP
         }
-        AlignmentComponent::DirectionTerminal => style_color(style),
-        AlignmentComponent::SmrtKinetics { .. } => [0.10, 0.63, 0.56, 1.0],
-        AlignmentComponent::SbxTailBase { .. } => [0.86, 0.52, 0.12, 1.0],
-        AlignmentComponent::SpecialistUnavailable { .. } => [0.52, 0.52, 0.54, 0.8],
-        AlignmentComponent::Label { .. }
+        AlignmentComponent::SmrtKinetics { .. } => T::SMRT_KINETICS,
+        AlignmentComponent::SbxTailBase { .. } => T::SBX_TAIL,
+        AlignmentComponent::SpecialistUnavailable { .. } => T::SPECIALIST_UNAVAILABLE,
+        AlignmentComponent::DirectionTerminal
+        | AlignmentComponent::Label { .. }
         | AlignmentComponent::ReadSpan
-        | AlignmentComponent::AlignedSegment { .. } => style_color(style),
-    }
+        | AlignmentComponent::AlignedSegment { .. } => return style_color(style),
+    })
 }
 
-fn style_color(style: AlignmentStyleToken) -> [f32; 4] {
-    match style.body {
+fn style_color(style: AlignmentStyleToken) -> PaletteColor {
+    use PaletteToken as T;
+    PaletteColor::Token(match style.body {
         // Keep ordinary reads visually quiet. Interaction is applied independently below, so
         // hover and selection still receive RGV's blue emphasis without making every unselected
         // record look active.
-        AlignmentBodyColorToken::Neutral => [0.73, 0.73, 0.73, 1.0],
-        AlignmentBodyColorToken::Strand { reverse: false } => [0.30, 0.50, 0.78, 1.0],
-        AlignmentBodyColorToken::Strand { reverse: true } => [0.78, 0.34, 0.38, 1.0],
+        AlignmentBodyColorToken::Neutral => T::READ_NEUTRAL,
+        AlignmentBodyColorToken::Strand { reverse: false } => T::STRAND_FORWARD,
+        AlignmentBodyColorToken::Strand { reverse: true } => T::STRAND_REVERSE,
         AlignmentBodyColorToken::MappingQuality(quality) => {
-            let fraction = f32::from(quality.unwrap_or(0)) / 60.0;
-            [
-                0.25 + fraction * 0.35,
-                0.30 + fraction * 0.40,
-                0.40 + fraction * 0.45,
-                1.0,
-            ]
+            return PaletteColor::Ramp {
+                low: T::MAPPING_QUALITY_LOW,
+                position: f32::from(quality.unwrap_or(0)) / 60.0,
+            };
         }
-        AlignmentBodyColorToken::Category(category) => category
-            .map_or(crate::palette::UNCATEGORIZED_COLOR, |category| {
-                crate::palette::categorical_hash_color(category.get())
-            }),
+        // Open-ended: the hash decides the hue, so the colour travels inline.
+        AlignmentBodyColorToken::Category(Some(category)) => {
+            return PaletteColor::inline(crate::palette::categorical_hash_color(category.get()));
+        }
+        AlignmentBodyColorToken::Category(None) => T::UNCATEGORIZED,
         // Closed categories use explicit tables: hashing their small ranks put every member
         // within a few degrees of red.
-        AlignmentBodyColorToken::PairOrientation(rank) => {
-            crate::palette::pair_orientation_color(rank)
-        }
+        AlignmentBodyColorToken::PairOrientation(rank) => T::pair_orientation(rank),
         AlignmentBodyColorToken::TemplateLength { status, .. }
-        | AlignmentBodyColorToken::PairStatus(status) => {
-            crate::palette::pair_classification_color(status)
-        }
+        | AlignmentBodyColorToken::PairStatus(status) => T::pair_classification(status),
         AlignmentBodyColorToken::FirstOfPairStrand(reverse) => match reverse {
-            Some(false) => [0.28, 0.56, 0.78, 1.0],
-            Some(true) => [0.80, 0.38, 0.42, 1.0],
-            None => [0.50, 0.50, 0.54, 1.0],
+            Some(false) => T::FIRST_OF_PAIR_FORWARD,
+            Some(true) => T::FIRST_OF_PAIR_REVERSE,
+            None => T::FIRST_OF_PAIR_UNKNOWN,
         },
-        AlignmentBodyColorToken::Specialist { mode, reverse } => {
-            crate::palette::specialist_body_color(mode, reverse)
-        }
-    }
+        AlignmentBodyColorToken::Specialist { mode, reverse } => T::specialist_body(mode, reverse),
+    })
 }
 
 const fn interaction_token_is_active(
@@ -3735,28 +4015,6 @@ fn interaction_page_instances(
         instances.push(AlignmentGpuInteractionInstance { flags });
     }
     (instances, active)
-}
-
-pub(crate) fn reference_interaction_color(
-    mut color: [f32; 4],
-    token: rgv_alignment_scene::AlignmentInteractionToken,
-) -> [f32; 4] {
-    let (target, amount) = if token.selected {
-        ([0.16, 0.42, 0.92], 0.58)
-    } else if token.hovered {
-        ([0.28, 0.52, 0.94], 0.32)
-    } else if token.selected_chain {
-        ([0.90, 0.62, 0.16], 0.38)
-    } else if token.highlighted {
-        ([0.96, 0.70, 0.12], 0.46)
-    } else {
-        return color;
-    };
-    for channel in 0..3 {
-        color[channel] += (target[channel] - color[channel]) * amount;
-    }
-    color[3] = 1.0;
-    color
 }
 
 fn camera_uniform(
@@ -3934,6 +4192,49 @@ fn mandatory_alignment_pages(
 /// contain no vertex instances. Keeping this boundary explicit prevents zero-byte semantic pages
 /// from acquiring fake GPU residency or appearing in a frame draw manifest that cache reclaim can
 /// later invalidate.
+/// Whether `key` is in the sorted `deferred` list.
+fn is_deferred(deferred: &[AlignmentPageKey], key: AlignmentPageKey) -> bool {
+    !deferred.is_empty() && deferred.binary_search(&key).is_ok()
+}
+
+/// The visible drawable pages of `requests`, most important first: by genomic distance from the
+/// centre of the viewport to the page (zero for the page under the centre), then by row block
+/// from the top of the visible rows down, then by page key so the order is total. A page visible
+/// through several requests takes its best rank.
+pub(crate) fn visible_page_admission_order(
+    requests: &[AlignmentGpuSceneRequest<'_>],
+) -> Vec<AlignmentPageKey> {
+    let mut ranked = BTreeMap::<AlignmentPageKey, (u64, u32)>::new();
+    for request in requests {
+        let interval = request.camera.interval();
+        let centre = interval.start() + interval.len() / 2;
+        let rows = request.camera.visible_rows();
+        for page in request
+            .scene
+            .visible_pages(interval, rows.clone())
+            .into_iter()
+            .filter(|page| alignment_page_has_gpu_geometry(page))
+        {
+            let page_interval = page.interval();
+            let distance = if centre < page_interval.start() {
+                page_interval.start() - centre
+            } else {
+                // The page end is exclusive: the last base it holds is `end - 1`.
+                centre.saturating_sub(page_interval.end().saturating_sub(1))
+            };
+            let row_distance = page.row_range().start.saturating_sub(rows.start);
+            let rank = (distance, row_distance);
+            ranked
+                .entry(page.key())
+                .and_modify(|best| *best = (*best).min(rank))
+                .or_insert(rank);
+        }
+    }
+    let mut order = ranked.into_iter().collect::<Vec<_>>();
+    order.sort_unstable_by_key(|(key, rank)| (*rank, *key));
+    order.into_iter().map(|(key, _)| key).collect()
+}
+
 fn alignment_page_has_gpu_geometry(page: &AlignmentSemanticPage) -> bool {
     page.has_drawable_primitives()
 }
@@ -4044,6 +4345,16 @@ pub enum AlignmentGpuPageAdmissionError {
     CapacityOverflow,
     #[error("alignment semantic primitive has invalid span {start}..{end}")]
     InvalidSemanticSpan { start: u64, end: u64 },
+    #[error(
+        "alignment semantic primitive spans page offsets {start}..{end}, beyond the {limit}-base \
+         range a GPU page can address"
+    )]
+    SemanticOffsetOutOfRange { start: u64, end: u64, limit: u64 },
+    #[error(
+        "alignment semantic primitive is on page row {row_offset}, beyond the {limit} rows a GPU \
+         page can address"
+    )]
+    RowOffsetOutOfRange { row_offset: u32, limit: u32 },
     #[error(
         "alignment GPU page table capacity is invalid: required {required}, allocated {actual}"
     )]

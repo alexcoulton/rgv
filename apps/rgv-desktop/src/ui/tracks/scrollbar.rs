@@ -269,8 +269,8 @@ pub(super) fn paint_annotation_scrollbar_with_id(
         });
     }
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, Color32::from_gray(250));
-    painter.rect_filled(geometry.track, 0.0, Color32::WHITE);
+    painter.rect_filled(rect, 0.0, crate::theme::adapt(Color32::from_gray(250)));
+    painter.rect_filled(geometry.track, 0.0, crate::theme::adapt(Color32::WHITE));
     if let Some(overview) = overview.filter(|overview| !overview.bins.is_empty()) {
         for (index, bin) in overview.bins.iter().enumerate() {
             painter.rect_filled(
@@ -286,32 +286,32 @@ pub(super) fn paint_annotation_scrollbar_with_id(
                     pos2(geometry.track.left(), y),
                     pos2(geometry.track.right(), y),
                 ],
-                Stroke::new(0.75, Color32::from_gray(72)),
+                Stroke::new(0.75, crate::theme::adapt(Color32::from_gray(72))),
             );
         }
     }
     painter.rect_stroke(
         geometry.track,
         0.0,
-        Stroke::new(0.75, Color32::from_gray(95)),
+        Stroke::new(0.75, crate::theme::adapt(Color32::from_gray(95))),
         egui::StrokeKind::Inside,
     );
     painter.rect_filled(
         geometry.thumb,
         1.0,
-        Color32::from_rgba_unmultiplied(75, 91, 112, 42),
+        crate::theme::adapt(Color32::from_rgba_unmultiplied(75, 91, 112, 42)),
     );
     painter.rect_stroke(
         geometry.thumb,
         1.0,
-        Stroke::new(1.5, Color32::from_rgb(75, 91, 112)),
+        Stroke::new(1.5, crate::theme::adapt(Color32::from_rgb(75, 91, 112))),
         egui::StrokeKind::Outside,
     );
     if response.has_focus() {
         painter.rect_stroke(
             rect.shrink(1.0),
             1.0,
-            Stroke::new(2.0, Color32::BLACK),
+            Stroke::new(2.0, crate::theme::adapt(Color32::BLACK)),
             egui::StrokeKind::Inside,
         );
     }
@@ -637,8 +637,8 @@ pub(super) fn paint_vertical_scrollbar_with_id(
         },
     );
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, Color32::from_gray(250));
-    painter.rect_filled(geometry.track, 0.0, Color32::WHITE);
+    painter.rect_filled(rect, 0.0, crate::theme::adapt(Color32::from_gray(250)));
+    painter.rect_filled(geometry.track, 0.0, crate::theme::adapt(Color32::WHITE));
     if let Some(overview) = overview.filter(|overview| !overview.bins.is_empty()) {
         for (index, bin) in overview.bins.iter().enumerate() {
             painter.rect_filled(
@@ -654,30 +654,30 @@ pub(super) fn paint_vertical_scrollbar_with_id(
                     pos2(geometry.track.left(), y),
                     pos2(geometry.track.right(), y),
                 ],
-                Stroke::new(0.75, Color32::from_gray(72)),
+                Stroke::new(0.75, crate::theme::adapt(Color32::from_gray(72))),
             );
         }
     }
     painter.rect_stroke(
         geometry.track,
         0.0,
-        Stroke::new(0.75, Color32::from_gray(95)),
+        Stroke::new(0.75, crate::theme::adapt(Color32::from_gray(95))),
         egui::StrokeKind::Inside,
     );
     if provisional {
         painter.rect_filled(
             geometry.track,
             0.0,
-            Color32::from_rgba_unmultiplied(245, 247, 250, 150),
+            crate::theme::adapt(Color32::from_rgba_unmultiplied(245, 247, 250, 150)),
         );
     }
     painter.rect_filled(
         geometry.thumb,
         1.0,
         if provisional {
-            Color32::from_rgba_unmultiplied(110, 116, 124, 42)
+            crate::theme::adapt(Color32::from_rgba_unmultiplied(110, 116, 124, 42))
         } else {
-            Color32::from_rgba_unmultiplied(
+            crate::theme::adapt(Color32::from_rgba_unmultiplied(
                 45,
                 92,
                 175,
@@ -686,7 +686,7 @@ pub(super) fn paint_vertical_scrollbar_with_id(
                 } else {
                     30
                 },
-            )
+            ))
         },
     );
     painter.rect_stroke(
@@ -695,9 +695,9 @@ pub(super) fn paint_vertical_scrollbar_with_id(
         Stroke::new(
             if provisional { 1.0 } else { 2.0 },
             if provisional {
-                Color32::from_gray(110)
+                crate::theme::adapt(Color32::from_gray(110))
             } else {
-                Color32::from_rgb(45, 92, 175)
+                crate::theme::adapt(Color32::from_rgb(45, 92, 175))
             },
         ),
         egui::StrokeKind::Outside,
@@ -706,7 +706,7 @@ pub(super) fn paint_vertical_scrollbar_with_id(
         painter.rect_stroke(
             rect.shrink(1.0),
             1.0,
-            Stroke::new(2.0, Color32::BLACK),
+            Stroke::new(2.0, crate::theme::adapt(Color32::BLACK)),
             egui::StrokeKind::Inside,
         );
     }
@@ -739,5 +739,5 @@ pub(super) fn scrollbar_overview_color(kind: Option<TrackKind>, density: f32) ->
             .round()
             .clamp(0.0, 255.0) as u8
     };
-    Color32::from_rgb(blend(red), blend(green), blend(blue))
+    crate::theme::adapt(Color32::from_rgb(blend(red), blend(green), blend(blue)))
 }

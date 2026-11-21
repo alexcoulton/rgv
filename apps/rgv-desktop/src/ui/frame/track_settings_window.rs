@@ -907,7 +907,7 @@ impl Viewer {
             st.align.apply_filter = true;
         }
         if let Some(error) = &st.align.filter_error {
-            ui.colored_label(egui::Color32::DARK_RED, error);
+            ui.colored_label(crate::theme::adapt(egui::Color32::DARK_RED), error);
         }
     }
 

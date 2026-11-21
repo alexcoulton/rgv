@@ -36,14 +36,17 @@ pub(super) fn paint_track_section_header(
         pos2(gutter.right(), full_rect.bottom()),
     );
     let (label, fill) = match channel {
-        TrackPane::Annotation => ("Annotations", Color32::from_rgb(219, 230, 242)),
-        TrackPane::Reads => ("Read data", Color32::from_gray(236)),
+        TrackPane::Annotation => (
+            "Annotations",
+            crate::theme::adapt(Color32::from_rgb(219, 230, 242)),
+        ),
+        TrackPane::Reads => ("Read data", crate::theme::adapt(Color32::from_gray(236))),
     };
     painter.rect_filled(full_rect, 0.0, fill.gamma_multiply(0.72));
     painter.rect_filled(gutter_rect, 0.0, fill);
     painter.line_segment(
         [full_rect.left_bottom(), full_rect.right_bottom()],
-        Stroke::new(1.0, Color32::from_gray(165)),
+        Stroke::new(1.0, crate::theme::adapt(Color32::from_gray(165))),
     );
     let response = ui
         .interact(
@@ -97,7 +100,10 @@ pub(super) fn paint_track_section_header(
         egui::vec2(16.0, 16.0),
     );
     for segment in group_chevron_segments(toggle_rect, !expanded) {
-        painter.line_segment(segment, Stroke::new(1.5, Color32::from_gray(65)));
+        painter.line_segment(
+            segment,
+            Stroke::new(1.5, crate::theme::adapt(Color32::from_gray(65))),
+        );
     }
     let count_label = if track_count == 1 {
         "1 track".to_owned()
@@ -108,7 +114,7 @@ pub(super) fn paint_track_section_header(
         painter,
         &format!("{label} · {count_label}"),
         FontId::proportional(13.0),
-        Color32::from_gray(45),
+        crate::theme::adapt(Color32::from_gray(45)),
         (gutter_rect.width() - 34.0).max(0.0),
         pos2(gutter_rect.left() + 28.0, gutter_rect.center().y),
         false,
@@ -257,7 +263,11 @@ impl GutterChromePass<'_> {
         let geometry = *geometry;
         let annotation_clip_bottom = *annotation_clip_bottom;
         let painter = &*painter;
-        painter.rect_filled(geometry.gutter, 0.0, READ_PANE_GUTTER_COLOR);
+        painter.rect_filled(
+            geometry.gutter,
+            0.0,
+            crate::theme::adapt(READ_PANE_GUTTER_COLOR),
+        );
         let annotation_gutter = Rect::from_min_max(
             geometry.gutter.min,
             pos2(
@@ -266,11 +276,15 @@ impl GutterChromePass<'_> {
             ),
         );
         if annotation_gutter.height() > 0.0 {
-            painter.rect_filled(annotation_gutter, 0.0, ANNOTATION_PANE_GUTTER_COLOR);
+            painter.rect_filled(
+                annotation_gutter,
+                0.0,
+                crate::theme::adapt(ANNOTATION_PANE_GUTTER_COLOR),
+            );
         }
         painter.line_segment(
             [geometry.gutter.right_top(), geometry.gutter.right_bottom()],
-            Stroke::new(1.0, Color32::from_gray(175)),
+            Stroke::new(1.0, crate::theme::adapt(Color32::from_gray(175))),
         );
     }
 
@@ -432,7 +446,7 @@ impl GutterChromePass<'_> {
                     pos2(rail_x, label_rect.top()),
                     pos2(rail_x, label_rect.bottom()),
                 ],
-                Stroke::new(1.0, Color32::from_rgb(126, 154, 189)),
+                Stroke::new(1.0, crate::theme::adapt(Color32::from_rgb(126, 154, 189))),
             );
             if group_anchor {
                 painter.line_segment(
@@ -440,7 +454,7 @@ impl GutterChromePass<'_> {
                         pos2(rail_x, label_rect.top()),
                         pos2(label_rect.right(), label_rect.top()),
                     ],
-                    Stroke::new(1.0, Color32::from_rgb(126, 154, 189)),
+                    Stroke::new(1.0, crate::theme::adapt(Color32::from_rgb(126, 154, 189))),
                 );
             }
         }
@@ -473,7 +487,7 @@ impl GutterChromePass<'_> {
                     pos2(label_rect.left() + 3.0, label_rect.bottom()),
                 ),
                 0.0,
-                Color32::from_rgb(45, 92, 175),
+                crate::theme::adapt(Color32::from_rgb(45, 92, 175)),
             );
         }
         let raw_header_rect = Rect::from_min_max(
@@ -761,7 +775,7 @@ impl GutterChromePass<'_> {
             painter.rect_stroke(
                 header_rect.shrink(1.0),
                 1.0,
-                Stroke::new(2.0, Color32::BLACK),
+                Stroke::new(2.0, crate::theme::adapt(Color32::BLACK)),
                 egui::StrokeKind::Inside,
             );
         }
@@ -931,15 +945,15 @@ impl GutterChromePass<'_> {
         ui.ctx()
             .style_mut_of(theme, |style| style.animation_time = animation_time);
         let text_color = if frame.visible {
-            Color32::from_gray(45)
+            crate::theme::adapt(Color32::from_gray(45))
         } else {
-            Color32::from_gray(145)
+            crate::theme::adapt(Color32::from_gray(145))
         };
         let label_painter = painter.with_clip_rect(label_rect.shrink2(egui::vec2(3.0, 1.0)));
         let eye_color = if eye.hovered() {
-            Color32::from_rgb(45, 92, 175)
+            crate::theme::adapt(Color32::from_rgb(45, 92, 175))
         } else {
-            Color32::from_gray(105)
+            crate::theme::adapt(Color32::from_gray(105))
         };
         label_painter.add(egui::epaint::Shape::ellipse_stroke(
             eye_rect.center(),
@@ -959,9 +973,9 @@ impl GutterChromePass<'_> {
         }
         if let (Some(toggle), Some(group)) = (&group_toggle, track_group.filter(|_| group_header)) {
             let chevron_color = if toggle.hovered() {
-                Color32::from_rgb(45, 92, 175)
+                crate::theme::adapt(Color32::from_rgb(45, 92, 175))
             } else {
-                Color32::from_gray(90)
+                crate::theme::adapt(Color32::from_gray(90))
             };
             for segment in group_chevron_segments(group_toggle_rect, group.collapsed) {
                 label_painter.line_segment(segment, Stroke::new(1.5, chevron_color));
@@ -972,7 +986,7 @@ impl GutterChromePass<'_> {
                 label_painter.rect_filled(
                     settings_rect,
                     3.0,
-                    Color32::from_rgba_unmultiplied(45, 92, 175, 24),
+                    crate::theme::adapt(Color32::from_rgba_unmultiplied(45, 92, 175, 24)),
                 );
             }
             paint_icon(
@@ -980,9 +994,9 @@ impl GutterChromePass<'_> {
                 settings_rect.shrink(3.0),
                 AppIcon::Settings,
                 if settings.hovered() {
-                    Color32::from_rgb(45, 92, 175)
+                    crate::theme::adapt(Color32::from_rgb(45, 92, 175))
                 } else {
-                    Color32::from_gray(95)
+                    crate::theme::adapt(Color32::from_gray(95))
                 },
             );
         }
@@ -1127,14 +1141,14 @@ impl GutterChromePass<'_> {
                             pos2(geometry.gutter.right(), subtrack_bottom),
                         ),
                         0.0,
-                        Color32::from_gray(242),
+                        crate::theme::adapt(Color32::from_gray(242)),
                     );
                     painter.line_segment(
                         [
                             pos2(geometry.gutter.left(), subtrack_bottom),
                             pos2(geometry.gutter.right(), subtrack_bottom),
                         ],
-                        Stroke::new(1.0, Color32::from_gray(218)),
+                        Stroke::new(1.0, crate::theme::adapt(Color32::from_gray(218))),
                     );
                 }
                 let eye_rect = Rect::from_center_size(
@@ -1197,9 +1211,9 @@ impl GutterChromePass<'_> {
                     }
                 });
                 let eye_color = if eye.hovered() {
-                    Color32::from_rgb(45, 92, 175)
+                    crate::theme::adapt(Color32::from_rgb(45, 92, 175))
                 } else {
-                    Color32::from_gray(115)
+                    crate::theme::adapt(Color32::from_gray(115))
                 };
                 label_painter.add(egui::epaint::Shape::ellipse_stroke(
                     eye_rect.center(),
@@ -1226,7 +1240,7 @@ impl GutterChromePass<'_> {
                             pos2(geometry.gutter.right(), subtrack_bottom),
                         ),
                         0.0,
-                        Color32::from_gray(242),
+                        crate::theme::adapt(Color32::from_gray(242)),
                     );
                 }
                 let eye_rect = Rect::from_center_size(
@@ -1279,9 +1293,9 @@ impl GutterChromePass<'_> {
                     }
                 });
                 let eye_color = if eye.hovered() {
-                    Color32::from_rgb(45, 92, 175)
+                    crate::theme::adapt(Color32::from_rgb(45, 92, 175))
                 } else {
-                    Color32::from_gray(115)
+                    crate::theme::adapt(Color32::from_gray(115))
                 };
                 label_painter.add(egui::epaint::Shape::ellipse_stroke(
                     eye_rect.center(),
@@ -1302,8 +1316,16 @@ impl GutterChromePass<'_> {
             }
             let label_font = FontId::proportional(10.0);
             let detail_font = FontId::proportional(9.0);
-            let label_color = Color32::from_gray(if subtrack.collapsed { 115 } else { 75 });
-            let detail_color = Color32::from_gray(if subtrack.collapsed { 135 } else { 105 });
+            let label_color = crate::theme::adapt(Color32::from_gray(if subtrack.collapsed {
+                115
+            } else {
+                75
+            }));
+            let detail_color = crate::theme::adapt(Color32::from_gray(if subtrack.collapsed {
+                135
+            } else {
+                105
+            }));
             let label_width = label_painter
                 .layout_no_wrap(subtrack.label.clone(), label_font.clone(), label_color)
                 .size()
@@ -1345,7 +1367,7 @@ impl GutterChromePass<'_> {
                     pos2(geometry.viewport.left(), bottom),
                     pos2(geometry.viewport.right(), bottom),
                 ],
-                Stroke::new(1.0, Color32::from_gray(205)),
+                Stroke::new(1.0, crate::theme::adapt(Color32::from_gray(205))),
             );
         }
 
@@ -1417,7 +1439,7 @@ impl GutterChromePass<'_> {
             }
             painter.line_segment(
                 [handle.left_center(), handle.right_center()],
-                Stroke::new(2.0, Color32::BLACK),
+                Stroke::new(2.0, crate::theme::adapt(Color32::BLACK)),
             );
         }
         if resize.drag_started() {
@@ -1561,9 +1583,9 @@ impl GutterChromePass<'_> {
                     pos2(geometry.viewport.right(), annotation_clip_bottom),
                 ],
                 if divider.hovered() || divider.dragged() {
-                    Stroke::new(3.0, Color32::from_rgb(45, 92, 175))
+                    Stroke::new(3.0, crate::theme::adapt(Color32::from_rgb(45, 92, 175)))
                 } else {
-                    Stroke::new(1.5, Color32::from_gray(165))
+                    Stroke::new(1.5, crate::theme::adapt(Color32::from_gray(165)))
                 },
             );
         }

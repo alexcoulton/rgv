@@ -37,6 +37,7 @@ pub(crate) struct SystemDialogDraft {
     pub(crate) autosave_retention: usize,
     pub(crate) interface_scale_percent: u16,
     pub(crate) high_contrast: bool,
+    pub(crate) interface_theme: rgv_core::InterfaceTheme,
     pub(crate) reduced_motion: bool,
     pub(crate) clear_recent_requested: bool,
     pub(crate) recent_alignment_requested: Option<TrackSource>,
@@ -171,7 +172,7 @@ pub(crate) fn show_system_dialogs(
                             .labelled_by(reference_index_label.id);
                         }
                         if let Some(error) = &draft.remote_source_editor.error {
-                            ui.colored_label(egui::Color32::DARK_RED, error);
+                            ui.colored_label(crate::theme::adapt(egui::Color32::DARK_RED), error);
                         }
                         ui.small(
                             "Indexed HTTP and HTTPS sources use range requests. BAM/CRAM/FASTA bearer authentication can use RGV_REMOTE_BEARER_TOKEN; signed source query strings are preserved.",
@@ -220,6 +221,22 @@ pub(crate) fn show_system_dialogs(
                                 .suffix("%"),
                             )
                             .labelled_by(label.id);
+                        });
+                        ui.horizontal(|ui| {
+                            let label = ui.label("Theme");
+                            egui::ComboBox::from_id_salt("rgv-interface-theme")
+                                .selected_text(crate::theme::theme_label(draft.interface_theme))
+                                .show_ui(ui, |ui| {
+                                    for theme in crate::theme::INTERFACE_THEMES {
+                                        ui.selectable_value(
+                                            &mut draft.interface_theme,
+                                            theme,
+                                            crate::theme::theme_label(theme),
+                                        );
+                                    }
+                                })
+                                .response
+                                .labelled_by(label.id);
                         });
                         ui.checkbox(&mut draft.high_contrast, "Increase interface contrast");
                         ui.checkbox(&mut draft.reduced_motion, "Reduce interface motion");
@@ -309,7 +326,7 @@ pub(crate) fn show_system_dialogs(
                             ));
                             if budget.pinned_overage_bytes > 0 {
                                 ui.colored_label(
-                                    egui::Color32::DARK_RED,
+                                    crate::theme::adapt(egui::Color32::DARK_RED),
                                     format!(
                                         "Committed scene pins {:.1} MiB above the selected budget",
                                         mib(budget.pinned_overage_bytes),
@@ -489,9 +506,9 @@ pub(crate) fn show_system_dialogs(
                         ui.separator();
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for (heading, notices, color) in [
-                                ("Imported", &report.imported, egui::Color32::from_rgb(25, 120, 65)),
-                                ("Approximated", &report.approximated, egui::Color32::from_rgb(165, 105, 20)),
-                                ("Ignored", &report.ignored, egui::Color32::from_rgb(170, 45, 45)),
+                                ("Imported", &report.imported, crate::theme::adapt(egui::Color32::from_rgb(25, 120, 65))),
+                                ("Approximated", &report.approximated, crate::theme::adapt(egui::Color32::from_rgb(165, 105, 20))),
+                                ("Ignored", &report.ignored, crate::theme::adapt(egui::Color32::from_rgb(170, 45, 45))),
                             ] {
                                 ui.colored_label(color, heading);
                                 if notices.is_empty() {

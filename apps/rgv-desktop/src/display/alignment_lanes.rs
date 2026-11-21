@@ -533,8 +533,15 @@ impl Viewer {
             .and_then(|snapshot| snapshot.reads().atlas().downsampled_read_counts())
             .map(|(shown, eligible)| format!(" · Downsampled: {shown} of {eligible} reads shown"))
             .unwrap_or_default();
+        // A partially resident picture says so: it is drawn from the pages that fit, not
+        // presented as complete.
+        let residency_status = crate::workspace::alignment_management::gpu_publication::alignment_partial_residency_status(
+            self.alignment_gpu_deferred_read_pages(),
+        )
+        .map(|status| format!(" · {status}"))
+        .unwrap_or_default();
         format!(
-            "Reads · {}{filter_status}{highlight_status}{sampling_status}",
+            "Reads · {}{filter_status}{highlight_status}{sampling_status}{residency_status}",
             track.config.name
         )
     }

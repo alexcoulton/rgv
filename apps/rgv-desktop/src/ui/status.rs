@@ -17,13 +17,17 @@ pub fn status_bar_with_badge(
             if let Some(badge) = badge {
                 badge_clicked = ui
                     .add(egui::Button::new(
-                        RichText::new(badge).color(Color32::from_rgb(170, 30, 30)),
+                        RichText::new(badge)
+                            .color(crate::theme::adapt(Color32::from_rgb(170, 30, 30))),
                     ))
                     .on_hover_text("Show errors and warnings")
                     .clicked();
                 ui.separator();
             }
-            ui.label(RichText::new(format!("{track_count} tracks")).color(Color32::from_gray(70)));
+            ui.label(
+                RichText::new(format!("{track_count} tracks"))
+                    .color(crate::theme::adapt(Color32::from_gray(70))),
+            );
             ui.separator();
             ui.monospace(locus);
             ui.separator();

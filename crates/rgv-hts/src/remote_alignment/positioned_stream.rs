@@ -8,8 +8,8 @@ use noodles::{bam, bgzf::VirtualPosition, cram, sam};
 use rgv_core::GenomicInterval;
 
 use super::{
-    CramSliceSpan, NoodlesReader, RemoteIndex, SelectedCramSlices, noodles_record_intersects,
-    noodles_record_span_on, noodles_record_starts_at_or_after_end, select_cram_containers,
+    BamBlockStream, CramSliceSpan, RemoteIndex, SelectedCramSlices, bam_placement_intersects,
+    bam_placement_starts_at_or_after_end, bam_record_placement, select_cram_containers,
     visit_cram_container_records,
 };
 use crate::{
@@ -34,10 +34,21 @@ enum StreamWork {
         resume: Option<VirtualPosition>,
         /// Reading never resumes before this offset: everything up to it was skipped.
         floor: VirtualPosition,
+        /// The record at `resume` that the last checkpoint read and found to belong to the
+        /// next owner block. It is kept instead of being read again, so a stream that is
+        /// simply continued never seeks backwards (a seek restarts a multithreaded reader).
+        held: Option<HeldBamRecord>,
     },
     Cram {
         containers: VecDeque<(u64, SelectedCramSlices)>,
     },
+}
+
+/// A decoded record together with the virtual offsets at which it starts and ends.
+struct HeldBamRecord {
+    record: bam::Record,
+    before: VirtualPosition,
+    after: VirtualPosition,
 }
 
 impl NoodlesPositionedStream {
@@ -75,6 +86,7 @@ impl NoodlesPositionedStream {
                     chunks: merged.into(),
                     resume: None,
                     floor: VirtualPosition::from(0),
+                    held: None,
                 },
                 ready: VecDeque::new(),
                 receipt: None,
@@ -189,15 +201,13 @@ fn bam_read_plan(
     plan
 }
 
-/// Performs at most one BGZF owner block of remote BAM work.
+/// Performs at most one BGZF owner block of BAM work.
 #[allow(clippy::too_many_lines)]
-pub(super) fn next_bam_checkpoint(
+pub(super) fn next_bam_checkpoint<B: BamBlockStream>(
     slot: &mut Option<NoodlesPositionedStream>,
-    reader: &mut NoodlesReader,
+    reader: &mut B,
     header: &sam::Header,
 ) -> Result<PositionedAlignmentStreamCheckpoint, AlignmentError> {
-    use noodles::bgzf::io::Seek as _;
-
     let mut state = slot
         .take()
         .ok_or(AlignmentError::NoActivePositionedStream)?;
@@ -216,11 +226,12 @@ pub(super) fn next_bam_checkpoint(
         chunks,
         resume,
         floor,
+        ..
     } = &state.work
     {
         // The chunks still to be read (the first from where the last checkpoint stopped) are
         // what the range reader should fetch; a narrowed plan keeps its cached bytes.
-        bgzf_reader.get_mut().set_bgzf_read_plan(bam_read_plan(
+        bgzf_reader.plan_reads(bam_read_plan(
             chunks,
             *resume,
             *floor,
@@ -233,6 +244,7 @@ pub(super) fn next_bam_checkpoint(
             chunks,
             resume,
             floor,
+            held,
         } = &mut state.work
         else {
             return Err(AlignmentError::NoActivePositionedStream);
@@ -261,14 +273,24 @@ pub(super) fn next_bam_checkpoint(
                 continue;
             }
         }
-        bgzf_reader.seek_to_virtual_position(position)?;
+        // The record held from the last checkpoint is the one at `position`, unless reading
+        // moved on (a skip); reading then continues just past it.
+        let mut held = held.take().filter(|held| held.before == position);
+        let read_from = held.as_ref().map_or(position, |held| held.after);
+        if bgzf_reader.virtual_position() != read_from {
+            bgzf_reader.seek_to_virtual_position(read_from)?;
+        }
         let mut direct_reader = bam::io::Reader::from(&mut *bgzf_reader);
         loop {
-            let before = direct_reader.get_ref().virtual_position();
+            let before = held.as_ref().map_or_else(
+                || direct_reader.get_ref().virtual_position(),
+                |held| held.before,
+            );
             let StreamWork::Bam {
                 chunks,
                 resume,
                 floor,
+                held: next_held,
             } = &mut state.work
             else {
                 unreachable!("stream work kind is fixed");
@@ -290,25 +312,37 @@ pub(super) fn next_bam_checkpoint(
                     continue 'chunks;
                 }
             }
-            if direct_reader.read_record(&mut record)? == 0 {
-                chunks.clear();
-                *resume = None;
-                break 'chunks;
-            }
-            let after = direct_reader.get_ref().virtual_position();
+            let after = if let Some(held) = held.take() {
+                record = held.record;
+                held.after
+            } else {
+                if direct_reader.read_record(&mut record)? == 0 {
+                    chunks.clear();
+                    *resume = None;
+                    break 'chunks;
+                }
+                direct_reader.get_ref().virtual_position()
+            };
             let end_position = u64::from(after);
             let block = end_position >> 16;
             if current_block.is_some_and(|current| current != block) {
-                // The record belongs to the next physical owner; re-read it at the next
-                // checkpoint. It lies in the target unless it starts at or beyond its end.
+                // The record belongs to the next physical owner; the next checkpoint starts
+                // with it. It lies in the target unless it starts at or beyond its end.
                 *resume = Some(before);
-                later_record |= noodles_record_span_on(&record, header, interval.contig())?
-                    .is_some_and(|(start, _)| start < interval.end());
+                later_record |= bam_record_placement(&record)?.is_some_and(|(contig, start, _)| {
+                    contig == interval.contig() && start < interval.end()
+                });
+                *next_held = Some(HeldBamRecord {
+                    record: std::mem::take(&mut record),
+                    before,
+                    after,
+                });
                 break 'chunks;
             }
             *resume = Some(after);
-            if !noodles_record_intersects(&record, header, interval)? {
-                if noodles_record_starts_at_or_after_end(&record, header, interval)? {
+            let placement = bam_record_placement(&record)?;
+            if !bam_placement_intersects(placement, interval) {
+                if bam_placement_starts_at_or_after_end(placement, interval) {
                     // Coordinate order: no later record can intersect; the remaining chunks
                     // are never fetched.
                     chunks.clear();

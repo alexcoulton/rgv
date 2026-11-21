@@ -203,7 +203,7 @@ pub(crate) fn quantitative_track_settings_ui(
         });
         if settings.fixed_minimum >= settings.fixed_maximum {
             ui.colored_label(
-                egui::Color32::DARK_RED,
+                crate::theme::adapt(egui::Color32::DARK_RED),
                 "The fixed maximum must be greater than the minimum.",
             );
         }
@@ -392,7 +392,7 @@ pub(crate) fn quantitative_track_settings_ui(
             );
         } else {
             ui.colored_label(
-                egui::Color32::DARK_RED,
+                crate::theme::adapt(egui::Color32::DARK_RED),
                 "Load another quantitative track to use arithmetic.",
             );
         }
@@ -536,7 +536,7 @@ pub(crate) fn copy_number_track_settings_ui(
         });
         if quantitative.fixed_minimum >= quantitative.fixed_maximum {
             ui.colored_label(
-                egui::Color32::DARK_RED,
+                crate::theme::adapt(egui::Color32::DARK_RED),
                 "The fixed maximum must be greater than the minimum.",
             );
         }
@@ -1075,7 +1075,7 @@ pub(crate) fn variant_track_settings_ui(
             }
         }
         if let Some(error) = predicate_error {
-            ui.colored_label(egui::Color32::DARK_RED, error);
+            ui.colored_label(crate::theme::adapt(egui::Color32::DARK_RED), error);
         }
         ui.small(
             "FORMAT conditions match when any selected sample satisfies the condition; missing behavior is always explicit.",

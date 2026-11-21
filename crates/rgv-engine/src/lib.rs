@@ -3,6 +3,7 @@
 mod alignment_scene_coordinator;
 mod alignment_scene_engine;
 mod cache;
+mod decode_allowance;
 mod local_bam_source;
 mod mailbox;
 mod reference_engine;
@@ -29,13 +30,19 @@ pub use alignment_scene_engine::{
     LocalAlignmentSceneEngineConfig,
 };
 pub use cache::SourceFingerprint;
+pub use decode_allowance::{
+    AlignmentDecodeAllowanceSnapshot, alignment_decode_allowance, set_alignment_decode_concurrency,
+};
+#[allow(deprecated)]
+pub use local_bam_source::LocalBamCanonicalBackend;
 pub use local_bam_source::{
-    LocalBamCanonicalBackend, LocalBamCanonicalBackendError, LocalBamSourceControl,
+    AlignmentDecodeTelemetry, LocalBamCanonicalBackendError, LocalBamSourceControl,
+    PositionedAlignmentBackend,
 };
 pub use mailbox::{EngineQueueError, set_ui_waker};
 pub use reference_engine::{
     MAX_REFERENCE_QUERY_BASES, MAX_REFERENCE_SLICE_BASES, ReferenceEngine, ReferenceEngineEvent,
-    ReferenceQueryIdentity,
+    ReferenceQueryIdentity, ReferenceSliceDelivery, ReferenceSliceSink,
 };
 pub use source_actor::{
     AlignmentSourceActor, AlignmentSourceActorAction, AlignmentSourceActorError,

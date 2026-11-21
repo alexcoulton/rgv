@@ -48,6 +48,8 @@ const TABIX_MAGIC: &[u8; 4] = b"TBI\x01";
 const TABIX_MIN_SHIFT: u8 = 14;
 const TABIX_DEPTH: u8 = 5;
 const TABIX_FORMAT_VCF: i32 = 2;
+/// Flag of a tabix format: begin coordinates are 0-based and ends exclusive (BED).
+pub(in crate::tracks) const TABIX_FLAG_ZERO_BASED: i32 = 0x10000;
 const BCF_MAGIC: &[u8; 5] = b"BCF\x02\x02";
 /// `l_shared`, `l_indiv`, then the fixed `CHROM`/`POS`/`rlen`/... fields of a BCF record.
 const BCF_RECORD_PREFIX_BYTES: usize = 8;
@@ -61,13 +63,27 @@ enum VariantFileFormat {
 
 type TabixIndex = csi::binning_index::Index<LinearIndex>;
 
-enum RemoteVariantIndex {
+pub(in crate::tracks) enum RemoteVariantIndex {
     Tabix(TabixIndex),
     Csi(csi::Index),
 }
 
+/// What a tabix index (or the tabix header of a CSI index) says about the indexed text: the
+/// `tbx_conf_t` of `HTSlib`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::tracks) struct TabixColumns {
+    /// Format (0 generic, 1 SAM, 2 VCF) with its flags.
+    pub(in crate::tracks) preset: i32,
+    /// 1-based column of the sequence name.
+    pub(in crate::tracks) sequence: i32,
+    /// 1-based column of the begin coordinate.
+    pub(in crate::tracks) begin: i32,
+    /// 1-based column of the end coordinate; 0 when there is none.
+    pub(in crate::tracks) end: i32,
+}
+
 impl RemoteVariantIndex {
-    fn query(
+    pub(in crate::tracks) fn query(
         &self,
         reference: usize,
         interval: noodles::core::region::Interval,
@@ -86,7 +102,7 @@ impl RemoteVariantIndex {
     }
 
     /// Largest 1-based position the binning scheme can address.
-    fn maximum_position(&self) -> u64 {
+    pub(in crate::tracks) fn maximum_position(&self) -> u64 {
         let (min_shift, depth) = match self {
             Self::Tabix(index) => (index.min_shift(), index.depth()),
             Self::Csi(index) => (index.min_shift(), index.depth()),
@@ -152,7 +168,7 @@ fn backend(error: impl std::fmt::Display) -> TrackError {
     TrackError::Backend(error.to_string())
 }
 
-fn combine_stats(left: RemoteIoStats, right: RemoteIoStats) -> RemoteIoStats {
+pub(in crate::tracks) fn combine_stats(left: RemoteIoStats, right: RemoteIoStats) -> RemoteIoStats {
     RemoteIoStats {
         requests: left.requests.saturating_add(right.requests),
         response_bytes: left.response_bytes.saturating_add(right.response_bytes),
@@ -560,7 +576,7 @@ fn read_bcf_header_text(
 }
 
 /// Reads one line without its terminator; returns the bytes consumed (0 at end of file).
-fn read_line(
+pub(in crate::tracks) fn read_line(
     reader: &mut bgzf::io::Reader<HttpRangeReader>,
     line: &mut Vec<u8>,
 ) -> Result<usize, TrackError> {
@@ -748,7 +764,7 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// C `strtoll(text, &end, 0)`: optional whitespace and sign, then a hexadecimal (`0x`), octal
 /// (leading `0`) or decimal integer. The flag reports whether any character was consumed as a
 /// number, which is what `tbx_parse1` tests.
-fn strtoll(text: &[u8]) -> (i64, bool) {
+pub(in crate::tracks) fn strtoll(text: &[u8]) -> (i64, bool) {
     let mut index = text
         .iter()
         .position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
@@ -857,7 +873,12 @@ fn parse_index(
                 "a BCF needs a CSI index, not a tabix index".to_owned(),
             ));
         }
-        let (index, names) = parse_tabix(&inflated)?;
+        let (index, names, columns) = parse_tabix(&inflated)?;
+        if columns.preset & 0xffff != TABIX_FORMAT_VCF {
+            return Err(TrackError::Backend(
+                "tabix index was not built for a VCF".to_owned(),
+            ));
+        }
         return Ok((RemoteVariantIndex::Tabix(index), names));
     }
     drop(inflated);
@@ -925,20 +946,20 @@ impl IndexBytes<'_> {
 
 /// Parses an inflated `.tbi` (SAM/tabix specification section 3) into the binning-index type
 /// `noodles` queries, which is also how `noodles-tabix` represents it.
-fn parse_tabix(inflated: &[u8]) -> Result<(TabixIndex, Vec<Vec<u8>>), TrackError> {
+fn parse_tabix(inflated: &[u8]) -> Result<(TabixIndex, Vec<Vec<u8>>, TabixColumns), TrackError> {
     let mut bytes = IndexBytes(inflated);
     if bytes.take(4)? != TABIX_MAGIC {
         return Err(IndexBytes::malformed());
     }
     let references = bytes.count(4)?;
-    let format = bytes.i32()?;
-    if format & 0xffff != TABIX_FORMAT_VCF {
-        return Err(TrackError::Backend(
-            "tabix index was not built for a VCF".to_owned(),
-        ));
-    }
-    // col_seq, col_beg, col_end, meta, skip: fixed by the VCF preset.
-    bytes.take(20)?;
+    let columns = TabixColumns {
+        preset: bytes.i32()?,
+        sequence: bytes.i32()?,
+        begin: bytes.i32()?,
+        end: bytes.i32()?,
+    };
+    // meta, skip: used only when the index is built.
+    bytes.take(8)?;
     let names_length = bytes.count(1)?;
     let names = bytes
         .take(names_length)?
@@ -984,12 +1005,67 @@ fn parse_tabix(inflated: &[u8]) -> Result<(TabixIndex, Vec<Vec<u8>>), TrackError
         .set_depth(TABIX_DEPTH)
         .set_reference_sequences(sequences)
         .build();
-    Ok((index, names))
+    Ok((index, names, columns))
 }
+
+/// Parses the tabix (`.tbi`) or CSI index of a bgzip-compressed text file of any tabix format,
+/// returning the sequence names in index order and the column layout the index was built
+/// with. `bytes` is the index file as stored (bgzip-compressed).
+pub(in crate::tracks) fn parse_text_index(
+    bytes: &[u8],
+) -> Result<(RemoteVariantIndex, Vec<Vec<u8>>, TabixColumns), TrackError> {
+    let mut inflated = Vec::new();
+    flate2::read::MultiGzDecoder::new(bytes)
+        .take(MAX_REMOTE_VARIANT_INDEX_INFLATED_BYTES + 1)
+        .read_to_end(&mut inflated)
+        .map_err(|error| TrackError::Backend(format!("invalid tabix index: {error}")))?;
+    if inflated.len() as u64 > MAX_REMOTE_VARIANT_INDEX_INFLATED_BYTES {
+        return Err(TrackError::ResourceLimit(
+            "remote tabix index exceeds the supported size".to_owned(),
+        ));
+    }
+    if inflated.starts_with(TABIX_MAGIC) {
+        let (index, names, columns) = parse_tabix(&inflated)?;
+        return Ok((RemoteVariantIndex::Tabix(index), names, columns));
+    }
+    drop(inflated);
+    let index = csi::io::Reader::new(std::io::Cursor::new(bytes))
+        .read_index()
+        .map_err(|error| TrackError::Backend(format!("invalid CSI index: {error}")))?;
+    let header = index.header().ok_or_else(|| {
+        TrackError::Backend("CSI index carries no tabix header for a text file".to_owned())
+    })?;
+    let column =
+        |index: usize| i32::try_from(index.saturating_add(1)).map_err(|_| IndexBytes::malformed());
+    let columns = TabixColumns {
+        preset: match header.format() {
+            TabixFormat::Generic(
+                csi::binning_index::index::header::format::CoordinateSystem::Gff,
+            ) => 0,
+            TabixFormat::Generic(
+                csi::binning_index::index::header::format::CoordinateSystem::Bed,
+            ) => TABIX_FLAG_ZERO_BASED,
+            TabixFormat::Sam => 1,
+            TabixFormat::Vcf => TABIX_FORMAT_VCF,
+        },
+        sequence: column(header.reference_sequence_name_index())?,
+        begin: column(header.start_position_index())?,
+        end: header.end_position_index().map_or(Ok(0), column)?,
+    };
+    let names = header
+        .reference_sequence_names()
+        .iter()
+        .map(|name| name.to_vec())
+        .collect();
+    Ok((RemoteVariantIndex::Csi(index), names, columns))
+}
+
+/// Largest compressed tabix/CSI index downloaded for a remote text file.
+pub(in crate::tracks) const MAX_REMOTE_TEXT_INDEX_BYTES: usize = MAX_REMOTE_VARIANT_INDEX_BYTES;
 
 /// Fuzz entry: parses an index for either format and queries every sequence it lists.
 pub(crate) fn fuzz_variant_index(bytes: &[u8]) -> bool {
-    let mut parsed = false;
+    let mut parsed = parse_text_index(bytes).is_ok();
     for format in [VariantFileFormat::Vcf, VariantFileFormat::Bcf] {
         let Ok((index, _)) = parse_index(bytes, format) else {
             continue;

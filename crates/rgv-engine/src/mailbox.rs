@@ -192,16 +192,68 @@ impl<T> CoalescingSender<T> {
         owner: u64,
         value: T,
     ) -> Result<(), T> {
-        let width = u128::from(u64::MAX) + 1;
-        let key = width
-            .saturating_mul(u128::from(namespace).saturating_add(1))
-            .saturating_add(u128::from(owner));
-        self.send_latest_for_key(key, value)
+        self.send_latest_for_key(system_owner_key(namespace, owner), value)
+    }
+
+    /// A handle through which a producer that does not own this mailbox can publish
+    /// replaceable values into it. See [`CoalescingSideSender`].
+    pub(crate) fn side_sender(&self) -> CoalescingSideSender<T> {
+        CoalescingSideSender {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     fn send_latest_for_key(&self, key: u128, value: T) -> Result<(), T> {
-        let mut state = self.inner.state.lock().expect("mailbox mutex poisoned");
-        if !state.receiver_open {
+        self.inner.send_latest_for_key(key, value, false)
+    }
+}
+
+fn system_owner_key(namespace: u64, owner: u64) -> u128 {
+    let width = u128::from(u64::MAX) + 1;
+    width
+        .saturating_mul(u128::from(namespace).saturating_add(1))
+        .saturating_add(u128::from(owner))
+}
+
+/// A second way into a mailbox, for a producer on another thread that is not the mailbox's
+/// owner (one engine handing a result straight to another engine's worker). It publishes
+/// replaceable values only, so it can never fill the owner's control queue; it does not keep
+/// the mailbox open; and every send fails once the owning sender or the receiver is gone.
+pub(crate) struct CoalescingSideSender<T> {
+    inner: Arc<MailboxInner<T>>,
+}
+
+impl<T> Clone for CoalescingSideSender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> CoalescingSideSender<T> {
+    /// As [`CoalescingSender::send_latest_system_for`]: at most one unread value per
+    /// `(namespace, owner)`, the newest.
+    pub(crate) fn send_latest_system_for(
+        &self,
+        namespace: u64,
+        owner: u64,
+        value: T,
+    ) -> Result<(), T> {
+        self.inner
+            .send_latest_for_key(system_owner_key(namespace, owner), value, true)
+    }
+}
+
+impl<T> MailboxInner<T> {
+    fn send_latest_for_key(
+        &self,
+        key: u128,
+        value: T,
+        requires_owning_sender: bool,
+    ) -> Result<(), T> {
+        let mut state = self.state.lock().expect("mailbox mutex poisoned");
+        if !state.receiver_open || (requires_owning_sender && !state.sender_open) {
             return Err(value);
         }
         if let Some(index) = state
@@ -213,9 +265,9 @@ impl<T> CoalescingSender<T> {
         }
         let stamped = stamp(&mut state, value);
         state.latest.push_back((key, stamped));
-        self.inner.has_data.notify_one();
+        self.has_data.notify_one();
         drop(state);
-        if self.inner.wakes_ui {
+        if self.wakes_ui {
             wake_ui();
         }
         Ok(())
@@ -406,6 +458,36 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn a_side_sender_publishes_replaceable_values_only_while_the_mailbox_has_both_owners() {
+        let (sender, receiver) = bounded_coalescing(1);
+        let side = sender.side_sender();
+        // The owner's control queue is full; a side sender is not affected and cannot add to it.
+        sender.try_send_control("control").unwrap();
+        side.send_latest_system_for(4, 7, "older offer").unwrap();
+        side.clone()
+            .send_latest_system_for(4, 7, "newer offer")
+            .unwrap();
+        side.send_latest_system_for(4, 8, "another panel").unwrap();
+        // The owner's own slot in another namespace with the same owner number is distinct.
+        sender.send_latest_system_for(1, 7, "retry").unwrap();
+        let mut values = Vec::new();
+        while let Some(value) = receiver.try_receive().unwrap() {
+            values.push(value);
+        }
+        assert_eq!(values, ["control", "newer offer", "another panel", "retry"]);
+
+        // It does not keep the mailbox open, and refuses once the owning sender is gone.
+        drop(sender);
+        assert_eq!(side.send_latest_system_for(4, 7, "late"), Err("late"));
+        assert_eq!(receiver.try_receive(), Err(MailboxDisconnected));
+
+        let (sender, receiver) = bounded_coalescing(1);
+        let side = sender.side_sender();
+        drop(receiver);
+        assert_eq!(side.send_latest_system_for(4, 7, "late"), Err("late"));
+    }
 
     #[test]
     fn newest_replaceable_value_supersedes_an_unread_value() {

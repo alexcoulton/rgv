@@ -39,7 +39,58 @@ pub(crate) struct SemanticExportCapture {
     pub(crate) height: u32,
     pub(crate) scope_label: String,
     ledger: rgv_alignment_scene::AllocationLedger,
+    /// The theme active when the frame was captured: the export draws the same palette and
+    /// canvas colour as the window it was taken from.
+    theme: crate::theme::DesktopTheme,
     _resources: rgv_alignment_scene::TransientResourceReservation,
+}
+
+/// Completes an exported display list for `theme`: under a dark theme the canvas colour is laid
+/// underneath (the encoders start from white) and generic text authored for a light canvas is
+/// recoloured the way the window recolours it. Light themes change nothing.
+pub(crate) fn themed_export_display_list(
+    mut display: DisplayList,
+    alignment_rectangles: &[RectPrimitive],
+    width: u32,
+    height: u32,
+    theme: &crate::theme::DesktopTheme,
+) -> DisplayList {
+    if theme.is_dark() {
+        let adapt = |color: rgv_layout::Rgba| {
+            let adapted = theme.adapt(crate::ui::alignment_settings::rgba_to_color32(color));
+            let [red, green, blue, alpha] = adapted.to_srgba_unmultiplied();
+            rgv_layout::Rgba::new(
+                f32::from(red) / 255.0,
+                f32::from(green) / 255.0,
+                f32::from(blue) / 255.0,
+                f32::from(alpha) / 255.0,
+            )
+        };
+        for text in &mut display.texts {
+            text.color = adapt(text.color);
+        }
+        let [red, green, blue, _] = theme.canvas().to_srgba_unmultiplied();
+        display.rectangles.insert(
+            0,
+            RectPrimitive {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+                color: rgv_layout::Rgba::new(
+                    f32::from(red) / 255.0,
+                    f32::from(green) / 255.0,
+                    f32::from(blue) / 255.0,
+                    1.0,
+                ),
+                object_id: 0,
+                shape: rgv_layout::RectShape::Rectangle,
+            },
+        );
+    }
+    // Alignment geometry already carries the theme's palette colours.
+    display.rectangles.extend_from_slice(alignment_rectangles);
+    display
 }
 
 /// Largest pixel density an interactive export uses.
@@ -116,12 +167,17 @@ impl SemanticExportCapture {
             &self.panels,
             &self.ledger,
             &self.interactions,
+            self.theme.palette(),
         )?;
-        let mut display = self.generic;
-        display
-            .rectangles
-            .extend_from_slice(&geometry.display.rectangles);
-        let display = cropped_display_list(&display, self.bounds);
+        let display = cropped_display_list(&self.generic, self.bounds);
+        let alignment = cropped_display_list(&geometry.display, self.bounds);
+        let display = themed_export_display_list(
+            display,
+            &alignment.rectangles,
+            self.width,
+            self.height,
+            &self.theme,
+        );
         match format {
             AutomationSnapshotFormat::Png => write_png_export(
                 gpu.as_ref(),
@@ -272,6 +328,7 @@ impl Viewer {
         Ok(SemanticExportCapture {
             interactions,
             ledger: self.alignment_scene_ledger.clone(),
+            theme: crate::theme::active(),
             generic: semantic_export_display_list(generic),
             panels,
             bounds,

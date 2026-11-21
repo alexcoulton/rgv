@@ -6,7 +6,7 @@ use std::{
 
 use rgv_alignment_scene::{
     AlignmentPresentationOwnerDemand, AlignmentPresentationStore, AlignmentSceneCamera,
-    PresentationContract, SceneRevision,
+    PresentationContract, ReferenceRevision, SceneRevision,
 };
 use rgv_core::GenomicInterval;
 
@@ -17,13 +17,13 @@ use crate::{
 
 use super::{
     AlignmentCoordinatorFrame, AlignmentCoordinatorUpdate, AlignmentReferenceAuthority,
-    AlignmentReferenceInstallOutcome, AlignmentRowActivityTelemetry, AlignmentSceneBuildContract,
-    AlignmentSceneCoordinatorConfigError, AlignmentSceneCoordinatorError,
-    AlignmentSceneCoordinatorTelemetry, AlignmentSceneOwnerFailure, AlignmentSceneOwnerPressure,
-    AlignmentSceneOwnerPublication, AlignmentSceneOwnerRefusal, AlignmentSceneOwnerRetry,
-    AlignmentSceneOwnerWorkState, AlignmentScenePreparationPolicy, AlignmentSceneSourceLane,
-    AlignmentSceneSourcePump, CameraDirection, ForegroundWorkingSetSample,
-    coordinator_budget_pressure, prepared_interval, presentation_owner,
+    AlignmentReferenceInstallOutcome, AlignmentReferenceRequirement, AlignmentRowActivityTelemetry,
+    AlignmentSceneBuildContract, AlignmentSceneCoordinatorConfigError,
+    AlignmentSceneCoordinatorError, AlignmentSceneCoordinatorTelemetry, AlignmentSceneOwnerFailure,
+    AlignmentSceneOwnerPressure, AlignmentSceneOwnerPublication, AlignmentSceneOwnerRefusal,
+    AlignmentSceneOwnerRetry, AlignmentSceneOwnerWorkState, AlignmentScenePreparationPolicy,
+    AlignmentSceneSourceLane, AlignmentSceneSourcePump, CameraDirection,
+    ForegroundWorkingSetSample, coordinator_budget_pressure, prepared_interval, presentation_owner,
     scene_build_failure_message, source_horizon, usize_as_u64,
 };
 
@@ -411,6 +411,46 @@ where
             .get_mut(&owner)
             .ok_or(AlignmentSceneCoordinatorError::UnknownOwner(owner))?;
         lane.install_reference_authority(owner, &mut self.actor, &mut self.presentation, authority)
+    }
+
+    /// Every owner whose live reference requirement is unmet, with the revision and the
+    /// horizon it needs. Cheap: no frame is built.
+    #[must_use]
+    pub fn pending_reference_requirements(
+        &self,
+    ) -> Vec<(SourceOwnerId, ReferenceRevision, GenomicInterval)> {
+        self.lanes
+            .iter()
+            .filter_map(
+                |(owner, lane)| match lane.reference_requirement(lane.desired.as_ref()?) {
+                    AlignmentReferenceRequirement::Pending { revision, horizon } => {
+                        Some((*owner, revision, horizon))
+                    }
+                    AlignmentReferenceRequirement::NotRequired
+                    | AlignmentReferenceRequirement::Ready { .. } => None,
+                },
+            )
+            .collect()
+    }
+
+    /// Whether `owner`'s lane already holds exactly this authority (the same slice
+    /// allocation) for its live requirement and has nothing latched that installing it again
+    /// would retry. Installing it again would then only rebuild the same scene.
+    #[must_use]
+    pub fn reference_authority_is_current(
+        &self,
+        owner: SourceOwnerId,
+        authority: &AlignmentReferenceAuthority,
+    ) -> bool {
+        self.lanes.get(&owner).is_some_and(|lane| {
+            lane.contract.reference.as_ref().is_some_and(|held| {
+                held.revision == authority.revision && Arc::ptr_eq(&held.slice, &authority.slice)
+            }) && lane.desired.as_ref().is_some_and(|desired| {
+                lane.matching_reference_slice(desired.source_horizon)
+                    .is_some()
+            }) && lane.foreground_row_pause.is_none()
+                && !lane.scene_build_failed
+        })
     }
 
     pub fn pump_once(

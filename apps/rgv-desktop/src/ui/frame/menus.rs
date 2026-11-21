@@ -129,7 +129,7 @@ impl Viewer {
             ));
         } else if let Some(suggestion) = &self.suggested_assembly_identity {
             ui.colored_label(
-                egui::Color32::from_rgb(150, 92, 20),
+                crate::theme::adapt(egui::Color32::from_rgb(150, 92, 20)),
                 format!(
                     "Suggested: {} ({} fingerprint matches); load a genome configuration to confirm",
                     suggestion.display_name, suggestion.matched_fingerprints
@@ -150,7 +150,7 @@ impl Viewer {
         ));
         if !self.assembly.has_cytobands() || self.assembly.default_annotation_count == 0 {
             ui.colored_label(
-                egui::Color32::from_rgb(150, 92, 20),
+                crate::theme::adapt(egui::Color32::from_rgb(150, 92, 20)),
                 "Genome context incomplete — open a genome configuration",
             );
         }
@@ -161,7 +161,10 @@ impl Viewer {
             ));
         }
         if let Some(error) = &self.landmark_catalogue_error {
-            ui.colored_label(egui::Color32::from_rgb(170, 45, 38), error);
+            ui.colored_label(
+                crate::theme::adapt(egui::Color32::from_rgb(170, 45, 38)),
+                error,
+            );
         }
         if ui.button("Open FASTA…").clicked() {
             st.commands.open_reference_requested = true;
@@ -216,7 +219,7 @@ impl Viewer {
             }
             HostedGenomeListStatus::Failed(error) => {
                 ui.colored_label(
-                    egui::Color32::from_rgb(170, 45, 38),
+                    crate::theme::adapt(egui::Color32::from_rgb(170, 45, 38)),
                     format!("The genome list could not be read: {error}"),
                 );
                 if ui.button("Try again").clicked() {

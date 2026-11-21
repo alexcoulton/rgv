@@ -233,6 +233,7 @@ pub(super) struct CommandDraft {
     pub(super) autosave_retention: usize,
     pub(super) interface_scale_percent: u16,
     pub(super) high_contrast: bool,
+    pub(super) interface_theme: rgv_core::InterfaceTheme,
     pub(super) reduced_motion: bool,
     pub(super) recent_loci: Vec<String>,
     pub(super) current_session_path: Option<PathBuf>,

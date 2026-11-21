@@ -29,7 +29,7 @@ use rgv_core::{
 use rgv_engine::{
     AlignmentCoordinatorFrame, AlignmentSceneBuildContract, AlignmentSceneCoordinatorTelemetry,
     AlignmentSceneEngine, AlignmentScenePreparationPolicy, AlignmentSceneRequestToken,
-    AlignmentSceneSourceMetadata, LocalAlignmentSceneEngineConfig, LocalBamCanonicalBackend,
+    AlignmentSceneSourceMetadata, LocalAlignmentSceneEngineConfig, PositionedAlignmentBackend,
     SourceOwnerId,
 };
 use rgv_hts::{
@@ -1206,7 +1206,7 @@ impl AlignmentSceneResolution {
 pub(crate) struct AlignmentTrackController {
     pub(crate) config: SessionAlignmentTrack,
     /// New source-scoped immutable-scene authority.
-    pub(crate) scene_engine: Option<AlignmentSceneEngine<LocalBamCanonicalBackend>>,
+    pub(crate) scene_engine: Option<AlignmentSceneEngine<PositionedAlignmentBackend>>,
     pub(crate) scene_metadata: Option<AlignmentSceneSourceMetadata>,
     /// Last Complete-read admission policy submitted to the source actor. This avoids flooding
     /// the bounded control mailbox while still making the user setting live and retryable.
@@ -2255,6 +2255,26 @@ pub(crate) fn alignment_source_is_cram(location: &str) -> bool {
     Path::new(path)
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("cram"))
+}
+
+/// Connects each track's scene engine to `reference_engine`, so reference slices reach the
+/// scene worker straight from the reference thread (ARCH-9) instead of only through the UI
+/// relay. A reference engine drops its sinks when it is retired and a new scene engine has
+/// none, so this runs once for every new (reference engine, scene engine) pair: for all tracks
+/// when a reference engine is spawned, and for the new tracks when tracks are installed.
+pub(crate) fn connect_reference_slice_sinks<'a>(
+    reference_engine: Option<&rgv_engine::ReferenceEngine>,
+    tracks: impl IntoIterator<Item = &'a AlignmentTrackController>,
+) {
+    let Some(reference_engine) = reference_engine else {
+        return;
+    };
+    for scene_engine in tracks
+        .into_iter()
+        .filter_map(|track| track.scene_engine.as_ref())
+    {
+        reference_engine.connect_slice_sink(scene_engine.reference_slice_sink());
+    }
 }
 
 pub(crate) fn spawn_alignment_track_controller(

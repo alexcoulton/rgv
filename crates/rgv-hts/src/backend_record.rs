@@ -237,21 +237,127 @@ impl<'a> NoodlesRecord<'a, noodles::bam::Record> {
     }
 }
 
-/// A noodles record type that knows which [`NoodlesRecord`] view describes it.
+/// A noodles record type that knows which [`BackendRecord`] view describes it.
 pub(crate) trait AsBackendRecord: sam::alignment::Record + Sized {
-    fn backend_record<'a>(&'a self, header: &'a sam::Header) -> NoodlesRecord<'a, Self>;
+    type View<'a>: BackendRecord
+    where
+        Self: 'a;
+
+    fn backend_record<'a>(&'a self, header: &'a sam::Header) -> Self::View<'a>;
 }
 
 impl AsBackendRecord for noodles::bam::Record {
-    fn backend_record<'a>(&'a self, header: &'a sam::Header) -> NoodlesRecord<'a, Self> {
-        NoodlesRecord::bam(self, header)
+    type View<'a> = NoodlesBamRecord<'a>;
+
+    fn backend_record<'a>(&'a self, header: &'a sam::Header) -> NoodlesBamRecord<'a> {
+        NoodlesBamRecord(NoodlesRecord::bam(self, header))
     }
 }
 
 /// Owned records come only from the CRAM decoder.
 impl AsBackendRecord for sam::alignment::RecordBuf {
+    type View<'a> = NoodlesRecord<'a, Self>;
+
     fn backend_record<'a>(&'a self, header: &'a sam::Header) -> NoodlesRecord<'a, Self> {
         NoodlesRecord::cram(self, header)
+    }
+}
+
+/// A noodles BAM record. It answers exactly as [`NoodlesRecord`] does, but reads the CIGAR,
+/// bases and qualities from the record's bytes instead of through the boxed per-element
+/// iterators of the generic alignment record trait, which dominate full-detail normalisation.
+pub(crate) struct NoodlesBamRecord<'a>(NoodlesRecord<'a, noodles::bam::Record>);
+
+impl BackendRecord for NoodlesBamRecord<'_> {
+    fn flags(&self) -> Result<AlignmentFlags, AlignmentError> {
+        self.0.flags()
+    }
+
+    fn contig(&self) -> Result<Option<ContigId>, AlignmentError> {
+        self.0.contig()
+    }
+
+    fn start(&self) -> Result<Option<u64>, AlignmentError> {
+        self.0.start()
+    }
+
+    fn mapping_quality(&self) -> Result<Option<u8>, AlignmentError> {
+        self.0.mapping_quality()
+    }
+
+    fn mate_contig(&self) -> Result<Option<ContigId>, AlignmentError> {
+        self.0.mate_contig()
+    }
+
+    fn mate_start(&self) -> Result<Option<u64>, AlignmentError> {
+        self.0.mate_start()
+    }
+
+    fn template_length(&self) -> Result<i64, AlignmentError> {
+        self.0.template_length()
+    }
+
+    fn read_name(&self) -> &[u8] {
+        self.0.read_name()
+    }
+
+    fn cigar_into(&self, cigar: &mut Vec<CigarOp>) -> Result<(), AlignmentError> {
+        cigar.clear();
+        // The `CG` payload when the stored CIGAR is the long-alignment placeholder.
+        let raw = self.0.record.cigar().as_bytes();
+        cigar.reserve(raw.len() / 4);
+        for chunk in raw.chunks_exact(4) {
+            let raw = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let kind = match raw & 0xf {
+                0 => CigarOpKind::Match,
+                1 => CigarOpKind::Insertion,
+                2 => CigarOpKind::Deletion,
+                3 => CigarOpKind::ReferenceSkip,
+                4 => CigarOpKind::SoftClip,
+                5 => CigarOpKind::HardClip,
+                6 => CigarOpKind::Padding,
+                7 => CigarOpKind::SequenceMatch,
+                8 => CigarOpKind::SequenceMismatch,
+                _ => return Err(invalid_data("alignment has an unknown CIGAR operation")),
+            };
+            cigar.push(CigarOp {
+                kind,
+                len: raw >> 4,
+            });
+        }
+        Ok(())
+    }
+
+    fn sequence_len(&self) -> usize {
+        self.0.record.sequence().len()
+    }
+
+    fn bases(&self) -> Vec<u8> {
+        const BASES: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
+        let sequence = self.0.record.sequence();
+        let length = sequence.len();
+        let mut bases = Vec::with_capacity(length.saturating_add(1));
+        for packed in sequence.as_bytes().iter().take(length.div_ceil(2)) {
+            bases.push(BASES[usize::from(packed >> 4)]);
+            bases.push(BASES[usize::from(packed & 0xf)]);
+        }
+        bases.truncate(length);
+        bases
+    }
+
+    fn qualities(&self) -> Result<Cow<'_, [u8]>, AlignmentError> {
+        Ok(Cow::Borrowed(self.0.record.quality_scores().as_bytes()))
+    }
+
+    fn auxiliary(&self, tag: [u8; 2]) -> Result<Option<AuxValue>, AlignmentError> {
+        self.0.auxiliary(tag)
+    }
+
+    fn auxiliary_fields(
+        &self,
+        retain: &dyn Fn([u8; 2]) -> bool,
+    ) -> Result<Vec<AuxField>, AlignmentError> {
+        self.0.auxiliary_fields(retain)
     }
 }
 

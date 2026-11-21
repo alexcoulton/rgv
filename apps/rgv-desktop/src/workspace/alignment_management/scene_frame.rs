@@ -26,7 +26,7 @@ use rgv_engine::{
     AlignmentIndividualReadCapability, AlignmentVerticalResidency,
     alignment_row_activity_satisfies_contract,
 };
-use rgv_render::{AlignmentGpuRenderer, AlignmentSummaryGpuRenderer};
+use rgv_render::{AlignmentGpuRenderer, AlignmentGpuVisibleAdmission, AlignmentSummaryGpuRenderer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -431,6 +431,8 @@ impl Viewer {
                 ));
                 self.resolve_pending_alignment_scene_selections();
                 self.invalidate_stale_alignment_scroll_cache();
+                // A capture over a partially resident presentation is partial too.
+                self.record_alignment_gpu_partial_residency();
                 // Camera capture preserves the immutable prepared authority. Keep any in-flight
                 // cursor and its pins instead of restarting complete-scene discovery on every
                 // pan/scroll frame.
@@ -578,6 +580,7 @@ impl Viewer {
         self.alignment_gpu_residency_bundle = None;
         self.alignment_gpu_prefetch.clear();
 
+        let mut planned_read_page_bytes = 0_usize;
         let first = self.try_publish_alignment_gpu_bundle(
             target_revision,
             publication_attempt_sequence,
@@ -585,6 +588,8 @@ impl Viewer {
             &summary_requests,
             lane_authorities.clone(),
             read_authorities.clone(),
+            AlignmentGpuVisibleAdmission::Complete,
+            &mut planned_read_page_bytes,
         );
         let published = match first {
             Ok(bundle) => Ok(bundle),
@@ -603,30 +608,53 @@ impl Viewer {
                                 publication_attempt_sequence,
                                 &read_requests,
                                 &summary_requests,
-                                lane_authorities,
-                                read_authorities,
+                                lane_authorities.clone(),
+                                read_authorities.clone(),
+                                AlignmentGpuVisibleAdmission::Complete,
+                                &mut planned_read_page_bytes,
                             ),
-                        Ok(AlignmentGpuReclaimOutcome::Insufficient { .. }) => {
-                            self.defer_alignment_gpu_publication_for_cross_owner_reclaim(
-                                &attempt,
-                                &navigation_candidates,
-                                pressure,
-                            );
-                            return;
-                        }
-                        Ok(AlignmentGpuReclaimOutcome::Infeasible { required_bytes, .. }) => {
-                            self.wait_alignment_navigation_transactions_for_gpu(
-                                &navigation_candidates,
-                            );
-                            let message = format!(
-                                "Complete alignment presentation is cache-budget limited: the minimum exact presentation exceeds the configured capacity by {} MiB",
-                                required_bytes.saturating_add((1 << 20) - 1) >> 20,
-                            );
-                            self.settle_alignment_navigation_gpu_budget_limited(&message);
-                            self.report_warning(message);
-                            self.mark_display_dirty("explicit display invalidation");
-                            self.window.request_redraw();
-                            return;
+                        // Reclaim could not make room for the complete candidate. Under the
+                        // bounded policy draw what fits; only when that is impossible too does
+                        // the strict settlement run.
+                        Ok(outcome) => {
+                            if let Some(bundle) = self
+                                .publish_alignment_gpu_bundle_drawing_what_fits(
+                                    target_revision,
+                                    publication_attempt_sequence,
+                                    &read_requests,
+                                    &summary_requests,
+                                    &lane_authorities,
+                                    &read_authorities,
+                                    pressure,
+                                    planned_read_page_bytes,
+                                )
+                            {
+                                Ok(bundle)
+                            } else if let AlignmentGpuReclaimOutcome::Infeasible {
+                                required_bytes,
+                                ..
+                            } = outcome
+                            {
+                                self.wait_alignment_navigation_transactions_for_gpu(
+                                    &navigation_candidates,
+                                );
+                                let message = format!(
+                                    "Complete alignment presentation is cache-budget limited: the minimum exact presentation exceeds the configured capacity by {} MiB",
+                                    required_bytes.saturating_add((1 << 20) - 1) >> 20,
+                                );
+                                self.settle_alignment_navigation_gpu_budget_limited(&message);
+                                self.report_warning(message);
+                                self.mark_display_dirty("explicit display invalidation");
+                                self.window.request_redraw();
+                                return;
+                            } else {
+                                self.defer_alignment_gpu_publication_for_cross_owner_reclaim(
+                                    &attempt,
+                                    &navigation_candidates,
+                                    pressure,
+                                );
+                                return;
+                            }
                         }
                         Err(error) => Err(AlignmentGpuBundleFailure::terminal(format!(
                             "could not coordinate alignment GPU cache reclaim: {error}"
@@ -643,12 +671,27 @@ impl Viewer {
                     .pressure
                     .expect("guarded aggregate GPU failure retains typed pressure");
                 self.alignment_last_gpu_budget_pressure = Some(pressure);
-                self.defer_alignment_gpu_publication_for_cross_owner_reclaim(
-                    &attempt,
-                    &navigation_candidates,
+                // The retry after a satisfied reclaim was refused as well: draw what fits
+                // before handing the shortfall to the other cache owners.
+                if let Some(bundle) = self.publish_alignment_gpu_bundle_drawing_what_fits(
+                    target_revision,
+                    publication_attempt_sequence,
+                    &read_requests,
+                    &summary_requests,
+                    &lane_authorities,
+                    &read_authorities,
                     pressure,
-                );
-                return;
+                    planned_read_page_bytes,
+                ) {
+                    Ok(bundle)
+                } else {
+                    self.defer_alignment_gpu_publication_for_cross_owner_reclaim(
+                        &attempt,
+                        &navigation_candidates,
+                        pressure,
+                    );
+                    return;
+                }
             }
             outcome => outcome,
         };
@@ -672,13 +715,23 @@ impl Viewer {
                 ));
                 self.resolve_pending_alignment_scene_selections();
                 self.invalidate_stale_alignment_scroll_cache();
-                // Speculation must never delay publication of the frame that satisfied the
-                // foreground camera. The render loop advances this authority only after that
-                // frame has been submitted and presented.
-                self.alignment_gpu_prefetch
-                    .reset(!read_requests.is_empty(), !summary_requests.is_empty());
-                if self.alignment_gpu_prefetch.pending() {
+                let deferred_read_pages = self.record_alignment_gpu_partial_residency();
+                if deferred_read_pages > 0 {
+                    // Visible pages are still waiting for GPU budget: speculative warm-up of
+                    // pages outside the view must not compete with them.
+                    self.alignment_gpu_prefetch.clear();
+                    self.alignment_gpu_speculation_gate
+                        .suppress_for_foreground_pressure();
                     self.window.request_redraw();
+                } else {
+                    // Speculation must never delay publication of the frame that satisfied the
+                    // foreground camera. The render loop advances this authority only after
+                    // that frame has been submitted and presented.
+                    self.alignment_gpu_prefetch
+                        .reset(!read_requests.is_empty(), !summary_requests.is_empty());
+                    if self.alignment_gpu_prefetch.pending() {
+                        self.window.request_redraw();
+                    }
                 }
                 let filter_authorities =
                     self.alignment_filter_authorities_for_trace(&navigation_candidates);
@@ -690,6 +743,7 @@ impl Viewer {
                         "publication_attempt_sequence": publication_attempt_sequence,
                         "read_requests": read_requests.len(),
                         "summary_requests": summary_requests.len(),
+                        "deferred_read_pages": deferred_read_pages,
                         "prefetch_reads": self.alignment_gpu_prefetch.reads,
                         "prefetch_summaries": self.alignment_gpu_prefetch.summaries,
                         "filter_authorities": filter_authorities,

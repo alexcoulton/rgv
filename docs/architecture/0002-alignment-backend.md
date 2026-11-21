@@ -15,7 +15,9 @@ decoded by `noodles` (ADR 0004), and since this date `HTSlib` no longer opens an
 object whose URL does not end in `.bam`/`.cram` is identified by its magic bytes and read by the
 same `noodles` range path. `rust-htslib` thread pools cannot be shared between readers, so the
 "shared pool" is a process-wide allowance of decompression threads that open sources lease from
-(HTS-12). See "Backend convergence" below for where this is heading.
+(HTS-12). See "Backend convergence" below for where this is heading. Step 1 of that plan is now
+in the tree: a local `.bam` can be opened through `noodles` on request
+(`AlignmentOpenOptions::local_bam_backend`); `rust-htslib` remains the default.
 
 ## Evidence
 
@@ -132,6 +134,151 @@ Converging on `HTSlib` instead is not recommended: it would put remote reads bac
 (no request accounting, budgets, authentication policy or cancellation, which is why ADR 0004
 exists), keeps every build problem above, and its region iterator cannot seek past held blocks
 without reading into them.
+
+### Step 1 as built (21 November 2026)
+
+`LocalBamAlignmentSource` (`crates/rgv-hts/src/remote_alignment/local_bam.rs`) is the local-file
+front end of the `noodles` BAM decoder. `ProductionAlignmentSource::open` returns it for a local
+file named `.bam` when `AlignmentOpenOptions::local_bam_backend` is
+`AlignmentBackendPreference::Noodles`. The default is `Htslib`, and nothing in RGV sets the option
+yet.
+
+- One decoder, three byte sources. The record iteration, the one-shot fold, the positioned
+  stream and the resume logic are generic over a small BGZF-stream trait (`BamBlockStream`). The
+  remote range reader, a local file and an in-memory BAM implement it; there is no second copy of
+  any of that logic.
+- BGZF: `noodles`' `MultithreadedReader` over the file, with as many workers as the source is
+  granted from the same process-wide decompression allowance the `HTSlib` sources lease from
+  (plus one thread that reads raw blocks while a read is in flight). A source granted no thread
+  uses the plain single-threaded reader. The index is the BAI or CSI beside the file (or
+  `index_path`), parsed by `noodles`; index overview, mapped-record totals, header metadata, the
+  source stamp and the changed-file guard are the same values the `HTSlib` front end reports.
+- The multithreaded reader reports a block it cannot read (an I/O error, a file cut short inside
+  a block) as the end of the stream, and after a seek to the end of the file keeps serving its
+  previous block. The front end checks its compressed position against the file length, so both
+  cases are errors or a clean end as appropriate, not silently short or repeated data
+  (`a_truncated_local_bam_is_an_error_not_a_short_result`).
+- A positioned stream keeps the one record it reads ahead (the first record of the next owner
+  block) instead of seeking back to read it again, so a stream that is simply continued never
+  restarts the reader's workers. This applies to remote BAM as well.
+- Two per-record costs of the `noodles` record view were removed for BAM, because they decided
+  the comparison: bases, qualities and CIGAR are now read from the record's bytes instead of
+  through the boxed per-element iterators of the generic alignment-record trait, and a one-shot
+  query reuses one record buffer instead of allocating one per record. Before this, full-detail
+  normalisation through `noodles` took about 2.5 times as long as through `HTSlib` (deep-hotspot
+  full-detail stream: 125 ms against 51 ms). Remote BAM gets the same saving.
+
+The differential suite now asserts the same fixtures identical across `HTSlib`-local,
+`noodles`-local without BGZF workers (the plain reader) and with them (the multithreaded reader),
+and `noodles`-remote: the edge-case fixture over the whole option matrix (one-shot queries and
+positioned streams, with whole and half admission), `mixed.bam` and `variants.bam`, the resume
+scenarios, and a positioned stream interleaved with one-shot queries. The two `noodles` front ends are additionally required to be equal as whole
+values. **No divergence was found** beyond the `H`-type difference already listed.
+
+Behaviour that differs by front end, in addition to the list above:
+
+- Cancellation. A cancelled one-shot query through `noodles` is an empty cancelled query (as for
+  remote sources). A `noodles` positioned-stream checkpoint is one BGZF block of work and does not
+  consult `keep_going` inside it; it never returns `Cancelled`. The `HTSlib` front end checks
+  between records.
+- Resume receipts. `noodles` receipts carry the chunk's start offset and are honoured before any
+  byte is read; a receipt issued by the `HTSlib` front end has no start offset and is ignored by a
+  `noodles` stream (the chunk is read once more). Receipts are not persisted, so this only matters
+  if one process mixes the two for one file.
+- Headers. The `noodles` front ends parse the SAM header with `noodles`' parser, which is stricter
+  than `HTSlib`'s; a header it rejects fails the open.
+
+#### Measurement of RGV's own path
+
+`cargo run --release -p rgv-alignment-bench -- compare-backends benchmark-data/mixed.bam
+--iterations 15`, production section: `ProductionAlignmentSource` opened once per backend on the
+local file (open excluded), then the same regional request 15 times, as a one-shot `query` and as
+a positioned `stream` drained to completion. This is the real path: index lookup, BGZF, record
+decode, eligibility, normalisation and packing, and for the one-shot query the pileup and summary
+derivation. "Layout" is `QueryOptions::default()` with the record limit raised; "full" is
+`QueryDetail::Full` with allele and modification pileups. A timing is accepted only when the
+query result and the stream's blocks are equal across all four configurations. `1t`/`4t` is the
+number of decompression threads requested (and granted) per source.
+
+Machine: Apple M4 (10 cores), 16 GB, macOS 15.5, rustc 1.93.1, `lto = "thin"`, warm page cache.
+The machine was busy with other builds throughout (load average 6.3 to 6.7 on 10 cores), so the
+table gives the fastest of 15 iterations, best of two runs, in milliseconds; the better median of
+each cell was within 9% of its figure here (13% for the 5.7 ms cell). One synthetic corpus written
+by `HTSlib`; no real data.
+
+| Workload (`mixed.bam`) | Request | Detail | htslib-1t | noodles-1t | htslib-4t | noodles-4t |
+|---|---|---|---:|---:|---:|---:|
+| deep-hotspot: 151,258 records | query | layout | 74.4 | 75.0 | 67.8 | 72.2 |
+| | query | full | 378.8 | 394.1 | 387.6 | 400.2 |
+| | stream | layout | 25.3 | 26.3 | 25.7 | 15.8 |
+| | stream | full | 49.0 | 42.7 | 47.4 | 42.4 |
+| broad-chr1: 269,999 records | query | layout | 126.5 | 132.4 | 120.8 | 131.2 |
+| | query | full | 599.0 | 634.1 | 603.5 | 632.1 |
+| | stream | layout | 46.3 | 46.2 | 45.8 | 26.1 |
+| | stream | full | 83.5 | 74.1 | 85.4 | 75.6 |
+| long-modified-split: 2,000 records | query | layout | 19.6 | 20.9 | 5.4 | 6.4 |
+| | query | full | 312.1 | 315.3 | 312.5 | 315.5 |
+| | stream | layout | 19.4 | 19.3 | 5.0 | 5.7 |
+| | stream | full | 18.8 | 20.6 | 11.2 | 12.2 |
+
+Reading: on RGV's own path `noodles` takes between 0.57 and 1.18 times the `HTSlib` time. It is
+within 10% everywhere except two cells: long-read layout at four threads (1.15x and 1.18x, about
+1 ms) and, in its favour, short-read layout streams at four threads (0.57x to 0.61x; the `HTSlib`
+region iterator gains nothing from its thread pool there). One-shot queries are 1% to 9% slower
+through `noodles`; full-detail short-read streams are 11% to 13% faster. The one-shot full-detail
+query is dominated by pileup derivation, which is the same code for both.
+
+#### What has to be true before the default changes
+
+The default stays `Htslib` until all of these hold. None of them is established by a synthetic
+corpus.
+
+1. **Identical results on real data.** The differential suite (one-shot and positioned stream,
+   both detail levels) passes with no divergence on at least: an Illumina WGS BAM, an RNA-seq BAM
+   with spliced reads, an ONT BAM with `MM`/`ML` and supplementary alignments, a PacBio HiFi BAM,
+   a BAM indexed with CSI on a contig longer than 512 Mb, and a BAM not written by `HTSlib` (its
+   records span BGZF blocks). The corpus has to be available to CI or to a documented local run;
+   `benchmark-data/large-public-alignments` holds none today.
+2. **Every header `HTSlib` accepts opens.** No file of that corpus fails to open through
+   `noodles` because of header strictness, or the front end is changed to take reference names
+   and lengths from the binary header and the metadata from the raw header text.
+3. **Speed on real data.** The production section of `compare-backends` on that corpus, on an
+   idle machine, shows `noodles` within 10% of `HTSlib` at four threads for the one-shot layout
+   query and for positioned streams at both detail levels, for short and long reads. On the
+   synthetic corpus the long-read layout case is the one outside that band.
+4. **Cancellation is decided, not inherited.** The engine either does not depend on a
+   `Cancelled` checkpoint and on partial statistics from a cancelled one-shot query, or the
+   `noodles` front end provides them.
+5. **Threads and memory under many tracks.** With 24 or more local BAM tracks open, the
+   decompression threads stay within the shared allowance (already true by construction and
+   tested for the lease), and the resident read-ahead (workers + 2 inflated blocks per active
+   source) is measured in the desktop application, not assumed.
+6. **Failure behaviour.** Truncated files, files replaced under an open source, unreadable
+   indexes and index/file mismatches produce errors, never short or stale results. Truncation is
+   covered by a test and replacement by the file-version guard the `HTSlib` front end also uses;
+   an index that belongs to another file is not detected by either front end.
+7. **`H` and `d` auxiliary types** have a specified representation that both decoders produce.
+8. **A release with the option exposed.** The desktop application offers the backend as a
+   setting (or environment override) for one release, with `HTSlib` still the default, and no
+   report traces to it.
+
+After the switch `HTSlib` stays as the oracle of the differential suite and as the local decoder
+for any file not named `.bam`, as the recommendation above says.
+
+### Unindexed input (PROD-10, 21 November 2026)
+
+A plain-text SAM file, or a BAM with no index (sorted or not), is served by the same `noodles`
+BAM decoder from memory: the file is read whole, its records are sorted by position (stably, so
+ties keep file order), written to an in-memory BGZF BAM, and indexed as they are written
+(`remote_alignment/in_memory.rs`). Queries, positioned streams, resume and the index overview
+then work exactly as for an indexed file, and nothing is written to disk.
+`ProductionAlignmentSource::open` does this for a file named `.sam`;
+`ProductionAlignmentSource::open_in_memory` does it for any SAM or BAM file. The file may be at
+most `MAX_IN_MEMORY_ALIGNMENT_BYTES` (256 MiB) on disk and its records at most that much once
+encoded as BAM; beyond that the open fails with `ErrorKind::FileTooLarge` and tells the user to
+sort and index. Tests hold a SAM file to the BAM `HTSlib` converts it to, and an unsorted,
+unindexed BAM to its sorted, indexed original, read by `HTSlib`. A sorted BAM too large for
+memory is still refused rather than indexed on load.
 
 Naming debt outside this crate: `LocalBamCanonicalBackend` in
 `crates/rgv-engine/src/local_bam_source.rs` drives `ProductionAlignmentSource`, which is local or
