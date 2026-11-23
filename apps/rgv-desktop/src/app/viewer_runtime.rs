@@ -26,7 +26,7 @@ use crate::{
     AlignmentGpuPrefetchState, AlignmentGpuSpeculationGate, AlignmentScenePublicationAuthority,
     INITIAL_INTERVAL_END, INITIAL_INTERVAL_START, RemoteSourceEditor, SYNTHETIC_ALIGNMENT_TRACK_ID,
     SYNTHETIC_CONTIG_LENGTH, SashimiInteractionDiagnostics, UiPanel, VariantPredicateOperator,
-    Viewer, alignment_gpu_bundle_is_current, app, apply_accessibility_preferences, ui,
+    Viewer, app, apply_accessibility_preferences, ui,
 };
 use anyhow::{Context as _, Result};
 use egui_wgpu::{RendererOptions, ScreenDescriptor};
@@ -972,6 +972,7 @@ impl Viewer {
             egui_context,
             egui_state,
             egui_renderer,
+            presented_text_painter: crate::ui::presented_text::PresentedTextPainter::default(),
             workspace_layout,
             genomic_canvas_layer_id: None,
             pane_divider_rect: None,
@@ -1269,6 +1270,7 @@ impl Viewer {
         self.track_tiles.device_lost();
         self.rectangle_renderer = RectangleRenderer::new(&device, format);
         self.egui_renderer = egui_wgpu::Renderer::new(&device, format, RendererOptions::default());
+        self.presented_text_painter.reset();
         // The new egui renderer has none of the textures egui believes it already delivered.
         // Rebuilding the font atlas makes the next frame resend it in full.
         self.egui_context
@@ -1357,15 +1359,9 @@ impl Viewer {
                 );
             }
             self.render_alignment_coverage_pyramid(&mut pass, target_size, &mut failures);
-            if let Some(bundle) = self
-                .alignment_presented_epoch
-                .as_ref()
-                .and_then(|epoch| epoch.gpu_bundle.as_ref())
-                && alignment_gpu_bundle_is_current(
-                    bundle,
-                    &self.alignment_scene_publication_authority,
-                )
-            {
+            // The same selector `presented_alignment_label_texts` reads this frame's read-level
+            // text from, so the text and these instances come from one capture.
+            if let Some(bundle) = self.drawable_alignment_gpu_bundle() {
                 if let Some(frame) = &bundle.summaries
                     && let Err(error) = self.alignment_summary_gpu_renderer.render_within(
                         &mut pass,
@@ -1433,9 +1429,14 @@ impl Viewer {
         }
         self.prepare_alignment_coverage_pyramid_frame(self.window.scale_factor() as f32);
         self.prepare_track_tile_frame(self.window.scale_factor() as f32);
-        let paint_jobs = self
+        let mut paint_jobs = self
             .egui_context
             .tessellate(full_output.shapes, full_output.pixels_per_point);
+        // Every capture of this frame (first display rebuild, shell commit, second display
+        // rebuild) has happened, and nothing below replaces the presented bundle before
+        // `render_composed_frame_target` draws it. Read-level text is laid out here, from that
+        // same bundle, into the slot the egui pass left for it.
+        self.paint_presented_alignment_text(&mut paint_jobs, full_output.pixels_per_point);
         self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::Tessellation,
             tessellation_started.elapsed(),

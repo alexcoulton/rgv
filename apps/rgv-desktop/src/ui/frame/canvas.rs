@@ -148,6 +148,13 @@ impl Viewer {
                 &workspace_layout,
             );
             ui::paint_genomic_text(ui, geometry.genomic, &frame_genomic_texts);
+            // Read-level text (base letters, event lengths, junction counts) belongs to the
+            // alignment capture the GPU draws, which this frame's commit or second display
+            // rebuild may still replace. Reserve its place in the shape order; it is laid out
+            // from the drawn capture in `submit_ui_frame`.
+            ui.painter()
+                .with_clip_rect(geometry.genomic)
+                .add(ui::presented_text::presented_text_slot(geometry.genomic));
             // Labels of lanes drawn by the experimental tile pipeline; none under `Legacy`.
             let tile_label_texts = self.track_tiles.label_texts().cloned().collect::<Vec<_>>();
             if !tile_label_texts.is_empty() {

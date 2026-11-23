@@ -298,11 +298,19 @@ impl Viewer {
             height <= MAX_AUTOMATION_FULL_PANEL_HEIGHT,
             "export height exceeds its resource limit"
         );
-        let generic = if active_only {
+        let mut generic = semantic_export_display_list(if active_only {
             &self.session.panels.active().display_list
         } else {
             &self.composite_display_list
-        };
+        });
+        // Read-level text is not part of any display list; take it from the presented bundle,
+        // the capture the window draws, for the same panels.
+        let active_panel_id = self.session.panels.active().id;
+        generic
+            .texts
+            .extend(self.presented_alignment_label_texts(|panel_id| {
+                !active_only || panel_id == active_panel_id
+            }));
         let bytes = (width as usize)
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(16))
@@ -329,7 +337,7 @@ impl Viewer {
             interactions,
             ledger: self.session.alignment_scene_ledger.clone(),
             theme: crate::theme::active(),
-            generic: semantic_export_display_list(generic),
+            generic,
             panels,
             bounds,
             width,

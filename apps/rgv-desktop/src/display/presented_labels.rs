@@ -1,0 +1,381 @@
+//! Read-level text taken from the presented alignment GPU bundle.
+//!
+//! Mismatch base letters, event-length labels, clip ghost letters and junction counts are CPU
+//! text projected into the label lists of one camera capture, while the blocks they belong to are
+//! GPU instances drawn through that same capture. The two stay aligned only if both come from the
+//! same captured frame. Panel display lists are rebuilt at times unrelated to captures (before
+//! the egui pass, after it, after a camera-only capture or not), so they never carry this text.
+//! Instead it is assembled from the bundle the GPU pass is about to draw, at paint time; see
+//! `Viewer::submit_ui_frame`. Exports read it the same way.
+
+use crate::{AlignmentGpuFrameBundle, Viewer, alignment_gpu_bundle_is_current};
+use rgv_alignment_scene::{AlignmentComponent, CpuProjectedPrimitive};
+use rgv_core::PanelId;
+use rgv_layout::{Rgba, TextPrimitive};
+use rgv_render::AlignmentSummaryGpuJunctionLabel;
+
+/// Styles one projected read label (base letter, event length, clip ghost letter) as text
+/// centred on its cell.
+pub(crate) fn alignment_text_primitive(label: &CpuProjectedPrimitive) -> Option<TextPrimitive> {
+    let text = label.text.as_deref()?;
+    let color = match label.component {
+        AlignmentComponent::Base { base, .. } => match base.to_ascii_uppercase() {
+            // Dark ink has the stronger contrast on the bright A/G fills; white remains clearer
+            // on the darker C/T fills. N and other ambiguous symbols use white on neutral grey.
+            b'A' | b'G' => Rgba::new(0.06, 0.07, 0.08, 0.96),
+            _ => Rgba::new(1.0, 1.0, 1.0, 0.98),
+        },
+        // Soft-clipped ghost bases sit on a faint tint of their read (or on the canvas): a
+        // muted mid-grey stays legible on either theme and reads as "not aligned".
+        AlignmentComponent::ClipGhostBase { .. } => Rgba::new(0.42, 0.43, 0.47, 0.95),
+        _ => Rgba::new(0.08, 0.09, 0.11, 0.94),
+    };
+    let font_size = if matches!(
+        label.component,
+        AlignmentComponent::Base { .. } | AlignmentComponent::ClipGhostBase { .. }
+    ) {
+        (label.width.min(label.height) as f32 - 1.0).clamp(8.0, 12.0)
+    } else {
+        (label.height as f32 - 2.0).clamp(8.0, 12.0)
+    };
+    Some(TextPrimitive {
+        x: (label.x + label.width * 0.5) as f32,
+        y: (label.y + label.height * 0.5) as f32,
+        text: text.to_owned(),
+        font_size,
+        color,
+    })
+}
+
+/// Styles one junction-count label of the summary frame.
+fn junction_text_primitive(label: &AlignmentSummaryGpuJunctionLabel) -> TextPrimitive {
+    TextPrimitive {
+        x: label.x as f32,
+        y: label.y as f32,
+        text: label.text.clone(),
+        font_size: 10.0,
+        color: Rgba::new(0.10, 0.10, 0.12, 0.94),
+    }
+}
+
+/// The read text of one panel: every label of every label frame whose read authority belongs to
+/// `panel_id`, in request order. `frames` pairs each label frame of one captured
+/// `AlignmentGpuFrame` with the panel of its read authority.
+pub(crate) fn panel_read_label_texts<'a>(
+    frames: impl IntoIterator<Item = (PanelId, &'a [CpuProjectedPrimitive])>,
+    panel_id: PanelId,
+) -> impl Iterator<Item = TextPrimitive> {
+    frames
+        .into_iter()
+        .filter(move |(owner, _)| *owner == panel_id)
+        .flat_map(|(_, labels)| labels.iter())
+        .filter_map(alignment_text_primitive)
+}
+
+/// The junction-count text of one panel, selected by the summary draw's coherence scope.
+pub(crate) fn panel_junction_label_texts(
+    labels: &[AlignmentSummaryGpuJunctionLabel],
+    panel_id: PanelId,
+) -> impl Iterator<Item = TextPrimitive> + '_ {
+    labels
+        .iter()
+        .filter(move |label| label.coherence_scope == panel_id.get())
+        .map(junction_text_primitive)
+}
+
+/// Assembles, for each panel in order, its junction labels then its read labels, from one
+/// presented bundle. This is the only producer of read-level text: painting and exports both
+/// call it, so neither can show text from a different capture than the one the GPU draws.
+pub(crate) fn presented_label_texts(
+    read_frames: &[(PanelId, &[CpuProjectedPrimitive])],
+    junction_labels: &[AlignmentSummaryGpuJunctionLabel],
+    panels: impl IntoIterator<Item = PanelId>,
+) -> Vec<TextPrimitive> {
+    let mut texts = Vec::new();
+    for panel_id in panels {
+        texts.extend(panel_junction_label_texts(junction_labels, panel_id));
+        texts.extend(panel_read_label_texts(
+            read_frames.iter().copied(),
+            panel_id,
+        ));
+    }
+    texts
+}
+
+impl Viewer {
+    /// The bundle the alignment GPU pass draws this frame, under exactly the condition
+    /// `render_composed_frame_target` uses to draw it.
+    pub(crate) fn drawable_alignment_gpu_bundle(&self) -> Option<&AlignmentGpuFrameBundle> {
+        self.alignment_presented_epoch
+            .as_ref()
+            .and_then(|epoch| epoch.gpu_bundle.as_ref())
+            .filter(|bundle| {
+                alignment_gpu_bundle_is_current(bundle, &self.alignment_scene_publication_authority)
+            })
+    }
+
+    /// Read-level text of the panels accepted by `include`, taken from the bundle the GPU pass
+    /// draws right now. Call it after the last capture of a frame; see `submit_ui_frame`.
+    pub(crate) fn presented_alignment_label_texts(
+        &self,
+        include: impl Fn(PanelId) -> bool,
+    ) -> Vec<TextPrimitive> {
+        let Some(bundle) = self.drawable_alignment_gpu_bundle() else {
+            return Vec::new();
+        };
+        let junction_labels = bundle
+            .summaries
+            .as_ref()
+            .map(|frame| self.alignment_summary_gpu_renderer.junction_labels(frame))
+            .unwrap_or_default();
+        let read_frames = bundle
+            .reads
+            .as_ref()
+            .map(|frame| {
+                bundle
+                    .read_authorities
+                    .iter()
+                    .zip(frame.label_frames())
+                    .map(|(authority, labels)| (authority.panel_id, &*labels.labels))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        presented_label_texts(
+            &read_frames,
+            &junction_labels,
+            self.session
+                .panels
+                .iter()
+                .map(|panel| panel.id)
+                .filter(|panel_id| include(*panel_id)),
+        )
+    }
+
+    /// Lays out every panel's read-level text from the bundle the GPU pass draws this frame and
+    /// splices it into `paint_jobs` at the slot the workspace canvas recorded, uploading any new
+    /// glyphs first. Must run after the frame's last alignment capture and before
+    /// `render_composed_frame_target`.
+    pub(crate) fn paint_presented_alignment_text(
+        &mut self,
+        paint_jobs: &mut Vec<egui::ClippedPrimitive>,
+        pixels_per_point: f32,
+    ) {
+        let texts = self.presented_alignment_label_texts(|_| true);
+        let context = self.egui_context.clone();
+        let (options, tessellation) = (
+            context.fonts(|fonts| *fonts.options()),
+            context.tessellation_options(|options| *options),
+        );
+        let frame = self.presented_text_painter.paint(
+            &texts,
+            self.workspace_layout.canvas_geometry().genomic,
+            pixels_per_point,
+            crate::ui::presented_text::PresentedTextFonts {
+                options,
+                definitions: || context.fonts(|fonts| fonts.definitions().clone()),
+                tessellation,
+            },
+            crate::ui::genomic_text_color,
+        );
+        if let Some(delta) = &frame.texture_delta {
+            self.egui_renderer.update_texture(
+                &self.device,
+                &self.queue,
+                crate::ui::presented_text::PRESENTED_TEXT_TEXTURE,
+                delta,
+            );
+        }
+        crate::ui::presented_text::splice_presented_text(paint_jobs, frame.primitives);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgv_alignment_scene::{
+        AlignmentBodyColorToken, AlignmentGeometryToken, AlignmentHandle,
+        AlignmentInteractionToken, AlignmentSourceRevision, AlignmentStyleToken, CpuPrimitiveShape,
+        RevisionFingerprint, SourceFingerprint,
+    };
+    use std::sync::Arc;
+
+    fn handle() -> AlignmentHandle {
+        AlignmentHandle::new(
+            AlignmentSourceRevision::new(
+                SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+                RevisionFingerprint::new(3, 4),
+            ),
+            rgv_hts::AlignmentSourcePosition::bam_virtual_offset(42),
+        )
+    }
+
+    fn base_label(x: f64, y: f64, base: u8) -> CpuProjectedPrimitive {
+        CpuProjectedPrimitive {
+            x,
+            y,
+            width: 10.0,
+            height: 12.0,
+            shape: CpuPrimitiveShape::TextLabel,
+            geometry: AlignmentGeometryToken::Rectangle,
+            handle: handle(),
+            component: AlignmentComponent::Base {
+                cigar_index: 0,
+                read_index: 3,
+                base,
+                quality: None,
+                classification: rgv_model::AlignedBaseClassification::Substitution,
+            },
+            style: AlignmentStyleToken {
+                flags: 0,
+                mapping_quality: None,
+                operation: None,
+                body: AlignmentBodyColorToken::Neutral,
+            },
+            interaction: AlignmentInteractionToken::default(),
+            draw_order: 0,
+            text: Some(Arc::from(char::from(base).to_string())),
+            row: 0,
+        }
+    }
+
+    fn junction(scope: u64, text: &str) -> AlignmentSummaryGpuJunctionLabel {
+        AlignmentSummaryGpuJunctionLabel {
+            coherence_scope: scope,
+            lane_identity: 9,
+            evidence: rgv_model::JunctionEvidence::default(),
+            x: 50.0,
+            y: 60.0,
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_panel_receives_exactly_the_label_frames_of_its_own_read_authorities() {
+        let (a, b) = (PanelId::new(1), PanelId::new(2));
+        let first = [base_label(0.0, 0.0, b'A'), base_label(10.0, 0.0, b'C')];
+        let second = [base_label(100.0, 40.0, b'G')];
+        let third = [base_label(200.0, 80.0, b'T')];
+        let frames = [(a, &first[..]), (b, &second[..]), (a, &third[..])];
+
+        let texts = panel_read_label_texts(frames.iter().copied(), a).collect::<Vec<_>>();
+        let expected = first
+            .iter()
+            .chain(&third)
+            .filter_map(alignment_text_primitive)
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts, expected);
+        assert_eq!(
+            texts
+                .iter()
+                .map(|text| text.text.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "C", "T"]
+        );
+        // Centred on the projected cell of the very frame that was passed in.
+        assert_eq!((texts[0].x, texts[0].y), (5.0, 6.0));
+        assert_eq!(
+            panel_read_label_texts(frames.iter().copied(), b)
+                .map(|text| text.text)
+                .collect::<Vec<_>>(),
+            ["G"]
+        );
+        assert_eq!(
+            panel_read_label_texts(frames.iter().copied(), PanelId::new(3)).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn labels_follow_whichever_frame_is_presented() {
+        // Two successive captures of the same reads under different cameras: the assembled text
+        // is a pure function of the frame handed in, so a capture made after any display rebuild
+        // is what gets painted.
+        let panel = PanelId::new(1);
+        let before = [base_label(0.0, 0.0, b'A')];
+        let after = [base_label(0.0, 37.0, b'A')];
+        let paint = |labels: &[CpuProjectedPrimitive]| {
+            presented_label_texts(&[(panel, labels)], &[], [panel])
+        };
+        assert!((paint(&before)[0].y - 6.0).abs() < f32::EPSILON);
+        assert!((paint(&after)[0].y - 43.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn junction_labels_are_scoped_to_their_panel_and_precede_read_text() {
+        let (a, b) = (PanelId::new(1), PanelId::new(2));
+        let reads = [base_label(0.0, 0.0, b'G')];
+        let junctions = [junction(a.get(), "12"), junction(b.get(), "99")];
+
+        let texts = presented_label_texts(&[(a, &reads[..])], &junctions, [a, b]);
+
+        assert_eq!(
+            texts
+                .iter()
+                .map(|text| text.text.as_str())
+                .collect::<Vec<_>>(),
+            ["12", "G", "99"]
+        );
+        assert!((texts[0].font_size - 10.0).abs() < f32::EPSILON);
+        assert!(
+            presented_label_texts(&[(a, &reads[..])], &junctions, [b])
+                .iter()
+                .all(|text| text.text == "99")
+        );
+    }
+
+    #[test]
+    fn unlabelled_primitives_produce_no_text() {
+        let mut silent = base_label(0.0, 0.0, b'A');
+        silent.text = None;
+        assert!(alignment_text_primitive(&silent).is_none());
+    }
+
+    fn rust_sources(root: &std::path::Path, output: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(root).expect("desktop source directory is readable") {
+            let path = entry.expect("desktop source entry is readable").path();
+            if path.is_dir() {
+                rust_sources(&path, output);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                output.push(path);
+            }
+        }
+    }
+
+    /// A display list rebuilt before a capture would carry the previous capture's text, which is
+    /// how read letters used to slide against their blocks. No display-list producer may read a
+    /// presented frame's labels: this module, which runs at paint and export time, is the only
+    /// one (diagnostics only count them).
+    #[test]
+    fn only_paint_time_assembly_reads_presented_label_frames() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        rust_sources(&root, &mut sources);
+        let readers = sources
+            .iter()
+            .filter(|path| {
+                let source = std::fs::read_to_string(path).expect("desktop source is readable");
+                [
+                    "label_frames()",
+                    ".junction_labels(",
+                    "alignment_text_primitive",
+                ]
+                .iter()
+                .any(|needle| source.contains(needle))
+            })
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .expect("source lies under the source root")
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            readers.into_iter().collect::<Vec<_>>(),
+            [
+                "diagnostics/manual_diagnostic_instrumentation.rs",
+                "display/presented_labels.rs",
+            ]
+        );
+    }
+}

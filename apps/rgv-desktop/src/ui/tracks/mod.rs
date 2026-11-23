@@ -8,7 +8,7 @@ mod scrollbar;
 mod tests;
 
 pub use chrome::paint_track_viewport_chrome_with_sections;
-pub use geometry::{frame_content_y_at_screen_y, paint_genomic_text};
+pub use geometry::{frame_content_y_at_screen_y, genomic_text_color, paint_genomic_text};
 pub use gutter::{TrackGroupChrome, TrackGutterResult, TrackSectionChrome, TrackUiAction};
 pub use model::{
     AlignmentSubtrack, PaneItemLayout, PaneLayoutSnapshot, TRACK_HEADER_HEIGHT,

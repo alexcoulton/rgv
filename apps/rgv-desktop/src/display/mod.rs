@@ -14,9 +14,9 @@ use crate::workspace::panels::{
 };
 use crate::{
     HoverInspectorTarget, JunctionArcHover, MAX_RENDERED_REGIONS_OF_INTEREST,
-    SYNTHETIC_ALIGNMENT_TRACK_ID, Viewer, alignment_gpu_bundle_is_current, app, ui,
+    SYNTHETIC_ALIGNMENT_TRACK_ID, Viewer, app, ui,
 };
-use rgv_alignment_scene::{AlignmentComponent, AlignmentRowActivityProfile};
+use rgv_alignment_scene::AlignmentRowActivityProfile;
 use rgv_core::PanelId;
 use rgv_core::{
     JunctionDisplayMode, PresentationNodeId, SessionFilters, TrackConfig, TrackId, TrackKind,
@@ -38,6 +38,7 @@ pub(crate) mod auxiliary;
 mod auxiliary_lanes;
 mod genomic_pass;
 pub(crate) mod hit_test;
+pub(crate) mod presented_labels;
 pub(crate) mod reference_lanes;
 
 use genomic_pass::GenomicDisplayPass;
@@ -51,39 +52,6 @@ pub(super) const PINNED_ALIGNMENT_MODIFICATION_HEIGHT: f32 = 26.0;
 pub(crate) const ANNOTATION_PANE_BACKGROUND: Rgba = Rgba::new(0.953, 0.969, 0.984, 1.0);
 const SYNTHETIC_READ_ROW_HEIGHT: f32 = 5.0;
 pub(crate) const SYNTHETIC_READ_ROW_STRIDE: f32 = 7.0;
-
-fn alignment_text_primitive(
-    label: &rgv_alignment_scene::CpuProjectedPrimitive,
-) -> Option<rgv_layout::TextPrimitive> {
-    let text = label.text.as_deref()?;
-    let color = match label.component {
-        AlignmentComponent::Base { base, .. } => match base.to_ascii_uppercase() {
-            // Dark ink has the stronger contrast on the bright A/G fills; white remains clearer
-            // on the darker C/T fills. N and other ambiguous symbols use white on neutral grey.
-            b'A' | b'G' => Rgba::new(0.06, 0.07, 0.08, 0.96),
-            _ => Rgba::new(1.0, 1.0, 1.0, 0.98),
-        },
-        // Soft-clipped ghost bases sit on a faint tint of their read (or on the canvas): a
-        // muted mid-grey stays legible on either theme and reads as "not aligned".
-        AlignmentComponent::ClipGhostBase { .. } => Rgba::new(0.42, 0.43, 0.47, 0.95),
-        _ => Rgba::new(0.08, 0.09, 0.11, 0.94),
-    };
-    let font_size = if matches!(
-        label.component,
-        AlignmentComponent::Base { .. } | AlignmentComponent::ClipGhostBase { .. }
-    ) {
-        (label.width.min(label.height) as f32 - 1.0).clamp(8.0, 12.0)
-    } else {
-        (label.height as f32 - 2.0).clamp(8.0, 12.0)
-    };
-    Some(rgv_layout::TextPrimitive {
-        x: (label.x + label.width * 0.5) as f32,
-        y: (label.y + label.height * 0.5) as f32,
-        text: text.to_owned(),
-        font_size,
-        color,
-    })
-}
 
 fn display_content_bottom(display: &DisplayList, fallback: f32) -> f32 {
     let rectangle_bottom = display
@@ -711,36 +679,6 @@ impl Viewer {
             return false;
         };
         let active_panel_id = panel_id;
-        let native_junction_labels = self
-            .alignment_presented_epoch
-            .as_ref()
-            .and_then(|epoch| epoch.gpu_bundle.as_ref())
-            .filter(|bundle| {
-                alignment_gpu_bundle_is_current(bundle, &self.alignment_scene_publication_authority)
-            })
-            .and_then(|bundle| bundle.summaries.as_ref())
-            .map(|frame| self.alignment_summary_gpu_renderer.junction_labels(frame))
-            .unwrap_or_default();
-        let native_read_labels = self
-            .alignment_presented_epoch
-            .as_ref()
-            .and_then(|epoch| epoch.gpu_bundle.as_ref())
-            .filter(|bundle| {
-                alignment_gpu_bundle_is_current(bundle, &self.alignment_scene_publication_authority)
-            })
-            .and_then(|bundle| {
-                bundle.reads.as_ref().map(|frame| {
-                    bundle
-                        .read_authorities
-                        .iter()
-                        .zip(frame.label_frames())
-                        .filter(|(authority, _)| authority.panel_id == active_panel_id)
-                        .flat_map(|(_, frame)| frame.labels.iter())
-                        .filter_map(alignment_text_primitive)
-                        .collect::<Vec<_>>()
-                })
-            })
-            .unwrap_or_default();
         let active_drag = self
             .vertical_overview_drag
             .filter(|drag| drag.density_dragging && drag.panel_id == active_panel_id);
@@ -962,19 +900,10 @@ impl Viewer {
             panel_rect.left(),
             panel_rect.right(),
         );
-        display.texts.extend(
-            native_junction_labels
-                .into_iter()
-                .filter(|label| label.coherence_scope == active_panel_id.get())
-                .map(|label| rgv_layout::TextPrimitive {
-                    x: label.x as f32,
-                    y: label.y as f32,
-                    text: label.text,
-                    font_size: 10.0,
-                    color: Rgba::new(0.10, 0.10, 0.12, 0.94),
-                }),
-        );
-        display.texts.extend(native_read_labels);
+        // Read-level text (base letters, event lengths, clip ghosts, junction counts) is not
+        // copied here: it belongs to whichever camera capture the GPU draws, which may be made
+        // after this rebuild. It is assembled at paint time from the presented bundle; see
+        // `presented_labels`.
         let (interaction_enabled, content_revision) = {
             let presentation = &self.session.panels.panel(panel_id).navigation_presentation;
             (

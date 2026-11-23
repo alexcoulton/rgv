@@ -7,6 +7,7 @@ pub(crate) mod inspectors;
 pub(crate) mod interaction;
 mod menu;
 mod navigation;
+pub(crate) mod presented_text;
 pub(crate) mod shell;
 mod status;
 pub(crate) mod system_dialogs;
@@ -26,7 +27,7 @@ pub use tracks::{
     AlignmentSubtrack, PaneItemLayout, PaneLayoutSnapshot, ScrollbarInteraction, ScrollbarOverview,
     ScrollbarOverviewBin, TRACK_HEADER_HEIGHT, TRACK_SECTION_HEADER_HEIGHT, TrackFrame,
     TrackFrameKey, TrackGroupChrome, TrackPane, TrackSectionChrome, TrackSubtrack, TrackUiAction,
-    WorkspacePaneLayout, frame_content_y_at_screen_y, paint_genomic_text,
+    WorkspacePaneLayout, frame_content_y_at_screen_y, genomic_text_color, paint_genomic_text,
     paint_read_panel_scrollbar, paint_read_stack_scrollbar,
     paint_track_viewport_chrome_with_sections, paint_workspace_annotation_scrollbar,
     resized_annotation_track_height, resized_read_pane_height, resized_read_track_height,

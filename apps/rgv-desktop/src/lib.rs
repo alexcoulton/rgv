@@ -1316,6 +1316,9 @@ struct Viewer {
     egui_context: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    /// Lays out read-level text from the presented alignment bundle after the egui pass, into
+    /// its own atlas texture in `egui_renderer`.
+    presented_text_painter: ui::presented_text::PresentedTextPainter,
     workspace_layout: WorkspaceLayoutSnapshot,
     genomic_canvas_layer_id: Option<egui::LayerId>,
     pane_divider_rect: Option<egui::Rect>,
