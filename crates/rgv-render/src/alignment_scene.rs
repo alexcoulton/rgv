@@ -289,6 +289,17 @@ pub fn project_alignment_gpu_instance(
         let (left, width) = rgv_alignment_scene::clip_edge_extent(x, right, height, edge);
         x = left;
         right = left + width;
+    } else if shape == AlignmentGpuShape::DirectionTerminalRight as u32
+        || shape == AlignmentGpuShape::DirectionTerminalLeft as u32
+    {
+        // The tip stays on the read's end; the one-point minimum grows away from it.
+        let (left, width) = rgv_alignment_scene::directional_extent(
+            x,
+            right,
+            shape == AlignmentGpuShape::DirectionTerminalRight as u32,
+        );
+        x = left;
+        right = left + width;
     } else {
         right = right.max(x + 1.0);
     }

@@ -235,6 +235,7 @@ mod tests {
             draw_order: 0,
             text: Some(Arc::from(char::from(base).to_string())),
             row: 0,
+            arrow: None,
         }
     }
 

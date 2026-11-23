@@ -4519,9 +4519,9 @@ fn clip_edges_and_terminal_insertion_markers_sit_on_the_read_boundaries() {
             } else {
                 (points_per_base * 0.5).clamp(2.0, 6.0)
             };
-            let terminal = points_per_base.max(1.0);
+            // The head length depends on the read height alone, at every zoom.
             let arrowhead = if token.behind_arrow {
-                (11.0_f64 * 0.55).min(terminal * 0.35)
+                11.0_f64 * 0.55
             } else {
                 0.0
             };
@@ -4529,8 +4529,8 @@ fn clip_edges_and_terminal_insertion_markers_sit_on_the_read_boundaries() {
             let expected_left = match (token.at_end, token.behind_arrow) {
                 (false, _) => boundary_x + arrowhead,
                 (true, false) => boundary_x - width,
-                // The arrow tip is the terminal base cell's right edge (one point minimum).
-                (true, true) => boundary_x - points_per_base + terminal - arrowhead - width,
+                // The arrow tip is the read's boundary at every zoom.
+                (true, true) => boundary_x - arrowhead - width,
             };
             assert!(
                 (marker.left - expected_left).abs() < 1.0e-9

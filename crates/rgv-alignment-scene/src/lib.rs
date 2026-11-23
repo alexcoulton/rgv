@@ -58,10 +58,11 @@ pub use coverage::{
     CertifiedCoverageSet, CompleteCoverage, CoverageError, FilteredRecordProvenance,
 };
 pub use cpu_projector::{
-    AlignmentCamera, AlignmentHit, CpuAlignmentFrame, CpuAlignmentLabelFrame,
-    CpuAlignmentProjector, CpuClipRect, CpuFrameCoverage, CpuInteractionError, CpuPrimitiveShape,
-    CpuProjectedPrimitive, CpuProjectionError, EVENT_LABEL_MINIMUM_POINTS_PER_BASE,
-    clip_edge_covers, clip_edge_extent, point_marker_extent,
+    ARROWHEAD_LENGTH_FRACTION, AlignmentCamera, AlignmentHit, CpuAlignmentFrame,
+    CpuAlignmentLabelFrame, CpuAlignmentProjector, CpuArrowhead, CpuClipRect, CpuFrameCoverage,
+    CpuInteractionError, CpuPrimitiveShape, CpuProjectedPrimitive, CpuProjectionError,
+    EVENT_LABEL_MINIMUM_POINTS_PER_BASE, arrowhead_covers, arrowhead_length, clip_edge_covers,
+    clip_edge_extent, directional_extent, point_marker_extent,
 };
 pub use cpu_summary_projector::{
     CoverageAlleleInterpretation, CpuAlleleProjectionOptions, CpuAlleleToken,

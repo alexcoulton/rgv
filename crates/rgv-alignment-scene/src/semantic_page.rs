@@ -6078,6 +6078,169 @@ mod tests {
         }
     }
 
+    /// The reported defect: zoomed out from base detail, a read grew a second, smaller point
+    /// past its arrowhead, because the aligned block, the one-base direction terminal and the
+    /// base cell at the tip each sized their head from their own width. All of them are now cut
+    /// by the read's one diagonal (0.55 x read height long, from the read's tip), so at every
+    /// zoom the union of the read's primitives is exactly one arrow: covered height grows
+    /// monotonically from the tip, nothing of the read is inside the cut-away corners, and
+    /// picking there does not select the read.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn tip_primitives_share_one_diagonal_so_the_read_has_one_clean_arrowhead_at_every_zoom() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let mut forward_bases = vec![b'A'; 60];
+        // A mismatch on the forward read's terminal base, so a coloured cell sits at the tip.
+        forward_bases[59] = b'C';
+        let mut reverse_bases = vec![b'A'; 60];
+        reverse_bases[0] = b'G';
+        let records = [
+            record(
+                b"forward",
+                100,
+                160,
+                &[(CigarOpKind::Match, 60)],
+                &forward_bases,
+            ),
+            with_flags(
+                record(
+                    b"reverse",
+                    150,
+                    210,
+                    &[(CigarOpKind::Match, 60)],
+                    &reverse_bases,
+                ),
+                0x10,
+            ),
+        ];
+        // Mismatch cells only (the default), so the terminal base's cell is the only one at the
+        // tip. (A mismatch cell a few bases short of the tip, inside the head when zoomed out,
+        // is not cut by the arrow: its instance does not know where the tip is.)
+        let scene = scene_for_records(
+            &ledger,
+            &records,
+            GeometryLod::Base,
+            crate::AlignmentStyleContract {
+                base_display: ReadBaseDisplayMode::Mismatches,
+                ..crate::AlignmentStyleContract::default()
+            },
+        );
+        // (record, tip position, points right)
+        for (ordinal, tip_position, points_right) in [(0, 160, true), (1, 150, false)] {
+            for points_per_base in [0.5_f64, 2.0, 10.0, 40.0] {
+                // About forty points either side of the tip.
+                let span = (40.0 / points_per_base).ceil() as u64;
+                let width = 2.0 * span as f64 * points_per_base;
+                let camera = clip_camera(tip_position - span, tip_position + span, width);
+                let frame = crate::CpuAlignmentProjector::project(&scene, 0, camera).unwrap();
+                let context = format!("record {ordinal} at {points_per_base} points per base");
+                let read = frame
+                    .primitives
+                    .iter()
+                    .filter(|primitive| {
+                        primitive.handle == handle_of(ordinal)
+                            && primitive.shape != crate::CpuPrimitiveShape::TextLabel
+                    })
+                    .collect::<Vec<_>>();
+                let tip = read
+                    .iter()
+                    .filter(|primitive| primitive.arrow.is_some())
+                    .collect::<Vec<_>>();
+                // The block, the one-base terminal and the base cell all carry the arrow ...
+                for wanted in ["AlignedSegment", "DirectionTerminal", "Base"] {
+                    assert!(
+                        tip.iter()
+                            .any(|primitive| format!("{:?}", primitive.component)
+                                .starts_with(wanted)),
+                        "{context}: no {wanted} at the tip"
+                    );
+                }
+                // ... and the same arrow: the read's tip, centre line and height.
+                let arrow = tip[0].arrow.unwrap();
+                assert!(tip.iter().all(|primitive| primitive.arrow == Some(arrow)));
+                assert_eq!(arrow.points_right, points_right, "{context}");
+                let tip_x = pane_x(camera, tip_position);
+                assert!((arrow.tip_x - tip_x).abs() < 1.0e-9, "{context}: {arrow:?}");
+                assert!((arrow.height - 11.0).abs() < 1.0e-9);
+                for primitive in &tip {
+                    // Every tip primitive ends on the read's tip.
+                    let edge = if points_right {
+                        primitive.x + primitive.width
+                    } else {
+                        primitive.x
+                    };
+                    assert!((edge - tip_x).abs() < 1.0e-9, "{context}: {primitive:?}");
+                }
+
+                // Written out independently: the head is 0.55 x 11 points long whatever the
+                // zoom, and the read is covered where |y - centre| <= 5.5 x min(d / head, 1).
+                let head = 11.0 * 0.55;
+                let (centre, half) = (arrow.centre_y, 5.5);
+                let into_read = |x: f64| if points_right { tip_x - x } else { x - tip_x };
+                let mut columns = Vec::new();
+                // Off-grid steps, so no sample sits exactly on an outline.
+                for column in 0..400 {
+                    let x = tip_x - 2.5 * head + f64::from(column) * 0.0503 + 0.0011;
+                    let distance = into_read(x);
+                    let mut covered_height = 0;
+                    for row in 0..300 {
+                        let y = centre - half - 1.0 + f64::from(row) * 0.0437 + 0.0007;
+                        let covered = read.iter().any(|primitive| primitive.contains(x, y));
+                        let expected = distance > 0.0
+                            && (y - centre).abs() < half
+                            && (y - centre).abs() <= half * (distance / head).min(1.0);
+                        assert_eq!(
+                            covered, expected,
+                            "{context}: ({x}, {y}) is {distance} from the tip"
+                        );
+                        covered_height += usize::from(covered);
+                    }
+                    columns.push((distance, covered_height));
+                }
+                // One monotonic diagonal: moving into the read, the covered height never drops.
+                columns.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for pair in columns.windows(2) {
+                    assert!(pair[0].1 <= pair[1].1, "{context}: step at {pair:?}");
+                }
+                assert!(columns.iter().any(|(distance, height)| *distance > 0.0
+                    && *distance < head
+                    && *height > 0
+                    && *height < 250));
+
+                // Hit-testing: inside the cut-away corner nothing is picked; on the centre line
+                // just inside the tip the read is.
+                let track = rgv_core::TrackId::new(3);
+                let corner_x = if points_right {
+                    tip_x - head * 0.4
+                } else {
+                    tip_x + head * 0.4
+                };
+                let corner = crate::CpuAlignmentProjector::pick(
+                    &scene,
+                    track,
+                    &frame,
+                    corner_x,
+                    centre - half + 0.5,
+                )
+                .unwrap();
+                assert!(
+                    corner.is_none_or(|hit| hit.handle != handle_of(ordinal)),
+                    "{context}: picked {corner:?} in the cut-away corner"
+                );
+                let inside_x = if points_right {
+                    tip_x - 0.2
+                } else {
+                    tip_x + 0.2
+                };
+                let inside =
+                    crate::CpuAlignmentProjector::pick(&scene, track, &frame, inside_x, centre)
+                        .unwrap()
+                        .expect("the arrow tip picks its read");
+                assert_eq!(inside.handle, handle_of(ordinal), "{context}");
+            }
+        }
+    }
+
     /// Clips are cut edges on the read's own boundary, never purple point markers: a soft
     /// clip's sawtooth or a hard clip's bar, just inside the boundary, moved behind the
     /// arrowhead when the clip is at the read's terminal. The CPU projector places them as the
@@ -6181,15 +6344,16 @@ mod tests {
                 } else {
                     (points_per_base * 0.5).clamp(2.0, 6.0)
                 };
+                // The head length depends on the read height alone, at every zoom.
                 let arrowhead = if token.behind_arrow {
-                    (11.0_f64 * 0.55).min(points_per_base.max(1.0) * 0.35)
+                    11.0_f64 * 0.55
                 } else {
                     0.0
                 };
                 let boundary_x = pane_x(camera, boundary);
-                // The arrow tip: the terminal base cell keeps a one-point minimum width, so
-                // below one point per base it reaches a little past the boundary.
-                let tip = boundary_x - points_per_base + points_per_base.max(1.0);
+                // The arrow tip is the read's boundary: below one point per base the terminal
+                // base cell keeps its one-point minimum by growing away from the tip.
+                let tip = boundary_x;
                 let expected_left = if token.at_end && token.behind_arrow {
                     tip - arrowhead - expected_width
                 } else if token.at_end {
@@ -6223,7 +6387,7 @@ mod tests {
                                 && primitive.component == AlignmentComponent::DirectionTerminal
                         })
                         .unwrap();
-                    let head = (terminal.height * 0.55).min(terminal.width * 0.35);
+                    let head = terminal.height * 0.55;
                     if token.at_end {
                         let terminal_tip = terminal.x + terminal.width;
                         assert!((terminal_tip - tip).abs() < 1.0e-9);

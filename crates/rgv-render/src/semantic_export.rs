@@ -248,9 +248,20 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                     .iter()
                     .map(sawtooth_slice_count)
                     .fold(0_usize, usize::saturating_add);
+                // A read's arrowhead is exported as its exact outline: a body rectangle plus a
+                // triangle, or slices where the pane clips the read.
+                let arrow_parts = frame
+                    .primitives
+                    .iter()
+                    .map(directional_part_count)
+                    .fold(0_usize, usize::saturating_add);
                 output.reserve(
                     ledger,
-                    frame.primitives.len().saturating_add(sawtooth_slices),
+                    frame
+                        .primitives
+                        .len()
+                        .saturating_add(sawtooth_slices)
+                        .saturating_add(arrow_parts),
                 )?;
                 for primitive in frame
                     .primitives
@@ -274,6 +285,20 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                         );
                         continue;
                     }
+                    if let Some(arrow) = primitive.arrow {
+                        directional_parts(primitive, arrow, |part| {
+                            output.display.rectangles.push(RectPrimitive {
+                                x: part.x as f32,
+                                y: part.y as f32,
+                                width: part.width as f32,
+                                height: part.height as f32,
+                                color: Rgba::new(r, g, b, a),
+                                object_id: 0,
+                                shape: part.shape,
+                            });
+                        });
+                        continue;
+                    }
                     output.display.rectangles.push(RectPrimitive {
                         x: primitive.x as f32,
                         y: primitive.y as f32,
@@ -281,21 +306,122 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                         height: primitive.height as f32,
                         color: Rgba::new(r, g, b, a),
                         object_id: 0,
-                        shape: match primitive.shape {
-                            CpuPrimitiveShape::DirectionTerminalLeft => {
-                                RectShape::DirectionalTerminalLeft
-                            }
-                            CpuPrimitiveShape::DirectionTerminalRight => {
-                                RectShape::DirectionalTerminalRight
-                            }
-                            _ => RectShape::Rectangle,
-                        },
+                        shape: RectShape::Rectangle,
                     });
                 }
             }
         }
     }
     Ok(output)
+}
+
+/// One display rectangle of a primitive cut by its read's arrowhead.
+pub(crate) struct DirectionalPart {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) width: f64,
+    pub(crate) height: f64,
+    pub(crate) shape: RectShape,
+}
+
+/// Height, in points, of the slices that trace an arrowhead the pane clips.
+const ARROW_SLICE_HEIGHT: f64 = 0.5;
+/// Tolerance, in points, for "this edge is the read's own tip / full height".
+const ARROW_EDGE_TOLERANCE: f64 = 1.0e-6;
+
+/// Number of display rectangles [`directional_parts`] emits for `primitive`; zero unless it is
+/// cut by its read's arrowhead.
+fn directional_part_count(primitive: &rgv_alignment_scene::CpuProjectedPrimitive) -> usize {
+    let mut count = 0_usize;
+    if let Some(arrow) = primitive.arrow {
+        directional_parts(primitive, arrow, |_| count += 1);
+    }
+    count
+}
+
+/// Exports a primitive at a read's tip as exactly the outline the GPU's `fragment_main` paints
+/// (`rgv_alignment_scene::arrowhead_covers`): every tip primitive is cut by the read's one
+/// diagonal, whose length depends on the read height alone, measured from the read's tip.
+///
+/// The display list's `DirectionalTerminal` shapes size their head from the rectangle's own
+/// width (other tracks rely on that) and `rgv-layout` is outside this change, so the cut is
+/// written out: the part beyond the head is a plain rectangle, and the part within it is a
+/// chevron (a triangle whose head is its whole width) as tall as the diagonal is at its base.
+/// Where the pane clips the read, so the tip or the full height is not in view, the head is
+/// traced with thin horizontal slices instead.
+pub(crate) fn directional_parts(
+    primitive: &rgv_alignment_scene::CpuProjectedPrimitive,
+    arrow: rgv_alignment_scene::CpuArrowhead,
+    mut emit: impl FnMut(DirectionalPart),
+) {
+    let length = arrow.length();
+    let left_distance = arrow.distance_from_tip(primitive.x);
+    let right_distance = arrow.distance_from_tip(primitive.x + primitive.width);
+    let (near, far) = (
+        left_distance.min(right_distance),
+        left_distance.max(right_distance),
+    );
+    // The horizontal extent between two distances from the tip.
+    let span = |from: f64, to: f64| {
+        if arrow.points_right {
+            (arrow.tip_x - to, to - from)
+        } else {
+            (arrow.tip_x + from, to - from)
+        }
+    };
+    if far > length {
+        let (x, width) = span(near.max(length), far);
+        emit(DirectionalPart {
+            x,
+            y: primitive.y,
+            width,
+            height: primitive.height,
+            shape: RectShape::Rectangle,
+        });
+    }
+    let head_end = far.min(length);
+    if near >= head_end {
+        return;
+    }
+    let top = arrow.centre_y - arrow.height * 0.5;
+    let whole = near.abs() <= ARROW_EDGE_TOLERANCE
+        && (primitive.y - top).abs() <= ARROW_EDGE_TOLERANCE
+        && (primitive.height - arrow.height).abs() <= ARROW_EDGE_TOLERANCE;
+    if whole {
+        let (x, width) = span(0.0, head_end);
+        let height = arrow.height * head_end / length;
+        emit(DirectionalPart {
+            x,
+            y: arrow.centre_y - height * 0.5,
+            width,
+            height,
+            shape: if arrow.points_right {
+                RectShape::ChevronRight
+            } else {
+                RectShape::ChevronLeft
+            },
+        });
+        return;
+    }
+    let mut slice_top = primitive.y;
+    let bottom = primitive.y + primitive.height;
+    while slice_top < bottom {
+        let slice_bottom = (slice_top + ARROW_SLICE_HEIGHT).min(bottom);
+        if let Some(outline) = arrow.outline_distance_at((slice_top + slice_bottom) * 0.5) {
+            let from = near.max(outline);
+            if from < head_end {
+                let (x, width) = span(from, head_end);
+                emit(DirectionalPart {
+                    x,
+                    y: slice_top,
+                    width,
+                    height: slice_bottom - slice_top,
+                    shape: RectShape::Rectangle,
+                });
+            }
+        }
+        slice_top = slice_bottom;
+    }
 }
 
 /// Height, in points, of the slices that trace a soft clip's sawtooth cut edge.
@@ -627,6 +753,7 @@ mod tests {
             draw_order: 0,
             text: None,
             row: 0,
+            arrow: None,
         };
         assert_eq!(sawtooth_slice_count(&edge), 22);
         let mut slices = Vec::new();
@@ -662,6 +789,142 @@ mod tests {
         assert!(high - low > 3.0, "{centres:?}");
         edge.geometry = AlignmentGeometryToken::ClipEdge(ClipEdgeToken { hard: true, ..soft });
         assert_eq!(sawtooth_slice_count(&edge), 0);
+    }
+
+    /// A primitive at a read's tip is exported as exactly the outline the GPU paints and the
+    /// CPU projector picks: the read's one diagonal (0.55 x height from the read's tip), whatever
+    /// the primitive's own width, so a one-base terminal or base cell narrower than the head is
+    /// a trimmed triangle, not a smaller arrow of its own. Unclipped it is at most a rectangle
+    /// and a chevron; clipped by the pane it is traced with slices.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn primitives_at_a_read_tip_export_the_shared_arrowhead_outline() {
+        use rgv_alignment_scene::{
+            AlignmentBodyColorToken, AlignmentComponent, AlignmentGeometryToken, AlignmentHandle,
+            AlignmentInteractionToken, AlignmentSourceRevision, AlignmentStyleToken, CpuArrowhead,
+            CpuProjectedPrimitive, RevisionFingerprint, SourceFingerprint,
+        };
+        let primitive =
+            |x: f64, y: f64, width: f64, height: f64, arrow: CpuArrowhead| CpuProjectedPrimitive {
+                x,
+                y,
+                width,
+                height,
+                shape: if arrow.points_right {
+                    CpuPrimitiveShape::DirectionTerminalRight
+                } else {
+                    CpuPrimitiveShape::DirectionTerminalLeft
+                },
+                geometry: if arrow.points_right {
+                    AlignmentGeometryToken::DirectionalTerminalRight
+                } else {
+                    AlignmentGeometryToken::DirectionalTerminalLeft
+                },
+                handle: AlignmentHandle::new(
+                    AlignmentSourceRevision::new(
+                        SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+                        RevisionFingerprint::new(3, 4),
+                    ),
+                    rgv_model::AlignmentSourcePosition::bam_virtual_offset(5),
+                ),
+                component: AlignmentComponent::DirectionTerminal,
+                style: AlignmentStyleToken {
+                    flags: 0,
+                    mapping_quality: None,
+                    operation: None,
+                    body: AlignmentBodyColorToken::Neutral,
+                },
+                interaction: AlignmentInteractionToken::default(),
+                draw_order: 0,
+                text: None,
+                row: 0,
+                arrow: Some(arrow),
+            };
+        // A read 11 points tall whose tip is at x = 100 (right) or x = 20 (left); the head is
+        // 6.05 points long.
+        let right = CpuArrowhead {
+            tip_x: 100.0,
+            centre_y: 15.5,
+            height: 11.0,
+            points_right: true,
+        };
+        let left = CpuArrowhead {
+            tip_x: 20.0,
+            points_right: false,
+            ..right
+        };
+        // (primitive, exported exactly, most parts)
+        let cases = [
+            // The block: wider than the head.
+            (primitive(40.0, 10.0, 60.0, 11.0, right), true, 2),
+            (primitive(20.0, 10.0, 60.0, 11.0, left), true, 2),
+            // The one-base terminal or base cell at 2 points per base: trimmed to a triangle.
+            (primitive(98.0, 10.0, 2.0, 11.0, right), true, 1),
+            (primitive(20.0, 10.0, 2.0, 11.0, left), true, 1),
+            // At 4 and 10 points per base.
+            (primitive(96.0, 10.0, 4.0, 11.0, right), true, 1),
+            (primitive(20.0, 10.0, 10.0, 11.0, left), true, 2),
+            // Clipped by the pane: the tip (3 points beyond its right edge) and the top row.
+            (primitive(40.0, 12.0, 57.0, 9.0, right), false, 1 + 18),
+        ];
+        for (index, (primitive, exact, most)) in cases.into_iter().enumerate() {
+            let arrow = primitive.arrow.unwrap();
+            let mut parts = Vec::new();
+            directional_parts(&primitive, arrow, |part| parts.push(part));
+            assert_eq!(parts.len(), directional_part_count(&primitive));
+            assert!(!parts.is_empty() && parts.len() <= most, "case {index}");
+            let rectangles = parts
+                .iter()
+                .map(|part| RectPrimitive {
+                    x: part.x as f32,
+                    y: part.y as f32,
+                    width: part.width as f32,
+                    height: part.height as f32,
+                    color: Rgba::new(0.0, 0.0, 0.0, 1.0),
+                    object_id: 0,
+                    shape: part.shape,
+                })
+                .collect::<Vec<_>>();
+            // Slices trace the diagonal at their middle height, so off it by at most a quarter
+            // of a slice times its slope.
+            let tolerance = if exact {
+                1.0e-3
+            } else {
+                ARROW_SLICE_HEIGHT * 0.5 * arrow.length() / (arrow.height * 0.5) + 1.0e-3
+            };
+            for column in 0..400 {
+                let x = primitive.x - 1.0 + f64::from(column) * (primitive.width + 2.0) / 400.0;
+                for row in 0..120 {
+                    let y = primitive.y - 1.0 + f64::from(row) * (primitive.height + 2.0) / 120.0;
+                    let near_outline = arrow.outline_distance_at(y).is_some_and(|outline| {
+                        (outline - arrow.distance_from_tip(x)).abs() < tolerance
+                    });
+                    let near_edge = [primitive.x, primitive.x + primitive.width]
+                        .iter()
+                        .any(|edge| (x - edge).abs() < 1.0e-3)
+                        || [primitive.y, primitive.y + primitive.height]
+                            .iter()
+                            .any(|edge| (y - edge).abs() < 1.0e-3);
+                    if near_outline || near_edge {
+                        continue;
+                    }
+                    // The rasteriser visits the rectangle's own pixels; its shape rule decides.
+                    let (px, py) = (x as f32, y as f32);
+                    let exported = rectangles.iter().any(|rectangle| {
+                        px >= rectangle.x
+                            && px < rectangle.x + rectangle.width
+                            && py >= rectangle.y
+                            && py < rectangle.y + rectangle.height
+                            && crate::rectangle_contains_point(*rectangle, px, py)
+                    });
+                    assert_eq!(
+                        exported,
+                        primitive.contains(x, y),
+                        "case {index} at ({x}, {y}): {rectangles:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

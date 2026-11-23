@@ -20,6 +20,10 @@ var<uniform> camera: Camera;
 // colour; mirrored by `CLIP_GHOST_TINT` in `palette.rs`.
 const CLIP_GHOST_TINT: f32 = 0.5;
 
+// The direction arrowhead's length along the read, as a fraction of the read height; mirrored by
+// `ARROWHEAD_LENGTH_FRACTION` in `rgv-alignment-scene`.
+const ARROWHEAD_LENGTH: f32 = 0.55;
+
 // One sixteen-byte instance (`AlignmentGpuInstance`):
 //   span.x     whole bases from the page start to the primitive's start
 //   span.y     whole bases covered
@@ -116,9 +120,9 @@ fn project_instance(
     } else if shape >= 6u && shape <= 13u {
         // Clip cut edges (6 + at_end + 2 hard + 4 behind_arrow), just inside the start (or end)
         // edge of the one-base span: a soft clip's sawtooth is half a base wide within [2, 6]
-        // points, a hard clip's bar two. Behind an arrowhead on the same boundary the edge moves
-        // inward by the arrowhead's length (the one-base terminal's head, see `fragment_main`).
-        // Mirrored by `clip_edge_extent` in `rgv-alignment-scene`.
+        // points, a hard clip's bar two. Behind an arrowhead on the same boundary (the read's
+        // tip) the edge moves inward by the arrowhead's length, `ARROWHEAD_LENGTH` of the
+        // height (see `fragment_main`). Mirrored by `clip_edge_extent` in `rgv-alignment-scene`.
         let bits = shape - 6u;
         let cell = right - left;
         var edge_width = 2.0;
@@ -127,11 +131,7 @@ fn project_instance(
         }
         var inset = 0.0;
         if (bits & 4u) != 0u {
-            // Behind the arrowhead: measured from the terminal's tip, the cell widened to its
-            // one-point minimum (rightwards, like every shape).
-            let terminal = max(cell, 1.0);
-            inset = min(height * 0.55, terminal * 0.35);
-            right = left + terminal;
+            inset = height * ARROWHEAD_LENGTH;
         }
         if (bits & 1u) != 0u {
             right = right - inset;
@@ -140,6 +140,10 @@ fn project_instance(
             left = left + inset;
             right = left + edge_width;
         }
+    } else if shape == 3u {
+        // A right-pointing direction terminal keeps its tip on the read's end: its one-point
+        // minimum grows leftwards. Mirrored by `directional_extent` in `rgv-alignment-scene`.
+        left = min(left, right - 1.0);
     } else {
         right = max(right, left + 1.0);
     }
@@ -186,12 +190,16 @@ fn interaction_vertex_main(input: InteractiveVertexInput) -> VertexOutput {
 @fragment
 fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if input.shape == 3u || input.shape == 4u {
-        let width = max(input.size.x, 0.0001);
+        // The read's one arrowhead. Every primitive at the tip (aligned block, one-base terminal,
+        // base cell) ends on the read's tip and is cut by this same diagonal: the head's length
+        // depends on the read height only, never on the primitive's own width, so a primitive
+        // narrower than the head is trimmed rather than re-pointed at its own scale. Mirrored by
+        // `arrowhead_covers` in `rgv-alignment-scene`.
         var distance_from_tip = input.size.x - input.local_point.x;
         if input.shape == 4u {
             distance_from_tip = input.local_point.x;
         }
-        let head_width = min(input.size.y * 0.55, width * 0.35);
+        let head_width = input.size.y * ARROWHEAD_LENGTH;
         if distance_from_tip < head_width {
             let half_height = input.size.y * 0.5;
             let allowed = half_height * clamp(distance_from_tip / head_width, 0.0, 1.0);

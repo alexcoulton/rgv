@@ -117,8 +117,8 @@ fn unclipped_quad(
     } else if (6..=13).contains(&instance.shape()) {
         // Written out independently of `clip_edge_extent`. Shape bits: 1 end edge, 2 hard clip,
         // 4 behind the arrowhead. A soft clip's edge is half a base wide within [2, 6] points, a
-        // hard clip's two; behind an arrowhead it moves inward by the one-base terminal's head
-        // length, min(0.55 x height, 0.35 x max(base, 1)).
+        // hard clip's two; behind an arrowhead it moves inward from the boundary (the read's
+        // tip) by the head length, 0.55 x height.
         let bits = instance.shape() - 6;
         let base = right - left;
         let width = if bits & 2 == 0 {
@@ -126,13 +126,7 @@ fn unclipped_quad(
         } else {
             2.0
         };
-        let inset = if bits & 4 == 0 {
-            0.0
-        } else {
-            // Measured from the direction terminal's tip: that cell keeps its one-point minimum.
-            right = left + base.max(1.0);
-            (height * 0.55).min(base.max(1.0) * 0.35)
-        };
+        let inset = if bits & 4 == 0 { 0.0 } else { height * 0.55 };
         if bits & 1 == 0 {
             left += inset;
             right = left + width;
@@ -140,6 +134,9 @@ fn unclipped_quad(
             right -= inset;
             left = right - width;
         }
+    } else if instance.shape() == AlignmentGpuShape::DirectionTerminalRight as u32 {
+        // The tip stays on the read's end: the one-point minimum grows leftwards.
+        left = left.min(right - 1.0);
     } else {
         right = right.max(left + 1.0);
     }
@@ -174,13 +171,13 @@ fn fragment_is_kept(shape: u32, local: [f64; 2], size: [f64; 2]) -> bool {
     {
         return true;
     }
-    let width = size[0].max(0.0001);
     let distance_from_tip = if shape == AlignmentGpuShape::DirectionTerminalLeft as u32 {
         local[0]
     } else {
         size[0] - local[0]
     };
-    let head_width = (size[1] * 0.55).min(width * 0.35);
+    // The head length depends on the read height only, whatever the shape's own width.
+    let head_width = size[1] * 0.55;
     if distance_from_tip < head_width {
         let half_height = size[1] * 0.5;
         let allowed = half_height * (distance_from_tip / head_width).clamp(0.0, 1.0);
@@ -883,8 +880,7 @@ fn soft_clip_sawtooth_sits_just_inside_the_arrowhead_on_the_gpu() {
     oracle.assert_matches(&image, "soft clip sawtooth behind the arrowhead");
 
     let boundary = CLIP.x + 3.0 * 64.0;
-    // The arrowhead is min(0.55 x 11, 0.35 x 64) = 6.05 points long; the six-point edge ends
-    // at its base.
+    // The arrowhead is 0.55 x 11 = 6.05 points long; the six-point edge ends at its base.
     let (edge_left, edge_right) = (boundary - 6.05 - 6.0, boundary - 6.05);
     let edge = light_rgb(PaletteToken::CLIP_EDGE);
     let white = [255, 255, 255];
@@ -1102,4 +1098,221 @@ fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
         "ghost bases on {}: ghost {ghost:?}, covered cell {b:?}",
         gpu.description
     );
+}
+
+/// The reported defect on the real GPU: zoomed out from base detail (about 2 to 10 points per
+/// base), a read's arrow end showed the block's arrowhead plus a smaller point protruding past
+/// it, because the aligned block, the one-base direction terminal and the base cell at the tip
+/// each sized their head from their own width. They now share one diagonal, so scanning the
+/// columns from the tip inwards the painted height is one contiguous run that grows
+/// monotonically to the full read height, with no step or notch, column for column as the CPU
+/// projector (which picking and export use) says.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn read_tips_are_one_clean_arrowhead_on_the_gpu_when_zoomed_out() {
+    use crate::alignment_scene::tests::test_scene_detailed;
+    use rgv_alignment_scene::{AlignmentComponent, GeometryLod};
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20);
+    // Forward [40, 50) and reverse [60, 70). Against the all-`A` reference of the base-detail
+    // scene the fixture sequence `ACGTACGTAC` puts a mismatch cell on the forward tip's base
+    // (and on others further in).
+    let reads = [
+        TestRead::forward(40),
+        TestRead {
+            start: 60,
+            reverse: true,
+            cigar: cigar(&[(CigarOpKind::Match, 10)]),
+        },
+    ];
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 200).unwrap();
+    let scene_at = |lod| {
+        test_scene_detailed(
+            &ledger,
+            interval,
+            200,
+            // Two tiles; no page boundary falls inside a head (a block piece that ends short of
+            // the tip, like a mismatch cell short of it, is not cut by the arrow).
+            NonZeroU64::new(100).unwrap(),
+            &reads,
+            NonZeroU32::new(2).unwrap(),
+            None,
+            lod,
+        )
+    };
+    let read_scene = scene_at(GeometryLod::Read);
+    let base_scene = scene_at(GeometryLod::Base);
+    let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    // (scene, camera interval, row and read height). At read detail tall rows give a 13.2-point
+    // head over thirteen pixel columns. At base detail the rows are the usual 11 points (a
+    // 6.05-point head) and the zoom keeps the next mismatch cells behind the head.
+    let cases = [
+        (
+            false,
+            0,
+            128,
+            30.0,
+            24.0,
+            "read detail at 2 points per base",
+        ),
+        (
+            false,
+            20,
+            84,
+            30.0,
+            24.0,
+            "read detail at 4 points per base",
+        ),
+        (true, 34, 66, 14.0, 11.0, "base detail at 8 points per base"),
+        (
+            true,
+            40,
+            65,
+            14.0,
+            11.0,
+            "base detail at 10.24 points per base",
+        ),
+    ];
+    for (index, (base_detail, start, end, row_height, read_height, label)) in
+        cases.into_iter().enumerate()
+    {
+        let scene = if base_detail {
+            &base_scene
+        } else {
+            &read_scene
+        };
+        let camera = AlignmentCamera::new(
+            GenomicInterval::new(ContigId::new(0), start, end).unwrap(),
+            0.0,
+            row_height,
+            read_height,
+            CLIP,
+        )
+        .unwrap();
+        let image = render_scene(
+            &gpu,
+            &mut renderer,
+            scene,
+            camera,
+            &ledger,
+            index as u64 + 1,
+        );
+        let (oracle, _) = oracle_for(scene, camera);
+        oracle.assert_matches(&image, label);
+
+        let frame = rgv_alignment_scene::CpuAlignmentProjector::project(scene, 1, camera).unwrap();
+        let mut arrows = Vec::new();
+        for primitive in frame.primitives.iter() {
+            if let Some(arrow) = primitive.arrow {
+                if let Some((_, seen)) = arrows
+                    .iter()
+                    .find(|(handle, _)| *handle == primitive.handle)
+                {
+                    // Every tip primitive of a read carries the same arrow.
+                    assert_eq!(*seen, arrow, "{label}");
+                } else {
+                    arrows.push((primitive.handle, arrow));
+                }
+            }
+        }
+        assert_eq!(arrows.len(), 2, "{label}: {arrows:?}");
+        if base_detail {
+            assert!(
+                frame
+                    .primitives
+                    .iter()
+                    .any(|primitive| primitive.arrow.is_some()
+                        && matches!(primitive.component, AlignmentComponent::Base { .. }))
+            );
+        }
+        for (handle, arrow) in arrows {
+            let head = arrow.length();
+            assert!((head - read_height * 0.55).abs() < 1.0e-9);
+            let top = arrow.centre_y - read_height * 0.5;
+            let band =
+                (top.floor() as u32).saturating_sub(2)..((top + read_height).ceil() as u32 + 2);
+            let mut heights = Vec::new();
+            // Pixel columns whose centres lie from just outside the tip to past the head.
+            for step in -2..(head as i32 + 4) {
+                let column = if arrow.points_right {
+                    (arrow.tip_x - 0.5).floor() as i64 - i64::from(step)
+                } else {
+                    (arrow.tip_x - 0.5).ceil() as i64 + i64::from(step)
+                };
+                let column = u32::try_from(column).unwrap();
+                let centre_x = f64::from(column) + 0.5;
+                let distance = arrow.distance_from_tip(centre_x);
+                let painted = band
+                    .clone()
+                    .filter(|row| image.get_pixel(column, *row).0 != [255, 255, 255, 255])
+                    .collect::<Vec<_>>();
+                // One contiguous run: no notch.
+                if let (Some(first), Some(last)) = (painted.first(), painted.last()) {
+                    assert_eq!(
+                        (last - first + 1) as usize,
+                        painted.len(),
+                        "{label}: column {column} is notched: {painted:?}"
+                    );
+                }
+                // Column for column what the CPU projector covers, wherever no pixel centre in
+                // the column is within a hair of the diagonal.
+                let mut ambiguous = false;
+                let cpu = band
+                    .clone()
+                    .filter(|row| {
+                        let centre_y = f64::from(*row) + 0.5;
+                        if let Some(outline) = arrow.outline_distance_at(centre_y) {
+                            ambiguous |= (outline - distance).abs() < 1.0e-3;
+                        }
+                        frame
+                            .primitives
+                            .iter()
+                            .filter(|primitive| primitive.handle == handle)
+                            .any(|primitive| primitive.contains(centre_x, centre_y))
+                    })
+                    .count();
+                if !ambiguous {
+                    assert_eq!(
+                        painted.len(),
+                        cpu,
+                        "{label}: column {column} ({distance:.2} from the tip)"
+                    );
+                }
+                heights.push((distance, painted.len()));
+            }
+            // From the tip inwards the painted height never drops: one diagonal, no stub.
+            for pair in heights.windows(2) {
+                assert!(
+                    pair[0].1 <= pair[1].1,
+                    "{label}: the arrow steps between {pair:?}: {heights:?}"
+                );
+            }
+            assert_eq!(
+                heights[0].1, 0,
+                "{label}: painted beyond the tip: {heights:?}"
+            );
+            assert_eq!(
+                heights.last().unwrap().1,
+                read_height as usize,
+                "{label}: {heights:?}"
+            );
+            // Within the head the height grows in many small steps, not one jump.
+            let within_head = heights
+                .iter()
+                .filter(|(distance, height)| *distance < head && *height > 0)
+                .count();
+            assert!(within_head + 1 >= head as usize, "{label}: {heights:?}");
+            eprintln!(
+                "{label} on {}: tip at {:.2}, column heights {:?}",
+                gpu.description,
+                arrow.tip_x,
+                heights
+                    .iter()
+                    .map(|(_, height)| *height)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 }

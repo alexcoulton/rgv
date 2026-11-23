@@ -212,6 +212,10 @@ pub struct CpuProjectedPrimitive {
     pub text: Option<Arc<str>>,
     /// Canonical atlas row. This remains stable while the row camera moves.
     pub row: u32,
+    /// The read's direction arrowhead that cuts this primitive, for the direction-terminal
+    /// shapes: described in unclipped pane coordinates, so a primitive clipped by the pane keeps
+    /// the read's own tip and diagonal rather than growing a point at the pane edge.
+    pub arrow: Option<CpuArrowhead>,
 }
 
 impl CpuProjectedPrimitive {
@@ -220,25 +224,95 @@ impl CpuProjectedPrimitive {
         if x < self.x || x >= self.x + self.width || y < self.y || y >= self.y + self.height {
             return false;
         }
-        let reverse = match self.shape {
-            CpuPrimitiveShape::DirectionTerminalLeft => true,
-            CpuPrimitiveShape::DirectionTerminalRight => false,
-            _ => return true,
-        };
-        let local_x = x - self.x;
-        let local_y = y - self.y;
-        let distance_from_tip = if reverse {
-            local_x
+        self.arrow.is_none_or(|arrow| arrow.covers(x, y))
+    }
+}
+
+/// The single direction arrowhead at a read's true terminal (shapes 3 and 4 of `fragment_main`
+/// in `rgv-render`'s `alignment_scene.wgsl`; keep in lockstep). Every primitive at the tip (the
+/// aligned block, the one-base direction terminal and, at base detail, the base cell) ends on
+/// the read's tip and is cut by this same diagonal, so the read's outline is one point at every
+/// zoom: a primitive narrower than the head is trimmed, never re-pointed at its own scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CpuArrowhead {
+    /// Pane x of the read's tip: its right end when `points_right`, else its left end.
+    pub tip_x: f64,
+    /// Pane y of the read's centre line.
+    pub centre_y: f64,
+    /// Unclipped height of the read, in points (at least one point).
+    pub height: f64,
+    pub points_right: bool,
+}
+
+impl CpuArrowhead {
+    /// Length of the head along the read; see [`arrowhead_length`].
+    #[must_use]
+    pub fn length(self) -> f64 {
+        arrowhead_length(self.height)
+    }
+
+    /// Distance of `x` from the tip, measured into the read.
+    #[must_use]
+    pub fn distance_from_tip(self, x: f64) -> f64 {
+        if self.points_right {
+            self.tip_x - x
         } else {
-            self.width - local_x
-        };
-        let head_width = (self.height * 0.55).min(self.width * 0.35);
-        if distance_from_tip >= head_width || head_width <= f64::EPSILON {
-            return true;
+            x - self.tip_x
         }
+    }
+
+    /// Distance from the tip at which the arrow's outline crosses height `y`: the read covers
+    /// `(x, y)` from there inwards. `None` when `y` is outside the read altogether.
+    #[must_use]
+    pub fn outline_distance_at(self, y: f64) -> Option<f64> {
         let half_height = self.height * 0.5;
-        let allowed = half_height * (distance_from_tip / head_width).clamp(0.0, 1.0);
-        (local_y - half_height).abs() <= allowed
+        let offset = (y - self.centre_y).abs();
+        (offset <= half_height).then(|| self.length() * offset / half_height)
+    }
+
+    /// Whether the arrowhead leaves `(x, y)` painted (any point inside the read's rectangle
+    /// beyond the head is).
+    #[must_use]
+    pub fn covers(self, x: f64, y: f64) -> bool {
+        arrowhead_covers(self.distance_from_tip(x), y - self.centre_y, self.height)
+    }
+}
+
+/// The direction arrowhead's length along the read, for a read drawn `height` points tall:
+/// [`ARROWHEAD_LENGTH_FRACTION`] of the height, and nothing else. It never depends on the width
+/// of the primitive being cut, so the block, the one-base terminal and a base cell at the tip
+/// share one diagonal; a read shorter on screen than this is drawn as (part of) the arrow.
+#[must_use]
+pub fn arrowhead_length(height: f64) -> f64 {
+    height * ARROWHEAD_LENGTH_FRACTION
+}
+
+/// Whether a point `distance_from_tip` into the read from its tip and `offset_from_centre`
+/// from its centre line is inside the arrow outline of a read `height` points tall: within the
+/// head the half-height allowed grows linearly from zero at the tip to the full half-height at
+/// [`arrowhead_length`]. Mirrors `fragment_main` in `alignment_scene.wgsl`.
+#[must_use]
+pub fn arrowhead_covers(distance_from_tip: f64, offset_from_centre: f64, height: f64) -> bool {
+    let length = arrowhead_length(height);
+    if distance_from_tip >= length || length <= f64::EPSILON {
+        return true;
+    }
+    let half_height = height * 0.5;
+    let allowed = half_height * (distance_from_tip / length).clamp(0.0, 1.0);
+    offset_from_centre.abs() <= allowed
+}
+
+/// Horizontal extent `(left, width)` of a direction-terminal shape whose span projects to
+/// `left..right`: at least one point wide (the minimum-size policy), grown away from its tip so
+/// the tip stays on the read's end (leftwards when `points_right`, rightwards otherwise).
+/// Mirrors `project_instance` in `alignment_scene.wgsl`.
+#[must_use]
+pub fn directional_extent(left: f64, right: f64, points_right: bool) -> (f64, f64) {
+    let width = (right - left).max(MINIMUM_PRIMITIVE_EXTENT);
+    if points_right {
+        (right - width, width)
+    } else {
+        (left, width)
     }
 }
 
@@ -777,9 +851,8 @@ const HARD_CLIP_EDGE_WIDTH: f64 = 2.0;
 const CLIP_EDGE_STROKE: f64 = 1.5;
 const CLIP_EDGE_TOOTH_HEIGHT: f64 = 4.0;
 /// The direction arrowhead of `fragment_main` (shapes 3 and 4): its length along the read is
-/// this fraction of the read height, but at most [`ARROWHEAD_WIDTH_FRACTION`] of the shape.
-const ARROWHEAD_HEIGHT_FRACTION: f64 = 0.55;
-const ARROWHEAD_WIDTH_FRACTION: f64 = 0.35;
+/// this fraction of the read height; see [`arrowhead_length`].
+pub const ARROWHEAD_LENGTH_FRACTION: f64 = 0.55;
 
 /// Horizontal extent `(left, width)` of a clip's cut edge whose one-base span (the aligned base
 /// at the clipped boundary) projects to `cell_left..cell_right`, for a read drawn `height`
@@ -787,10 +860,9 @@ const ARROWHEAD_WIDTH_FRACTION: f64 = 0.35;
 /// start edge, or its end edge when `edge.at_end`), so it never covers a ghost base beyond it.
 ///
 /// When the read's direction arrowhead is on the same boundary (`edge.behind_arrow`) the edge
-/// is moved inward by exactly the arrowhead's length, which is the head of the one-base
-/// direction terminal on that same cell: `min(0.55 x height, 0.35 x max(cell, 1))`, measured
-/// from that terminal's tip (the cell, widened to its one-point minimum). The edge then starts
-/// where the arrowhead's base is, so tip and cut both stay visible.
+/// is moved inward from that boundary (the read's tip) by exactly the arrowhead's length,
+/// [`arrowhead_length`] of `height`. The edge then starts where the arrowhead's base is, so
+/// tip and cut both stay visible.
 #[must_use]
 pub fn clip_edge_extent(
     cell_left: f64,
@@ -812,12 +884,10 @@ pub fn clip_edge_extent(
             (cell_left, width)
         };
     }
-    // The terminal cell keeps the one-point minimum width, grown rightwards like every shape,
-    // so its tip (and hence the arrowhead's base) is measured from that widened cell.
-    let terminal = cell.max(MINIMUM_PRIMITIVE_EXTENT);
-    let arrowhead = (height * ARROWHEAD_HEIGHT_FRACTION).min(terminal * ARROWHEAD_WIDTH_FRACTION);
+    // Direction terminals keep their tip on the read's boundary (see `directional_extent`).
+    let arrowhead = arrowhead_length(height);
     if edge.at_end {
-        (cell_left + terminal - arrowhead - width, width)
+        (cell_right - arrowhead - width, width)
     } else {
         (cell_left + arrowhead, width)
     }
@@ -878,6 +948,7 @@ fn project_primitive(
         + (f64::from(global_row) - camera.row_scroll) * camera.row_height
         + (camera.row_height - camera.read_height) * 0.5;
     let body_height = camera.read_height.max(MINIMUM_PRIMITIVE_EXTENT);
+    let mut arrow = None;
     let (shape, y, height) = match primitive.geometry {
         AlignmentGeometryToken::EventLine => {
             width = width.max(MINIMUM_PRIMITIVE_EXTENT);
@@ -917,7 +988,13 @@ fn project_primitive(
             (CpuPrimitiveShape::ClipGhostCell, row_top, body_height)
         }
         AlignmentGeometryToken::DirectionalTerminalLeft => {
-            width = width.max(MINIMUM_PRIMITIVE_EXTENT);
+            (x, width) = directional_extent(x, x + width, false);
+            arrow = Some(CpuArrowhead {
+                tip_x: x,
+                centre_y: row_top + body_height * 0.5,
+                height: body_height,
+                points_right: false,
+            });
             (
                 CpuPrimitiveShape::DirectionTerminalLeft,
                 row_top,
@@ -925,7 +1002,13 @@ fn project_primitive(
             )
         }
         AlignmentGeometryToken::DirectionalTerminalRight => {
-            width = width.max(MINIMUM_PRIMITIVE_EXTENT);
+            (x, width) = directional_extent(x, x + width, true);
+            arrow = Some(CpuArrowhead {
+                tip_x: x + width,
+                centre_y: row_top + body_height * 0.5,
+                height: body_height,
+                points_right: true,
+            });
             (
                 CpuPrimitiveShape::DirectionTerminalRight,
                 row_top,
@@ -968,6 +1051,7 @@ fn project_primitive(
         draw_order: primitive.draw_order,
         text,
         row: global_row,
+        arrow,
     })
 }
 

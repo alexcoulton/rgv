@@ -935,17 +935,36 @@ fn semantic_export_contains_committed_read_and_depth_geometry_and_pins_its_captu
         &crate::palette::AlignmentPalette::light(),
     )
     .unwrap();
+    let exported = |x: f64, y: f64, width: f64, height: f64| {
+        export.display.rectangles.iter().any(|rectangle| {
+            (f64::from(rectangle.x) - x).abs() < 1e-4
+                && (f64::from(rectangle.y) - y).abs() < 1e-4
+                && (f64::from(rectangle.width) - width).abs() < 1e-4
+                && (f64::from(rectangle.height) - height).abs() < 1e-4
+        })
+    };
     for body in expected
         .primitives
         .iter()
         .filter(|primitive| primitive.shape != CpuPrimitiveShape::TextLabel)
     {
-        assert!(export.display.rectangles.iter().any(|rectangle| {
-            (f64::from(rectangle.x) - body.x).abs() < 1e-4
-                && (f64::from(rectangle.y) - body.y).abs() < 1e-4
-                && (f64::from(rectangle.width) - body.width).abs() < 1e-4
-                && (f64::from(rectangle.height) - body.height).abs() < 1e-4
-        }));
+        if let Some(arrow) = body.arrow {
+            // Cut by its read's arrowhead: exported as the exact outline's parts.
+            let mut parts = 0;
+            crate::semantic_export::directional_parts(body, arrow, |part| {
+                parts += 1;
+                assert!(
+                    exported(part.x, part.y, part.width, part.height),
+                    "{body:?}"
+                );
+            });
+            assert!(parts > 0, "{body:?}");
+        } else {
+            assert!(
+                exported(body.x, body.y, body.width, body.height),
+                "{body:?}"
+            );
+        }
     }
     assert!(
         export
