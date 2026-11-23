@@ -153,8 +153,10 @@ impl Viewer {
         ui.label(&st.nav.assembly_label);
         if let Some(identity) = &self.session.assembly.identity {
             ui.small(format!(
-                "{} · {:?} · {} fingerprint matches",
-                identity.stable_id, identity.confidence, identity.matched_fingerprints
+                "{} · {} · {}",
+                identity.display_name,
+                identity.confidence.label(),
+                identity.stable_id
             ));
         } else if let Some(suggestion) = &self.session.suggested_assembly_identity {
             ui.colored_label(
@@ -196,6 +198,10 @@ impl Viewer {
                 crate::theme::adapt(egui::Color32::from_rgb(170, 45, 38)),
                 error,
             );
+        } else if self.landmark_resource_root.is_none() {
+            ui.small(
+                "Gene landmarks: not configured — choose a landmark folder or set RGV_LANDMARK_RESOURCE_ROOT",
+            );
         }
         if ui.button("Open FASTA…").clicked() {
             st.commands.open_reference_requested = true;
@@ -224,6 +230,10 @@ impl Viewer {
             && ui.button("Open landmark resource folder").clicked()
         {
             st.commands.open_landmark_folder_requested = true;
+            ui.close();
+        }
+        if ui.button("Choose landmark folder…").clicked() {
+            st.commands.choose_landmark_folder_requested = true;
             ui.close();
         }
         ui.separator();

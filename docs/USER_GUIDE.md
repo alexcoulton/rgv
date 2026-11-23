@@ -30,22 +30,52 @@ A small remote BED, GFF3, GTF, genePred, refFlat, narrowPeak, broadPeak or PSL f
 **Built-in gene landmarks.** When a landmark catalogue is installed and the loaded reference is
 positively matched to one of its assemblies, RGV adds a **Genes** track automatically, uses the
 bundle's gene-name index for symbol search, and can take cytobands and chromosome aliases from the
-same bundle. The **Genomes** menu shows the match as a `Landmarks: …` line (status, evidence and
-reason), or an error line when no catalogue was found. If you remove the automatic Genes track,
-**Genomes → Restore default genes** brings it back; **Genomes → Open landmark resource folder**
-opens the catalogue directory.
+same bundle. The **Genomes** menu shows the assembly as, for example,
+`GRCh38 (+ 98 extra contigs) · inferred from primary contigs · GRCh38.no_alt_analysis_set`, then a
+`Landmarks: …` line (status, evidence and reason), and an error line when something failed. If you
+remove the automatic Genes track, **Genomes → Restore default genes** brings it back;
+**Genomes → Open landmark resource folder** opens the catalogue directory.
 
-RGV looks for a directory containing `catalog.json` in this order: `--landmark-resource-root`,
-the `RGV_LANDMARK_RESOURCE_ROOT` environment variable, then
-`benchmark-data/large-public-alignments/landmarks/igv` and `resources/landmarks` relative to the
-working directory, then `landmarks`, `resources/landmarks` and `../Resources/landmarks` beside the
-executable. The catalogue is **not tracked in Git and the packaging scripts do not currently copy
-it into the staged application**, so on a fresh checkout or packaged build there is no automatic
-Genes track until you build the bundles (hg38, hg19, mm10, mm39 and hs1; see
-[Curated gene landmark bundles](LANDMARK_BUNDLES.md)) or point RGV at an existing catalogue.
-Without one, the Genomes menu reports "No built-in landmark catalogue was found; automatic Genes
-tracks are unavailable" and everything else works as usual. Hosted genomes (above) supply their
-own default gene track and do not depend on the landmark catalogue.
+A bare FASTA (or BAM header) is recognised without a genome configuration. In order of strength:
+an exact match of the whole ordered sequence dictionary; sequence MD5 fingerprints (from a BAM
+`@SQ M5` tag); or, failing both, every **primary chromosome** of exactly one catalogued build
+present with exactly its catalogued length. Names may use the `chr1`/`1` and `chrM`/`MT`/`M`
+spellings. Extra sequences — ERCC spike-ins, phiX, EBV, decoys, unplaced or alternate contigs — do
+not change the identity; they are counted and shown ("+ 98 extra contigs"). RGV refuses rather than
+guesses when a nuclear chromosome is missing or has another length, when a sequence the build
+catalogues by name has another length, when a chromosome appears under two spellings, when sequence
+MD5s contradict the build, or when two builds fit equally. The mitochondrial genome is not required,
+and one of a different length (the rCRS `MT` of b37 against hg19's `chrM`) is left unbound and
+reported. An identity inferred this way is labelled **inferred from primary contigs**, distinct from
+**explicit genome configuration** (a `.rgvgenome` or IGV genome) and **exact sequence dictionary**.
+
+RGV looks for a directory containing `catalog.json` — or a folder with an `igv/catalog.json`, as
+written by the curation script under `landmarks/` — in this order:
+
+1. `--landmark-resource-root` (when given, nothing else is consulted);
+2. the `RGV_LANDMARK_RESOURCE_ROOT` environment variable;
+3. the **landmark folder setting**, chosen with **Genomes → Choose landmark folder…** and saved as
+   `landmark_resource_root` in the settings file;
+4. the per-user data folder: `~/Library/Application Support/RGV/landmarks` on macOS,
+   `%APPDATA%\RGV\landmarks` on Windows, `$XDG_DATA_HOME/rgv/landmarks` (or
+   `~/.local/share/rgv/landmarks`) elsewhere;
+5. `benchmark-data/large-public-alignments/landmarks/igv` and `resources/landmarks` relative to the
+   working directory, then `landmarks`, `resources/landmarks` and `../Resources/landmarks` beside
+   the executable.
+
+The first location holding a catalogue wins. Choosing a folder reads and validates its catalogue
+in the background, saves the setting only if it is valid, and immediately re-matches the open
+reference. Every bundle asset is verified against its catalogued size and SHA-256 before use: a
+damaged gene model refuses the bundle, and a damaged gene-name index keeps the Genes track but says
+that symbol search is unavailable. The catalogue is **not tracked in Git and the packaging scripts
+do not currently copy it into the staged application**, so until you build the bundles (hg38, hg19,
+mm10, mm39 and hs1; see [Curated gene landmark bundles](LANDMARK_BUNDLES.md)) or point RGV at an
+existing catalogue there is no automatic Genes track. That state is reported as **not configured**
+("Gene landmarks: not configured" in the Genomes menu; `integrity: "not_configured"`,
+`automatic_track_state: "unconfigured"` in automation), not as a failure. A location you named
+(command line, environment variable or setting) that holds no catalogue, an invalid catalogue, or an
+asset that fails verification is reported as a failure with its reason. Hosted genomes (above)
+supply their own default gene track and do not depend on the landmark catalogue.
 
 Use **File → Open BAM/CRAM** for an alignment source, **Genomes → Open FASTA** for an indexed
 reference genome, and **Tracks → Add track** for annotations, variants, or signal. Use
@@ -141,6 +171,16 @@ Submitting a name also searches VCF/BCF record IDs. That bounded ID index is cre
 background track worker, so opening a variant track does not add a whole-file scan to startup.
 Use **Regions → Previous annotation feature** or **Next annotation feature** to move to the nearest
 feature boundary on the active contig across all searchable text annotation tracks.
+
+Gene symbols are searchable without opening any annotation file when the reference is matched to a
+built-in landmark bundle (see **Built-in gene landmarks** above): the bundle's gene-name index
+supplies symbol, alias, gene-ID and transcript-ID matches for its compact gene track. The compact
+track holds one representative transcript per gene (MANE for hg38, RefSeq Select for hg19), so a
+gene outside that set (for example one absent from MANE 1.0) is found only through an open,
+searchable annotation track that contains it, such as your own GTF. If gene
+search finds nothing for a bare FASTA, check the Genomes menu: "not configured" means no landmark
+catalogue was found (set `RGV_LANDMARK_RESOURCE_ROOT` or use **Genomes → Choose landmark folder…**),
+and "Assembly unidentified" means the reference did not match a catalogued build.
 
 Open the reference track settings to display the reverse strand and enable any combination of the
 three forward and three reverse translation frames. Translation uses absolute genomic phase and an

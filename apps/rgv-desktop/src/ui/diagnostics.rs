@@ -595,7 +595,12 @@ impl Viewer {
         }
         let root = self.landmark_resource_root.as_ref().map_or_else(
             || "unavailable".to_owned(),
-            |path| path.display().to_string(),
+            |path| {
+                self.landmark_resource_source.map_or_else(
+                    || path.display().to_string(),
+                    |source| format!("{} ({})", path.display(), source.label()),
+                )
+            },
         );
         let resolution = self.landmark_resolution.as_ref();
         let bundle = snapshot

@@ -1,10 +1,11 @@
+use super::feature_search::{FeatureSearchIndex, StreamingFeatureSearch};
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
 pub struct TextFeatureSource {
     pub(super) features: HashMap<String, FeatureIndex>,
-    pub(super) search_terms: BTreeMap<String, Vec<(String, usize)>>,
-    pub(super) search_index_truncated: bool,
+    /// Name index of a fully loaded source; empty for an indexed one.
+    pub(super) search: FeatureSearchIndex,
     /// Present when the source is a bgzip-compressed file with a tabix or CSI index. Records are
     /// then read on demand for each query and `features` stays empty.
     pub(super) indexed: Option<IndexedTextFeatures>,
@@ -22,7 +23,7 @@ pub(super) struct IndexedTextFeatures {
     /// again).
     malformed_lines: std::sync::atomic::AtomicUsize,
     /// Built by one bounded streaming pass the first time a name search is submitted.
-    search: OnceLock<IndexedFeatureSearch>,
+    search: OnceLock<StreamingFeatureSearch>,
 }
 
 /// Where the lines of an indexed annotation come from.
@@ -42,13 +43,6 @@ const MAX_REMOTE_FEATURE_SEARCH_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 
 fn poisoned() -> TrackError {
     TrackError::Backend("indexed annotation reader is poisoned".to_owned())
-}
-
-#[derive(Default)]
-struct IndexedFeatureSearch {
-    /// For every search term, the widest feature carrying it on each contig.
-    terms: BTreeMap<String, Vec<FeatureRecord>>,
-    truncated: bool,
 }
 
 /// Initial distance searched backwards for the previous feature; quadrupled until one is found.
@@ -269,39 +263,24 @@ impl IndexedTextFeatures {
         }
     }
 
-    /// Streams the whole file once, retaining only one slim record per search term and contig.
+    /// Streams the whole file once, retaining one record per search term and contig (see
+    /// [`StreamingFeatureSearch`]).
     /// A remote file is streamed through the range reader until
     /// [`MAX_REMOTE_FEATURE_SEARCH_SCAN_BYTES`] have been transferred (or its transfer budget
     /// or cancellation stops it); the index is then reported as truncated.
-    fn build_search(&self) -> IndexedFeatureSearch {
-        let mut search = IndexedFeatureSearch::default();
-        let mut associations = 0_usize;
+    fn build_search(&self) -> StreamingFeatureSearch {
+        let mut search = StreamingFeatureSearch::default();
         // Whether to go on to the next line.
-        let mut add = |search: &mut IndexedFeatureSearch, line: &str| -> bool {
+        let add = |search: &mut StreamingFeatureSearch, line: &str| -> bool {
             let Ok(Some(record)) = parse_feature_line(self.format, line) else {
                 return true;
             };
-            for term in feature_search_terms(&record) {
-                let hits = search.terms.entry(term).or_default();
-                if let Some(existing) = hits.iter_mut().find(|hit| hit.contig == record.contig) {
-                    if record.end - record.start > existing.end - existing.start {
-                        *existing = slim_search_record(&record);
-                    }
-                    continue;
-                }
-                if associations == MAX_FEATURE_SEARCH_ASSOCIATIONS {
-                    search.truncated = true;
-                    return false;
-                }
-                associations += 1;
-                hits.push(slim_search_record(&record));
-            }
-            true
+            search.add(&record, MAX_FEATURE_SEARCH_ASSOCIATIONS)
         };
         match &self.backend {
             IndexedTextBackend::Local { path, .. } => {
                 let Ok(file) = File::open(path) else {
-                    search.truncated = true;
+                    search.truncate();
                     return search;
                 };
                 let mut reader = BufReader::new(MultiGzDecoder::new(file));
@@ -315,7 +294,7 @@ impl IndexedTextFeatures {
                         Ok(0) => break,
                         Ok(bytes) if bytes <= MAX_FEATURE_LINE_BYTES => {}
                         _ => {
-                            search.truncated = true;
+                            search.truncate();
                             break;
                         }
                     }
@@ -326,11 +305,11 @@ impl IndexedTextFeatures {
             }
             IndexedTextBackend::Remote(remote) => {
                 let Ok(mut remote) = remote.lock() else {
-                    search.truncated = true;
+                    search.truncate();
                     return search;
                 };
                 let Ok(baseline) = remote.start_scan() else {
-                    search.truncated = true;
+                    search.truncate();
                     return search;
                 };
                 let mut line = Vec::new();
@@ -338,14 +317,14 @@ impl IndexedTextFeatures {
                     if remote.response_bytes().saturating_sub(baseline)
                         > MAX_REMOTE_FEATURE_SEARCH_SCAN_BYTES
                     {
-                        search.truncated = true;
+                        search.truncate();
                         break;
                     }
                     match remote.next_scan_line(&mut line) {
                         Ok(true) if line.len() <= MAX_FEATURE_LINE_BYTES => {}
                         Ok(false) => break,
                         _ => {
-                            search.truncated = true;
+                            search.truncate();
                             break;
                         }
                     }
@@ -362,61 +341,9 @@ impl IndexedTextFeatures {
     }
 
     fn search(&self, query: &str, limit: usize) -> FeatureSearchResults {
-        let search = self.search.get_or_init(|| self.build_search());
-        let limit = limit.min(MAX_FEATURE_SEARCH_RESULTS);
-        let mut candidates = Vec::new();
-        let mut scan_truncated = false;
-        'terms: for (term, hits) in search.terms.range(query.to_owned()..) {
-            if !term.starts_with(query) {
-                break;
-            }
-            for hit in hits {
-                if candidates.len() == MAX_FEATURE_SEARCH_SCANNED_ASSOCIATIONS {
-                    scan_truncated = true;
-                    break 'terms;
-                }
-                candidates.push((term == query, term.clone(), hit.clone()));
-            }
-        }
-        candidates.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.2.contig.cmp(&right.2.contig))
-                .then_with(|| left.2.start.cmp(&right.2.start))
-                .then_with(|| left.2.end.cmp(&right.2.end))
-                .then_with(|| left.2.name.cmp(&right.2.name))
-        });
-        candidates.truncate(limit);
-        FeatureSearchResults {
-            hits: candidates
-                .into_iter()
-                .map(|(_, matched_term, record)| FeatureSearchHit {
-                    matched_term,
-                    record,
-                })
-                .collect(),
-            index_truncated: search.truncated,
-            scan_truncated,
-        }
-    }
-}
-
-/// A search hit needs identity and location, not exon structure or the full attribute list.
-fn slim_search_record(record: &FeatureRecord) -> FeatureRecord {
-    FeatureRecord {
-        contig: record.contig.clone(),
-        start: record.start,
-        end: record.end,
-        name: record.name.clone(),
-        feature_type: record.feature_type.clone(),
-        score: None,
-        strand: record.strand,
-        blocks: Vec::new(),
-        coding_interval: None,
-        peak: None,
-        attributes: Vec::new(),
+        self.search
+            .get_or_init(|| self.build_search())
+            .search(query, limit)
     }
 }
 
@@ -517,8 +444,7 @@ impl TextFeatureSource {
             {
                 return Ok(Self {
                     features: HashMap::new(),
-                    search_terms: BTreeMap::new(),
-                    search_index_truncated: false,
+                    search: FeatureSearchIndex::default(),
                     indexed: Some(IndexedTextFeatures::remote(indexed, format)),
                     malformed_lines: 0,
                     first_malformed_line: None,
@@ -548,8 +474,7 @@ impl TextFeatureSource {
         if compressed && adjacent_text_index(path).is_some() {
             return Ok(Self {
                 features: HashMap::new(),
-                search_terms: BTreeMap::new(),
-                search_index_truncated: false,
+                search: FeatureSearchIndex::default(),
                 indexed: Some(IndexedTextFeatures::open(path, format)?),
                 malformed_lines: 0,
                 first_malformed_line: None,
@@ -563,9 +488,15 @@ impl TextFeatureSource {
         }
     }
 
-    pub fn from_reader(
+    pub fn from_reader(reader: impl BufRead, format: FeatureFormat) -> Result<Self, TrackError> {
+        Self::from_reader_with_search_cap(reader, format, MAX_FEATURE_SEARCH_ASSOCIATIONS)
+    }
+
+    /// As [`Self::from_reader`], with the name index bounded at `search_cap` associations.
+    pub(super) fn from_reader_with_search_cap(
         mut reader: impl BufRead,
         format: FeatureFormat,
+        search_cap: usize,
     ) -> Result<Self, TrackError> {
         let mut features: HashMap<String, FeatureIndex> = HashMap::new();
         let mut source_records = 0_usize;
@@ -622,11 +553,10 @@ impl TextFeatureSource {
         for index in features.values_mut() {
             index.finish();
         }
-        let (search_terms, search_index_truncated) = build_feature_search_index(&features);
+        let search = FeatureSearchIndex::build(&features, search_cap);
         Ok(Self {
             features,
-            search_terms,
-            search_index_truncated,
+            search,
             indexed: None,
             malformed_lines,
             first_malformed_line,
@@ -743,128 +673,33 @@ impl TextFeatureSource {
         let query = normalized_feature_search_term(query);
         if query.is_empty() || limit == 0 {
             return FeatureSearchResults {
-                index_truncated: self.search_index_truncated,
+                index_truncated: self
+                    .search_index_coverage()
+                    .is_some_and(|coverage| coverage.truncated),
                 ..FeatureSearchResults::default()
             };
         }
         if let Some(indexed) = &self.indexed {
             return indexed.search(&query, limit);
         }
-        let limit = limit.min(MAX_FEATURE_SEARCH_RESULTS);
-        let mut candidates = Vec::new();
-        let mut seen = HashSet::new();
-        let mut scanned = 0_usize;
-        let mut scan_truncated = false;
-        for (term, locations) in self.search_terms.range(query.clone()..) {
-            if !term.starts_with(&query) {
-                break;
-            }
-            for (contig, index) in locations {
-                if scanned == MAX_FEATURE_SEARCH_SCANNED_ASSOCIATIONS {
-                    scan_truncated = true;
-                    break;
-                }
-                scanned = scanned.saturating_add(1);
-                if seen.insert((contig.as_str(), *index))
-                    && let Some(record) = self
-                        .features
-                        .get(contig)
-                        .and_then(|features| features.records.get(*index))
-                {
-                    candidates.push((term == &query, term.clone(), record.clone()));
-                }
-            }
-            if scan_truncated {
-                break;
-            }
-        }
-        candidates.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| left.2.contig.cmp(&right.2.contig))
-                .then_with(|| left.2.start.cmp(&right.2.start))
-                .then_with(|| left.2.end.cmp(&right.2.end))
-                .then_with(|| left.2.name.cmp(&right.2.name))
-        });
-        candidates.truncate(limit);
-        FeatureSearchResults {
-            hits: candidates
-                .into_iter()
-                .map(|(_, matched_term, record)| FeatureSearchHit {
-                    matched_term,
-                    record,
-                })
-                .collect(),
-            index_truncated: self.search_index_truncated,
-            scan_truncated,
-        }
+        self.search.search(&self.features, &query, limit)
     }
-}
 
-fn build_feature_search_index(
-    features: &HashMap<String, FeatureIndex>,
-) -> (BTreeMap<String, Vec<(String, usize)>>, bool) {
-    let mut terms = BTreeMap::<String, Vec<(String, usize)>>::new();
-    let mut associations = 0_usize;
-    let mut contigs = features.keys().collect::<Vec<_>>();
-    contigs.sort();
-    for contig in contigs {
-        let Some(index) = features.get(contig) else {
-            continue;
-        };
-        for (record_index, record) in index.records.iter().enumerate() {
-            for term in feature_search_terms(record) {
-                if associations == MAX_FEATURE_SEARCH_ASSOCIATIONS {
-                    return (terms, true);
-                }
-                terms
-                    .entry(term)
-                    .or_default()
-                    .push((contig.clone(), record_index));
-                associations = associations.saturating_add(1);
-            }
+    /// How much of the source the name index covers. `None` for an indexed source whose
+    /// index has not been built yet (it is built by the first name search).
+    #[must_use]
+    pub fn search_index_coverage(&self) -> Option<FeatureSearchIndexCoverage> {
+        match &self.indexed {
+            Some(indexed) => indexed.search.get().map(|search| search.coverage().clone()),
+            None => Some(self.search.coverage().clone()),
         }
     }
-    (terms, false)
-}
-
-pub(super) fn feature_search_terms(record: &FeatureRecord) -> Vec<String> {
-    let mut record_terms = Vec::new();
-    if let Some(name) = &record.name {
-        record_terms.push(name.as_str());
-    }
-    for (key, value) in &record.attributes {
-        if matches!(
-            key.to_ascii_lowercase().as_str(),
-            "id" | "name"
-                | "alias"
-                | "gene_id"
-                | "gene_name"
-                | "gene_name2"
-                | "gene_synonym"
-                | "name2"
-                | "transcript_id"
-                | "transcript_name"
-        ) {
-            record_terms.extend(value.split(','));
-        }
-    }
-    let mut normalized = record_terms
-        .into_iter()
-        .map(normalized_feature_search_term)
-        .filter(|term| !term.is_empty())
-        .collect::<Vec<_>>();
-    normalized.sort();
-    normalized.dedup();
-    normalized
-}
-
-pub(super) fn normalized_feature_search_term(value: &str) -> String {
-    value.trim().to_lowercase().chars().take(256).collect()
 }
 
 #[cfg(test)]
 #[path = "text_feature_remote_tests.rs"]
 mod remote_tests;
+
+#[cfg(test)]
+#[path = "text_feature_search_tests.rs"]
+mod search_tests;

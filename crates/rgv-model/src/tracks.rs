@@ -151,6 +151,24 @@ pub struct FeatureSearchResults {
     pub scan_truncated: bool,
 }
 
+/// How much of an annotation source its name-search index covers.
+///
+/// Names are indexed once per gene and per transcript: exon, CDS, UTR and codon rows add no
+/// term their gene or transcript row already carries, so the index grows with the number of
+/// genes and transcripts, not with the number of rows. When it still reaches
+/// [`MAX_FEATURE_SEARCH_ASSOCIATIONS`] (or a remote scan its transfer limit) it is truncated,
+/// and `complete_through` names the last contig whose names were all indexed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FeatureSearchIndexCoverage {
+    /// Term-to-feature associations held by the index.
+    pub associations: usize,
+    /// Whether the index stopped before the whole source was read.
+    pub truncated: bool,
+    /// For a truncated index, the last contig whose names were all indexed; `None` when the
+    /// index stopped within the first contig it read.
+    pub complete_through: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct VariantRecord {
     pub contig: String,

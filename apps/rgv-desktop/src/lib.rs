@@ -1339,6 +1339,8 @@ struct Viewer {
     automation_auxiliary_open_state: HashMap<TrackId, AutomationAuxiliaryOpenState>,
     reference_remote_io_stats: Option<RemoteIoStats>,
     landmark_resource_root: Option<PathBuf>,
+    /// Where `landmark_resource_root` was found (command line, environment, setting, ...).
+    landmark_resource_source: Option<rgv_core::LandmarkRootSource>,
     landmark_catalogue: Option<GenomeLandmarkCatalogue>,
     landmark_catalogue_error: Option<String>,
     landmark_resolution: Option<rgv_core::AssemblyResolution>,
@@ -1403,6 +1405,8 @@ struct Viewer {
     annotation_navigation_generation: u64,
     annotation_search_results: TrackSearchResults,
     pending_annotation_navigation: Option<String>,
+    /// Why the last name submitted from the locus box went nowhere, shown beside the box.
+    locus_search_note: Option<workspace::navigation_controller::LocusSearchNote>,
     /// Derived strings of the read shown in the inspector, reused across frames.
     read_inspector_derived: std::cell::RefCell<crate::inspection::read::ReadInspectorDerivedCache>,
     /// Window-shell policy state: unsaved-changes gate, notification window, newer-writer guard.

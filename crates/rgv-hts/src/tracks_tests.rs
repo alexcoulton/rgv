@@ -1275,8 +1275,7 @@ fn nested_features_do_not_break_overlap_queries() {
                 prefix_max_end: vec![1_000, 1_000],
             },
         )]),
-        search_terms: BTreeMap::default(),
-        search_index_truncated: false,
+        search: Default::default(),
         indexed: None,
     };
     let records = source.query("chr1", 500, 600).unwrap();

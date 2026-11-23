@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    fmt::Write as _,
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
@@ -544,6 +545,11 @@ pub struct AssemblyResolution {
     pub reason: String,
     #[serde(default)]
     pub rejected: Vec<String>,
+    /// Dictionary sequences that are not part of the matched build (spike-ins,
+    /// decoys, viral or unplaced sequences under other names). They never
+    /// change the identity; zero when nothing matched.
+    #[serde(default)]
+    pub extra_contigs: usize,
 }
 
 impl AssemblyResolution {
@@ -559,6 +565,7 @@ impl AssemblyResolution {
             subset: false,
             reason: reason.into(),
             rejected,
+            extra_contigs: 0,
         }
     }
 }
@@ -579,6 +586,7 @@ pub fn dictionary_sha256(dictionary: &ReferenceDictionary) -> String {
         .collect::<String>()
 }
 
+#[allow(clippy::too_many_lines)]
 fn resolve_assembly(
     catalogue: &GenomeLandmarkCatalogue,
     input: &AssemblyResolutionInput<'_>,
@@ -611,10 +619,12 @@ fn resolve_assembly(
                 reason: "explicit identity conflicts with the loaded sequence dictionary"
                     .to_owned(),
                 rejected: conflicts,
+                extra_contigs: 0,
             };
         }
         return matched_resolution(
             bundle,
+            input.dictionary,
             AssemblyMatchEvidence::ExplicitIdentity,
             matched,
             "explicit assembly identity is compatible with the sequence dictionary",
@@ -653,10 +663,12 @@ fn resolve_assembly(
                     subset: false,
                     reason: "sequence MD5 conflicts with an exact dictionary candidate".to_owned(),
                     rejected: vec![reason],
+                    extra_contigs: 0,
                 };
             }
             return matched_resolution(
                 exact[0],
+                input.dictionary,
                 AssemblyMatchEvidence::OrderedDictionarySha256,
                 input.dictionary.len(),
                 "ordered sequence dictionary SHA-256 matched exactly",
@@ -665,11 +677,15 @@ fn resolve_assembly(
     }
 
     let mut fingerprint_candidates = Vec::new();
+    // Bundles whose sequence MD5s contradict the input are never offered by
+    // the weaker primary-contig rule below.
+    let mut md5_conflicts = BTreeSet::new();
     if !input.sequence_md5.is_empty() {
         for bundle in &catalogue.bundles {
             match fingerprint_match(bundle, input.dictionary, input.sequence_md5) {
                 FingerprintMatch::Matched(count) => fingerprint_candidates.push((bundle, count)),
                 FingerprintMatch::Rejected(reason) => {
+                    md5_conflicts.insert(bundle.id.as_str());
                     rejected.push(format!("{}: {reason}", bundle.id));
                 }
                 FingerprintMatch::Insufficient => {}
@@ -689,6 +705,7 @@ fn resolve_assembly(
             subset: count < bundle.assembly.primary_contig_count,
             reason: format!("{count} sequence length and MD5 fingerprints matched"),
             rejected,
+            extra_contigs: bind_primary_contigs(bundle, input.dictionary).extra_contigs,
         };
     }
     if fingerprint_candidates.len() > 1 {
@@ -703,31 +720,59 @@ fn resolve_assembly(
             subset: true,
             reason: "sequence fingerprints match more than one landmark bundle".to_owned(),
             rejected,
+            extra_contigs: 0,
         };
     }
 
-    let length_candidates = catalogue
+    let mut primary_candidates = Vec::new();
+    for bundle in catalogue
         .bundles
         .iter()
-        .filter(|bundle| complete_primary_lengths_match(bundle, input.dictionary))
-        .collect::<Vec<_>>();
-    if length_candidates.len() == 1 {
-        let bundle = length_candidates[0];
+        .filter(|bundle| !md5_conflicts.contains(bundle.id.as_str()))
+    {
+        let binding = bind_primary_contigs(bundle, input.dictionary);
+        match binding.refusal() {
+            None => primary_candidates.push((bundle, binding)),
+            // Report only near misses: a bundle of another species or build
+            // would list every chromosome and explain nothing.
+            Some(reason) if binding.matched_primary > 0 => {
+                rejected.push(format!("{}: {reason}", bundle.id));
+            }
+            Some(_) => {}
+        }
+    }
+    if primary_candidates.len() == 1 {
+        let (bundle, binding) = primary_candidates.remove(0);
+        let mut reason = format!(
+            "inferred from primary contigs: all {} primary chromosomes match by name and length",
+            binding.matched_primary
+        );
+        if binding.extra_contigs > 0 {
+            let _ = write!(
+                reason,
+                "; {} extra contig{} (spike-ins, decoys or other sequences) do not change the identity",
+                binding.extra_contigs,
+                if binding.extra_contigs == 1 { "" } else { "s" }
+            );
+        }
+        for note in &binding.notes {
+            let _ = write!(reason, "; {note}");
+        }
         return AssemblyResolution {
-            status: AssemblyResolutionStatus::Suggested,
+            status: AssemblyResolutionStatus::Matched,
             bundle_id: Some(bundle.id.clone()),
             stable_id: Some(bundle.assembly.stable_id.clone()),
             display_name: Some(bundle.assembly.display_name.clone()),
             evidence: AssemblyMatchEvidence::CompletePrimaryLengths,
-            matched_contigs: bundle.assembly.primary_contig_count,
+            matched_contigs: binding.matched_primary,
             expected_contigs: bundle.assembly.primary_contig_count,
             subset: false,
-            reason: "primary-contig lengths match uniquely, but no strong identity evidence is available"
-                .to_owned(),
+            reason,
             rejected,
+            extra_contigs: binding.extra_contigs,
         };
     }
-    if length_candidates.len() > 1 {
+    if primary_candidates.len() > 1 {
         return AssemblyResolution {
             status: AssemblyResolutionStatus::Ambiguous,
             bundle_id: None,
@@ -737,8 +782,16 @@ fn resolve_assembly(
             matched_contigs: 0,
             expected_contigs: 0,
             subset: false,
-            reason: "primary-contig lengths match more than one landmark bundle".to_owned(),
+            reason: format!(
+                "primary-contig lengths match more than one landmark bundle ({})",
+                primary_candidates
+                    .iter()
+                    .map(|(bundle, _)| bundle.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             rejected,
+            extra_contigs: 0,
         };
     }
     AssemblyResolution::unknown(
@@ -786,6 +839,7 @@ fn compatible_contigs(
 
 fn matched_resolution(
     bundle: &GenomeLandmarkBundle,
+    dictionary: &ReferenceDictionary,
     evidence: AssemblyMatchEvidence,
     matched: usize,
     reason: &str,
@@ -801,6 +855,7 @@ fn matched_resolution(
         subset: matched < bundle.assembly.primary_contig_count,
         reason: reason.to_owned(),
         rejected: Vec::new(),
+        extra_contigs: bind_primary_contigs(bundle, dictionary).extra_contigs,
     }
 }
 
@@ -845,21 +900,140 @@ fn fingerprint_match(
     }
 }
 
-fn complete_primary_lengths_match(
+/// How a reference dictionary lines up with one catalogued build, matching
+/// each catalogued sequence under its own name or its `chr`-prefix and
+/// mitochondrial spellings (`chr1`/`1`, `chrM`/`MT`).
+#[derive(Debug, Default)]
+struct PrimaryContigBinding {
+    matched_primary: usize,
+    /// Nuclear primary chromosomes absent from the dictionary.
+    missing: Vec<String>,
+    /// Catalogued sequences present under a matching name with another length.
+    conflicts: Vec<String>,
+    /// Catalogued sequences present more than once under different spellings.
+    ambiguous: Vec<String>,
+    /// Dictionary sequences that are not part of the catalogued build.
+    extra_contigs: usize,
+    notes: Vec<String>,
+}
+
+impl PrimaryContigBinding {
+    fn refusal(&self) -> Option<String> {
+        let mut reasons = Vec::new();
+        if !self.missing.is_empty() {
+            reasons.push(format!(
+                "missing primary {}",
+                summarize_contigs(&self.missing)
+            ));
+        }
+        if !self.conflicts.is_empty() {
+            reasons.push(format!("length mismatch {}", self.conflicts.join(", ")));
+        }
+        if !self.ambiguous.is_empty() {
+            reasons.push(format!(
+                "more than one spelling of {}",
+                self.ambiguous.join(", ")
+            ));
+        }
+        (!reasons.is_empty()).then(|| reasons.join("; "))
+    }
+}
+
+fn summarize_contigs(names: &[String]) -> String {
+    const SHOWN: usize = 6;
+    if names.len() <= SHOWN {
+        names.join(", ")
+    } else {
+        format!(
+            "{} and {} more",
+            names[..SHOWN].join(", "),
+            names.len() - SHOWN
+        )
+    }
+}
+
+fn is_mitochondrial_name(name: &str) -> bool {
+    let base = name
+        .get(..3)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("chr"))
+        .map_or(name, |_| &name[3..]);
+    base.eq_ignore_ascii_case("M") || base.eq_ignore_ascii_case("MT")
+}
+
+/// Binds a dictionary to a build by its primary chromosomes. Every nuclear
+/// primary chromosome must be present exactly once with exactly the catalogued
+/// length. A catalogued non-primary sequence present with another length is a
+/// conflict too (it names a different build). The mitochondrial genome is not
+/// required, and a mitochondrial sequence of another length (for example the
+/// rCRS `MT` of b37 against the hg19 `chrM`) is left unbound and reported
+/// rather than refusing; the same exemption applies when its coordinates are
+/// bound for the gene track. Sequences that are not catalogued at all are
+/// counted as extra and never change the identity.
+fn bind_primary_contigs(
     bundle: &GenomeLandmarkBundle,
     dictionary: &ReferenceDictionary,
-) -> bool {
-    bundle
-        .assembly
-        .contigs
-        .iter()
-        .filter(|contig| contig.primary)
-        .all(|expected| {
-            dictionary
-                .id_by_name(&expected.name)
-                .and_then(|id| dictionary.get(id))
-                .is_some_and(|actual| actual.length() == expected.length)
-        })
+) -> PrimaryContigBinding {
+    let mut binding = PrimaryContigBinding::default();
+    let mut catalogued = BTreeSet::new();
+    for expected in &bundle.assembly.contigs {
+        let mut candidates = crate::locus::contig_spellings(&expected.name)
+            .iter()
+            .filter_map(|name| dictionary.id_by_name(name))
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        candidates.dedup();
+        let same_length = candidates
+            .iter()
+            .copied()
+            .filter(|id| {
+                dictionary
+                    .get(*id)
+                    .is_some_and(|contig| contig.length() == expected.length)
+            })
+            .collect::<Vec<_>>();
+        let mitochondrial = is_mitochondrial_name(&expected.name);
+        match same_length.as_slice() {
+            [id] => {
+                catalogued.insert(*id);
+                if expected.primary {
+                    binding.matched_primary += 1;
+                }
+            }
+            [] if candidates.is_empty() => {
+                if expected.primary && !mitochondrial {
+                    binding.missing.push(expected.name.clone());
+                }
+            }
+            [] if mitochondrial => {
+                for id in &candidates {
+                    if let Some(contig) = dictionary.get(*id) {
+                        binding.notes.push(format!(
+                            "mitochondrial {} has length {} (catalogued {} is {}), so it is not bound",
+                            contig.name(),
+                            contig.length(),
+                            expected.name,
+                            expected.length
+                        ));
+                    }
+                }
+            }
+            [] => {
+                for id in &candidates {
+                    if let Some(contig) = dictionary.get(*id) {
+                        binding.conflicts.push(format!(
+                            "{} has length {}, expected {}",
+                            contig.name(),
+                            contig.length(),
+                            expected.length
+                        ));
+                    }
+                }
+            }
+            _ => binding.ambiguous.push(expected.name.clone()),
+        }
+    }
+    binding.extra_contigs = dictionary.len().saturating_sub(catalogued.len());
+    binding
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1186,6 +1360,115 @@ pub enum LandmarkSearchIndexError {
     EntryLimit,
     #[error("invalid landmark index row {0}")]
     InvalidRow(usize),
+}
+
+/// Where a landmark resource folder came from. Sources are consulted in the
+/// order of the variants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LandmarkRootSource {
+    /// `--landmark-resource-root`. When given, nothing else is consulted.
+    CommandLine,
+    /// The `RGV_LANDMARK_RESOURCE_ROOT` environment variable.
+    Environment,
+    /// The persisted `landmark_resource_root` desktop setting.
+    Setting,
+    /// The platform user data directory (for example
+    /// `~/Library/Application Support/RGV/landmarks` on macOS).
+    UserData,
+    /// Development and packaged locations relative to the working directory
+    /// or the executable.
+    Bundled,
+}
+
+impl LandmarkRootSource {
+    /// Whether the user named this location, so a location without a
+    /// catalogue is a configuration error rather than an absent default.
+    #[must_use]
+    pub const fn is_user_configured(self) -> bool {
+        matches!(self, Self::CommandLine | Self::Environment | Self::Setting)
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CommandLine => "--landmark-resource-root",
+            Self::Environment => "RGV_LANDMARK_RESOURCE_ROOT",
+            Self::Setting => "landmark folder setting",
+            Self::UserData => "user data directory",
+            Self::Bundled => "bundled resources",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LandmarkRootCandidate {
+    pub source: LandmarkRootSource,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LandmarkRootDiscovery {
+    /// The first candidate holding a catalogue; its path is the catalogue
+    /// directory itself.
+    pub root: Option<LandmarkRootCandidate>,
+    /// User-configured locations that hold no catalogue.
+    pub unusable: Vec<LandmarkRootCandidate>,
+}
+
+impl LandmarkRootDiscovery {
+    /// A configuration error worth reporting: a location the user named holds
+    /// no catalogue. Finding nothing at the default locations is not an error;
+    /// landmarks are then simply not configured.
+    #[must_use]
+    pub fn configuration_problem(&self) -> Option<String> {
+        if self.unusable.is_empty() {
+            return None;
+        }
+        Some(
+            self.unusable
+                .iter()
+                .map(|candidate| {
+                    format!(
+                        "{} ({}) contains no catalog.json",
+                        candidate.path.display(),
+                        candidate.source.label()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    }
+}
+
+/// The catalogue directory for a user-chosen folder: the folder itself when it
+/// holds `catalog.json`, or its `igv` subfolder (the layout written by the
+/// curation script under `landmarks/`).
+#[must_use]
+pub fn landmark_catalogue_directory(path: &Path) -> Option<PathBuf> {
+    [path.to_path_buf(), path.join("igv")]
+        .into_iter()
+        .find(|directory| directory.join("catalog.json").is_file())
+}
+
+/// Picks the first candidate, in the given order, that holds a catalogue.
+pub fn discover_landmark_root(
+    candidates: impl IntoIterator<Item = LandmarkRootCandidate>,
+) -> LandmarkRootDiscovery {
+    let mut discovery = LandmarkRootDiscovery::default();
+    for candidate in candidates {
+        if let Some(directory) = landmark_catalogue_directory(&candidate.path) {
+            discovery.root = Some(LandmarkRootCandidate {
+                source: candidate.source,
+                path: directory,
+            });
+            break;
+        }
+        if candidate.source.is_user_configured() {
+            discovery.unusable.push(candidate);
+        }
+    }
+    discovery
 }
 
 #[cfg(test)]
@@ -1641,6 +1924,395 @@ mod tests {
                 .rejected
                 .iter()
                 .any(|reason| reason.contains("chr1"))
+        );
+    }
+
+    fn resolve_dictionary(
+        catalogue: &GenomeLandmarkCatalogue,
+        contigs: &[(&str, u64)],
+    ) -> AssemblyResolution {
+        let dictionary = ReferenceDictionary::from_contigs(
+            contigs
+                .iter()
+                .map(|(name, length)| ((*name).to_owned(), *length)),
+        );
+        catalogue.resolve(&AssemblyResolutionInput {
+            explicit_stable_id: None,
+            dictionary: &dictionary,
+            sequence_md5: &BTreeMap::new(),
+        })
+    }
+
+    #[test]
+    fn primary_contigs_with_extra_sequences_are_recognised() {
+        let catalogue = catalogue();
+        let resolution = resolve_dictionary(
+            &catalogue,
+            &[
+                ("chr1", 100),
+                ("chr2", 200),
+                ("chrM", 50),
+                ("chrEBV", 171_823),
+                ("ERCC-00002", 1_061),
+                ("phiX174", 5_386),
+            ],
+        );
+        assert_eq!(resolution.status, AssemblyResolutionStatus::Matched);
+        assert_eq!(
+            resolution.evidence,
+            AssemblyMatchEvidence::CompletePrimaryLengths
+        );
+        assert_eq!(resolution.bundle_id.as_deref(), Some("test"));
+        assert_eq!(resolution.extra_contigs, 3);
+        assert_eq!(resolution.matched_contigs, 3);
+        assert!(!resolution.subset);
+        assert!(resolution.reason.contains("inferred from primary contigs"));
+        assert!(resolution.reason.contains("3 extra contigs"));
+
+        // Extra contigs never change the identity, wherever they sit.
+        let reordered = resolve_dictionary(
+            &catalogue,
+            &[
+                ("ERCC-00002", 1_061),
+                ("chrM", 50),
+                ("chr2", 200),
+                ("decoy_hs37d5", 35_477_943),
+                ("chr1", 100),
+            ],
+        );
+        assert_eq!(reordered.status, AssemblyResolutionStatus::Matched);
+        assert_eq!(reordered.extra_contigs, 2);
+
+        // An exact dictionary has no extras.
+        let exact = resolve_dictionary(&catalogue, &[("chr1", 100), ("chr2", 200), ("chrM", 50)]);
+        assert_eq!(
+            exact.evidence,
+            AssemblyMatchEvidence::OrderedDictionarySha256
+        );
+        assert_eq!(exact.extra_contigs, 0);
+    }
+
+    #[test]
+    fn a_missing_or_mismatched_primary_chromosome_is_refused() {
+        let catalogue = catalogue();
+        let missing = resolve_dictionary(&catalogue, &[("chr1", 100), ("chrM", 50), ("ERCC", 9)]);
+        assert_eq!(missing.status, AssemblyResolutionStatus::Unknown);
+        assert_eq!(missing.bundle_id, None);
+        assert!(
+            missing
+                .rejected
+                .iter()
+                .any(|reason| reason.contains("missing primary chr2")),
+            "{missing:?}"
+        );
+
+        let wrong_length = resolve_dictionary(
+            &catalogue,
+            &[("chr1", 100), ("chr2", 201), ("chrM", 50), ("ERCC", 9)],
+        );
+        assert_eq!(wrong_length.status, AssemblyResolutionStatus::Unknown);
+        assert!(
+            wrong_length
+                .rejected
+                .iter()
+                .any(|reason| reason.contains("chr2 has length 201, expected 200"))
+        );
+
+        // Both spellings of one chromosome: which one is meant is a guess.
+        let doubled = resolve_dictionary(
+            &catalogue,
+            &[("chr1", 100), ("1", 100), ("chr2", 200), ("chrM", 50)],
+        );
+        assert_ne!(doubled.status, AssemblyResolutionStatus::Matched);
+    }
+
+    #[test]
+    fn a_catalogued_non_primary_sequence_of_another_length_is_refused() {
+        let mut catalogue = catalogue();
+        catalogue.bundles[0]
+            .assembly
+            .contigs
+            .push(LandmarkContigFingerprint {
+                name: "chrUn_KI270302v1".to_owned(),
+                length: 2_274,
+                md5: None,
+                primary: false,
+            });
+        let matching = resolve_dictionary(
+            &catalogue,
+            &[
+                ("chr1", 100),
+                ("chr2", 200),
+                ("chrM", 50),
+                ("chrUn_KI270302v1", 2_274),
+                ("ERCC", 9),
+            ],
+        );
+        assert_eq!(matching.status, AssemblyResolutionStatus::Matched);
+        // The catalogued unplaced sequence belongs to the build.
+        assert_eq!(matching.extra_contigs, 1);
+
+        let conflicting = resolve_dictionary(
+            &catalogue,
+            &[
+                ("chr1", 100),
+                ("chr2", 200),
+                ("chrM", 50),
+                ("chrUn_KI270302v1", 2_275),
+            ],
+        );
+        assert_eq!(conflicting.status, AssemblyResolutionStatus::Unknown);
+    }
+
+    #[test]
+    fn primary_contigs_match_under_chr_and_mitochondrial_aliases() {
+        let catalogue = catalogue();
+        let ensembl = resolve_dictionary(
+            &catalogue,
+            &[("1", 100), ("2", 200), ("MT", 50), ("GL000192.1", 547_496)],
+        );
+        assert_eq!(ensembl.status, AssemblyResolutionStatus::Matched);
+        assert_eq!(ensembl.extra_contigs, 1);
+        assert_eq!(ensembl.matched_contigs, 3);
+
+        // A mitochondrial genome of another length (b37 rCRS against hg19
+        // chrM) is left unbound and reported, and its absence is tolerated;
+        // a nuclear chromosome never is.
+        let other_mitochondrion =
+            resolve_dictionary(&catalogue, &[("1", 100), ("2", 200), ("MT", 49)]);
+        assert_eq!(
+            other_mitochondrion.status,
+            AssemblyResolutionStatus::Matched
+        );
+        assert_eq!(other_mitochondrion.extra_contigs, 1);
+        assert!(other_mitochondrion.reason.contains("MT has length 49"));
+        let no_mitochondrion = resolve_dictionary(&catalogue, &[("chr1", 100), ("chr2", 200)]);
+        assert_eq!(no_mitochondrion.status, AssemblyResolutionStatus::Matched);
+        assert_eq!(no_mitochondrion.matched_contigs, 2);
+    }
+
+    #[test]
+    fn sequence_md5_conflicts_block_the_primary_contig_rule() {
+        let catalogue = catalogue();
+        let dictionary = ReferenceDictionary::from_contigs([
+            ("chr1".to_owned(), 100),
+            ("chr2".to_owned(), 200),
+            ("chrM".to_owned(), 50),
+            ("ERCC".to_owned(), 9),
+        ]);
+        let md5 = BTreeMap::from([("chr2".to_owned(), "0".repeat(32))]);
+        let resolution = catalogue.resolve(&AssemblyResolutionInput {
+            explicit_stable_id: None,
+            dictionary: &dictionary,
+            sequence_md5: &md5,
+        });
+        assert_ne!(resolution.status, AssemblyResolutionStatus::Matched);
+    }
+
+    /// Catalogue fixtures for the five supported builds, with distinct
+    /// lengths and the mouse builds carrying 19 autosomes.
+    fn supported_builds_catalogue() -> GenomeLandmarkCatalogue {
+        let builds = [
+            ("hg38", "GRCh38.no_alt_analysis_set", 1_000_u64, 22),
+            ("hg19", "GRCh37.p13", 2_000_u64, 22),
+            ("mm10", "GRCm38.p6", 3_000_u64, 19),
+            ("mm39", "GRCm39", 4_000_u64, 19),
+            ("hs1", "T2T-CHM13v2.0", 5_000_u64, 22),
+        ];
+        let mut template_catalogue = catalogue();
+        let template = template_catalogue.bundles.remove(0);
+        let bundles = builds
+            .iter()
+            .map(|(id, stable_id, base, autosomes)| {
+                let mut bundle = template.clone();
+                bundle.id = (*id).to_owned();
+                bundle.assembly.stable_id = (*stable_id).to_owned();
+                bundle.assembly.display_name = (*id).to_owned();
+                bundle.assembly.compatible_ids = vec![(*id).to_owned()];
+                bundle.assembly.contigs = (1..=*autosomes)
+                    .map(|number| format!("chr{number}"))
+                    .chain(["chrX".to_owned(), "chrY".to_owned(), "chrM".to_owned()])
+                    .enumerate()
+                    .map(|(index, name)| LandmarkContigFingerprint {
+                        name,
+                        length: base + index as u64,
+                        md5: None,
+                        primary: true,
+                    })
+                    .collect();
+                bundle.assembly.primary_contig_count = bundle.assembly.contigs.len();
+                let dictionary = ReferenceDictionary::from_contigs(
+                    bundle
+                        .assembly
+                        .contigs
+                        .iter()
+                        .map(|contig| (contig.name.clone(), contig.length)),
+                );
+                bundle.assembly.dictionary_sha256 = dictionary_sha256(&dictionary);
+                for asset in &mut bundle.assets {
+                    asset.path = format!("{id}/{}", asset.path.rsplit('/').next().unwrap());
+                }
+                bundle
+            })
+            .collect();
+        let catalogue = GenomeLandmarkCatalogue {
+            schema_version: LANDMARK_CATALOGUE_SCHEMA_VERSION,
+            bundles,
+        };
+        catalogue.validate().unwrap();
+        catalogue
+    }
+
+    #[test]
+    fn every_supported_build_is_recognised_beside_extra_contigs() {
+        let catalogue = supported_builds_catalogue();
+        for bundle in &catalogue.bundles {
+            let mut contigs = bundle
+                .assembly
+                .contigs
+                .iter()
+                .map(|contig| {
+                    // Ensembl-style names for the mouse builds.
+                    let name = if bundle.id.starts_with("mm") {
+                        contig.name.trim_start_matches("chr").replace('M', "MT")
+                    } else {
+                        contig.name.clone()
+                    };
+                    (name, contig.length)
+                })
+                .collect::<Vec<_>>();
+            contigs.push(("ERCC-00002".to_owned(), 1_061));
+            contigs.push(("phiX174".to_owned(), 5_386));
+            let dictionary = ReferenceDictionary::from_contigs(contigs);
+            let resolution = catalogue.resolve(&AssemblyResolutionInput {
+                explicit_stable_id: None,
+                dictionary: &dictionary,
+                sequence_md5: &BTreeMap::new(),
+            });
+            assert_eq!(
+                resolution.status,
+                AssemblyResolutionStatus::Matched,
+                "{}: {resolution:?}",
+                bundle.id
+            );
+            assert_eq!(resolution.bundle_id.as_deref(), Some(bundle.id.as_str()));
+            assert_eq!(resolution.extra_contigs, 2);
+        }
+
+        // A mouse chromosome set never matches a human build, nor the reverse.
+        let human_on_mouse_names = resolve_dictionary(
+            &catalogue,
+            &[("chr1", 3_000), ("chr2", 3_001), ("chr20", 3_019)],
+        );
+        assert_ne!(
+            human_on_mouse_names.status,
+            AssemblyResolutionStatus::Matched
+        );
+    }
+
+    #[test]
+    fn two_builds_with_the_same_primary_contigs_are_ambiguous() {
+        let mut catalogue = supported_builds_catalogue();
+        let mut twin = catalogue.bundles[0].clone();
+        twin.id = "hg38-twin".to_owned();
+        twin.assembly.stable_id = "GRCh38-twin".to_owned();
+        twin.assembly.compatible_ids = Vec::new();
+        twin.assembly.dictionary_sha256 = "b".repeat(64);
+        catalogue.bundles.push(twin);
+        catalogue.validate().unwrap();
+        let mut contigs = catalogue.bundles[0]
+            .assembly
+            .contigs
+            .iter()
+            .map(|contig| (contig.name.clone(), contig.length))
+            .collect::<Vec<_>>();
+        contigs.push(("ERCC-00002".to_owned(), 1_061));
+        let dictionary = ReferenceDictionary::from_contigs(contigs);
+        let resolution = catalogue.resolve(&AssemblyResolutionInput {
+            explicit_stable_id: None,
+            dictionary: &dictionary,
+            sequence_md5: &BTreeMap::new(),
+        });
+        assert_eq!(resolution.status, AssemblyResolutionStatus::Ambiguous);
+        assert_eq!(resolution.bundle_id, None);
+    }
+
+    #[test]
+    fn landmark_root_discovery_takes_the_first_location_with_a_catalogue() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = |name: &str, catalogue: bool| {
+            let path = temp.path().join(name);
+            fs::create_dir_all(&path).unwrap();
+            if catalogue {
+                fs::write(path.join("catalog.json"), b"{}").unwrap();
+            }
+            path
+        };
+        let candidate = |source, path: &Path| LandmarkRootCandidate {
+            source,
+            path: path.to_path_buf(),
+        };
+        let environment = folder("environment", true);
+        let setting = folder("setting", true);
+        let user_data = folder("user", true);
+        let bundled = folder("bundled", true);
+        let ordered = |environment: &Path, setting: &Path, user_data: &Path| {
+            discover_landmark_root([
+                candidate(LandmarkRootSource::Environment, environment),
+                candidate(LandmarkRootSource::Setting, setting),
+                candidate(LandmarkRootSource::UserData, user_data),
+                candidate(LandmarkRootSource::Bundled, &bundled),
+            ])
+        };
+
+        let found = ordered(&environment, &setting, &user_data);
+        assert_eq!(
+            found.root,
+            Some(candidate(LandmarkRootSource::Environment, &environment))
+        );
+        assert_eq!(found.configuration_problem(), None);
+
+        fs::remove_file(environment.join("catalog.json")).unwrap();
+        let found = ordered(&environment, &setting, &user_data);
+        assert_eq!(
+            found.root,
+            Some(candidate(LandmarkRootSource::Setting, &setting))
+        );
+        // A named location without a catalogue is recorded, not hidden.
+        assert_eq!(found.unusable.len(), 1);
+
+        fs::remove_file(setting.join("catalog.json")).unwrap();
+        let found = ordered(&environment, &setting, &user_data);
+        assert_eq!(
+            found.root,
+            Some(candidate(LandmarkRootSource::UserData, &user_data))
+        );
+
+        fs::remove_file(user_data.join("catalog.json")).unwrap();
+        let found = ordered(&environment, &setting, &user_data);
+        assert_eq!(
+            found.root,
+            Some(candidate(LandmarkRootSource::Bundled, &bundled))
+        );
+
+        fs::remove_file(bundled.join("catalog.json")).unwrap();
+        let found = ordered(&environment, &setting, &user_data);
+        assert_eq!(found.root, None);
+        let problem = found.configuration_problem().unwrap();
+        assert!(problem.contains("RGV_LANDMARK_RESOURCE_ROOT"));
+        assert!(problem.contains("landmark folder setting"));
+
+        // Nothing configured and nothing bundled is "not configured", not an error.
+        let empty = discover_landmark_root([candidate(LandmarkRootSource::UserData, &user_data)]);
+        assert_eq!(empty, LandmarkRootDiscovery::default());
+        assert_eq!(empty.configuration_problem(), None);
+
+        // The parent `landmarks/` folder written by the curation script is accepted.
+        let parent = folder("landmarks", false);
+        let igv = folder("landmarks/igv", true);
+        assert_eq!(
+            discover_landmark_root([candidate(LandmarkRootSource::Setting, &parent)]).root,
+            Some(candidate(LandmarkRootSource::Setting, &igv))
         );
     }
 }

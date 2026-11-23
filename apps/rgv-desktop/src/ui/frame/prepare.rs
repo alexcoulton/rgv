@@ -710,6 +710,7 @@ impl Viewer {
         let refresh_hosted_genomes_requested = false;
         let restore_default_genes_requested = false;
         let open_landmark_folder_requested = false;
+        let choose_landmark_folder_requested = false;
         let add_track_requested = pending_command == Some(UiCommand::AddTrack);
         let open_session_requested = pending_command == Some(UiCommand::OpenSession);
         let save_session_requested = pending_command == Some(UiCommand::SaveSession);
@@ -773,6 +774,7 @@ impl Viewer {
             refresh_hosted_genomes_requested,
             restore_default_genes_requested,
             open_landmark_folder_requested,
+            choose_landmark_folder_requested,
             add_track_requested,
             open_session_requested,
             save_session_requested,
@@ -1031,6 +1033,11 @@ impl Viewer {
             TrackSearchResults::default()
         };
         let locus_search_changed = false;
+        let locus_search_note = crate::workspace::navigation_controller::visible_locus_search_note(
+            self.locus_search_note.as_ref(),
+            &self.locus_editor,
+        )
+        .cloned();
         let search_popup_position = None;
         let annotation_hit_requested = None;
         let navigate_back_requested = false;
@@ -1069,6 +1076,7 @@ impl Viewer {
             next_feature_requested,
             annotation_search_results,
             locus_search_changed,
+            locus_search_note,
             search_popup_position,
             annotation_hit_requested,
             navigate_back_requested,

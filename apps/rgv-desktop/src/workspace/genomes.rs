@@ -165,6 +165,10 @@ pub(crate) enum GenomeTaskOutcome {
     Genome(Box<IgvGenomeImport>),
     /// A built-in landmark bundle verified and decoded off the event loop.
     Landmark(Box<crate::workspace::landmarks::PreparedLandmarkContext>),
+    /// A landmark catalogue read from a folder the user chose, or why it is unusable.
+    LandmarkCatalogue(
+        Box<std::result::Result<crate::workspace::landmarks::LoadedLandmarkCatalogue, String>>,
+    ),
 }
 
 pub(crate) struct GenomeTask {
@@ -258,6 +262,9 @@ impl Viewer {
             }
             match outcome {
                 Ok(GenomeTaskOutcome::Landmark(_)) => {}
+                Ok(GenomeTaskOutcome::LandmarkCatalogue(loaded)) => {
+                    self.finish_landmark_catalogue_load(*loaded);
+                }
                 Ok(GenomeTaskOutcome::List {
                     entries,
                     from_cache,

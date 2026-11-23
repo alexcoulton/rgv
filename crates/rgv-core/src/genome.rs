@@ -20,6 +20,24 @@ pub enum AssemblyIdentityConfidence {
     Explicit,
     Dictionary,
     Fingerprint,
+    /// Every primary chromosome of a catalogued build matched by name (or its
+    /// `chr`/mitochondrial spelling) and exact length; other sequences in the
+    /// reference were ignored. Weaker than an explicit genome configuration.
+    PrimaryContigs,
+}
+
+impl AssemblyIdentityConfidence {
+    /// How the identity was established, for display.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unconfirmed",
+            Self::Explicit => "explicit genome configuration",
+            Self::Dictionary => "exact sequence dictionary",
+            Self::Fingerprint => "sequence MD5 fingerprints",
+            Self::PrimaryContigs => "inferred from primary contigs",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

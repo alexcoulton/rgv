@@ -58,30 +58,15 @@ impl Viewer {
         let matched = resolution.is_some_and(|resolution| {
             resolution.status == rgv_core::AssemblyResolutionStatus::Matched
         });
-        let automatic_track_state = if failed {
-            AutomationLandmarkTrackState::Failed
-        } else if suppressed {
-            AutomationLandmarkTrackState::Suppressed
-        } else if automatic_track_visible {
-            AutomationLandmarkTrackState::Visible
-        } else if automatic_track_loaded {
-            AutomationLandmarkTrackState::Loaded
-        } else if matched {
-            AutomationLandmarkTrackState::Matched
-        } else if resource_configured && catalogue_schema_version.is_some() {
-            AutomationLandmarkTrackState::Configured
-        } else {
-            AutomationLandmarkTrackState::Unconfigured
-        };
-        let integrity = if failed {
-            AutomationLandmarkIntegrityState::Failed
-        } else if matched {
-            AutomationLandmarkIntegrityState::Verified
-        } else if resource_configured && catalogue_schema_version.is_some() {
-            AutomationLandmarkIntegrityState::Unchecked
-        } else {
-            AutomationLandmarkIntegrityState::Unavailable
-        };
+        let state = landmark_states(LandmarkStateInputs {
+            resource_configured,
+            catalogue_loaded: catalogue_schema_version.is_some(),
+            failed,
+            matched,
+            suppressed,
+            automatic_track_loaded,
+            automatic_track_visible,
+        });
         let representative_asset =
             bundle.and_then(|bundle| bundle.asset(LandmarkAssetRole::RepresentativeGenes));
         AutomationLandmarkSnapshot {
@@ -92,14 +77,19 @@ impl Viewer {
             subset: resolution.is_some_and(|resolution| resolution.subset),
             matched_bundle_id: bundle.map(|bundle| bundle.id.clone()),
             matched_bundle_version: bundle.map(|bundle| bundle.version.clone()),
-            integrity,
-            automatic_track_state,
+            integrity: state.1,
+            automatic_track_state: state.0,
             automatic_track_loaded,
             automatic_track_visible,
             suppressed,
             gene_asset_format: representative_asset.map(|asset| asset.format),
             gene_asset_sha256: representative_asset.map(|asset| asset.sha256.clone()),
             search_ready: self.landmark_search_index.is_some(),
+            extra_contigs: resolution
+                .filter(|_| matched)
+                .map_or(0, |resolution| resolution.extra_contigs),
+            resource_source: self.landmark_resource_source,
+            catalogue_error: self.landmark_catalogue_error.clone(),
         }
     }
 
@@ -251,14 +241,19 @@ impl Viewer {
                     rgv_core::AssemblyMatchEvidence::SequenceMd5 => {
                         rgv_core::AssemblyIdentityConfidence::Fingerprint
                     }
-                    rgv_core::AssemblyMatchEvidence::CompletePrimaryLengths
-                    | rgv_core::AssemblyMatchEvidence::None => {
+                    rgv_core::AssemblyMatchEvidence::CompletePrimaryLengths => {
+                        rgv_core::AssemblyIdentityConfidence::PrimaryContigs
+                    }
+                    rgv_core::AssemblyMatchEvidence::None => {
                         rgv_core::AssemblyIdentityConfidence::Unknown
                     }
                 };
                 let identity = GenomeAssemblyIdentity {
                     stable_id: stable_id.unwrap_or_default(),
-                    display_name: display_name.unwrap_or_default(),
+                    display_name: assembly_display_name(
+                        display_name.as_deref().unwrap_or_default(),
+                        resolution.extra_contigs,
+                    ),
                     confidence,
                     provenance: resolution.reason.clone(),
                     matched_fingerprints: resolution.matched_contigs,
@@ -414,6 +409,7 @@ impl Viewer {
             contig_bindings,
             cytobands,
             search_index,
+            search_error,
         } = prepared;
         let bundle_id = bundle.id.as_str();
 
@@ -507,7 +503,18 @@ impl Viewer {
                 bundle.assembly.display_name, bundle.release
             );
         }
+        if let Some(error) = search_error {
+            self.report_landmark_search_error(bundle_id, &error);
+        }
         Ok(())
+    }
+
+    fn report_landmark_search_error(&mut self, bundle_id: &str, error: &str) {
+        let message = format!(
+            "Gene-name search for landmark bundle {bundle_id} is unavailable: the index {error}"
+        );
+        self.landmark_catalogue_error = Some(message.clone());
+        self.report_error(message);
     }
 
     pub(crate) fn merge_landmark_search_results(
@@ -688,6 +695,97 @@ impl Viewer {
         self.restore_default_genes()
     }
 
+    /// Reads the catalogue in a folder the user chose, off the event loop. It
+    /// becomes the landmark folder setting once it has been read and validated.
+    pub(crate) fn start_landmark_catalogue_load(&mut self, folder: PathBuf) {
+        let label = folder.display().to_string();
+        let spawned = std::thread::Builder::new()
+            .name("rgv-landmark-catalogue".to_owned())
+            .spawn(move || {
+                let loaded = rgv_core::landmark_catalogue_directory(&folder)
+                    .ok_or_else(|| {
+                        format!(
+                            "{} contains no catalog.json (nor igv/catalog.json)",
+                            folder.display()
+                        )
+                    })
+                    .and_then(|root| match crate::launch::read_landmark_catalogue(&root) {
+                        (root, Some(catalogue), _) => Ok(LoadedLandmarkCatalogue {
+                            folder,
+                            root,
+                            catalogue,
+                        }),
+                        (_, None, error) => Err(error.unwrap_or_else(|| {
+                            "the landmark catalogue could not be read".to_owned()
+                        })),
+                    });
+                Ok(
+                    crate::workspace::genomes::GenomeTaskOutcome::LandmarkCatalogue(Box::new(
+                        loaded,
+                    )),
+                )
+            });
+        match spawned {
+            Ok(worker) => {
+                self.set_busy_status(format!("Reading landmark catalogue in {label}…"));
+                self.genome_tasks
+                    .push(crate::workspace::genomes::GenomeTask {
+                        label: format!("landmark folder {label}"),
+                        is_list: false,
+                        landmark: None,
+                        worker,
+                    });
+            }
+            Err(error) => {
+                self.report_error(format!(
+                    "Could not start reading the landmark folder: {error}"
+                ));
+            }
+        }
+        self.mark_display_dirty("explicit display invalidation");
+    }
+
+    /// Adopts a catalogue read by [`Self::start_landmark_catalogue_load`]:
+    /// saves the folder setting and re-resolves the open reference against it,
+    /// installing the matched bundle's Genes track and name search.
+    pub(crate) fn finish_landmark_catalogue_load(
+        &mut self,
+        loaded: std::result::Result<LoadedLandmarkCatalogue, String>,
+    ) {
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.report_error(format!("Landmark folder not used: {error}"));
+                return;
+            }
+        };
+        let had_context = self.landmark_resolution.as_ref().is_some_and(|resolution| {
+            resolution.status == rgv_core::AssemblyResolutionStatus::Matched
+                && resolution.bundle_id.is_some()
+        });
+        if had_context && let Err(error) = self.remove_installed_landmark_context(None) {
+            self.report_error(format!(
+                "Could not retire the previous landmark context: {error}"
+            ));
+            return;
+        }
+        // Any install still verifying the previous catalogue's assets is stale.
+        self.landmark_install_ticket = self.landmark_install_ticket.saturating_add(1);
+        self.landmark_resource_root = Some(loaded.root.clone());
+        self.landmark_resource_source = Some(rgv_core::LandmarkRootSource::Setting);
+        self.landmark_catalogue = Some(loaded.catalogue);
+        self.landmark_catalogue_error = None;
+        self.landmark_resolution = None;
+        self.session.settings.landmark_resource_root = Some(loaded.folder);
+        self.persist_settings();
+        self.session.data_status = format!("Using landmark catalogue at {}", loaded.root.display());
+        let dictionary = self.session.assembly.dictionary.clone();
+        if !dictionary.is_empty() {
+            self.update_landmark_resolution_from_dictionary(&dictionary);
+        }
+        self.mark_display_dirty("explicit display invalidation");
+    }
+
     pub(crate) fn open_landmark_resource_folder(&mut self) -> Result<()> {
         let root = self
             .landmark_resource_root
@@ -703,6 +801,79 @@ impl Viewer {
         self.session.data_status = format!("Opened landmark resources at {}", root.display());
         Ok(())
     }
+}
+
+/// The assembly name shown for a recognised reference, with the sequences
+/// outside the build counted honestly: `GRCh38 (+ 98 extra contigs)`.
+pub(crate) fn assembly_display_name(name: &str, extra_contigs: usize) -> String {
+    match extra_contigs {
+        0 => name.to_owned(),
+        1 => format!("{name} (+ 1 extra contig)"),
+        count => format!("{name} (+ {count} extra contigs)"),
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LandmarkStateInputs {
+    pub(crate) resource_configured: bool,
+    pub(crate) catalogue_loaded: bool,
+    pub(crate) failed: bool,
+    pub(crate) matched: bool,
+    pub(crate) suppressed: bool,
+    pub(crate) automatic_track_loaded: bool,
+    pub(crate) automatic_track_visible: bool,
+}
+
+/// The automatic-track and integrity states reported for automation. No
+/// configured catalogue is "unconfigured"/"not configured", never "failed":
+/// failure is reserved for a catalogue, integrity or install error. An error
+/// that left the Genes track loaded (for example a gene-name index that failed
+/// verification) still reports integrity as failed, but not the track.
+pub(crate) fn landmark_states(
+    inputs: LandmarkStateInputs,
+) -> (
+    AutomationLandmarkTrackState,
+    AutomationLandmarkIntegrityState,
+) {
+    let catalogue_ready = inputs.resource_configured && inputs.catalogue_loaded;
+    let track = if inputs.failed && !inputs.automatic_track_loaded {
+        AutomationLandmarkTrackState::Failed
+    } else if inputs.suppressed {
+        AutomationLandmarkTrackState::Suppressed
+    } else if inputs.automatic_track_visible {
+        AutomationLandmarkTrackState::Visible
+    } else if inputs.automatic_track_loaded {
+        AutomationLandmarkTrackState::Loaded
+    } else if inputs.matched {
+        AutomationLandmarkTrackState::Matched
+    } else if catalogue_ready {
+        AutomationLandmarkTrackState::Configured
+    } else {
+        AutomationLandmarkTrackState::Unconfigured
+    };
+    let integrity = if inputs.failed {
+        AutomationLandmarkIntegrityState::Failed
+    } else if !inputs.resource_configured {
+        AutomationLandmarkIntegrityState::NotConfigured
+    } else if inputs.matched {
+        AutomationLandmarkIntegrityState::Verified
+    } else if catalogue_ready {
+        AutomationLandmarkIntegrityState::Unchecked
+    } else {
+        AutomationLandmarkIntegrityState::Unavailable
+    };
+    (track, integrity)
+}
+
+/// A landmark catalogue read from a folder the user chose.
+#[derive(Debug)]
+pub(crate) struct LoadedLandmarkCatalogue {
+    /// The folder as chosen; persisted as the setting.
+    folder: PathBuf,
+    /// The directory holding `catalog.json` (the folder or its `igv` child).
+    root: PathBuf,
+    catalogue: GenomeLandmarkCatalogue,
 }
 
 /// Identifies what a landmark preparation was computed for.
@@ -738,6 +909,9 @@ pub(crate) struct PreparedLandmarkContext {
     contig_bindings: LandmarkContigBindings,
     cytobands: Vec<rgv_core::Cytoband>,
     search_index: Option<LandmarkSearchIndex>,
+    /// Why the gene-name index is unavailable: its integrity check or decoding
+    /// failed. Reported, never silently dropped.
+    search_error: Option<String>,
 }
 
 /// The blocking half of a landmark install: integrity checks, file reads and
@@ -772,20 +946,20 @@ fn prepare_landmark_context(
         &contig_bindings.workspace_aliases,
     )?;
 
-    let search_index = match catalogue.verify_asset(root, bundle_id, LandmarkAssetRole::GeneSearch)
-    {
-        Ok(path) => match read_landmark_search(&path) {
-            Ok(index) => Some(index),
-            Err(error) => {
-                tracing::warn!(bundle = bundle_id, %error, "landmark search index unavailable");
-                None
-            }
-        },
-        Err(error) => {
-            tracing::warn!(bundle = bundle_id, %error, "landmark search index unavailable");
-            None
-        }
-    };
+    let (search_index, search_error) =
+        match catalogue.verify_asset(root, bundle_id, LandmarkAssetRole::GeneSearch) {
+            Ok(path) => match read_landmark_search(&path) {
+                Ok(index) => (Some(index), None),
+                Err(error) => (None, Some(format!("could not be read: {error:#}"))),
+            },
+            Err(error) => (
+                None,
+                Some(format!("failed integrity verification: {error}")),
+            ),
+        };
+    if let Some(error) = &search_error {
+        tracing::warn!(bundle = bundle_id, %error, "landmark search index unavailable");
+    }
     Ok(PreparedLandmarkContext {
         bundle,
         genes_path,
@@ -793,6 +967,7 @@ fn prepare_landmark_context(
         contig_bindings,
         cytobands,
         search_index,
+        search_error,
     })
 }
 
@@ -1258,5 +1433,209 @@ mod tests {
         );
         assert!(!bindings.workspace_aliases.contains_key("chrM"));
         assert!(!bindings.query_contig_aliases.contains_key("MT"));
+    }
+
+    #[test]
+    fn no_configured_catalogue_is_reported_as_not_configured_rather_than_failed() {
+        let (track, integrity) = landmark_states(LandmarkStateInputs::default());
+        assert_eq!(track, AutomationLandmarkTrackState::Unconfigured);
+        assert_eq!(integrity, AutomationLandmarkIntegrityState::NotConfigured);
+
+        // A real failure (invalid catalogue, unusable configured folder,
+        // asset integrity) is still a failure.
+        let (track, integrity) = landmark_states(LandmarkStateInputs {
+            failed: true,
+            ..LandmarkStateInputs::default()
+        });
+        assert_eq!(track, AutomationLandmarkTrackState::Failed);
+        assert_eq!(integrity, AutomationLandmarkIntegrityState::Failed);
+
+        let configured = LandmarkStateInputs {
+            resource_configured: true,
+            catalogue_loaded: true,
+            ..LandmarkStateInputs::default()
+        };
+        assert_eq!(
+            landmark_states(configured),
+            (
+                AutomationLandmarkTrackState::Configured,
+                AutomationLandmarkIntegrityState::Unchecked
+            )
+        );
+        assert_eq!(
+            landmark_states(LandmarkStateInputs {
+                matched: true,
+                automatic_track_loaded: true,
+                automatic_track_visible: true,
+                ..configured
+            }),
+            (
+                AutomationLandmarkTrackState::Visible,
+                AutomationLandmarkIntegrityState::Verified
+            )
+        );
+        // A gene-name index that failed verification leaves the Genes track
+        // in place but integrity reported as failed.
+        assert_eq!(
+            landmark_states(LandmarkStateInputs {
+                matched: true,
+                failed: true,
+                automatic_track_loaded: true,
+                ..configured
+            }),
+            (
+                AutomationLandmarkTrackState::Loaded,
+                AutomationLandmarkIntegrityState::Failed
+            )
+        );
+    }
+
+    #[test]
+    fn recognised_assemblies_name_their_extra_contigs() {
+        assert_eq!(assembly_display_name("GRCh38", 0), "GRCh38");
+        assert_eq!(
+            assembly_display_name("GRCh38", 1),
+            "GRCh38 (+ 1 extra contig)"
+        );
+        assert_eq!(
+            assembly_display_name("GRCh38", 98),
+            "GRCh38 (+ 98 extra contigs)"
+        );
+    }
+
+    /// A one-chromosome bundle whose assets are written to `root` with their
+    /// real sizes and SHA-256 digests.
+    fn written_bundle(root: &Path) -> GenomeLandmarkCatalogue {
+        use flate2::{Compression, write::GzEncoder};
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        use std::io::Write as _;
+
+        let mut names = GzEncoder::new(Vec::new(), Compression::default());
+        names
+            .write_all(b"rgv_gene_names_v1\nactb\tACTB\tENSG1\tNM_1\tchr1\t10\t20\t+\t\n")
+            .unwrap();
+        let files: [(
+            LandmarkAssetRole,
+            rgv_core::LandmarkAssetFormat,
+            &str,
+            Vec<u8>,
+        ); 4] = [
+            (
+                LandmarkAssetRole::RepresentativeGenes,
+                rgv_core::LandmarkAssetFormat::GenePredExtGzip,
+                "fixture/genes.genePred.gz",
+                b"genes".to_vec(),
+            ),
+            (
+                LandmarkAssetRole::ContigAliases,
+                rgv_core::LandmarkAssetFormat::AliasTsv,
+                "fixture/aliases.tsv",
+                b"1\tchr1\n".to_vec(),
+            ),
+            (
+                LandmarkAssetRole::Cytobands,
+                rgv_core::LandmarkAssetFormat::UcscCytoband,
+                "fixture/cytobands.txt",
+                b"chr1\t0\t100\tp1\tgneg\n".to_vec(),
+            ),
+            (
+                LandmarkAssetRole::GeneSearch,
+                rgv_core::LandmarkAssetFormat::RgvGeneNamesV1Gzip,
+                "fixture/names.tsv.gz",
+                names.finish().unwrap(),
+            ),
+        ];
+        std::fs::create_dir_all(root.join("fixture")).unwrap();
+        let assets = files
+            .into_iter()
+            .map(|(role, format, path, bytes)| {
+                std::fs::write(root.join(path), &bytes).unwrap();
+                rgv_core::GenomeLandmarkAsset {
+                    role,
+                    path: path.to_owned(),
+                    format,
+                    bytes: bytes.len() as u64,
+                    sha256: Sha256::digest(&bytes)
+                        .iter()
+                        .fold(String::new(), |mut hex, byte| {
+                            let _ = write!(hex, "{byte:02x}");
+                            hex
+                        }),
+                    source_url: "https://example.test".to_owned(),
+                    upstream_project: "fixture".to_owned(),
+                    upstream_version: "1".to_owned(),
+                    derivation: "fixture".to_owned(),
+                    citation: "fixture".to_owned(),
+                    license: "fixture".to_owned(),
+                    license_url: "https://example.test".to_owned(),
+                    required_notice: String::new(),
+                }
+            })
+            .collect();
+        GenomeLandmarkCatalogue {
+            schema_version: rgv_core::LANDMARK_CATALOGUE_SCHEMA_VERSION,
+            bundles: vec![rgv_core::GenomeLandmarkBundle {
+                id: "fixture".to_owned(),
+                version: "1".to_owned(),
+                display_name: "Genes".to_owned(),
+                provider: "fixture".to_owned(),
+                release: "fixture".to_owned(),
+                selection_policy: "fixture".to_owned(),
+                assembly: rgv_core::LandmarkAssemblyIdentity {
+                    stable_id: "FIXTURE.1".to_owned(),
+                    display_name: "Fixture".to_owned(),
+                    compatible_ids: Vec::new(),
+                    primary_contig_count: 1,
+                    dictionary_sha256: "a".repeat(64),
+                    compatible_dictionary_sha256: Vec::new(),
+                    contigs: vec![rgv_core::LandmarkContigFingerprint {
+                        name: "chr1".to_owned(),
+                        length: 100,
+                        md5: None,
+                        primary: true,
+                    }],
+                },
+                assets,
+            }],
+        }
+    }
+
+    #[test]
+    fn landmark_integrity_failures_are_reported_not_silently_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let catalogue = written_bundle(root.path());
+        let dictionary =
+            ReferenceDictionary::from_contigs([("chr1".to_owned(), 100), ("ERCC".to_owned(), 9)]);
+
+        let prepared =
+            prepare_landmark_context(root.path(), &catalogue, "fixture", &dictionary).unwrap();
+        assert!(prepared.search_error.is_none());
+        let index = prepared
+            .search_index
+            .expect("verified names are searchable");
+        assert_eq!(index.search("ACT", 5)[0].display_symbol, "ACTB");
+
+        // A damaged gene-name index keeps the verified Genes track but says why
+        // search is unavailable.
+        std::fs::write(root.path().join("fixture/names.tsv.gz"), b"tampered").unwrap();
+        let prepared =
+            prepare_landmark_context(root.path(), &catalogue, "fixture", &dictionary).unwrap();
+        assert!(prepared.search_index.is_none());
+        assert!(
+            prepared
+                .search_error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed integrity verification")),
+            "{:?}",
+            prepared.search_error
+        );
+
+        // A damaged gene model refuses the whole context.
+        std::fs::write(root.path().join("fixture/genes.genePred.gz"), b"GENES").unwrap();
+        let error = prepare_landmark_context(root.path(), &catalogue, "fixture", &dictionary)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SHA-256"), "{error}");
     }
 }

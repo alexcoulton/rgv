@@ -47,7 +47,8 @@ pub(crate) const REMOTE_TRACK_OPERATION_TRANSFER_BUDGET: RemoteTransferBudget =
         maximum_response_bytes: 512 << 20,
     };
 
-/// Input lines a track source skipped because they could not be parsed.
+/// Input lines a track source skipped because they could not be parsed, and a name-search
+/// index that does not cover the whole source.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TrackSourceDiagnostics {
     /// Lines skipped so far. A fully loaded source counts its whole file at open; an indexed
@@ -55,6 +56,9 @@ pub struct TrackSourceDiagnostics {
     pub malformed_lines: usize,
     /// One-based line number and parse error of the first skipped line, when known.
     pub first_malformed_line: Option<(usize, String)>,
+    /// The source's name-search index, when it stopped before the end of the source. An
+    /// indexed source builds its index on the first search, so this appears after it.
+    pub truncated_search_index: Option<rgv_model::tracks::FeatureSearchIndexCoverage>,
 }
 
 /// Latest diagnostics of every open track that reports any, shared with the engine handle.
@@ -67,7 +71,7 @@ fn record_track_diagnostics(diagnostics: &SharedTrackDiagnostics, track: &OpenTr
     let mut diagnostics = diagnostics
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if report.malformed_lines == 0 {
+    if report.malformed_lines == 0 && report.truncated_search_index.is_none() {
         diagnostics.remove(&track.id);
     } else {
         diagnostics.insert(track.id, report);
@@ -762,9 +766,13 @@ fn worker_loop(
                 include_variant_ids,
             } => {
                 let superseded = || latest_search.load(Ordering::Acquire) > generation;
-                if let Some(results) =
-                    search_tracks(&mut tracks, query, limit, include_variant_ids, &superseded)
-                {
+                let results =
+                    search_tracks(&mut tracks, query, limit, include_variant_ids, &superseded);
+                // The first search builds an indexed source's name index, which may be partial.
+                for track in &tracks {
+                    record_track_diagnostics(diagnostics, track);
+                }
+                if let Some(results) = results {
                     send_event(
                         output,
                         TrackEngineEvent::SearchCompleted {

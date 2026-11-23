@@ -10,7 +10,82 @@ use anyhow::{Context as _, Result};
 use rgv_automation::AutomationHistoryNavigation;
 use rgv_core::PanelId;
 use rgv_core::{ContigId, NavigationEntry, Viewport};
-use rgv_engine::TrackSearchHit;
+use rgv_engine::{TrackSearchHit, TrackSearchResults};
+
+const NO_SEARCHABLE_TRACKS: &str = "No searchable annotation tracks are open";
+
+/// What the locus box says about a name it searched for, shown beside the box until the box is
+/// edited or the view navigates.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct LocusSearchNote {
+    /// The query as submitted; the note shows only while the box still holds it.
+    pub(crate) query: String,
+    pub(crate) text: String,
+    /// A failure (also kept in the notification log), not a hint.
+    pub(crate) failure: bool,
+}
+
+/// What submitting a searched name from the locus box does.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LocusSearchOutcome<'a> {
+    /// One feature answers the query: go there.
+    Navigate(&'a TrackSearchHit),
+    /// Nothing to go to: say why beside the box.
+    Note(LocusSearchNote),
+}
+
+/// Decides between navigating and explaining, for results of a search for `query`.
+pub(crate) fn locus_search_outcome<'a>(
+    results: &'a TrackSearchResults,
+    query: &str,
+) -> LocusSearchOutcome<'a> {
+    if let Some(hit) = preferred_annotation_search_hit(results, query) {
+        return LocusSearchOutcome::Navigate(hit);
+    }
+    let query = query.trim();
+    let note = if results.hits.is_empty() {
+        let reason = if results.index_truncated {
+            "; gene search covers only part of an open track (see Notifications)"
+        } else if results.scan_truncated {
+            "; the search was bounded, so a longer name may find it"
+        } else {
+            ""
+        };
+        LocusSearchNote {
+            query: query.to_owned(),
+            text: format!("No annotation matches for {query}{reason}"),
+            failure: true,
+        }
+    } else {
+        LocusSearchNote {
+            query: query.to_owned(),
+            text: format!(
+                "{} matches for {query}; choose one from the list",
+                results.hits.len()
+            ),
+            failure: false,
+        }
+    };
+    LocusSearchOutcome::Note(note)
+}
+
+/// The note for a search submitted while no annotation track can be searched.
+pub(crate) fn no_searchable_tracks_note(query: &str) -> LocusSearchNote {
+    LocusSearchNote {
+        query: query.trim().to_owned(),
+        text: NO_SEARCHABLE_TRACKS.to_owned(),
+        failure: true,
+    }
+}
+
+/// The note to show beside a locus box holding `editor`: only while it still holds the query
+/// the note answers, so editing the box (or navigating, which rewrites it) hides it.
+pub(crate) fn visible_locus_search_note<'a>(
+    note: Option<&'a LocusSearchNote>,
+    editor: &str,
+) -> Option<&'a LocusSearchNote> {
+    note.filter(|note| note.query.eq_ignore_ascii_case(editor.trim()))
+}
 
 impl Viewer {
     /// Moves the focused panel to an explicit viewport, possibly on another contig.
@@ -49,8 +124,9 @@ impl Viewer {
         self.apply_action(Action::GoToLocus {
             panel_id,
             locus: locus.to_owned(),
-        })
-        .map(|_| ())
+        })?;
+        self.locus_search_note = None;
+        Ok(())
     }
 
     pub(crate) fn request_annotation_search(
@@ -64,7 +140,13 @@ impl Viewer {
             return;
         }
         let Some(engine) = &self.session.track_engine else {
-            "No searchable annotation tracks are open".clone_into(&mut self.session.data_status);
+            if navigate_when_ready {
+                let note = no_searchable_tracks_note(query);
+                self.report_warning(note.text.clone());
+                self.locus_search_note = Some(note);
+            } else {
+                NO_SEARCHABLE_TRACKS.clone_into(&mut self.session.data_status);
+            }
             return;
         };
         self.annotation_search_generation = self.annotation_search_generation.saturating_add(1);
@@ -87,7 +169,7 @@ impl Viewer {
 
     pub(crate) fn request_adjacent_feature(&mut self, forward: bool) {
         let Some(engine) = &self.session.track_engine else {
-            "No searchable annotation tracks are open".clone_into(&mut self.session.data_status);
+            NO_SEARCHABLE_TRACKS.clone_into(&mut self.session.data_status);
             return;
         };
         self.annotation_navigation_generation =
@@ -108,18 +190,22 @@ impl Viewer {
         }
     }
 
+    /// Navigates to the one feature a locus-box search found, or says beside the box (and, for
+    /// a failure, in the notification log) why it did not.
     pub(crate) fn submit_annotation_search_results(&mut self, query: &str) {
-        if let Some(hit) =
-            preferred_annotation_search_hit(&self.annotation_search_results, query).cloned()
-        {
-            self.navigate_to_annotation_hit(&hit);
-        } else if self.annotation_search_results.hits.is_empty() {
-            self.session.data_status = format!("No annotation matches for {query}");
-        } else {
-            self.session.data_status = format!(
-                "{} annotation matches for {query}; choose one from the search results",
-                self.annotation_search_results.hits.len()
-            );
+        match locus_search_outcome(&self.annotation_search_results, query) {
+            LocusSearchOutcome::Navigate(hit) => {
+                let hit = hit.clone();
+                self.navigate_to_annotation_hit(&hit);
+            }
+            LocusSearchOutcome::Note(note) => {
+                if note.failure {
+                    self.report_warning(note.text.clone());
+                } else {
+                    self.session.data_status.clone_from(&note.text);
+                }
+                self.locus_search_note = Some(note);
+            }
         }
     }
 
@@ -149,7 +235,9 @@ impl Viewer {
     pub(crate) fn navigate_to_loci(&mut self, expression: &str) -> Result<()> {
         let action =
             crate::action::translate::locus_box(self.session.panels.active().id, expression)?;
-        self.apply_action(action).map(|_| ())
+        self.apply_action(action)?;
+        self.locus_search_note = None;
+        Ok(())
     }
 
     pub(crate) fn navigate_to_chain_segment(&mut self, index: usize) -> Result<()> {
@@ -239,5 +327,123 @@ impl Viewer {
             self.locus_editor.clone_from(&locus);
         }
         self.session.settings.remember_locus(locus);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgv_core::TrackId;
+    use rgv_hts::{FeatureRecord, Strand};
+
+    fn hit(matched_term: &str, start: u64) -> TrackSearchHit {
+        TrackSearchHit {
+            track_id: TrackId::new(1),
+            track_name: "genes.gtf.gz".to_owned(),
+            matched_term: matched_term.to_owned(),
+            record: FeatureRecord {
+                contig: "chr3".to_owned(),
+                start,
+                end: start + 100,
+                name: Some(matched_term.to_uppercase()),
+                feature_type: Some("gene".to_owned()),
+                score: None,
+                strand: Strand::Forward,
+                blocks: Vec::new(),
+                coding_interval: None,
+                peak: None,
+                attributes: Vec::new(),
+            },
+        }
+    }
+
+    fn results(hits: Vec<TrackSearchHit>) -> TrackSearchResults {
+        TrackSearchResults {
+            query: "PBRM1".to_owned(),
+            hits,
+            ..TrackSearchResults::default()
+        }
+    }
+
+    fn note(outcome: LocusSearchOutcome<'_>) -> LocusSearchNote {
+        match outcome {
+            LocusSearchOutcome::Note(note) => note,
+            LocusSearchOutcome::Navigate(hit) => panic!("navigated to {hit:?}"),
+        }
+    }
+
+    #[test]
+    fn one_exact_match_navigates() {
+        let found = results(vec![hit("pbrm1", 10), hit("pbrm1-201", 20)]);
+        assert_eq!(
+            locus_search_outcome(&found, " PBRM1 "),
+            LocusSearchOutcome::Navigate(&found.hits[0])
+        );
+    }
+
+    #[test]
+    fn no_match_is_a_failure_note_that_says_why_when_the_search_was_partial() {
+        let none = note(locus_search_outcome(&results(Vec::new()), "PBRM1 "));
+        assert_eq!(
+            none,
+            LocusSearchNote {
+                query: "PBRM1".to_owned(),
+                text: "No annotation matches for PBRM1".to_owned(),
+                failure: true,
+            }
+        );
+        let partial = TrackSearchResults {
+            index_truncated: true,
+            ..results(Vec::new())
+        };
+        assert_eq!(
+            note(locus_search_outcome(&partial, "PBRM1")).text,
+            "No annotation matches for PBRM1; gene search covers only part of an open track \
+             (see Notifications)"
+        );
+        let bounded = TrackSearchResults {
+            scan_truncated: true,
+            ..results(Vec::new())
+        };
+        assert!(
+            note(locus_search_outcome(&bounded, "PBRM1"))
+                .text
+                .ends_with("the search was bounded, so a longer name may find it")
+        );
+    }
+
+    #[test]
+    fn several_matches_are_a_neutral_hint_to_choose() {
+        let ambiguous = results(vec![hit("pbrm1", 10), hit("pbrm1", 900)]);
+        assert_eq!(
+            note(locus_search_outcome(&ambiguous, "PBRM1")),
+            LocusSearchNote {
+                query: "PBRM1".to_owned(),
+                text: "2 matches for PBRM1; choose one from the list".to_owned(),
+                failure: false,
+            }
+        );
+    }
+
+    #[test]
+    fn no_searchable_track_is_a_failure_note() {
+        let note = no_searchable_tracks_note(" PBRM1");
+        assert_eq!(note.query, "PBRM1");
+        assert_eq!(note.text, NO_SEARCHABLE_TRACKS);
+        assert!(note.failure);
+    }
+
+    #[test]
+    fn the_note_shows_only_while_the_box_holds_its_query() {
+        let note = no_searchable_tracks_note("PBRM1");
+        assert_eq!(visible_locus_search_note(Some(&note), "PBRM1"), Some(&note));
+        assert_eq!(
+            visible_locus_search_note(Some(&note), " pbrm1 "),
+            Some(&note)
+        );
+        // Edited, or rewritten by navigation.
+        assert_eq!(visible_locus_search_note(Some(&note), "PBRM"), None);
+        assert_eq!(visible_locus_search_note(Some(&note), "chr3:1-100"), None);
+        assert_eq!(visible_locus_search_note(None, "PBRM1"), None);
     }
 }

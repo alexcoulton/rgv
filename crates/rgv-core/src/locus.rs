@@ -246,7 +246,7 @@ pub fn split_loci(expression: &str) -> Vec<&str> {
 }
 
 /// `name` followed by its `chr`-prefix and mitochondrial equivalents.
-fn contig_spellings(name: &str) -> Vec<String> {
+pub(crate) fn contig_spellings(name: &str) -> Vec<String> {
     let has_prefix = name
         .get(..3)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("chr"));

@@ -294,6 +294,9 @@ impl TrackSource for TextFeatureSource {
             first_malformed_line: self
                 .first_malformed_line()
                 .map(|(line, message)| (line, message.to_owned())),
+            truncated_search_index: self
+                .search_index_coverage()
+                .filter(|coverage| coverage.truncated),
         })
     }
 }

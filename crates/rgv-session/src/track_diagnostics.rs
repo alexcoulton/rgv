@@ -5,10 +5,12 @@ use std::collections::BTreeSet;
 
 /// Reports a text track's skipped (malformed) lines once per track load. Indexed sources keep
 /// counting as queries meet more of the file, so later, larger counts for the same track are
-/// not reported again.
+/// not reported again. A name-search index that covers only part of a track is reported once
+/// per track load as well.
 #[derive(Debug, Default)]
 pub struct SkippedLineReporter {
     reported: BTreeSet<TrackId>,
+    reported_search_truncation: BTreeSet<TrackId>,
 }
 
 impl SkippedLineReporter {
@@ -39,9 +41,39 @@ impl SkippedLineReporter {
         })
     }
 
+    /// `track`'s name-search index stopped early; `complete_through` is the last contig whose
+    /// names were all indexed. Returns the warning to log the first time a track reports it.
+    pub fn observe_search_truncation(
+        &mut self,
+        track: TrackId,
+        track_name: &str,
+        complete_through: Option<&str>,
+    ) -> Option<String> {
+        if !self.reported_search_truncation.insert(track) {
+            return None;
+        }
+        Some(search_truncation_message(track_name, complete_through))
+    }
+
     /// Forget every track: the engine (and with it every track load) was replaced.
     pub fn reset(&mut self) {
         self.reported.clear();
+        self.reported_search_truncation.clear();
+    }
+}
+
+/// The warning for a name-search index that covers only part of a track.
+#[must_use]
+pub fn search_truncation_message(track_name: &str, complete_through: Option<&str>) -> String {
+    match complete_through {
+        Some(contig) => format!(
+            "Gene search covers only part of {track_name}: names are indexed through {contig}; \
+             names on later contigs cannot be found by search"
+        ),
+        None => format!(
+            "Gene search covers only part of {track_name}: the name index stopped within its \
+             first contig; most names cannot be found by search"
+        ),
     }
 }
 
@@ -78,5 +110,37 @@ mod tests {
                 .is_some()
         );
         assert!(reporter.observe(gff, "genes.gff", 1, None).is_some());
+    }
+
+    #[test]
+    fn a_partial_search_index_is_reported_once_per_track_load() {
+        let (gtf, bed) = (TrackId::new(7), TrackId::new(8));
+        let mut reporter = SkippedLineReporter::default();
+        assert_eq!(
+            reporter
+                .observe_search_truncation(gtf, "genes.gtf.gz", Some("chr19"))
+                .as_deref(),
+            Some(
+                "Gene search covers only part of genes.gtf.gz: names are indexed through \
+                 chr19; names on later contigs cannot be found by search"
+            )
+        );
+        assert_eq!(
+            reporter.observe_search_truncation(gtf, "genes.gtf.gz", Some("chr19")),
+            None
+        );
+        // Independent of the skipped-line report for the same track.
+        assert!(reporter.observe(gtf, "genes.gtf.gz", 2, None).is_some());
+        assert!(
+            reporter
+                .observe_search_truncation(bed, "peaks.bed", None)
+                .is_some_and(|message| message.contains("within its first contig"))
+        );
+        reporter.reset();
+        assert!(
+            reporter
+                .observe_search_truncation(gtf, "genes.gtf.gz", Some("chr19"))
+                .is_some()
+        );
     }
 }

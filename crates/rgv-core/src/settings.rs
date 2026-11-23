@@ -95,6 +95,10 @@ pub struct DesktopSettings {
     pub coverage_cache_enabled: bool,
     /// Which pipeline draws auxiliary tracks. Absent in older files, which load as `Legacy`.
     pub track_pipeline: TrackPipeline,
+    /// Folder holding the built-in gene landmark catalogue (`catalog.json`, or an `igv`
+    /// subfolder with one), chosen with **Genomes → Choose landmark folder**. Consulted after
+    /// `--landmark-resource-root` and `RGV_LANDMARK_RESOURCE_ROOT`. Absent in older files.
+    pub landmark_resource_root: Option<PathBuf>,
 }
 
 impl Default for DesktopSettings {
@@ -117,6 +121,7 @@ impl Default for DesktopSettings {
             theme: InterfaceTheme::default(),
             coverage_cache_enabled: true,
             track_pipeline: TrackPipeline::Legacy,
+            landmark_resource_root: None,
         }
     }
 }
@@ -579,5 +584,22 @@ mod tests {
             invalid.to_json(),
             Err(SettingsError::InvalidReadBrowsingBuffer(_))
         ));
+    }
+
+    #[test]
+    fn landmark_folder_setting_round_trips_and_is_absent_in_older_files() {
+        let older = DesktopSettings::from_json(r#"{"schema_version":1}"#).unwrap();
+        assert_eq!(older.landmark_resource_root, None);
+
+        let settings = DesktopSettings {
+            landmark_resource_root: Some(PathBuf::from("/data/landmarks")),
+            ..DesktopSettings::default()
+        };
+        assert_eq!(
+            DesktopSettings::from_json(&settings.to_json().unwrap())
+                .unwrap()
+                .landmark_resource_root,
+            Some(PathBuf::from("/data/landmarks"))
+        );
     }
 }

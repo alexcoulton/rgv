@@ -200,6 +200,7 @@ pub(super) struct CommandDraft {
     pub(super) refresh_hosted_genomes_requested: bool,
     pub(super) restore_default_genes_requested: bool,
     pub(super) open_landmark_folder_requested: bool,
+    pub(super) choose_landmark_folder_requested: bool,
     pub(super) add_track_requested: bool,
     pub(super) open_session_requested: bool,
     pub(super) save_session_requested: bool,
@@ -292,6 +293,8 @@ pub(super) struct NavigationDraft {
     pub(super) next_feature_requested: bool,
     pub(super) annotation_search_results: TrackSearchResults,
     pub(super) locus_search_changed: bool,
+    /// The note shown beside the locus box about the name it last searched for.
+    pub(super) locus_search_note: Option<crate::workspace::navigation_controller::LocusSearchNote>,
     pub(super) search_popup_position: Option<egui::Pos2>,
     pub(super) annotation_hit_requested: Option<TrackSearchHit>,
     pub(super) navigate_back_requested: bool,

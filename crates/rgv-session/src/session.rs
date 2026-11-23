@@ -343,7 +343,8 @@ impl<P: Panel> Session<P> {
     }
 
     /// Logs a warning the first time each text track of the current engine reports skipped
-    /// malformed lines. Returns whether anything was logged.
+    /// malformed lines, and the first time its name-search index proves partial. Returns
+    /// whether anything was logged.
     pub fn report_track_source_diagnostics(&mut self) -> bool {
         let Some(engine) = &self.track_engine else {
             return false;
@@ -366,6 +367,23 @@ impl<P: Panel> Session<P> {
                 diagnostics.first_malformed_line.as_ref(),
             ) {
                 tracing::warn!(track_id = track_id.get(), %message, "track source skipped lines");
+                self.notifications
+                    .push(NotificationSeverity::Warning, Some(track_id), message);
+                reported = true;
+            }
+            if let Some(coverage) = &diagnostics.truncated_search_index
+                && let Some(message) = self.skipped_lines.observe_search_truncation(
+                    track_id,
+                    &name,
+                    coverage.complete_through.as_deref(),
+                )
+            {
+                tracing::warn!(
+                    track_id = track_id.get(),
+                    associations = coverage.associations,
+                    %message,
+                    "track name-search index is partial"
+                );
                 self.notifications
                     .push(NotificationSeverity::Warning, Some(track_id), message);
                 reported = true;

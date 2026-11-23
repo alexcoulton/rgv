@@ -93,6 +93,16 @@ impl Viewer {
                         .labelled_by(locus_label.id);
                     st.nav.locus_search_changed = locus_response.changed();
                     st.nav.search_popup_position = Some(locus_response.rect.left_bottom());
+                    // The results popup, when open, takes the place under the box.
+                    if let Some(note) = &st.nav.locus_search_note
+                        && st.nav.annotation_search_results.hits.is_empty()
+                    {
+                        Self::show_locus_search_note(
+                            ui.ctx(),
+                            locus_response.rect.left_bottom(),
+                            note,
+                        );
+                    }
                     if st.commands.focus_locus_requested {
                         locus_response.request_focus();
                     }
@@ -123,6 +133,39 @@ impl Viewer {
                         },
                     );
                 });
+            });
+    }
+
+    /// Why the name last searched from the locus box went nowhere, just under the box. It is
+    /// shown while the box still holds that name.
+    fn show_locus_search_note(
+        context: &egui::Context,
+        position: egui::Pos2,
+        note: &crate::workspace::navigation_controller::LocusSearchNote,
+    ) {
+        egui::Area::new(egui::Id::new("locus-search-note"))
+            .fixed_pos(position + egui::vec2(0.0, 2.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(context, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.set_max_width(380.0);
+                        let color = if note.failure {
+                            ui.visuals().error_fg_color
+                        } else {
+                            ui.visuals().weak_text_color()
+                        };
+                        let label = ui.label(egui::RichText::new(&note.text).small().color(color));
+                        label.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Label,
+                                true,
+                                format!("Locus search: {}", note.text),
+                            )
+                        });
+                    });
             });
     }
 
@@ -332,6 +375,13 @@ impl Viewer {
                 .resizable(false)
                 .title_bar(false)
                 .show(ui.ctx(), |ui| {
+                    if let Some(note) = &st.nav.locus_search_note {
+                        ui.label(
+                            egui::RichText::new(&note.text)
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
                     for hit in st.nav.annotation_search_results.hits.iter().take(12) {
                         let name = annotation_search_hit_primary_label(hit);
                         let identifiers = annotation_search_hit_secondary_identity(hit);

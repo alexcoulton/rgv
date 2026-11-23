@@ -2050,6 +2050,8 @@ pub struct AutomationTrackGestureSnapshot {
 pub enum AutomationLandmarkIntegrityState {
     #[default]
     Unavailable,
+    /// No landmark catalogue was configured or found, so there is nothing to verify.
+    NotConfigured,
     Unchecked,
     Verified,
     Failed,
@@ -2100,6 +2102,15 @@ pub struct AutomationLandmarkSnapshot {
     pub gene_asset_sha256: Option<String>,
     #[serde(default)]
     pub search_ready: bool,
+    /// Reference sequences outside the matched build (spike-ins, decoys and the like).
+    #[serde(default)]
+    pub extra_contigs: usize,
+    /// Where the catalogue directory came from, when one was found.
+    #[serde(default)]
+    pub resource_source: Option<rgv_core::LandmarkRootSource>,
+    /// The catalogue, integrity or installation failure, when there is one.
+    #[serde(default)]
+    pub catalogue_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

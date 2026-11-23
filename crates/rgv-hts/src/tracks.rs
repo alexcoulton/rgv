@@ -31,12 +31,13 @@ const MAX_FEATURE_SEARCH_SCANNED_ASSOCIATIONS: usize = 100_000;
 const BIGBED_BACKWARD_NAVIGATION_WINDOW_BASES: u32 = 1_000_000;
 const MAX_GWAS_SEARCH_SCANNED_ASSOCIATIONS: usize = 100_000;
 
+mod feature_search;
+use feature_search::{feature_search_terms, normalized_feature_search_term};
 mod remote_tabix;
 mod text_feature;
 #[cfg(test)]
 use text_feature::FeatureIndex;
 pub use text_feature::*;
-use text_feature::{feature_search_terms, normalized_feature_search_term};
 
 mod text_quantitative;
 pub use text_quantitative::*;

@@ -32,8 +32,9 @@ pub(super) struct LaunchOptions {
     /// Display name for the reference assembly loaded from the alignment header.
     #[arg(long, default_value = "BAM header")]
     pub(super) genome_name: String,
-    /// Directory containing the schema-versioned built-in landmark catalog.
-    /// Defaults to RGV_LANDMARK_RESOURCE_ROOT, packaged resources, or the local development bundle.
+    /// Directory containing the schema-versioned built-in landmark catalog (or its parent
+    /// holding an `igv/` catalogue). Defaults, in order, to `RGV_LANDMARK_RESOURCE_ROOT`, the
+    /// landmark folder setting, the user data directory, then bundled/development resources.
     #[arg(long)]
     pub(super) landmark_resource_root: Option<PathBuf>,
     /// Portable JSON genome bundle describing FASTA, aliases, cytobands, and default annotations.
@@ -159,6 +160,8 @@ pub(super) struct LaunchOptions {
     #[arg(skip)]
     pub(super) landmark_catalogue_error: Option<String>,
     #[arg(skip)]
+    pub(super) landmark_resource_source: Option<rgv_core::LandmarkRootSource>,
+    #[arg(skip)]
     pub(super) loaded_settings: DesktopSettings,
     #[arg(skip)]
     pub(super) loaded_settings_recovery: Option<rgv_core::SettingsRecovery>,
@@ -215,7 +218,6 @@ impl LaunchOptions {
     }
 
     pub(super) fn load_session(&mut self) -> Result<()> {
-        self.load_landmark_catalogue();
         let settings_path = self
             .settings_path
             .clone()
@@ -240,6 +242,8 @@ impl LaunchOptions {
         }
         self.loaded_settings = settings;
         self.loaded_settings_recovery = recovery;
+        // The landmark folder setting is one of the catalogue locations.
+        self.load_landmark_catalogue();
         self.load_launch_genome()?;
         let mut document = if let Some(path) = &self.session {
             Some(
@@ -312,37 +316,45 @@ impl LaunchOptions {
     }
 
     fn load_landmark_catalogue(&mut self) {
-        let Some(root) = discover_landmark_resource_root(self.landmark_resource_root.as_deref())
-        else {
-            self.landmark_catalogue_error = Some(
-                "No built-in landmark catalogue was found; automatic Genes tracks are unavailable"
-                    .to_owned(),
-            );
+        let candidates = landmark_root_candidates(
+            self.landmark_resource_root.as_deref(),
+            std::env::var_os("RGV_LANDMARK_RESOURCE_ROOT"),
+            self.loaded_settings.landmark_resource_root.as_deref(),
+            default_landmark_user_directory(),
+            std::env::current_exe()
+                .ok()
+                .as_deref()
+                .and_then(Path::parent),
+        );
+        let discovery = rgv_core::discover_landmark_root(candidates);
+        let problem = discovery.configuration_problem();
+        let Some(found) = discovery.root else {
+            self.landmark_resource_root = None;
+            self.loaded_landmark_catalogue = None;
+            self.landmark_resource_source = None;
+            // Finding nothing at the default locations means landmarks are
+            // not configured, which is not a failure; a location the user
+            // named without a catalogue is.
+            self.landmark_catalogue_error = problem.map(|problem| {
+                format!(
+                    "Landmark folder unusable: {problem}; automatic Genes tracks are unavailable"
+                )
+            });
+            if let Some(error) = &self.landmark_catalogue_error {
+                tracing::warn!(%error);
+            } else {
+                tracing::info!("no built-in landmark catalogue is configured");
+            }
             return;
         };
-        let catalogue_path = root.join("catalog.json");
-        match GenomeLandmarkCatalogue::read(&catalogue_path) {
-            Ok(catalogue) => {
-                tracing::info!(
-                    path = %catalogue_path.display(),
-                    bundles = catalogue.bundles.len(),
-                    "loaded built-in landmark catalogue"
-                );
-                self.landmark_resource_root = Some(root);
-                self.loaded_landmark_catalogue = Some(catalogue);
-                self.landmark_catalogue_error = None;
-            }
-            Err(error) => {
-                let message = format!(
-                    "Built-in landmark catalogue {} is invalid: {error}",
-                    catalogue_path.display()
-                );
-                tracing::warn!(%message);
-                self.landmark_resource_root = Some(root);
-                self.loaded_landmark_catalogue = None;
-                self.landmark_catalogue_error = Some(message);
-            }
+        if let Some(problem) = problem {
+            tracing::warn!(%problem, "skipping an unusable landmark folder");
         }
+        let (root, catalogue, error) = read_landmark_catalogue(&found.path);
+        self.landmark_resource_root = Some(root);
+        self.landmark_resource_source = Some(found.source);
+        self.loaded_landmark_catalogue = catalogue;
+        self.landmark_catalogue_error = error;
     }
 
     pub(super) fn rebind_builtin_session_tracks(
@@ -542,35 +554,117 @@ impl LaunchOptions {
     }
 }
 
-pub(super) fn discover_landmark_resource_root(explicit: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = explicit {
-        return path
-            .join("catalog.json")
-            .is_file()
-            .then(|| path.to_path_buf());
-    }
-    if let Some(path) = std::env::var_os("RGV_LANDMARK_RESOURCE_ROOT") {
-        let path = PathBuf::from(path);
-        if path.join("catalog.json").is_file() {
-            return Some(path);
+/// Reads and validates `catalog.json` in a discovered catalogue directory.
+/// Returns the directory, the catalogue when valid, and the error otherwise.
+pub(crate) fn read_landmark_catalogue(
+    root: &Path,
+) -> (PathBuf, Option<GenomeLandmarkCatalogue>, Option<String>) {
+    let catalogue_path = root.join("catalog.json");
+    match GenomeLandmarkCatalogue::read(&catalogue_path) {
+        Ok(catalogue) => {
+            tracing::info!(
+                path = %catalogue_path.display(),
+                bundles = catalogue.bundles.len(),
+                "loaded built-in landmark catalogue"
+            );
+            (root.to_path_buf(), Some(catalogue), None)
+        }
+        Err(error) => {
+            let message = format!(
+                "Built-in landmark catalogue {} is invalid: {error}",
+                catalogue_path.display()
+            );
+            tracing::warn!(%message);
+            (root.to_path_buf(), None, Some(message))
         }
     }
-    let mut candidates = vec![
-        PathBuf::from("benchmark-data/large-public-alignments/landmarks/igv"),
-        PathBuf::from("resources/landmarks"),
-    ];
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
-        candidates.extend([
-            directory.join("landmarks"),
-            directory.join("resources/landmarks"),
-            directory.join("../Resources/landmarks"),
-        ]);
+}
+
+/// Landmark catalogue locations in discovery order: `--landmark-resource-root` alone when given;
+/// otherwise `RGV_LANDMARK_RESOURCE_ROOT`, the landmark folder setting, the platform user data
+/// directory, then the development and packaged locations relative to the working directory and
+/// the executable.
+pub(super) fn landmark_root_candidates(
+    explicit: Option<&Path>,
+    environment: Option<std::ffi::OsString>,
+    setting: Option<&Path>,
+    user_data: Option<PathBuf>,
+    executable_directory: Option<&Path>,
+) -> Vec<rgv_core::LandmarkRootCandidate> {
+    use rgv_core::{LandmarkRootCandidate, LandmarkRootSource};
+    let candidate = |source, path: PathBuf| LandmarkRootCandidate { source, path };
+    if let Some(path) = explicit {
+        return vec![candidate(
+            LandmarkRootSource::CommandLine,
+            path.to_path_buf(),
+        )];
+    }
+    let mut candidates = Vec::new();
+    if let Some(path) = environment.filter(|value| !value.is_empty()) {
+        candidates.push(candidate(LandmarkRootSource::Environment, path.into()));
+    }
+    if let Some(path) = setting.filter(|path| !path.as_os_str().is_empty()) {
+        candidates.push(candidate(LandmarkRootSource::Setting, path.to_path_buf()));
+    }
+    if let Some(path) = user_data {
+        candidates.push(candidate(LandmarkRootSource::UserData, path));
+    }
+    candidates.extend(
+        [
+            PathBuf::from("benchmark-data/large-public-alignments/landmarks/igv"),
+            PathBuf::from("resources/landmarks"),
+        ]
+        .into_iter()
+        .map(|path| candidate(LandmarkRootSource::Bundled, path)),
+    );
+    if let Some(directory) = executable_directory {
+        candidates.extend(
+            [
+                directory.join("landmarks"),
+                directory.join("resources/landmarks"),
+                directory.join("../Resources/landmarks"),
+            ]
+            .into_iter()
+            .map(|path| candidate(LandmarkRootSource::Bundled, path)),
+        );
     }
     candidates
-        .into_iter()
-        .find(|path| path.join("catalog.json").is_file())
+}
+
+/// The per-user landmark folder: `landmarks` in the platform user data directory
+/// (`~/Library/Application Support/RGV` on macOS, `%APPDATA%\RGV` on Windows,
+/// `$XDG_DATA_HOME/rgv` or `~/.local/share/rgv` elsewhere).
+pub(super) fn default_landmark_user_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("APPDATA")
+            .map(|directory| PathBuf::from(directory).join("RGV").join("landmarks"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|directory| {
+            PathBuf::from(directory)
+                .join("Library")
+                .join("Application Support")
+                .join("RGV")
+                .join("landmarks")
+        })
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|value| !value.is_empty())
+            .map(|directory| PathBuf::from(directory).join("rgv").join("landmarks"))
+            .or_else(|| {
+                std::env::var_os("HOME").map(|directory| {
+                    PathBuf::from(directory)
+                        .join(".local")
+                        .join("share")
+                        .join("rgv")
+                        .join("landmarks")
+                })
+            })
+    }
 }
 
 pub(super) fn default_settings_path() -> PathBuf {
@@ -998,6 +1092,99 @@ mod tests {
         assert_eq!(
             enabled.diagnostic_trace_dir,
             Some(PathBuf::from("diagnostic-traces"))
+        );
+    }
+
+    #[test]
+    fn landmark_locations_are_consulted_in_the_documented_order() {
+        use rgv_core::LandmarkRootSource;
+        let sources = |candidates: &[rgv_core::LandmarkRootCandidate]| {
+            candidates
+                .iter()
+                .map(|candidate| candidate.source)
+                .collect::<Vec<_>>()
+        };
+        let all = landmark_root_candidates(
+            None,
+            Some("/env/landmarks".into()),
+            Some(Path::new("/setting/landmarks")),
+            Some(PathBuf::from("/user/landmarks")),
+            Some(Path::new("/app/bin")),
+        );
+        assert_eq!(
+            sources(&all)[..4],
+            [
+                LandmarkRootSource::Environment,
+                LandmarkRootSource::Setting,
+                LandmarkRootSource::UserData,
+                LandmarkRootSource::Bundled,
+            ]
+        );
+        assert_eq!(all[0].path, PathBuf::from("/env/landmarks"));
+        assert_eq!(all[1].path, PathBuf::from("/setting/landmarks"));
+        assert_eq!(all[2].path, PathBuf::from("/user/landmarks"));
+        assert_eq!(
+            all[3].path,
+            PathBuf::from("benchmark-data/large-public-alignments/landmarks/igv")
+        );
+        assert_eq!(
+            all.last().unwrap().path,
+            Path::new("/app/bin/../Resources/landmarks")
+        );
+
+        // The command line is authoritative; empty values are not locations.
+        let explicit = landmark_root_candidates(
+            Some(Path::new("/cli")),
+            Some("/env".into()),
+            Some(Path::new("/setting")),
+            None,
+            None,
+        );
+        assert_eq!(sources(&explicit), [LandmarkRootSource::CommandLine]);
+        let unset =
+            landmark_root_candidates(None, Some("".into()), Some(Path::new("")), None, None);
+        assert!(
+            sources(&unset)
+                .iter()
+                .all(|source| *source == LandmarkRootSource::Bundled)
+        );
+    }
+
+    #[test]
+    fn an_unusable_or_invalid_landmark_folder_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut options = LaunchOptions::parse_from(["rgv"]);
+        // A folder without a catalogue named on the command line is a
+        // configuration error, reported as such.
+        options.landmark_resource_root = Some(temp.path().to_path_buf());
+        options.load_landmark_catalogue();
+        assert!(options.landmark_resource_root.is_none());
+        assert!(
+            options
+                .landmark_catalogue_error
+                .as_deref()
+                .is_some_and(|error| error.contains("contains no catalog.json"))
+        );
+
+        // An invalid catalogue is a failure that names the file.
+        std::fs::create_dir(temp.path().join("igv")).unwrap();
+        std::fs::write(temp.path().join("igv/catalog.json"), b"{}").unwrap();
+        options.landmark_resource_root = Some(temp.path().to_path_buf());
+        options.load_landmark_catalogue();
+        assert_eq!(
+            options.landmark_resource_root.as_deref(),
+            Some(temp.path().join("igv").as_path())
+        );
+        assert_eq!(
+            options.landmark_resource_source,
+            Some(rgv_core::LandmarkRootSource::CommandLine)
+        );
+        assert!(options.loaded_landmark_catalogue.is_none());
+        assert!(
+            options
+                .landmark_catalogue_error
+                .as_deref()
+                .is_some_and(|error| error.contains("is invalid"))
         );
     }
 

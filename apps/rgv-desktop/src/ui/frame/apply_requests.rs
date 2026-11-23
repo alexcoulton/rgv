@@ -358,6 +358,13 @@ impl Viewer {
         {
             self.report_error(error.to_string());
         }
+        if st.commands.choose_landmark_folder_requested
+            && let Some(folder) = rfd::FileDialog::new()
+                .set_title("Choose the landmark folder (containing catalog.json)")
+                .pick_folder()
+        {
+            self.start_landmark_catalogue_load(folder);
+        }
         if let Some(bundle_id) = st.inspect.show_all_transcripts_requested.take()
             && let Err(error) = self.show_all_transcripts(&bundle_id)
         {

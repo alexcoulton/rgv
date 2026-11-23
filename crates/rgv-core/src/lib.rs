@@ -37,9 +37,10 @@ pub use landmarks::{
     BuiltInLandmarkContext, BuiltInTrackIdentity, GenomeLandmarkAsset, GenomeLandmarkBundle,
     GenomeLandmarkCatalogue, GenomeLandmarkCatalogueError, LANDMARK_CATALOGUE_SCHEMA_VERSION,
     LANDMARK_SEARCH_SCHEMA_VERSION, LandmarkAssemblyIdentity, LandmarkAssetFormat,
-    LandmarkAssetRole, LandmarkContigFingerprint, LandmarkSearchEntry, LandmarkSearchIndex,
-    LandmarkSearchIndexError, MAXIMUM_LANDMARK_ASSETS, MAXIMUM_LANDMARK_BUNDLES, dictionary_sha256,
-    parse_landmark_aliases, parse_landmark_search_index,
+    LandmarkAssetRole, LandmarkContigFingerprint, LandmarkRootCandidate, LandmarkRootDiscovery,
+    LandmarkRootSource, LandmarkSearchEntry, LandmarkSearchIndex, LandmarkSearchIndexError,
+    MAXIMUM_LANDMARK_ASSETS, MAXIMUM_LANDMARK_BUNDLES, dictionary_sha256, discover_landmark_root,
+    landmark_catalogue_directory, parse_landmark_aliases, parse_landmark_search_index,
 };
 pub use locus::{Locus, LocusError, LocusRange, ResolvedLocus, resolve_contig_name, split_loci};
 pub use lod::{DetailLevel, MAXIMUM_BASE_MARK_BASES_PER_PIXEL, RenderBudget};
