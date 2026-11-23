@@ -22,6 +22,7 @@ use rgv_alignment_scene::{
     AlignmentPanelLanePublication, AlignmentPanelSceneAdmission, AlignmentSashimiLaneOptions,
     AlignmentSashimiScalePolicy, AlleleSummaryDetail,
 };
+use rgv_core::PanelId;
 use rgv_engine::{
     AlignmentIndividualReadCapability, AlignmentVerticalResidency,
     alignment_row_activity_satisfies_contract,
@@ -407,6 +408,11 @@ impl Viewer {
             .capture_alignment_gpu_bundle_from_resident_content(&read_requests, &summary_requests)
         {
             AlignmentGpuCameraCaptureOutcome::Captured { reads, summaries } => {
+                let labelled_panels =
+                    camera_capture_labelled_panels(
+                    reads.is_some(),
+                    read_authorities.iter().map(|authority| authority.panel_id),
+                );
                 let bundle = AlignmentGpuFrameBundle {
                     target_revision,
                     publication_attempt_sequence,
@@ -433,6 +439,17 @@ impl Viewer {
                 self.invalidate_stale_alignment_scroll_cache();
                 // A capture over a partially resident presentation is partial too.
                 self.record_alignment_gpu_partial_residency();
+                // The read pages move with the new camera on the GPU, but their base letters are
+                // CPU text projected into this frame's label lists, and a panel's display list
+                // copies them when it is rebuilt. Vertical scrolling rebuilds the display list
+                // *before* asking for this capture, so without a second pass the letters stay at
+                // the previous frame's positions and slide against their coloured blocks while
+                // dragging. A display already marked dirty is rebuilt later from this frame.
+                if !self.display_dirty {
+                    for panel_id in labelled_panels {
+                        let _ = self.refresh_panel_scroll_display(panel_id);
+                    }
+                }
                 // Camera capture preserves the immutable prepared authority. Keep any in-flight
                 // cursor and its pins instead of restarting complete-scene discovery on every
                 // pan/scroll frame.
@@ -1226,5 +1243,45 @@ impl Viewer {
             lane_sources,
             panel_scene_stores,
         })
+    }
+}
+
+/// Panels whose display lists copy base letters from a camera-only capture and so must be
+/// refreshed once it commits. Each panel appears once, in first-seen order; a capture without
+/// read frames carries no letters.
+fn camera_capture_labelled_panels(
+    captured_reads: bool,
+    read_panels: impl IntoIterator<Item = PanelId>,
+) -> Vec<PanelId> {
+    let mut panels = Vec::new();
+    if !captured_reads {
+        return panels;
+    }
+    for panel_id in read_panels {
+        if !panels.contains(&panel_id) {
+            panels.push(panel_id);
+        }
+    }
+    panels
+}
+
+#[cfg(test)]
+mod camera_capture_label_tests {
+    use super::camera_capture_labelled_panels;
+    use rgv_core::PanelId;
+
+    #[test]
+    fn every_panel_with_captured_reads_is_refreshed_once() {
+        let (a, b) = (PanelId::new(1), PanelId::new(2));
+        assert_eq!(
+            camera_capture_labelled_panels(true, [a, b, a, b, a]),
+            vec![a, b]
+        );
+    }
+
+    #[test]
+    fn a_capture_without_read_frames_refreshes_nothing() {
+        assert!(camera_capture_labelled_panels(false, [PanelId::new(1)]).is_empty());
+        assert!(camera_capture_labelled_panels(true, []).is_empty());
     }
 }
