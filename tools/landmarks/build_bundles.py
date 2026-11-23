@@ -50,8 +50,6 @@ REQUIRED_RUNTIME_ROLES = {
 @dataclass(frozen=True)
 class BuildSpec:
     identifier: str
-    landmark_mode: str
-    landmark_url: Optional[str] = None
     bundle_version: str = "1.0-rgv1"
     assembly_stable_id: str = ""
     assembly_display_name: str = ""
@@ -59,60 +57,67 @@ class BuildSpec:
     provider: str = "NCBI RefSeq"
     release: str = "IGV curated snapshot"
     compatible_dictionary_sha256: tuple[str, ...] = ()
+    # IGV configuration key of a bigGenePred whose transcripts are preferred as
+    # each gene's representative (MANE Select, RefSeq Select). The gene list
+    # itself always comes from IGV's default gene track, so every gene IGV
+    # draws and finds by name is drawn and searchable in RGV too.
+    preferred_transcripts_key: Optional[str] = None
+    preferred_transcripts_label: str = ""
 
 
 BUILD_SPECS = {
     "hg38": BuildSpec(
         "hg38",
-        "igv_mane",
+        bundle_version="1.1-rgv1",
         assembly_stable_id="GRCh38.no_alt_analysis_set",
         assembly_display_name="GRCh38",
         compatible_ids=("GRCh38", "GRCh38.p14", "hg38"),
-        provider="MANE (NCBI RefSeq and Ensembl/GENCODE)",
-        release="MANE 1.0",
+        provider="NCBI RefSeq (MANE Select preferred)",
+        release="IGV RefSeq All snapshot; MANE 1.0 preference",
         # GENCODE v29 UCSC-named GRCh38 plus the ERCC and phiX sequences used
         # by the qualified ENCODE RNA-seq fixture. This is exact dictionary
         # evidence, not a primary-length heuristic.
         compatible_dictionary_sha256=(
             "36bda445209ba362bb534c9acf5f453f1adeacd3707586a346257f8f69a53fae",
         ),
+        preferred_transcripts_key="maneBbURL",
+        preferred_transcripts_label="MANE Select",
     ),
     "hg19": BuildSpec(
         "hg19",
-        "igv_mane",
+        bundle_version="1.1-rgv1",
         assembly_stable_id="GRCh37.p13",
         assembly_display_name="GRCh37 / hg19",
         compatible_ids=("GRCh37", "hg19"),
-        release="RefSeq Select snapshot used by IGV hg19",
+        release="IGV RefSeq All snapshot; RefSeq Select preference",
         # 1000 Genomes b37 plus hs37d5, with Ensembl-style primary names and
         # the 16,569-base mitochondrial sequence. Its nuclear coordinates are
         # exactly GRCh37; source-contig aliases are bound separately at runtime.
         compatible_dictionary_sha256=(
             "d74373ee19d2e0f8378f17ea869b31f242189d381b2e04be48f6fbd76fb7028b",
         ),
+        preferred_transcripts_key="maneBbURL",
+        preferred_transcripts_label="RefSeq Select",
     ),
     "mm10": BuildSpec(
         "mm10",
-        "representative_refgene",
         assembly_stable_id="GRCm38.p6",
         assembly_display_name="GRCm38 / mm10",
         compatible_ids=("GRCm38", "mm10"),
     ),
     "mm39": BuildSpec(
         "mm39",
-        "representative_refgene",
         assembly_stable_id="GRCm39",
         assembly_display_name="GRCm39 / mm39",
         compatible_ids=("GRCm39", "mm39"),
     ),
     "hs1": BuildSpec(
         "hs1",
-        "curated_biggenepred",
-        "https://hgdownload.soe.ucsc.edu/gbdb/hs1/ncbiRefSeq/ncbiRefSeqCurated.bb",
+        bundle_version="1.1-rgv1",
         assembly_stable_id="T2T-CHM13v2.0",
         assembly_display_name="T2T CHM13 v2.0 / hs1",
         compatible_ids=("CHM13v2.0", "hs1"),
-        release="NCBI RefSeq Curated snapshot used by UCSC hs1",
+        release="NCBI RefSeq All snapshot used by IGV hs1",
     ),
 }
 
@@ -149,11 +154,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--force", action="store_true", help="Download existing assets again.")
     parser.add_argument(
+        "--offline",
+        action="store_true",
+        help=(
+            "Re-curate from the source files already in the output root; never use the network "
+            "and fail if a source file is missing."
+        ),
+    )
+    parser.add_argument(
         "--validate-existing",
         action="store_true",
         help="Validate installed bundles and print their gene/cytoband qualification without downloading.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.offline and args.force:
+        parser.error("--offline cannot be combined with --force")
+    return args
+
+
+# Set by `--offline`: every source must already be on disk.
+NETWORK_ALLOWED = True
 
 
 def request(url: str) -> urllib.request.Request:
@@ -163,6 +183,8 @@ def request(url: str) -> urllib.request.Request:
 def download(url: str, destination: Path, force: bool = False) -> None:
     if destination.is_file() and not force:
         return
+    if not NETWORK_ALLOWED:
+        raise ValueError(f"{destination} is missing and --offline forbids downloading {url}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         prefix=f".{destination.name}.", suffix=".part", dir=destination.parent, delete=False
@@ -632,6 +654,21 @@ def validate_curated_gene_assets(representatives: Path, names: Path) -> int:
     return len(representative_by_transcript)
 
 
+def detailed_symbols(path: Path, track_format: str, sizes: dict[str, int]) -> set[str]:
+    """Gene names of a full gene track on the bundle's contigs, as curation keys them."""
+    return {
+        fields[11] or fields[0]
+        for fields in gene_track_rows(path, track_format)
+        if fields[1] in sizes
+    }
+
+
+def search_symbols(names: Path) -> set[str]:
+    with gzip.open(names, "rt", encoding="utf-8", newline="") as stream:
+        stream.readline()
+        return {line.split("\t", 2)[1] for line in stream if line.strip()}
+
+
 def validate_existing_bundle(output_root: Path, identifier: str) -> dict[str, Any]:
     manifest_path = output_root / identifier / "manifest.json"
     with manifest_path.open(encoding="utf-8") as stream:
@@ -662,6 +699,22 @@ def validate_existing_bundle(output_root: Path, identifier: str) -> dict[str, An
     )
     assembly = bundle["assembly"]
     sizes = {contig["name"]: contig["length"] for contig in assembly["contigs"]}
+    detailed_entry = next(
+        entry for entry in bundle["assets"] if entry["role"] == "detailed_transcripts"
+    )
+    unsearchable = sorted(
+        detailed_symbols(
+            assets_by_role["detailed_transcripts"],
+            "biggenepred" if detailed_entry["format"] == "big_gene_pred" else "refgene",
+            sizes,
+        )
+        - search_symbols(assets_by_role["gene_search"])
+    )
+    if unsearchable:
+        raise ValueError(
+            f"{len(unsearchable)} genes of the detailed track are not searchable, "
+            f"such as {unsearchable[:3]}"
+        )
     primary = {contig["name"] for contig in assembly["contigs"] if contig["primary"]}
     cytoband_contigs: set[str] = set()
     acen_contigs: set[str] = set()
@@ -682,67 +735,12 @@ def validate_existing_bundle(output_root: Path, identifier: str) -> dict[str, An
                 acen_contigs.add(fields[0])
     return {
         "bundle": identifier,
+        "version": bundle["version"],
         "genes": genes,
+        "detailed_track_genes_unsearchable": len(unsearchable),
         "cytobands": cytoband_count,
         "primary_without_cytobands": sorted(primary - cytoband_contigs),
         "primary_without_acen": sorted(primary - acen_contigs),
-    }
-
-
-def curate_refgene(
-    source: Path,
-    representatives: Path,
-    names: Path,
-    sizes: dict[str, int],
-    chromosome_order: Sequence[str],
-) -> dict[str, int]:
-    selected: dict[str, list[str]] = {}
-    source_transcript_count = 0
-    transcript_count = 0
-    excluded_transcript_count = 0
-    exon_count = 0
-    for fields in refgene_rows(source):
-        source_transcript_count += 1
-        if fields[1] not in sizes:
-            excluded_transcript_count += 1
-            continue
-        exons, _ = validate_refgene(fields, sizes)
-        transcript_count += 1
-        exon_count += exons
-        gene = fields[11] or fields[0]
-        previous = selected.get(gene)
-        if previous is None or representative_rank(fields) < representative_rank(previous):
-            selected[gene] = fields
-
-    order = {chrom: index for index, chrom in enumerate(chromosome_order)}
-    rows = sorted(
-        selected.values(),
-        key=lambda fields: (
-            order.get(fields[1], len(order)),
-            int(fields[3]),
-            int(fields[4]),
-            fields[0],
-        ),
-    )
-    write_gzip_lines(representatives, ("\t".join(fields) + "\n" for fields in rows))
-    search_rows = [
-        (fields[11].casefold(), fields[11], fields[11], fields[0], fields[1], fields[3], fields[4], fields[2], "")
-        for fields in rows
-    ]
-    search_rows.sort(key=lambda row: (row[0], order.get(row[4], len(order)), int(row[5]), int(row[6]), row[2]))
-    write_gzip_lines(
-        names,
-        chain(
-            [SEARCH_SCHEMA_VERSION + "\n"],
-            ("\t".join(row) + "\n" for row in search_rows),
-        ),
-    )
-    return {
-        "genes": len(rows),
-        "source_transcripts": source_transcript_count,
-        "transcripts": transcript_count,
-        "off_reference_transcripts_excluded": excluded_transcript_count,
-        "exons": exon_count,
     }
 
 
@@ -758,22 +756,6 @@ def biggenepred_gene_identity(fields: Sequence[str]) -> tuple[str, str]:
     transcript_like = stable_gene.startswith(("NM_", "NR_", "XM_", "XR_", "ENST"))
     gene_id = symbol if not stable_gene or transcript_like else stable_gene
     return gene_id, symbol
-
-
-def biggenepred_rank(record: dict[str, Any]) -> tuple[int, int, int, int, int, str]:
-    fields = record["fields"]
-    mane_status = fields[21] if len(fields) > 21 else ""
-    mane_priority = 0 if mane_status == "MANE Select" else 1 if mane_status else 2
-    cds_start, cds_end = int(fields[3]), int(fields[4])
-    block_sizes = comma_integers(fields[7])
-    return (
-        mane_priority,
-        accession_priority(fields[0]),
-        -(cds_end - cds_start),
-        -sum(block_sizes),
-        -(record["end"] - record["start"]),
-        fields[0],
-    )
 
 
 def biggenepred_to_refgene(record: dict[str, Any], symbol: str) -> list[str]:
@@ -810,78 +792,199 @@ def biggenepred_to_refgene(record: dict[str, Any], symbol: str) -> list[str]:
     return normalized
 
 
-def curate_biggenepred(
+def biggenepred_records(path: Path) -> Iterator[tuple[str, int, int, list[str]]]:
+    module = require_pybigwig()
+    bigbed = module.open(str(path))
+    try:
+        for chrom, length in bigbed.chroms().items():
+            for start, end, rest in bigbed.entries(chrom, 0, length) or []:
+                yield chrom, int(start), int(end), rest.split("\t")
+    finally:
+        bigbed.close()
+
+
+def biggenepred_refgene_rows(path: Path) -> Iterator[list[str]]:
+    """bigGenePred records as genePred rows named by their gene symbol."""
+    for chrom, start, end, fields in biggenepred_records(path):
+        _, symbol = biggenepred_gene_identity(fields)
+        record = {"chrom": chrom, "start": start, "end": end, "fields": fields}
+        yield biggenepred_to_refgene(record, symbol)
+
+
+def gene_track_rows(path: Path, track_format: str) -> Iterator[list[str]]:
+    if track_format == "refgene":
+        return refgene_rows(path)
+    if track_format == "biggenepred":
+        return biggenepred_refgene_rows(path)
+    raise ValueError(f"unsupported gene-track format {track_format!r}")
+
+
+def unversioned(accession: str) -> str:
+    return accession.split(".", 1)[0]
+
+
+@dataclass(frozen=True)
+class PreferredTranscript:
+    """One transcript a build prefers as its gene's representative."""
+
+    accession: str
+    chrom: str
+    symbol: str
+    # Stable gene and transcript IDs the preferred set adds (Ensembl, for
+    # MANE); empty when the set carries none.
+    gene_id: str = ""
+    ensembl_transcript: str = ""
+
+
+@dataclass
+class PreferredTranscripts:
+    exact: dict[tuple[str, str], PreferredTranscript]
+    by_accession: dict[tuple[str, str], PreferredTranscript]
+    by_symbol: dict[str, PreferredTranscript]
+
+    @classmethod
+    def from_records(cls, records: Iterable[PreferredTranscript]) -> "PreferredTranscripts":
+        preferred = cls({}, {}, {})
+        for record in sorted(
+            records, key=lambda item: (item.accession, item.chrom, item.gene_id, item.symbol)
+        ):
+            preferred.exact.setdefault((record.accession, record.chrom), record)
+            preferred.by_accession.setdefault((unversioned(record.accession), record.chrom), record)
+            preferred.by_symbol.setdefault(record.symbol, record)
+        return preferred
+
+    def match(self, fields: Sequence[str]) -> Optional[PreferredTranscript]:
+        """The preferred record this genePred row is (a version of), if any."""
+        return self.exact.get((fields[0], fields[1])) or self.by_accession.get(
+            (unversioned(fields[0]), fields[1])
+        )
+
+    def priority(self, fields: Sequence[str]) -> int:
+        if (fields[0], fields[1]) in self.exact:
+            return 0
+        return 1 if (unversioned(fields[0]), fields[1]) in self.by_accession else 2
+
+
+def preferred_transcript_record(chrom: str, fields: Sequence[str]) -> Optional[PreferredTranscript]:
+    if len(fields) > 21:
+        # MANE bigGenePred: an Ensembl model whose RefSeq twin is `ncbiId`.
+        if fields[21] != "MANE Select" or not fields[18]:
+            return None
+        return PreferredTranscript(fields[18], chrom, fields[15], fields[14], fields[0])
+    _, symbol = biggenepred_gene_identity(fields)
+    return PreferredTranscript(fields[0], chrom, symbol)
+
+
+def read_preferred_transcripts(path: Path, sizes: dict[str, int]) -> PreferredTranscripts:
+    return PreferredTranscripts.from_records(
+        record
+        for chrom, _, _, fields in biggenepred_records(path)
+        if chrom in sizes
+        for record in [preferred_transcript_record(chrom, fields)]
+        if record is not None
+    )
+
+
+def curate_refgene(
     source: Path,
     representatives: Path,
     names: Path,
     sizes: dict[str, int],
     chromosome_order: Sequence[str],
+    *,
+    track_format: str = "refgene",
+    preferred: Optional[PreferredTranscripts] = None,
 ) -> dict[str, int]:
-    module = require_pybigwig()
-    bigbed = module.open(str(source))
-    selected: dict[str, dict[str, Any]] = {}
+    """Select one model per gene symbol of a full gene track and derive its search rows.
+
+    A transcript in `preferred` (MANE Select, RefSeq Select) outranks every other model
+    of its gene; the remaining order is NM, NR, XM, XR, then coding length, spliced
+    length, genomic span, and accession. Each search row's stable gene ID is the
+    preferred set's gene ID (the Ensembl gene of a MANE record) when the gene has one,
+    and otherwise the RefSeq gene symbol, which names exactly one selected record.
+    """
+
+    def rank(fields: Sequence[str]) -> tuple[Any, ...]:
+        return (preferred.priority(fields) if preferred else 2, *representative_rank(fields))
+
+    selected: dict[str, list[str]] = {}
     source_transcript_count = 0
+    transcript_count = 0
     excluded_transcript_count = 0
-    try:
-        for chrom, length in bigbed.chroms().items():
-            for start, end, rest in bigbed.entries(chrom, 0, length) or []:
-                source_transcript_count += 1
-                if chrom not in sizes:
-                    excluded_transcript_count += 1
-                    continue
-                fields = rest.split("\t")
-                gene_id, symbol = biggenepred_gene_identity(fields)
-                record = {
-                    "chrom": chrom,
-                    "start": int(start),
-                    "end": int(end),
-                    "fields": fields,
-                    "gene_id": gene_id,
-                    "symbol": symbol,
-                }
-                previous = selected.get(gene_id)
-                if previous is None or biggenepred_rank(record) < biggenepred_rank(previous):
-                    selected[gene_id] = record
-    finally:
-        bigbed.close()
+    exon_count = 0
+    for fields in gene_track_rows(source, track_format):
+        source_transcript_count += 1
+        if fields[1] not in sizes:
+            excluded_transcript_count += 1
+            continue
+        exons, _ = validate_refgene(fields, sizes)
+        transcript_count += 1
+        exon_count += exons
+        gene = fields[11] or fields[0]
+        previous = selected.get(gene)
+        if previous is None or rank(fields) < rank(previous):
+            selected[gene] = fields
 
     order = {chrom: index for index, chrom in enumerate(chromosome_order)}
-    records = sorted(
+    rows = sorted(
         selected.values(),
-        key=lambda record: (
-            order.get(record["chrom"], len(order)),
-            record["start"],
-            record["end"],
-            record["fields"][0],
+        key=lambda fields: (
+            order.get(fields[1], len(order)),
+            int(fields[3]),
+            int(fields[4]),
+            fields[0],
         ),
     )
-    normalized = [biggenepred_to_refgene(record, record["symbol"]) for record in records]
-    for fields in normalized:
-        validate_refgene(fields, sizes)
-    write_gzip_lines(representatives, ("\t".join(fields) + "\n" for fields in normalized))
+    write_gzip_lines(representatives, ("\t".join(fields) + "\n" for fields in rows))
 
-    search_rows = [
-        (
-            record["symbol"].casefold(),
-            record["symbol"],
-            record["gene_id"],
-            record["fields"][0],
-            record["chrom"],
-            str(record["start"]),
-            str(record["end"]),
-            record["fields"][2],
-            "",
+    # A gene's preferred record is its representative's own (exact or other
+    # version); failing that, an unclaimed record of the same symbol. Its
+    # Ensembl transcript stays searchable and finds the gene.
+    matched: dict[str, PreferredTranscript] = {}
+    if preferred is not None:
+        claimed: set[tuple[str, str]] = set()
+        for fields in rows:
+            record = preferred.match(fields)
+            if record is not None:
+                matched[fields[0]] = record
+                claimed.add((record.accession, record.chrom))
+        for fields in rows:
+            record = preferred.by_symbol.get(fields[11])
+            if (
+                fields[0] not in matched
+                and record is not None
+                and (record.accession, record.chrom) not in claimed
+            ):
+                matched[fields[0]] = record
+                claimed.add((record.accession, record.chrom))
+
+    search_rows = []
+    for fields in rows:
+        symbol = fields[11] or fields[0]
+        gene_id = symbol
+        synonyms: list[str] = []
+        record = matched.get(fields[0])
+        if record is not None:
+            gene_id = record.gene_id or symbol
+            if record.symbol and record.symbol.casefold() != symbol.casefold():
+                synonyms.append(record.symbol)
+            if record.ensembl_transcript:
+                synonyms.append(record.ensembl_transcript)
+        search_rows.append(
+            (
+                symbol.casefold(),
+                symbol,
+                gene_id,
+                fields[0],
+                fields[1],
+                fields[3],
+                fields[4],
+                fields[2],
+                ",".join(synonyms),
+            )
         )
-        for record in records
-    ]
     search_rows.sort(
-        key=lambda row: (
-            row[0],
-            order.get(row[4], len(order)),
-            int(row[5]),
-            int(row[6]),
-            row[2],
-        )
+        key=lambda row: (row[0], order.get(row[4], len(order)), int(row[5]), int(row[6]), row[2])
     )
     write_gzip_lines(
         names,
@@ -890,13 +993,21 @@ def curate_biggenepred(
             ("\t".join(row) + "\n" for row in search_rows),
         ),
     )
-    return {
-        "genes": len(records),
+    counts = {
+        "genes": len(rows),
         "source_transcripts": source_transcript_count,
-        "transcripts": source_transcript_count - excluded_transcript_count,
+        "transcripts": transcript_count,
         "off_reference_transcripts_excluded": excluded_transcript_count,
-        "exons": sum(int(fields[7]) for fields in normalized),
+        "exons": exon_count,
     }
+    if preferred is not None:
+        counts["preferred_representatives"] = sum(
+            1 for fields in rows if preferred.priority(fields) < 2
+        )
+        counts["preferred_gene_ids"] = sum(
+            1 for record in matched.values() if record.gene_id
+        )
+    return counts
 
 
 def validate_bigbed(path: Path) -> None:
@@ -1056,7 +1167,6 @@ def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, A
 
     track_url = track["url"]
     track_format = str(track.get("format", "")).lower()
-    counts: dict[str, int] = {}
     if track_format == "refgene":
         transcripts = directory / "transcripts.genePred.gz"
         download(track_url, transcripts, force)
@@ -1089,60 +1199,64 @@ def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, A
     else:
         raise ValueError(f"unsupported IGV gene format {track_format!r} for {spec.identifier}")
 
-    if spec.landmark_mode == "igv_mane":
-        landmark_url = configuration.get("maneBbURL")
-        if not isinstance(landmark_url, str):
-            raise ValueError(f"IGV configuration {spec.identifier} has no MANE BigBed")
-        landmark_source = directory / "genes.bigGenePred"
-        download(landmark_url, landmark_source, force)
-        validate_bigbed(landmark_source)
-    elif spec.landmark_mode == "curated_biggenepred":
-        if spec.landmark_url is None:
-            raise ValueError(f"missing curated landmark URL for {spec.identifier}")
-        landmark_url = spec.landmark_url
-        landmark_source = directory / "genes.bigGenePred"
-        download(landmark_url, landmark_source, force)
-        validate_bigbed(landmark_source)
-    elif spec.landmark_mode == "representative_refgene":
-        landmark_url = track_url
-        landmark_source = directory / "transcripts.genePred.gz"
-    else:
-        raise ValueError(f"unknown landmark mode {spec.landmark_mode}")
+    track_name = str(track.get("name") or track.get("id") or "default gene track")
+    preferred: Optional[PreferredTranscripts] = None
+    preference = "no preferred transcript set"
+    if spec.preferred_transcripts_key is not None:
+        preferred_url = configuration.get(spec.preferred_transcripts_key)
+        if not isinstance(preferred_url, str):
+            raise ValueError(
+                f"IGV configuration {spec.identifier} has no {spec.preferred_transcripts_key}"
+            )
+        preferred_source = directory / "genes.bigGenePred"
+        download(preferred_url, preferred_source, force)
+        validate_bigbed(preferred_source)
+        preferred = read_preferred_transcripts(preferred_source, sizes)
+        preference = f"{spec.preferred_transcripts_label} transcripts from {preferred_url} first"
 
     genes = directory / "genes.representative.genePred.gz"
     names = directory / "names.rgv.tsv.gz"
-    if spec.landmark_mode == "representative_refgene":
-        counts = curate_refgene(landmark_source, genes, names, sizes, order)
-    else:
-        counts = curate_biggenepred(landmark_source, genes, names, sizes, order)
+    counts = curate_refgene(
+        transcripts, genes, names, sizes, order, track_format=track_format, preferred=preferred
+    )
     validated_gene_count = validate_curated_gene_assets(genes, names)
     if validated_gene_count != counts["genes"]:
         raise ValueError(
             "curated gene count disagrees with representative/search validation: "
             f"{counts['genes']} != {validated_gene_count}"
         )
+    selection_policy = (
+        f"one representative transcript per gene symbol of IGV's default {track_name} track: "
+        f"{preference}, then NM, NR, XM, XR; then coding length, spliced length, "
+        "genomic span, and accession"
+    )
+    stable_id_rule = (
+        "the Ensembl gene of the gene's MANE Select record, otherwise the RefSeq gene symbol"
+        if spec.preferred_transcripts_label == "MANE Select"
+        else "the RefSeq gene symbol"
+    )
     assets.extend(
         [
             igv_asset(
                 genes,
                 output_root,
                 "representative_genes",
-                landmark_url,
+                track_url,
                 "gene_pred_ext_gzip",
                 version=spec.release,
-                derivation=(
-                    "Selected exactly one model per stable gene: MANE Select first, then NM/NR/XM/XR, "
-                    "coding length, spliced length, genomic span, and stable accession."
-                ),
+                derivation=f"Selected exactly one model for every gene: {selection_policy}.",
             ),
             igv_asset(
                 names,
                 output_root,
                 "gene_search",
-                landmark_url,
+                track_url,
                 "rgv_gene_names_v1_gzip",
                 version=spec.release,
-                derivation="Derived deterministically from the representative records.",
+                derivation=(
+                    "Derived deterministically from the representative records; one row per "
+                    f"gene, whose stable gene ID is {stable_id_rule}."
+                ),
             ),
         ]
     )
@@ -1166,10 +1280,6 @@ def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, A
     )
 
     reference_url = configuration.get("fastaURL") or configuration.get("twoBitURL")
-    selection_policy = (
-        "one representative transcript per gene: MANE Select first, then NM, NR, XM, XR; "
-        "then coding length, spliced length, genomic span, and stable accession"
-    )
     bundle = {
         "id": spec.identifier,
         "version": spec.bundle_version,
@@ -1217,7 +1327,9 @@ def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, A
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    global NETWORK_ALLOWED
     args = parse_args(argv)
+    NETWORK_ALLOWED = not args.offline
     builds = args.builds or list(BUILD_SPECS)
     if args.validate_existing:
         qualifications = [

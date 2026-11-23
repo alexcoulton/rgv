@@ -78,6 +78,76 @@ class LandmarkBundleTests(unittest.TestCase):
                 output_hashes.append((self.digest(genes), self.digest(names)))
             self.assertEqual(output_hashes[0], output_hashes[1])
 
+    def test_full_gene_list_prefers_mane_select_and_keeps_every_symbol(self):
+        rows = [
+            # ACTB: the longer NM_2 would win alone; MANE Select picks NM_1.2.
+            "0\tNM_1.2\tchr1\t+\t0\t60\t10\t50\t1\t0,\t60,\t0\tACTB\tcmpl\tcmpl\t0,\n",
+            "0\tNM_2.1\tchr1\t+\t0\t90\t10\t80\t1\t0,\t90,\t0\tACTB\tcmpl\tcmpl\t0,\n",
+            # Renamed since MANE 1.0: found by both names.
+            "0\tNM_3.1\tchr1\t-\t100\t150\t100\t150\t1\t100,\t150,\t0\tBMAL1\tcmpl\tcmpl\t0,\n",
+            # No MANE record matches this accession; same symbol, other version.
+            "0\tNM_5.4\tchr1\t+\t160\t170\t160\t170\t1\t160,\t170,\t0\tCCNA1\tcmpl\tcmpl\t0,\n",
+            # Only in the full RefSeq list (like PBRM1): searchable by its symbol.
+            "0\tNM_4.1\tchr2\t-\t10\t90\t20\t80\t1\t10,\t90,\t0\tPBRM1\tcmpl\tcmpl\t0,\n",
+        ]
+        preferred = build_bundles.PreferredTranscripts.from_records(
+            [
+                build_bundles.PreferredTranscript("NM_1.2", "chr1", "ACTB", "ENSG1.1", "ENST1.1"),
+                build_bundles.PreferredTranscript("NM_3.1", "chr1", "ARNTL", "ENSG3.1", "ENST3.1"),
+                build_bundles.PreferredTranscript("NM_9.1", "chr1", "CCNA1", "ENSG5.1", "ENST9.1"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.gz"
+            with gzip.open(source, "wt", encoding="utf-8") as stream:
+                stream.writelines(rows)
+            genes = root / "genes.gz"
+            names = root / "names.gz"
+            counts = build_bundles.curate_refgene(
+                source,
+                genes,
+                names,
+                {"chr1": 200, "chr2": 100},
+                ["chr1", "chr2"],
+                preferred=preferred,
+            )
+            self.assertEqual(build_bundles.validate_curated_gene_assets(genes, names), 4)
+            with gzip.open(names, "rt", encoding="utf-8") as stream:
+                stream.readline()
+                search = {
+                    fields[1]: fields
+                    for fields in (line.rstrip("\n").split("\t") for line in stream)
+                }
+        self.assertEqual(sorted(search), ["ACTB", "BMAL1", "CCNA1", "PBRM1"])
+        self.assertEqual(search["ACTB"][2:4], ["ENSG1.1", "NM_1.2"])
+        self.assertEqual(search["ACTB"][8], "ENST1.1")
+        self.assertEqual(search["BMAL1"][2], "ENSG3.1")
+        self.assertEqual(search["BMAL1"][8], "ARNTL,ENST3.1")
+        # Matched by symbol only: its Ensembl gene and transcript still find it.
+        self.assertEqual(search["CCNA1"][2], "ENSG5.1")
+        self.assertEqual(search["CCNA1"][8], "ENST9.1")
+        self.assertEqual(
+            search["PBRM1"], ["pbrm1", "PBRM1", "PBRM1", "NM_4.1", "chr2", "10", "90", "-", ""]
+        )
+        self.assertEqual(counts["genes"], 4)
+        self.assertEqual(counts["preferred_representatives"], 2)
+        self.assertEqual(counts["preferred_gene_ids"], 3)
+
+    def test_offline_mode_never_downloads_a_missing_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "missing.gz"
+            build_bundles.NETWORK_ALLOWED = False
+            try:
+                with self.assertRaisesRegex(ValueError, "--offline forbids downloading"):
+                    build_bundles.download("https://example.invalid/missing.gz", destination)
+                existing = Path(temporary) / "present.gz"
+                existing.write_bytes(b"kept")
+                build_bundles.download("https://example.invalid/present.gz", existing)
+                self.assertEqual(existing.read_bytes(), b"kept")
+            finally:
+                build_bundles.NETWORK_ALLOWED = True
+
     def test_curated_gene_assets_require_matching_symbol_identity_and_coordinates(self):
         representative_row = (
             "NM_2\tchr1\t+\t0\t80\t10\t70\t2\t0,40,\t20,80,\t0\tACTB\tcmpl\tcmpl\t0,1,\n"

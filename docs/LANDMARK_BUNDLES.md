@@ -5,26 +5,43 @@ not the curation program. The offline curation workflow is a standard-library Py
 mirrors the annotation choices in IGV's official genome definitions and records the source URL,
 size, and SHA-256 digest for every downloaded or derived file.
 
-The initial catalogue contains the five current human and mouse builds discussed for RGV:
+The initial catalogue contains the five current human and mouse builds discussed for RGV. Every
+build draws and searches **every gene of IGV's default gene track** — the track IGV itself shows and
+whose names it finds — as one representative transcript per gene symbol. A build with a curated
+"select" set prefers that set's transcript as the representative:
 
-| Build | Assembly | Compact landmark source | Detailed source |
-| --- | --- | --- | --- |
-| `hg38` | GRCh38 | IGV MANE BigGenePred | IGV RefSeq All |
-| `hg19` | GRCh37 | IGV RefSeq Select BigGenePred | IGV RefSeq All |
-| `mm10` | GRCm38 | Python-selected representative per gene | IGV RefSeq All |
-| `mm39` | GRCm39 | Python-selected representative per gene | IGV RefSeq Curated |
-| `hs1` | T2T CHM13 v2.0 | UCSC RefSeq Curated BigGenePred | IGV RefSeq All BigGenePred |
+| Build | Assembly | Gene list (drawn and searchable) | Preferred representative | Genes | Drawn / search size | Detailed source |
+| --- | --- | --- | --- | ---: | --- | --- |
+| `hg38` | GRCh38 | IGV RefSeq All | MANE Select (IGV `mane.1.0.bb`) | 42,764 | 3.2 MB / 1.1 MB | IGV RefSeq All |
+| `hg19` | GRCh37 | IGV RefSeq All | RefSeq Select (IGV `ncbiRefSeqSelect.bb`) | 29,692 | 2.7 MB / 0.7 MB | IGV RefSeq All |
+| `mm10` | GRCm38 | IGV RefSeq All | — | 38,779 | 3.0 MB / 0.8 MB | IGV RefSeq All |
+| `mm39` | GRCm39 | IGV RefSeq Curated | — | 26,683 | 2.5 MB / 0.6 MB | IGV RefSeq Curated |
+| `hs1` | T2T CHM13 v2.0 | IGV RefSeq All BigGenePred | — | 41,566 | 3.2 MB / 0.9 MB | IGV RefSeq All BigGenePred |
 
 Each directory also contains IGV's genome definition, chromosome sizes, aliases and cytobands when
 the preset supplies them. IGV Trix search files are retained where available. The bundles do not
 include multi-gigabyte FASTA or 2bit sequences; their manifests preserve the matching reference URL.
 
-For mouse tables, representative selection prefers `NM_`, `NR_`, `XM_`, then `XR_` accessions,
-followed by coding length, spliced length, genomic span, and stable accession. Exon arrays and all
+Representative selection keys genes by their RefSeq gene symbol, so the drawn track and the search
+index hold exactly one record for every symbol of the default track on the bundle's contigs. Within a
+gene, a preferred transcript (same accession and contig; another version of it ranks next) comes
+first, then `NM_`, `NR_`, `XM_` and `XR_` accessions, followed by coding length, spliced length,
+genomic span, and accession. In `hg38` the MANE Select record's RefSeq twin (`ncbiId`) is the
+representative, so MANE genes keep their MANE model wherever RefSeq All still carries that
+accession; genes MANE does not cover (PBRM1 in MANE 1.0,
+for example) are drawn and found through their RefSeq representative. Exon arrays and all
 coordinates are validated against IGV's chromosome-size file. The unfiltered source table is kept
-beside the compact derived track. Every build also cross-validates the representative gene model
-and symbol-search assets before its manifest is written: transcript, symbol, contig, coordinates,
-and strand must agree one-for-one, and every search row must retain a non-empty stable gene ID.
+beside the compact derived track.
+
+Every build also cross-validates the representative gene model and symbol-search assets before its
+manifest is written: transcript, symbol, contig, coordinates, and strand must agree one-for-one, so
+every search hit lands on a gene the Genes track draws. Every search row must retain a non-empty
+stable gene ID: in `hg38` it is the Ensembl gene (`ENSG…`) of the gene's MANE Select record —
+matched by accession, or by symbol when MANE's RefSeq accession is no longer in RefSeq All — and
+otherwise, in every build, the RefSeq gene symbol, which the selection makes unique within the
+bundle. `hg38` search rows also carry the MANE symbol (when RefSeq has since renamed the gene, as
+`ARNTL` → `BMAL1`) and the MANE Ensembl transcript as synonyms, so those names still find the gene.
+`--validate-existing` additionally fails if any gene of the detailed track is not searchable.
 
 ## Build or refresh the local catalogue
 
@@ -38,8 +55,22 @@ Build only selected assemblies with repeatable `--build` arguments:
 scripts/build-landmark-bundles.sh --build hg19 --build mm39
 ```
 
-Validate every installed file, representative/search identity pair, and cytoband record without
-performing any network requests:
+Re-curate from the source files already downloaded, without any network access (a missing source
+is an error, never a download):
+
+```sh
+scripts/build-landmark-bundles.sh --offline --build hg38
+```
+
+Add `--output-root DIR` to work on a catalogue stored elsewhere (the folder holding `catalog.json`).
+
+A rebuild that changes a bundle's assets must also bump its `bundle_version` in `build_bundles.py`;
+the curator refuses to change an existing release in place. Saved sessions pin the version and
+checksum of a built-in track, so after such an update their Genes track is reported as not rebound
+and is added again from the new bundle.
+
+Validate every installed file, representative/search identity pair, search coverage of the detailed
+track, and cytoband record without performing any network requests:
 
 ```sh
 scripts/build-landmark-bundles.sh --validate-existing
