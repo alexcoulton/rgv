@@ -1485,8 +1485,10 @@ mod tests {
                 AlignmentGeometryToken::PointMarker
                     | AlignmentGeometryToken::PointMarkerAtEnd
                     | AlignmentGeometryToken::ClipEdge(_)
+                    | AlignmentGeometryToken::ClipGhost
             ) {
-                // Boundary marks are exempt: below 0.1 points per base they are not drawn.
+                // Exempt: boundary marks are not drawn below 0.1 points per base, and clip ghost
+                // cells not below the base-letter width (they appear only with their letters).
                 assert!(
                     projected.is_none(),
                     "{geometry:?} drawn at 0.001 points per base"
