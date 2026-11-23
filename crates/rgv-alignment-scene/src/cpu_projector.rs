@@ -409,9 +409,12 @@ impl CpuAlignmentProjector {
             left.row
                 .cmp(&right.row)
                 .then_with(|| {
-                    left.geometry
-                        .paint_layer()
-                        .cmp(&right.geometry.paint_layer())
+                    crate::semantic_page::primitive_paint_layer(left.component, left.geometry).cmp(
+                        &crate::semantic_page::primitive_paint_layer(
+                            right.component,
+                            right.geometry,
+                        ),
+                    )
                 })
                 .then_with(|| left.y.total_cmp(&right.y))
                 .then_with(|| left.x.total_cmp(&right.x))
@@ -721,7 +724,10 @@ fn pick_captured_scene(
         // order), so the paint layer decides here too.
         .max_by_key(|primitive| {
             (
-                primitive.geometry.paint_layer(),
+                crate::semantic_page::primitive_paint_layer(
+                    primitive.component,
+                    primitive.geometry,
+                ),
                 primitive.draw_order,
                 primitive.component,
                 primitive.handle,

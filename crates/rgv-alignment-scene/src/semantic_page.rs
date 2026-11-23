@@ -388,9 +388,9 @@ impl AlignmentGeometryToken {
         )
     }
 
-    /// Paint order within one row, shared by the semantic page (and so the GPU), the CPU
-    /// projector and picking: clip ghosts first (beneath every read of the row), then read
-    /// bodies and bases, then boundary marks (which overhang neighbouring cells).
+    /// Paint order of a geometry alone: clip ghosts, then everything drawn on a read, then
+    /// boundary marks. It cannot tell a read body from the bases drawn on it, which share the
+    /// `Rectangle` geometry; order primitives with [`primitive_paint_layer`] instead.
     #[must_use]
     pub const fn paint_layer(self) -> u8 {
         match self {
@@ -414,6 +414,63 @@ impl AlignmentGeometryToken {
             Self::PointMarker
         }
     }
+}
+
+/// Paint order within one row, shared by the semantic page (and so the GPU), the CPU projector
+/// and picking:
+///
+/// 0. clip ghosts, beneath every read of the row;
+/// 1. read bodies: the read span, aligned blocks, the direction terminal, deletion and skip
+///    lines and pair connectors;
+/// 2. everything drawn on a read body: base and mismatch cells, modification, bisulfite,
+///    kinetics and other specialist cells;
+/// 3. boundary marks (point markers, clip edges), which overhang neighbouring cells.
+///
+/// Bodies and the cells drawn on them share the `Rectangle` geometry, so the component decides.
+/// Ordering them by position alone painted an aligned block over a mismatch cell that starts
+/// at the same base (the first base after an insertion, deletion or splice), hiding its fill
+/// while its letter, drawn separately, stayed visible.
+#[must_use]
+pub const fn primitive_paint_layer(
+    component: AlignmentComponent,
+    geometry: AlignmentGeometryToken,
+) -> u8 {
+    match geometry.paint_layer() {
+        0 => 0,
+        2 => 3,
+        _ => match component {
+            AlignmentComponent::ReadSpan
+            | AlignmentComponent::AlignedSegment { .. }
+            | AlignmentComponent::DirectionTerminal
+            | AlignmentComponent::Deletion { .. }
+            | AlignmentComponent::ReferenceSkip { .. }
+            | AlignmentComponent::PairConnector { .. } => 1,
+            _ => 2,
+        },
+    }
+}
+
+/// The within-page paint order of one primitive; see [`primitive_paint_layer`].
+fn page_paint_key(
+    primitive: &AlignmentSemanticPrimitive,
+) -> (
+    u32,
+    u8,
+    u64,
+    u64,
+    u32,
+    AlignmentHandle,
+    AlignmentComponent,
+) {
+    (
+        primitive.row_offset,
+        primitive_paint_layer(primitive.component, primitive.geometry),
+        primitive.start_offset,
+        primitive.end_offset,
+        primitive.draw_order,
+        primitive.handle,
+        primitive.component,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1079,17 +1136,7 @@ impl AlignmentSemanticPage {
         // last: they sit on a base boundary and overhang the neighbouring cells, so they must
         // paint over the read body and bases on both sides (the GPU draws a page's instances in
         // this order). See `AlignmentGeometryToken::paint_layer`.
-        primitives.sort_unstable_by_key(|primitive| {
-            (
-                primitive.row_offset,
-                primitive.geometry.paint_layer(),
-                primitive.start_offset,
-                primitive.end_offset,
-                primitive.draw_order,
-                primitive.handle,
-                primitive.component,
-            )
-        });
+        primitives.sort_unstable_by_key(page_paint_key);
         let mut row_offsets = vec![0_u32; row_offset_count];
         let mut cursor = 0_usize;
         for row in 0..row_offset_count.saturating_sub(1) {
@@ -6691,5 +6738,72 @@ mod tests {
         assert_eq!(size_of::<AlignmentSemanticPrimitive>(), 152);
         // The page ledger charge is derived from the same `size_of`, so it shrank with it.
         assert_eq!(size_of::<SemanticPageHit>(), 96);
+    }
+
+    #[test]
+    fn a_mismatch_cell_paints_over_an_aligned_block_that_starts_at_the_same_base() {
+        let ledger = AllocationLedger::new(8 << 20, 0);
+        let (evidence, atlas) = evidence_and_atlas(&ledger);
+        let reference = ReferenceSlice {
+            interval: GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+            bases: vec![b'A'; 300],
+        };
+        let pages = (0..3)
+            .map(|tile| {
+                page(
+                    &ledger,
+                    &evidence,
+                    &atlas,
+                    tile,
+                    GeometryLod::Base,
+                    Some(&reference),
+                )
+            })
+            .collect::<Vec<_>>();
+        let primitives = pages
+            .iter()
+            .flat_map(|page| page.primitives().iter().copied())
+            .collect::<Vec<_>>();
+
+        // The case that hid the fill: a block and a one-base cell starting at the same base.
+        let segment = primitives
+            .iter()
+            .copied()
+            .find(|primitive| {
+                matches!(primitive.component, AlignmentComponent::AlignedSegment { .. })
+                    && primitive.end_offset > primitive.start_offset + 1
+            })
+            .expect("the fixture has a multi-base aligned block");
+        let mut base = primitives
+            .iter()
+            .copied()
+            .find(|primitive| matches!(primitive.component, AlignmentComponent::Base { .. }))
+            .expect("the fixture has base cells at base LOD");
+        base.row_offset = segment.row_offset;
+        base.start_offset = segment.start_offset;
+        base.end_offset = segment.start_offset + 1;
+        let mut ordered = vec![base, segment];
+        ordered.sort_unstable_by_key(page_paint_key);
+        assert!(
+            matches!(ordered[0].component, AlignmentComponent::AlignedSegment { .. })
+                && matches!(ordered[1].component, AlignmentComponent::Base { .. }),
+            "the base cell must paint after (over) the block it sits on"
+        );
+
+        // On every real page, within each row, nothing drawn on a read body paints before a
+        // body, and boundary marks paint last.
+        for page in &pages {
+            let mut last_layer_in_row = std::collections::HashMap::<u32, u8>::new();
+            for primitive in page.primitives() {
+                let layer = primitive_paint_layer(primitive.component, primitive.geometry);
+                let previous = last_layer_in_row.insert(primitive.row_offset, layer);
+                assert!(
+                    previous.is_none_or(|previous| previous <= layer),
+                    "row {} paints layer {layer} after layer {:?}",
+                    primitive.row_offset,
+                    previous
+                );
+            }
+        }
     }
 }
