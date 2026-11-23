@@ -211,6 +211,18 @@ impl Viewer {
                 let pending = panel.pending_read_selection.clone()?;
                 let lane = epoch.panel_frames.get(&panel.id)?.lane(pending.track_id)?;
                 let snapshot = lane.snapshot.as_ref()?;
+                // The pending identity is retained after resolution so the selection can be
+                // re-bound when a new scene is published. Re-resolving against the scene it is
+                // already bound to changes nothing, yet scans every read by name and invalidates
+                // the display, which then prepares this frame again: an idle window holding a
+                // selection spun at 100% CPU. Only re-resolve for a new scene or a reveal.
+                if pending_selection_is_bound_to_scene(
+                    &pending,
+                    panel.selected_alignment_hit.as_ref(),
+                    snapshot.revision(),
+                ) {
+                    return None;
+                }
                 let (handle, record) = pending.matching_scene_record(snapshot.reads())?;
                 let chain = selected_supplementary_chain(&record, &panel.contig_name);
                 let (retained, reveal) = pending.retained_after_resolution(Some(&record));
@@ -347,5 +359,90 @@ impl Viewer {
     ) -> Option<AlignmentRecord> {
         let snapshot = self.alignment_scene_snapshot_for_panel_track(panel_id, hit.track)?;
         snapshot.inspect_retained(hit.handle).ok().flatten()
+    }
+}
+
+/// Whether a retained pending read selection is already bound to `scene_revision`: the panel's
+/// current alignment hit is on the same track and was resolved against that very scene, and no
+/// one-shot reveal is still owed. Such a selection needs no re-resolution until the scene changes.
+fn pending_selection_is_bound_to_scene(
+    pending: &crate::workspace::panels::PendingReadSelection,
+    current_hit: Option<&AlignmentHit>,
+    scene_revision: rgv_alignment_scene::SceneRevision,
+) -> bool {
+    !pending.reveal_when_resolved
+        && current_hit
+            .is_some_and(|hit| hit.track == pending.track_id && hit.scene_revision == scene_revision)
+}
+
+#[cfg(test)]
+mod pending_selection_tests {
+    use super::pending_selection_is_bound_to_scene;
+    use crate::workspace::panels::PendingReadSelection;
+    use rgv_alignment_scene::{
+        AlignmentComponent, AlignmentHandle, AlignmentHit, AlignmentSourceRevision,
+        RevisionFingerprint, SceneRevision, SourceFingerprint,
+    };
+    use rgv_core::TrackId;
+
+    fn scene_revision(revision: u64) -> SceneRevision {
+        SceneRevision::new(RevisionFingerprint::new(revision, revision + 1))
+    }
+
+    fn read_handle() -> AlignmentHandle {
+        AlignmentHandle::new(
+            AlignmentSourceRevision::new(
+                SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+                RevisionFingerprint::new(3, 4),
+            ),
+            rgv_hts::AlignmentSourcePosition::bam_virtual_offset(42),
+        )
+    }
+
+    fn hit(track: u64, scene: SceneRevision, handle: AlignmentHandle) -> AlignmentHit {
+        AlignmentHit {
+            track: TrackId::new(track),
+            scene_revision: scene,
+            handle,
+            component: AlignmentComponent::ReadSpan,
+        }
+    }
+
+    #[test]
+    fn a_selection_resolved_against_the_current_scene_is_not_resolved_again() {
+        let scene = scene_revision(7);
+        let pending = PendingReadSelection::by_name(TrackId::new(1), b"read/1".to_vec()).unwrap();
+        assert!(pending_selection_is_bound_to_scene(
+            &pending,
+            Some(&hit(1, scene, read_handle())),
+            scene
+        ));
+    }
+
+    #[test]
+    fn a_new_scene_a_different_track_no_hit_or_an_owed_reveal_resolves_again() {
+        let scene = scene_revision(7);
+        let next = scene_revision(8);
+        let pending = PendingReadSelection::by_name(TrackId::new(1), b"read/1".to_vec()).unwrap();
+        assert!(!pending_selection_is_bound_to_scene(
+            &pending,
+            Some(&hit(1, scene, read_handle())),
+            next
+        ));
+        assert!(!pending_selection_is_bound_to_scene(
+            &pending,
+            Some(&hit(2, scene, read_handle())),
+            scene
+        ));
+        assert!(!pending_selection_is_bound_to_scene(&pending, None, scene));
+        let revealing = PendingReadSelection {
+            reveal_when_resolved: true,
+            ..pending
+        };
+        assert!(!pending_selection_is_bound_to_scene(
+            &revealing,
+            Some(&hit(1, scene, read_handle())),
+            scene
+        ));
     }
 }

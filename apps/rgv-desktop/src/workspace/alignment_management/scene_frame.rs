@@ -435,21 +435,25 @@ impl Viewer {
                     candidate_epoch.panel_frames,
                     bundle,
                 ));
-                self.resolve_pending_alignment_scene_selections();
-                self.invalidate_stale_alignment_scroll_cache();
-                // A capture over a partially resident presentation is partial too.
-                self.record_alignment_gpu_partial_residency();
-                // The read pages move with the new camera on the GPU, but their base letters are
-                // CPU text projected into this frame's label lists, and a panel's display list
-                // copies them when it is rebuilt. Vertical scrolling rebuilds the display list
-                // *before* asking for this capture, so without a second pass the letters stay at
-                // the previous frame's positions and slide against their coloured blocks while
-                // dragging. A display already marked dirty is rebuilt later from this frame.
+                // The read pages move with the new camera on the GPU, but their base letters and
+                // event-length labels are CPU text projected into this frame's label lists, and a
+                // panel's display list copies them when it is rebuilt. Vertical scrolling rebuilds
+                // the display list *before* asking for this capture, so without a second pass the
+                // text stays at the previous frame's positions and slides against its blocks while
+                // dragging. Refresh before anything below can mark the display dirty: the refresh
+                // refuses a dirty display, and a later full rebuild would copy this frame's labels
+                // and then capture again, leaving the text one frame behind once more. A
+                // camera-only capture keeps the prepared content, so the scroll cache is still
+                // valid here.
                 if !self.display_dirty {
                     for panel_id in labelled_panels {
                         let _ = self.refresh_panel_scroll_display(panel_id);
                     }
                 }
+                self.resolve_pending_alignment_scene_selections();
+                self.invalidate_stale_alignment_scroll_cache();
+                // A capture over a partially resident presentation is partial too.
+                self.record_alignment_gpu_partial_residency();
                 // Camera capture preserves the immutable prepared authority. Keep any in-flight
                 // cursor and its pins instead of restarting complete-scene discovery on every
                 // pan/scroll frame.
