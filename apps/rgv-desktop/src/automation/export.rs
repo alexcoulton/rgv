@@ -331,6 +331,25 @@ impl Viewer {
         let label_backdrops = self.presented_alignment_label_backdrops(|panel_id| {
             !active_only || panel_id == active_panel_id
         });
+        // The read panels' modification legends, where the window draws them (their header
+        // strips, never over reads), in the captured theme's colours.
+        let theme = crate::theme::active();
+        let legends = self
+            .read_panel_modification_legends(self.canvas_geometry().genomic)
+            .into_iter()
+            .filter(|legend| !active_only || legend.panel_id == active_panel_id)
+            .collect::<Vec<_>>();
+        let chip_fill = theme
+            .chrome_fill()
+            .to_srgba_unmultiplied()
+            .map(|channel| f32::from(channel) / 255.0);
+        let legend_display = crate::ui::modification_legend::modification_legend_display(
+            &legends,
+            theme.palette(),
+            chip_fill,
+        );
+        generic.rectangles.extend(legend_display.rectangles);
+        generic.texts.extend(legend_display.texts);
         let bytes = (width as usize)
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(16))
@@ -366,7 +385,7 @@ impl Viewer {
                 .map(|(key, presentation)| (*key, std::sync::Arc::clone(&presentation.table)))
                 .collect(),
             ledger: self.session.alignment_scene_ledger.clone(),
-            theme: crate::theme::active(),
+            theme,
             generic,
             panels,
             bounds,

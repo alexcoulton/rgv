@@ -939,6 +939,7 @@ impl Viewer {
             application_instance_id,
             shell: app::shell_state::ShellState::default(),
             read_inspector_derived: std::cell::RefCell::default(),
+            modification_legend_codes: std::cell::RefCell::default(),
             gpu_device_health,
             gpu_recovery: GpuRecoveryState::default(),
             next_evidence_revision: 1,

@@ -3589,10 +3589,46 @@ pub(crate) fn legacy_semantic_alignment_color(
     }
     match component {
         AlignmentComponent::Base { base, .. } => crate::palette::base_color(base),
-        AlignmentComponent::ModifiedBase { state, .. } => match state {
-            rgv_alignment_scene::ModificationState::Modified => [0.58, 0.24, 0.78, 1.0],
-            rgv_alignment_scene::ModificationState::Canonical => [0.42, 0.42, 0.48, 1.0],
-        },
+        // Deliberate change: modification cells were one purple (close to the insertion
+        // purple) whatever their type or probability. They are now IGV-style: the type colour
+        // (or 5mC red outside the by-type mode) for a likelier modification, blue for a likelier
+        // unmodified base, with the alpha rising from the faint 0.15 at a 50% call to opaque at
+        // a certain one.
+        AlignmentComponent::ModifiedBase {
+            code,
+            probability,
+            state,
+            color_by_type,
+            ..
+        } => {
+            let colors = crate::palette::MODIFICATION_COLORS;
+            let (color, shown) = match state {
+                rgv_alignment_scene::ModificationState::Modified => (
+                    match (color_by_type, code) {
+                        (true, rgv_model::ModificationCode::Letter(b'h')) => {
+                            colors.five_hydroxymethyl_c
+                        }
+                        (true, rgv_model::ModificationCode::Letter(b'a')) => colors.six_methyl_a,
+                        (true, rgv_model::ModificationCode::Letter(b'm')) | (false, _) => {
+                            colors.five_methyl_c
+                        }
+                        (true, _) => colors.other,
+                    },
+                    f32::from(probability.unwrap_or(255)),
+                ),
+                rgv_alignment_scene::ModificationState::Canonical => (
+                    colors.unmodified,
+                    255.0 - f32::from(probability.unwrap_or(0)),
+                ),
+            };
+            let confidence = ((2.0 * shown - 255.0) / 255.0).clamp(0.0, 1.0);
+            [
+                color[0],
+                color[1],
+                color[2],
+                0.15 + (1.0 - 0.15) * confidence,
+            ]
+        }
         AlignmentComponent::BisulfiteBase { observation, .. } => match observation {
             rgv_alignment_scene::BisulfiteObservationToken::Protected => [0.86, 0.46, 0.12, 1.0],
             rgv_alignment_scene::BisulfiteObservationToken::Converted => [0.18, 0.62, 0.78, 1.0],
@@ -3713,6 +3749,31 @@ fn light_palette_reproduces_every_legacy_baked_colour() {
             code: rgv_model::ModificationCode::Letter(b'm'),
             probability: Some(200),
             state: ModificationState::Modified,
+            color_by_type: true,
+        },
+        AlignmentComponent::ModifiedBase {
+            read_index: 0,
+            canonical_base: b'C',
+            code: rgv_model::ModificationCode::Letter(b'h'),
+            probability: Some(255),
+            state: ModificationState::Modified,
+            color_by_type: true,
+        },
+        AlignmentComponent::ModifiedBase {
+            read_index: 0,
+            canonical_base: b'A',
+            code: rgv_model::ModificationCode::Letter(b'a'),
+            probability: None,
+            state: ModificationState::Modified,
+            color_by_type: false,
+        },
+        AlignmentComponent::ModifiedBase {
+            read_index: 0,
+            canonical_base: b'C',
+            code: rgv_model::ModificationCode::Letter(b'f'),
+            probability: Some(140),
+            state: ModificationState::Modified,
+            color_by_type: true,
         },
         AlignmentComponent::ModifiedBase {
             read_index: 0,
@@ -3720,6 +3781,15 @@ fn light_palette_reproduces_every_legacy_baked_colour() {
             code: rgv_model::ModificationCode::Letter(b'm'),
             probability: None,
             state: ModificationState::Canonical,
+            color_by_type: true,
+        },
+        AlignmentComponent::ModifiedBase {
+            read_index: 0,
+            canonical_base: b'C',
+            code: rgv_model::ModificationCode::Letter(b'm'),
+            probability: Some(30),
+            state: ModificationState::Canonical,
+            color_by_type: false,
         },
         AlignmentComponent::BisulfiteBase {
             read_index: 0,

@@ -47,7 +47,20 @@ pub(crate) fn rgba_to_color32(color: rgv_layout::Rgba) -> egui::Color32 {
     )
 }
 
-fn collect_scene_modification_codes(snapshot: &AlignmentSceneSnapshot) -> Vec<ModificationCode> {
+/// One palette slot of `palette` as an egui colour.
+pub(crate) fn palette_color32(
+    palette: &rgv_render::palette::AlignmentPalette,
+    token: rgv_render::palette::PaletteToken,
+) -> egui::Color32 {
+    let [red, green, blue, alpha] = palette.color(token);
+    rgba_to_color32(rgv_layout::Rgba::new(red, green, blue, alpha))
+}
+
+/// The modification codes present in a scene: those of its exact summaries, then those the
+/// `MM` tags of its retained reads declare.
+pub(crate) fn collect_scene_modification_codes(
+    snapshot: &AlignmentSceneSnapshot,
+) -> Vec<ModificationCode> {
     let mut codes = std::collections::BTreeSet::new();
     for tile in snapshot.summaries().modification_tiles() {
         for series in &tile.summary().series {
@@ -59,7 +72,7 @@ fn collect_scene_modification_codes(snapshot: &AlignmentSceneSnapshot) -> Vec<Mo
     }
     if let Ok(discovered) = snapshot
         .reads()
-        .modification_codes(10_000, MAX_HIDDEN_MODIFICATION_CODES)
+        .declared_modification_codes(10_000, MAX_HIDDEN_MODIFICATION_CODES)
     {
         for code in discovered {
             codes.insert(code);

@@ -1420,6 +1420,10 @@ struct Viewer {
     locus_search_note: Option<workspace::navigation_controller::LocusSearchNote>,
     /// Derived strings of the read shown in the inspector, reused across frames.
     read_inspector_derived: std::cell::RefCell<crate::inspection::read::ReadInspectorDerivedCache>,
+    /// The modification codes each presented read panel's legend lists; see
+    /// [`ui::modification_legend`].
+    modification_legend_codes:
+        std::cell::RefCell<crate::ui::modification_legend::ModificationLegendCodes>,
     /// Window-shell policy state: unsaved-changes gate, notification window, newer-writer guard.
     shell: app::shell_state::ShellState,
     /// Health of the GPU device this viewer currently owns; shared with the wgpu callbacks.

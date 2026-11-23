@@ -568,6 +568,27 @@ impl Default for AlignmentStyleContract {
 }
 
 impl AlignmentStyleContract {
+    /// Whether a specialist-overlay page at `lod` reads the reference for its modification
+    /// cells: at base detail, with bases shown, a modification cell gives way to the mismatch
+    /// cell the read geometry draws on the same base.
+    #[must_use]
+    pub fn modification_overlay_reads_reference(self, lod: GeometryLod) -> bool {
+        lod == GeometryLod::Base
+            && self.show_modified_bases
+            && self.base_display != ReadBaseDisplayMode::Hidden
+    }
+
+    /// Whether a specialist-overlay page at `lod` reads the reference slice at all.
+    #[must_use]
+    pub fn specialist_overlay_reads_reference(self, lod: GeometryLod) -> bool {
+        (matches!(lod, GeometryLod::Read | GeometryLod::Base)
+            && matches!(
+                self.color_mode,
+                AlignmentColorMode::Bisulfite(_) | AlignmentColorMode::Ultima(_)
+            ))
+            || self.modification_overlay_reads_reference(lod)
+    }
+
     #[must_use]
     pub fn fingerprint(self) -> ContractFingerprint {
         let mut hash = StableHasher::default();
@@ -752,10 +773,18 @@ impl PresentationContract {
                     },
                 ]);
                 write_hidden_modification_codes(&mut hash, self.style.hidden_modification_codes);
-                if matches!(
-                    self.style.color_mode,
-                    AlignmentColorMode::Bisulfite(_) | AlignmentColorMode::Ultima(_)
-                ) {
+                if self
+                    .style
+                    .modification_overlay_reads_reference(self.geometry_lod)
+                {
+                    // Modification cells give way to mismatch cells, which depend on whether
+                    // bases are drawn and on the reference.
+                    hash.write(b"modification-mismatch-priority");
+                }
+                if self
+                    .style
+                    .specialist_overlay_reads_reference(self.geometry_lod)
+                {
                     write_optional_revision(
                         &mut hash,
                         self.reference.map(ReferenceRevision::fingerprint),

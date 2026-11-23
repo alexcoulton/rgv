@@ -577,6 +577,36 @@ mod tests {
     }
 
     #[test]
+    fn records_without_usable_tags_are_never_counted_as_unmodified() {
+        let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
+        // A tag-less supplementary copy of the read, and one whose MM was copied onto its
+        // hard-clipped sequence: neither adds a canonical observation (an "unmodified" vote).
+        let mut tagless = record("C+m,1;", Some(vec![128]), 0x800);
+        tagless.auxiliary_fields.clear();
+        let mut copied = record("C+m,1;", Some(vec![128]), 0x800);
+        copied.cigar.insert(
+            0,
+            CigarOp {
+                kind: CigarOpKind::HardClip,
+                len: 5,
+            },
+        );
+        let mut alone = ModificationSummaryBuilder::new(interval, 4);
+        alone.add_record(&record("C+m,1;", Some(vec![128]), 0));
+        let alone = alone.finish(1, true);
+        let mut builder = ModificationSummaryBuilder::new(interval, 4);
+        builder.add_record(&tagless);
+        builder.add_record(&record("C+m,1;", Some(vec![128]), 0));
+        builder.add_record(&copied);
+        let summary = builder.finish(3, true);
+        assert_eq!(summary.series, alone.series);
+        assert_eq!(summary.series[0].bins[1].canonical_observations, 1);
+        assert_eq!(summary.series[0].bins[2].raw_fraction(), Some(1.0));
+        assert_eq!(summary.provenance.records_with_modification_tags, 2);
+        assert_eq!(summary.provenance.unavailable_records, 1);
+    }
+
+    #[test]
     fn malformed_records_are_reported_without_failing_the_summary() {
         let interval = GenomicInterval::new(ContigId::new(0), 100, 104).unwrap();
         let mut builder = ModificationSummaryBuilder::new(interval, 4);

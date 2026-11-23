@@ -78,6 +78,51 @@ pub const SPECIALIST_BODY_COLORS: [[[f32; 4]; 2]; 4] = [
     [[0.52, 0.76, 0.86, 1.0], [0.86, 0.78, 0.62, 1.0]],
 ];
 
+/// Full colours of the base-modification classes in one palette.
+///
+/// They follow IGV's convention (5mC red, unmodified blue) but are deliberately deeper than the
+/// mismatch colours (T is a light red, C a light azure) and far from the insertion purple and
+/// the selection blue, so a modification cell is never read as a mismatch, an insertion or a
+/// selection. A test holds every palette to a minimum CIE76 difference from those colours.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ModificationColors {
+    /// No modification is the likelier state.
+    pub unmodified: [f32; 4],
+    pub five_methyl_c: [f32; 4],
+    pub five_hydroxymethyl_c: [f32; 4],
+    pub six_methyl_a: [f32; 4],
+    pub other: [f32; 4],
+}
+
+/// Alpha of the faint end of every modification ramp: a call whose two states are equally
+/// likely is a barely visible tint on its read.
+pub const MODIFICATION_FAINT_ALPHA: f32 = 0.15;
+
+/// The Light and Dark palettes' modification colours.
+pub const MODIFICATION_COLORS: ModificationColors = ModificationColors {
+    unmodified: [0.05, 0.05, 0.85, 1.0],
+    five_methyl_c: [0.62, 0.00, 0.08, 1.0],
+    // Dark amber: the light orange is the mismatch colour of G.
+    five_hydroxymethyl_c: [0.58, 0.38, 0.00, 1.0],
+    // Teal: the light green is the mismatch colour of A.
+    six_methyl_a: [0.00, 0.55, 0.60, 1.0],
+    // Pale cream: far from every base, the insertion purple and the other classes.
+    other: [0.95, 1.00, 0.70, 1.0],
+};
+
+/// The Okabe-Ito palettes give G black (light) or yellow (dark) and T vermillion, so 5hmC moves
+/// to whichever of yellow and amber stays clear of both under simulated dichromacy.
+pub const LIGHT_COLOR_BLIND_MODIFICATION_COLORS: ModificationColors = ModificationColors {
+    five_hydroxymethyl_c: [0.94, 0.80, 0.10, 1.0],
+    ..MODIFICATION_COLORS
+};
+
+pub const DARK_COLOR_BLIND_MODIFICATION_COLORS: ModificationColors = ModificationColors {
+    five_hydroxymethyl_c: [0.90, 0.62, 0.00, 1.0],
+    six_methyl_a: [0.00, 0.62, 0.68, 1.0],
+    ..MODIFICATION_COLORS
+};
+
 fn table_color<const N: usize>(table: &[[f32; 4]; N], rank: u8) -> [f32; 4] {
     table
         .get(usize::from(rank))
@@ -163,8 +208,13 @@ impl PaletteToken {
     pub const PAIR_CLASSIFICATION_FIRST: Self = Self(19);
     /// Eight slots indexed by `mode * 2 + reverse`.
     pub const SPECIALIST_BODY_FIRST: Self = Self(29);
-    pub const MODIFIED_BASE: Self = Self(37);
-    pub const CANONICAL_BASE: Self = Self(38);
+    /// A base-modification call where no modification is the likelier state (and implicitly
+    /// unmodified bases): the faint end of its probability ramp, then the full colour. Every
+    /// `MODIFICATION_*` pair is laid out `faint, full` so a cell can be drawn as a
+    /// [`PaletteColor::Ramp`] whose position is the call's confidence; see
+    /// [`crate::modification_style::modification_cell_color`].
+    pub const MODIFICATION_UNMODIFIED_FAINT: Self = Self(37);
+    pub const MODIFICATION_UNMODIFIED: Self = Self(38);
     pub const BISULFITE_PROTECTED: Self = Self(39);
     pub const BISULFITE_CONVERTED: Self = Self(40);
     /// Insertions, padding and the specialist indel markers.
@@ -203,8 +253,21 @@ impl PaletteToken {
     /// [`CLIP_GHOST_TINT`] and drawn with this slot's alpha. See
     /// [`AlignmentPalette::clip_ghost_color`].
     pub const CLIP_GHOST: Self = Self(67);
+    /// 5-methylcytosine (`C+m`), and every modification in the single-colour and
+    /// modified-versus-unmodified modes.
+    pub const MODIFICATION_5MC_FAINT: Self = Self(68);
+    pub const MODIFICATION_5MC: Self = Self(69);
+    /// 5-hydroxymethylcytosine (`C+h`).
+    pub const MODIFICATION_5HMC_FAINT: Self = Self(70);
+    pub const MODIFICATION_5HMC: Self = Self(71);
+    /// N6-methyladenine (`A+a`).
+    pub const MODIFICATION_6MA_FAINT: Self = Self(72);
+    pub const MODIFICATION_6MA: Self = Self(73);
+    /// Every other modification code.
+    pub const MODIFICATION_OTHER_FAINT: Self = Self(74);
+    pub const MODIFICATION_OTHER: Self = Self(75);
     /// One past the last assigned slot.
-    pub const END: Self = Self(68);
+    pub const END: Self = Self(76);
 
     #[must_use]
     pub const fn index(self) -> u8 {
@@ -346,8 +409,9 @@ impl AlignmentPalette {
         }
     }
 
-    /// Blends `color` towards the interaction colour of the strongest active state, exactly as
-    /// `interaction_color` in `alignment_scene.wgsl` does. Returns `color` when nothing is active.
+    /// Blends `color` towards the interaction colour of the strongest active state, keeping its
+    /// alpha, exactly as `interaction_color` in `alignment_scene.wgsl` does. Returns `color` when
+    /// nothing is active.
     #[must_use]
     pub fn interaction_color(
         &self,
@@ -369,7 +433,8 @@ impl AlignmentPalette {
         for channel in 0..3 {
             color[channel] += (target[channel] - color[channel]) * amount;
         }
-        color[3] = 1.0;
+        // The alpha is kept: a faint (low-confidence) modification cell on a selected read
+        // stays faint rather than becoming an opaque block.
         color
     }
 
@@ -422,8 +487,7 @@ impl AlignmentPalette {
         palette.set_run(T::PAIR_ORIENTATION_FIRST, PAIR_ORIENTATION_COLORS);
         palette.set_run(T::PAIR_CLASSIFICATION_FIRST, PAIR_CLASSIFICATION_COLORS);
         palette.set_specialist_bodies(SPECIALIST_BODY_COLORS);
-        palette.set(T::MODIFIED_BASE, [0.58, 0.24, 0.78, 1.0]);
-        palette.set(T::CANONICAL_BASE, [0.42, 0.42, 0.48, 1.0]);
+        palette.set_modifications(MODIFICATION_COLORS);
         palette.set(T::BISULFITE_PROTECTED, [0.86, 0.46, 0.12, 1.0]);
         palette.set(T::BISULFITE_CONVERTED, [0.18, 0.62, 0.78, 1.0]);
         palette.set(T::INSERTION, [0.55, 0.20, 0.70, 1.0]);
@@ -437,8 +501,7 @@ impl AlignmentPalette {
         palette.set(T::INTERACTION_SELECTED_CHAIN, [0.90, 0.62, 0.16, 1.0]);
         palette.set(T::INTERACTION_HIGHLIGHTED, [0.96, 0.70, 0.12, 1.0]);
         palette.set(T::SUMMARY_DEPTH, [0.48, 0.48, 0.48, 1.0]);
-        palette.set(T::SUMMARY_MODIFICATION, [0.90, 0.24, 0.92, 0.92]);
-        palette.set(T::SUMMARY_MODIFICATION_BACKGROUND, [0.14, 0.44, 0.82, 0.20]);
+        palette.set_modification_summary();
         palette.set(T::JUNCTION_POSITIVE, [0.84, 0.30, 0.38, 0.82]);
         palette.set(T::JUNCTION_NEGATIVE, [0.25, 0.45, 0.82, 0.82]);
         palette.set(T::JUNCTION_UNKNOWN, [0.42, 0.45, 0.50, 0.76]);
@@ -454,6 +517,38 @@ impl AlignmentPalette {
         palette.set(T::CLIP_EDGE, [0.12, 0.12, 0.14, 1.0]);
         palette.set(T::CLIP_GHOST, [1.0, 1.0, 1.0, 0.45]);
         palette
+    }
+
+    /// Sets every modification pair from its full colour: the faint end is the same colour at
+    /// [`MODIFICATION_FAINT_ALPHA`], so a low-confidence call fades towards whatever the read
+    /// body beneath it is drawn in.
+    fn set_modifications(&mut self, colors: ModificationColors) {
+        use PaletteToken as T;
+        for (faint, color) in [
+            (T::MODIFICATION_UNMODIFIED_FAINT, colors.unmodified),
+            (T::MODIFICATION_5MC_FAINT, colors.five_methyl_c),
+            (T::MODIFICATION_5HMC_FAINT, colors.five_hydroxymethyl_c),
+            (T::MODIFICATION_6MA_FAINT, colors.six_methyl_a),
+            (T::MODIFICATION_OTHER_FAINT, colors.other),
+        ] {
+            self.set_run(
+                faint,
+                [
+                    [color[0], color[1], color[2], MODIFICATION_FAINT_ALPHA],
+                    color,
+                ],
+            );
+        }
+    }
+
+    /// The modification summary lane draws modified fractions in the 5mC colour and the
+    /// unmodified band in the unmodified colour, as the read stack does.
+    fn set_modification_summary(&mut self) {
+        use PaletteToken as T;
+        let [r, g, b, _] = self.color(T::MODIFICATION_5MC);
+        self.set(T::SUMMARY_MODIFICATION, [r, g, b, 0.92]);
+        let [r, g, b, _] = self.color(T::MODIFICATION_UNMODIFIED);
+        self.set(T::SUMMARY_MODIFICATION_BACKGROUND, [r, g, b, 0.20]);
     }
 
     fn set_specialist_bodies(&mut self, bodies: [[[f32; 4]; 2]; 4]) {
@@ -507,15 +602,12 @@ impl AlignmentPalette {
             [[0.40, 0.32, 0.56, 1.0], [0.58, 0.28, 0.36, 1.0]],
             [[0.24, 0.46, 0.56, 1.0], [0.56, 0.48, 0.32, 1.0]],
         ]);
-        palette.set(T::MODIFIED_BASE, [0.72, 0.40, 0.92, 1.0]);
-        palette.set(T::CANONICAL_BASE, [0.58, 0.58, 0.64, 1.0]);
         palette.set(T::INSERTION, [0.74, 0.42, 0.90, 1.0]);
         palette.set(T::DELETION, [0.88, 0.88, 0.90, 1.0]);
         palette.set(T::SKIP, [0.62, 0.64, 0.70, 1.0]);
         palette.set(T::INTERACTION_SELECTED, [0.40, 0.62, 1.00, 1.0]);
         palette.set(T::INTERACTION_HOVERED, [0.50, 0.70, 1.00, 1.0]);
         palette.set(T::SUMMARY_DEPTH, [0.56, 0.57, 0.60, 1.0]);
-        palette.set(T::SUMMARY_MODIFICATION_BACKGROUND, [0.35, 0.60, 0.95, 0.25]);
         palette.set(T::JUNCTION_UNKNOWN, [0.62, 0.65, 0.70, 0.76]);
         palette.set(T::JUNCTION_BASELINE, [0.70, 0.72, 0.76, 0.24]);
         palette.set(T::JUNCTION_ANNOTATED, [0.25, 0.72, 0.38, 1.0]);
@@ -596,7 +688,12 @@ impl AlignmentPalette {
                 [0.32, 0.26, 0.95, 1.0],
             ],
         );
-        self.set(T::MODIFIED_BASE, okabe_ito::REDDISH_PURPLE);
+        self.set_modifications(if dark {
+            DARK_COLOR_BLIND_MODIFICATION_COLORS
+        } else {
+            LIGHT_COLOR_BLIND_MODIFICATION_COLORS
+        });
+        self.set_modification_summary();
         self.set(T::BISULFITE_PROTECTED, okabe_ito::ORANGE);
         self.set(T::BISULFITE_CONVERTED, okabe_ito::SKY_BLUE);
         let with_alpha = |color: [f32; 4], alpha: f32| [color[0], color[1], color[2], alpha];
@@ -1214,6 +1311,87 @@ mod tests {
             let palette = AlignmentPalette::for_theme(theme);
             assert!(minimum_delta_e(&run(&palette, T::BASE_A, 4)) < 30.0);
             assert!(minimum_delta_e(&run(&palette, T::PAIR_CLASSIFICATION_FIRST, 10)) < 12.0);
+        }
+    }
+
+    /// CIE76 difference between two colours under one vision.
+    fn delta_e(left: [f32; 4], right: [f32; 4], vision: &[[f64; 3]; 3]) -> f64 {
+        let (left, right) = (simulated_lab(left, vision), simulated_lab(right, vision));
+        (0..3)
+            .map(|axis| (left[axis] - right[axis]).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    #[test]
+    fn modification_colours_stay_clear_of_insertions_mismatches_and_selection() {
+        use PaletteToken as T;
+        let modifications = [
+            ("unmodified", T::MODIFICATION_UNMODIFIED),
+            ("5mC", T::MODIFICATION_5MC),
+            ("5hmC", T::MODIFICATION_5HMC),
+            ("6mA", T::MODIFICATION_6MA),
+            ("other", T::MODIFICATION_OTHER),
+        ];
+        let neighbours = [
+            ("insertion", T::INSERTION),
+            ("A", T::BASE_A),
+            ("C", T::BASE_C),
+            ("G", T::BASE_G),
+            ("T", T::BASE_T),
+            ("selection", T::INTERACTION_SELECTED),
+            ("hover", T::INTERACTION_HOVERED),
+            ("read body", T::READ_NEUTRAL),
+        ];
+        for theme in ThemeId::ALL {
+            let palette = AlignmentPalette::for_theme(theme);
+            // Normal vision everywhere; the colour-blind palettes also under simulated
+            // protanopia and deuteranopia. Ten is roughly four just-noticeable differences.
+            let mut floors = vec![(&NORMAL, 20.0)];
+            if matches!(theme, ThemeId::LightColorBlind | ThemeId::DarkColorBlind) {
+                floors.extend([(&PROTANOPIA, 15.0), (&DEUTERANOPIA, 15.0)]);
+            }
+            for (vision, floor) in floors {
+                for (index, (name, token)) in modifications.iter().enumerate() {
+                    let color = palette.color(*token);
+                    for (other, neighbour) in neighbours {
+                        let delta = delta_e(color, palette.color(neighbour), vision);
+                        assert!(
+                            delta >= floor,
+                            "{theme:?}: {name} is only {delta:.1} from {other}"
+                        );
+                    }
+                    for (other, token) in &modifications[index + 1..] {
+                        let delta = delta_e(color, palette.color(*token), vision);
+                        assert!(
+                            delta >= floor,
+                            "{theme:?}: {name} is only {delta:.1} from {other}"
+                        );
+                    }
+                }
+            }
+            for (name, token) in modifications {
+                let full = palette.color(token);
+                assert!((full[3] - 1.0).abs() < 1.0e-6, "{theme:?}: {name}");
+                // The faint end of each ramp is the same colour, translucent.
+                let faint = palette.color(PaletteToken(token.0 - 1));
+                assert_same(
+                    [faint[0], faint[1], faint[2], 1.0],
+                    [full[0], full[1], full[2], 1.0],
+                );
+                assert!((faint[3] - MODIFICATION_FAINT_ALPHA).abs() < 1.0e-6);
+            }
+            // The summary lane draws in the read stack's colours.
+            let summary = palette.color(T::SUMMARY_MODIFICATION);
+            assert_same(
+                [summary[0], summary[1], summary[2], 1.0],
+                palette.color(T::MODIFICATION_5MC),
+            );
+            let background = palette.color(T::SUMMARY_MODIFICATION_BACKGROUND);
+            assert_same(
+                [background[0], background[1], background[2], 1.0],
+                palette.color(T::MODIFICATION_UNMODIFIED),
+            );
         }
     }
 

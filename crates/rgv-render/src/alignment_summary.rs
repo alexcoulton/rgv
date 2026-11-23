@@ -26,7 +26,7 @@ use rgv_core::{
     BisulfiteContext, CoverageScaleTransform, GenomicInterval, JunctionDisplayMode,
     ModifiedBaseColorMode, SashimiCountMode, SashimiLabelMode,
 };
-use rgv_layout::{MAX_RENDERED_JUNCTION_LABELS, modification_code_color};
+use rgv_layout::MAX_RENDERED_JUNCTION_LABELS;
 use rgv_model::{
     JunctionEvidence, ModificationBin, ModificationCode, ModificationSeriesKey,
     SashimiPresentationTable,

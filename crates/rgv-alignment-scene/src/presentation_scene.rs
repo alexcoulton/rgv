@@ -555,6 +555,37 @@ impl AlignmentPresentationScene {
         Ok(codes.into_iter().collect())
     }
 
+    /// The modification codes the `MM` tags of a bounded prefix of the retained population
+    /// declare, read from the group headers alone (no call is decoded and no record
+    /// materialised), so it is cheap enough for a legend refreshed with each scene.
+    pub fn declared_modification_codes(
+        &self,
+        maximum_records: usize,
+        maximum_codes: usize,
+    ) -> Result<Vec<ModificationCode>, AlignmentExportError> {
+        let mut codes = BTreeSet::new();
+        if maximum_codes == 0 {
+            return Ok(Vec::new());
+        }
+        let selection = self.evidence.select(self.prepared_interval)?;
+        for index in 0..selection.len().min(maximum_records) {
+            let mm = match selection.auxiliary_field(index, *b"MM")? {
+                Some(field) => Some(field),
+                None => selection.auxiliary_field(index, *b"Mm")?,
+            };
+            for code in mm
+                .iter()
+                .flat_map(|field| rgv_model::modification_codes_in_tag(&field.value))
+            {
+                codes.insert(code);
+                if codes.len() == maximum_codes {
+                    return Ok(codes.into_iter().collect());
+                }
+            }
+        }
+        Ok(codes.into_iter().collect())
+    }
+
     #[must_use]
     pub fn contains_handle(&self, handle: AlignmentHandle) -> bool {
         self.evidence.contains_handle(handle)

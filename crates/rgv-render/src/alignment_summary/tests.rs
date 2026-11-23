@@ -730,7 +730,9 @@ fn assert_near(left: f64, right: f64) {
 fn summary_instance_sizes_are_pinned_and_depth_spans_are_validated() {
     assert_eq!(size_of::<AlignmentSummaryGpuDepthInstance>(), 12);
     assert_eq!(size_of::<AlignmentSummaryGpuAlleleInstance>(), 64);
-    assert_eq!(size_of::<AlignmentSummaryGpuModificationInstance>(), 72);
+    // Deliberately 56 (was 72): the by-type colour is a palette slot, not an inline RGBA, so
+    // the lane follows the theme.
+    assert_eq!(size_of::<AlignmentSummaryGpuModificationInstance>(), 56);
     assert_eq!(size_of::<AlignmentSummaryGpuJunctionInstance>(), 48);
     assert_eq!(size_of::<AlignmentSummaryGpuOverlayInstance>(), 24);
     assert_eq!(

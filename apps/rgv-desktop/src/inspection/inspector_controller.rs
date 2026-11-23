@@ -16,8 +16,7 @@ use rgv_core::{GenomicInterval, OverlappingMatePolicy, SashimiCountMode};
 use rgv_hts::{
     AlignmentRecord, AuxValue, CigarOpKind, QUALITY_WEIGHT_SCALE, SequenceData,
     UltimaTagOrientation, analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse,
-    decode_modified_bases, pair_evidence, smrt_kinetics_series, summarize_bisulfite_record,
-    summarize_sbx_record,
+    pair_evidence, smrt_kinetics_series, summarize_bisulfite_record, summarize_sbx_record,
 };
 use rgv_layout::{AlignmentColorMode, JunctionAnnotationStatus, JunctionArcComponent};
 use std::fmt::Write as _;
@@ -213,10 +212,7 @@ impl Viewer {
             .borrow_mut()
             .get_or_compute(&record, |record| {
                 crate::inspection::read::ReadInspectorDerived {
-                    modified_bases: decode_modified_bases(record).map_or_else(
-                        |error| format!("error: {error}"),
-                        |calls| calls.len().to_string(),
-                    ),
+                    modified_bases: crate::inspection::read::modified_base_calls_text(record),
                     cigar: format_cigar(&record.cigar),
                 }
             });

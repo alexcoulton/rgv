@@ -5,6 +5,7 @@ mod alignment_summary;
 mod context_scene;
 mod device_health;
 mod gpu_export;
+pub mod modification_style;
 mod paged_cache;
 pub mod palette;
 #[cfg(test)]

@@ -6,6 +6,7 @@ pub(crate) mod icons;
 pub(crate) mod inspectors;
 pub(crate) mod interaction;
 mod menu;
+pub(crate) mod modification_legend;
 mod navigation;
 pub(crate) mod presented_text;
 pub(crate) mod shell;

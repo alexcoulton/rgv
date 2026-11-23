@@ -414,10 +414,22 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   provenance. Expanded, Squished, and Collapsed buttons set useful read-row
   densities, while the right overview remains available for continuous adjustment. Lane visibility,
   fixed scale, and the exact continuous density survive session round trips.
-- Modified-base controls use stable colours per `MM` modification code, a live legend with
-  per-code visibility, a `ML` probability threshold for markers on individual reads, and optional
-  single-colour or modified-versus-unmodified display. Unknown skipped-base mode is never treated
-  as evidence of an unmodified canonical base.
+- Modified-base calls (`MM`/`ML`) are drawn on reads in IGV's convention: each called base shows
+  its likelier state, a modification in its type's colour (5mC red, 5hmC amber, 6mA teal, any other
+  code cream) or, when no modification is likelier, blue. Colour strength is the call probability:
+  low-confidence calls fade towards the read. Single-colour and modified-versus-unmodified modes
+  draw every modification red. A mismatch takes priority: a base drawn as a mismatch at base detail
+  shows no modification. These colours stay clear of the insertion purple, the mismatch colours and
+  the selection blue in every theme, colour-blind ones included.
+- When modification colouring is on, a compact legend at the right of the read panel's header row
+  (above the first read) lists the codes present in the loaded reads; hover it for an explanation.
+  Track settings list the same codes with per-code visibility and a `ML` probability threshold.
+  Exports draw the same legend.
+- A read without usable modification calls (no `MM`/`ML` tags, as on most supplementary or
+  secondary alignments, or tags that cannot be placed on a hard-clipped alignment without a matching
+  `MN`) is drawn as an ordinary read. The read inspector's **Modified-base calls** field says why it
+  has none. Such reads never count as unmodified in the Modifications lane, and an unknown
+  skipped-base mode is never treated as evidence of an unmodified canonical base.
 - The alignment **Colour** control includes reference-aware bisulfite modes for CG, CHG, CHH, HCG,
   GCH, and WCG contexts. Forward/first-of-pair-forward templates have grey bodies and reverse
   templates have sage bodies. Red C/G marks mean protected or nonconverted cytosines; blue T/A
@@ -726,8 +738,9 @@ When enabled, the pinned **Modifications** lane appears beneath coverage at regi
 detail. Its bars show the dominant visible modification type at each exact site or bounded genomic
 bin. Bar height is the raw modified/canonical fraction when the `MM` skipped-base mode establishes a
 canonical denominator; otherwise it uses mean call probability only as a display score and the
-fraction remains explicitly unavailable. In modified-versus-unmodified mode, blue is canonical
-evidence and magenta is modified evidence.
+fraction remains explicitly unavailable. By type, bars use the read colours (5mC red, 5hmC amber,
+6mA teal, others cream); in the other modes modified evidence is red and, in
+modified-versus-unmodified mode, blue is canonical evidence.
 
 Click the lane to inspect every modification series in that bin, including canonical base,
 modification code and strand, optional `HP`, raw and probability-weighted fractions, alignment

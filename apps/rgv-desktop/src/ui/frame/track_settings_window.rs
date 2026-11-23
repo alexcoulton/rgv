@@ -6,7 +6,7 @@ use crate::app::alignment_context::{
 use crate::display::auxiliary::alignment_sort_position;
 use crate::ui::alignment_settings::{
     alignment_style_controls, modification_code_label, modified_base_color_mode_label,
-    read_base_display_mode_label, rgba_to_color32,
+    palette_color32, read_base_display_mode_label,
 };
 use crate::ui::frame::ShellFrame;
 use crate::ui::track_settings::{
@@ -23,7 +23,7 @@ use rgv_core::{
     ReferenceTranslationFrame, SashimiCountMode, SashimiLabelMode, SashimiScaleMode, TrackId,
     TranscriptDisplay,
 };
-use rgv_layout::{AlignmentSortMode, MAX_HIDDEN_MODIFICATION_CODES, modification_code_color};
+use rgv_layout::{AlignmentSortMode, MAX_HIDDEN_MODIFICATION_CODES};
 
 impl Viewer {
     pub(super) fn show_track_settings_window(&self, ui: &mut egui::Ui, st: &mut ShellFrame) {
@@ -771,15 +771,39 @@ impl Viewer {
                 .labelled_by(label.id);
         });
         if !st.align.available_modification_codes.is_empty() {
-            ui.label("Modification legend and visibility");
+            ui.label("Modification legend and visibility")
+                .on_hover_text(rgv_render::modification_style::MODIFICATION_LEGEND_HELP);
+            let palette = *crate::theme::active().palette();
+            let swatch = |ui: &mut egui::Ui, token| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, 1.0, palette_color32(&palette, token));
+            };
             for code in &st.align.available_modification_codes {
                 let mut visible = !st.align.hidden_modification_codes.contains(code);
-                let label = modification_code_label(*code);
-                let color = rgba_to_color32(modification_code_color(*code));
-                if ui
-                    .checkbox(&mut visible, egui::RichText::new(label).color(color))
-                    .changed()
-                {
+                let name = rgv_render::modification_style::modification_code_name(*code);
+                let written = modification_code_label(*code);
+                let label = if name == written {
+                    name
+                } else {
+                    format!("{name} ({written})")
+                };
+                let token = match st.align.modified_base_color_mode {
+                    ModifiedBaseColorMode::ByType => {
+                        rgv_render::modification_style::modification_type_token(*code)
+                    }
+                    ModifiedBaseColorMode::Mono | ModifiedBaseColorMode::ModifiedVsUnmodified => {
+                        rgv_render::palette::PaletteToken::MODIFICATION_5MC
+                    }
+                };
+                let changed = ui
+                    .horizontal(|ui| {
+                        swatch(ui, token);
+                        ui.checkbox(&mut visible, label).changed()
+                    })
+                    .inner;
+                if changed {
                     if visible {
                         st.align
                             .hidden_modification_codes
@@ -791,6 +815,17 @@ impl Viewer {
                     }
                 }
             }
+            ui.horizontal(|ui| {
+                swatch(
+                    ui,
+                    rgv_render::palette::PaletteToken::MODIFICATION_UNMODIFIED,
+                );
+                ui.label("unmodified (no modification is likelier)");
+            });
+            ui.small(
+                "Colour strength is the call probability (ML): faint cells are low-confidence \
+                 calls. Reads without MM/ML tags are drawn normally.",
+            );
         }
     }
 

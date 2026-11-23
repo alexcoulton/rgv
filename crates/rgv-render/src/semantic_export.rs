@@ -8,7 +8,7 @@ use rgv_alignment_scene::{
     TransientResourceClass, TransientResourceReservation,
 };
 use rgv_core::ModifiedBaseColorMode;
-use rgv_layout::{DisplayList, RectPrimitive, RectShape, Rgba, modification_code_color};
+use rgv_layout::{DisplayList, RectPrimitive, RectShape, Rgba};
 use std::{collections::HashMap, io};
 
 use crate::palette::{AlignmentPalette, PaletteToken};
@@ -724,11 +724,11 @@ fn summary_color(
             JunctionAnnotationStatus::Unknown => T::SUMMARY_NEUTRAL,
         },
         C::Modification { series, .. } => match options {
-            // Open-ended: one colour per modification code, the same under every theme.
+            // The read stack's type colour, so the lane and the reads agree under every theme.
             AlignmentDerivedLaneOptions::Modifications(options)
                 if options.color_mode == ModifiedBaseColorMode::ByType =>
             {
-                return modification_code_color(series.code);
+                crate::modification_style::modification_type_token(series.code)
             }
             _ => T::SUMMARY_MODIFICATION,
         },

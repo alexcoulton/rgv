@@ -265,8 +265,13 @@ pub enum AlignmentComponent {
         read_index: u32,
         canonical_base: u8,
         code: rgv_model::ModificationCode,
+        /// For [`ModificationState::Modified`], the shown code's `ML` value; for
+        /// [`ModificationState::Canonical`], the summed probability of every modification
+        /// called at the base, or `None` for an implicitly unmodified base.
         probability: Option<u8>,
         state: ModificationState,
+        /// Drawn in the code's type colour rather than the single modification colour.
+        color_by_type: bool,
     },
     BisulfiteBase {
         read_index: u32,
@@ -514,9 +519,12 @@ fn page_paint_key(
     )
 }
 
+/// The likelier state of a base with modification calls.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ModificationState {
+    /// The cell's code is the likeliest modification, at least as likely as none.
     Modified,
+    /// No modification is the likelier state (or the base is implicitly unmodified).
     Canonical,
 }
 
@@ -971,6 +979,7 @@ impl AlignmentSemanticPage {
                     selection_index,
                     record,
                     presentation.style,
+                    key.lod,
                     reference,
                     interval,
                 )?
@@ -1596,17 +1605,32 @@ const fn classification_rank(value: PairClassification) -> u8 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_specialist_overlays(
     selection: &crate::EvidenceSelection,
     index: usize,
     record: rgv_model::AlignmentRecordView<'_>,
     style: AlignmentStyleContract,
+    lod: GeometryLod,
     reference: Option<&ReferenceSlice>,
     tile: GenomicInterval,
 ) -> Result<Vec<PreparedOverlay>, SemanticPageError> {
     let mut output = Vec::new();
     if style.show_modified_bases {
-        prepare_modified_base_overlays(selection, index, record, style, tile, &mut output)?;
+        // Mismatch cells are drawn at base detail only, and only when bases are shown at all;
+        // there a mismatch takes priority over a modification on the same base.
+        let mismatches = style
+            .modification_overlay_reads_reference(lod)
+            .then_some(MismatchPriority { reference });
+        prepare_modified_base_overlays(
+            selection,
+            index,
+            record,
+            style,
+            mismatches,
+            tile,
+            &mut output,
+        )?;
     }
     match style.color_mode {
         AlignmentColorMode::Bisulfite(context) => {
@@ -1643,11 +1667,56 @@ fn prepare_specialist_overlays(
     Ok(output)
 }
 
+/// The reference against which modification cells give way to mismatch cells. `reference` is
+/// `None` while no FASTA slice is available: then only `X` operations are mismatches, exactly as
+/// the read geometry classifies them.
+#[derive(Clone, Copy)]
+struct MismatchPriority<'a> {
+    reference: Option<&'a ReferenceSlice>,
+}
+
+impl MismatchPriority<'_> {
+    /// Whether the read geometry draws the base `base` aligned at `position` by an operation of
+    /// `kind` as a mismatch cell.
+    fn is_mismatch(self, kind: CigarOpKind, base: u8, position: u64) -> bool {
+        !matches!(
+            classify_aligned_base(
+                kind,
+                Some(base),
+                self.reference
+                    .and_then(|reference| reference.base_at(position))
+            ),
+            AlignedBaseClassification::Match | AlignedBaseClassification::Unknown
+        )
+    }
+}
+
+/// Every call of one record at one base: what decides the cell drawn there.
+#[derive(Clone, Copy)]
+struct BaseModificationCalls {
+    canonical_base: u8,
+    /// Summed probability (of 255) of every modification called at the base; a call without
+    /// `ML` counts as certain.
+    total: u32,
+    /// The likeliest call of a shown code: its code, `ML` value and effective probability.
+    best_shown: Option<(rgv_model::ModificationCode, Option<u8>, u8)>,
+    /// The effective probability of the likeliest call of a hidden code.
+    best_hidden: u8,
+}
+
+/// The modification cells of one record, one per called base, showing its likelier state as IGV
+/// does: the likeliest shown modification when it is at least as likely as no modification,
+/// else "unmodified" (blue). A record with no usable calls (no `MM` tag at all, or an `MM` tag
+/// that cannot be placed on its stored sequence, as on a hard-clipped supplementary alignment
+/// without a matching `MN`, or one that cannot be parsed) gets no overlay at all and is drawn
+/// as an ordinary read; the read inspector says why it has no calls.
+#[allow(clippy::too_many_lines)]
 fn prepare_modified_base_overlays(
     selection: &crate::EvidenceSelection,
     index: usize,
     record: rgv_model::AlignmentRecordView<'_>,
     style: AlignmentStyleContract,
+    mismatches: Option<MismatchPriority<'_>>,
     tile: GenomicInterval,
     output: &mut Vec<PreparedOverlay>,
 ) -> Result<(), SemanticPageError> {
@@ -1664,7 +1733,7 @@ fn prepare_modified_base_overlays(
     let ml = ml_upper.as_ref().or(ml_lower.as_ref());
     // `MM` counts bases of the sequence it was written against. A hard-clipped record (or one
     // whose `MN` disagrees with the stored sequence) would place every call on the wrong base,
-    // so it is reported unavailable: the same decision the exact modification summary makes.
+    // so it has no usable calls: the same decision the exact modification summary makes.
     let mn = selection.auxiliary_field(index, *b"MN")?;
     let mn = mn.as_ref().map(|field| &field.value);
     let hard_clipped = record
@@ -1672,13 +1741,6 @@ fn prepare_modified_base_overlays(
         .iter()
         .any(|operation| operation.kind == CigarOpKind::HardClip);
     if !modified_bases_resolvable(bases.len(), mn, hard_clipped) {
-        push_unavailable(
-            output,
-            record,
-            tile,
-            SpecialistMode::ModifiedBases,
-            SpecialistUnavailableReason::MissingRecordData,
-        );
         return Ok(());
     }
     let Ok(calls) = decode_modified_bases_parts_checked(
@@ -1689,112 +1751,127 @@ fn prepare_modified_base_overlays(
         mn,
         hard_clipped,
     ) else {
-        push_unavailable(
-            output,
-            record,
-            tile,
-            SpecialistMode::ModifiedBases,
-            SpecialistUnavailableReason::MalformedRecordData,
-        );
         return Ok(());
     };
-    let mut canonical_groups = Vec::<(u8, rgv_model::ModificationCode, BTreeSet<usize>)>::new();
+    let color_by_type = style.modified_base_color_mode == ModifiedBaseColorMode::ByType;
+    let minimum = style.minimum_modification_probability;
+    let hidden = |code| style.hidden_modification_codes.contains(&Some(code));
+    let mut called = std::collections::BTreeMap::<usize, BaseModificationCalls>::new();
+    let mut canonical_groups = BTreeSet::<(u8, rgv_model::ModificationCode)>::new();
     for call in &calls {
-        if style.hidden_modification_codes.contains(&Some(call.code))
-            || (style.minimum_modification_probability > 0
-                && call
-                    .probability
-                    .is_none_or(|probability| probability < style.minimum_modification_probability))
-        {
+        let effective = call.probability.unwrap_or(u8::MAX);
+        let base = called
+            .entry(call.sequencer_position)
+            .or_insert(BaseModificationCalls {
+                canonical_base: call.canonical_base,
+                total: 0,
+                best_shown: None,
+                best_hidden: 0,
+            });
+        base.total = base.total.saturating_add(u32::from(effective));
+        if hidden(call.code) {
+            base.best_hidden = base.best_hidden.max(effective);
             continue;
         }
-        let Some(read_index) = aligned_position_for_sequencer_position(
-            bases.len(),
-            record.flags(),
-            call.sequencer_position,
-        ) else {
-            continue;
-        };
-        let Some(position) =
-            reference_position_for_read_position(record.start(), record.cigar(), read_index)
-        else {
-            continue;
-        };
-        if tile.contains(position) {
-            output.push(PreparedOverlay {
-                end_anchored: false,
-                start: position,
-                end: position.saturating_add(1),
-                component: AlignmentComponent::ModifiedBase {
-                    read_index: u32::try_from(read_index)
-                        .map_err(|_| SemanticPageError::ReadCoordinateOverflow)?,
-                    canonical_base: call.canonical_base,
-                    code: call.code,
-                    probability: call.probability,
-                    state: ModificationState::Modified,
-                },
-            });
+        if base.best_shown.is_none_or(|(_, _, best)| effective > best) {
+            base.best_shown = Some((call.code, call.probability, effective));
         }
         if style.modified_base_color_mode == ModifiedBaseColorMode::ModifiedVsUnmodified
             && call.implicit_mode == ImplicitModificationMode::Canonical
         {
-            if let Some((_, _, positions)) = canonical_groups
-                .iter_mut()
-                .find(|(base, code, _)| *base == call.canonical_base && *code == call.code)
-            {
-                positions.insert(call.sequencer_position);
-            } else {
-                canonical_groups.push((
-                    call.canonical_base,
-                    call.code,
-                    BTreeSet::from([call.sequencer_position]),
-                ));
-            }
+            canonical_groups.insert((call.canonical_base, call.code));
         }
     }
-    if style.modified_base_color_mode == ModifiedBaseColorMode::ModifiedVsUnmodified {
-        for (canonical_base, code, called) in canonical_groups {
-            for sequencer_position in 0..bases.len() {
-                if called.contains(&sequencer_position)
-                    || !sequencer_base_matches(
-                        bases,
-                        record.flags(),
-                        sequencer_position,
-                        canonical_base,
-                    )
-                {
-                    continue;
-                }
-                let Some(read_index) = aligned_position_for_sequencer_position(
-                    bases.len(),
+    let mut push = |sequencer_position: usize,
+                    canonical_base: u8,
+                    code: rgv_model::ModificationCode,
+                    probability: Option<u8>,
+                    state: ModificationState|
+     -> Result<(), SemanticPageError> {
+        let Some(read_index) = aligned_position_for_sequencer_position(
+            bases.len(),
+            record.flags(),
+            sequencer_position,
+        ) else {
+            return Ok(());
+        };
+        let Some((position, kind)) =
+            reference_position_for_read_position(record.start(), record.cigar(), read_index)
+        else {
+            return Ok(());
+        };
+        if !tile.contains(position)
+            || mismatches.is_some_and(|mismatches| {
+                bases
+                    .get(read_index)
+                    .is_some_and(|base| mismatches.is_mismatch(kind, *base, position))
+            })
+        {
+            return Ok(());
+        }
+        output.push(PreparedOverlay {
+            end_anchored: false,
+            start: position,
+            end: position.saturating_add(1),
+            component: AlignmentComponent::ModifiedBase {
+                read_index: u32::try_from(read_index)
+                    .map_err(|_| SemanticPageError::ReadCoordinateOverflow)?,
+                canonical_base,
+                code,
+                probability,
+                state,
+                color_by_type,
+            },
+        });
+        Ok(())
+    };
+    for (&sequencer_position, base) in &called {
+        let Some((code, probability, best)) = base.best_shown else {
+            continue;
+        };
+        let modified = u8::try_from(base.total.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
+        let unmodified = u8::MAX - modified;
+        if best >= unmodified && best >= base.best_hidden {
+            if minimum == 0 || probability.is_some_and(|probability| probability >= minimum) {
+                push(
+                    sequencer_position,
+                    base.canonical_base,
+                    code,
+                    probability,
+                    ModificationState::Modified,
+                )?;
+            }
+        } else if unmodified > best && unmodified >= base.best_hidden && unmodified >= minimum {
+            push(
+                sequencer_position,
+                base.canonical_base,
+                code,
+                Some(modified),
+                ModificationState::Canonical,
+            )?;
+        }
+    }
+    // Under `.` (implicitly unmodified) groups, every uncalled base of the canonical base is
+    // unmodified; the modified-versus-unmodified mode draws those too.
+    for (canonical_base, code) in canonical_groups {
+        for sequencer_position in 0..bases.len() {
+            if called.contains_key(&sequencer_position)
+                || !sequencer_base_matches(
+                    bases,
                     record.flags(),
                     sequencer_position,
-                ) else {
-                    continue;
-                };
-                let Some(position) = reference_position_for_read_position(
-                    record.start(),
-                    record.cigar(),
-                    read_index,
-                ) else {
-                    continue;
-                };
-                if tile.contains(position) {
-                    output.push(PreparedOverlay {
-                        end_anchored: false,
-                        start: position,
-                        end: position.saturating_add(1),
-                        component: AlignmentComponent::ModifiedBase {
-                            read_index: u32::try_from(read_index)
-                                .map_err(|_| SemanticPageError::ReadCoordinateOverflow)?,
-                            canonical_base,
-                            code,
-                            probability: None,
-                            state: ModificationState::Canonical,
-                        },
-                    });
-                }
+                    canonical_base,
+                )
+            {
+                continue;
             }
+            push(
+                sequencer_position,
+                canonical_base,
+                code,
+                None,
+                ModificationState::Canonical,
+            )?;
         }
     }
     Ok(())
@@ -2140,11 +2217,13 @@ fn for_each_aligned_base(
     }
 }
 
+/// The reference position of the aligned read base `target` and the CIGAR operation aligning
+/// it, or `None` for a base no `M`, `=` or `X` operation aligns.
 fn reference_position_for_read_position(
     alignment_start: u64,
     cigar: &[rgv_model::CigarOp],
     target: usize,
-) -> Option<u64> {
+) -> Option<(u64, CigarOpKind)> {
     let mut reference_position = alignment_start;
     let mut read_position = 0_usize;
     for operation in cigar {
@@ -2152,9 +2231,10 @@ fn reference_position_for_read_position(
             CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
                 let read_end = read_position.saturating_add(operation.len as usize);
                 if (read_position..read_end).contains(&target) {
-                    return Some(
+                    return Some((
                         reference_position.saturating_add((target - read_position) as u64),
-                    );
+                        operation.kind,
+                    ));
                 }
                 read_position = read_end;
                 reference_position = reference_position.saturating_add(u64::from(operation.len));
@@ -3383,13 +3463,8 @@ fn validate_dependencies(
     reference: Option<&ReferenceSlice>,
 ) -> Result<(), SemanticPageError> {
     validate_root_dependencies(key, evidence, atlas, presentation)?;
-    let page_uses_reference = (key.family == AlignmentPageFamily::ReadGeometry
-        && key.lod == GeometryLod::Base)
-        || (key.family == AlignmentPageFamily::SpecialistOverlay
-            && matches!(
-                presentation.style.color_mode,
-                AlignmentColorMode::Bisulfite(_) | AlignmentColorMode::Ultima(_)
-            ));
+    let page_uses_reference =
+        crate::page_identity::page_reads_reference(key.family, key.lod, presentation.style);
     if page_uses_reference && presentation.reference.is_some() && reference.is_none() {
         return Err(SemanticPageError::ReferenceUnavailable);
     }
@@ -5059,35 +5134,31 @@ mod tests {
                 AlignmentPageFamily::SpecialistOverlay,
             );
             let mut calls = Vec::new();
-            let mut unavailable = Vec::new();
             for primitive in page.primitives() {
                 match primitive.component {
+                    // A call below one half is drawn as "unmodified" (its likelier state); its
+                    // probability is still the record's single call's.
                     AlignmentComponent::ModifiedBase {
                         read_index,
                         canonical_base: b'C',
                         probability,
-                        state: ModificationState::Modified,
                         ..
                     } => {
                         assert_eq!(primitive.end_offset, primitive.start_offset + 1);
                         calls.push((primitive.start_offset, read_index, probability));
                     }
-                    AlignmentComponent::SpecialistUnavailable {
-                        mode: SpecialistMode::ModifiedBases,
-                        reason,
-                    } => unavailable.push(reason),
                     other => panic!("{name}: unexpected overlay {other:?}"),
                 }
             }
-            let overlay = match unavailable.as_slice() {
-                [] => ModificationOutcome::Calls(calls),
-                [SpecialistUnavailableReason::MissingRecordData] if calls.is_empty() => {
-                    ModificationOutcome::Unavailable
+            // A record whose calls cannot be placed or parsed is drawn as an ordinary read: no
+            // overlay at all (formerly a whole-read "unavailable" overlay). The summary still
+            // counts it as unavailable or malformed, never as unmodified.
+            let overlay = ModificationOutcome::Calls(calls);
+            let expected_overlay = match &expected {
+                ModificationOutcome::Calls(calls) => ModificationOutcome::Calls(calls.clone()),
+                ModificationOutcome::Unavailable | ModificationOutcome::Malformed => {
+                    ModificationOutcome::Calls(Vec::new())
                 }
-                [SpecialistUnavailableReason::MalformedRecordData] if calls.is_empty() => {
-                    ModificationOutcome::Malformed
-                }
-                other => panic!("{name}: unexpected unavailable markers {other:?}"),
             };
 
             let tile = crate::ExactModificationSummaryTile::build(
@@ -5140,9 +5211,316 @@ mod tests {
                 other => panic!("{name}: unexpected provenance {other:?}"),
             };
 
-            assert_eq!(overlay, expected, "{name}: overlay");
+            assert_eq!(overlay, expected_overlay, "{name}: overlay");
             assert_eq!(summarized, expected, "{name}: summary");
         }
+    }
+
+    /// The modification cells of one record's overlay page, as `(reference position, state,
+    /// code, probability)`.
+    fn modification_cells(
+        record: AlignmentRecord,
+        lod: GeometryLod,
+        reference: Option<&ReferenceSlice>,
+        style: crate::AlignmentStyleContract,
+    ) -> Vec<(
+        u64,
+        ModificationState,
+        rgv_model::ModificationCode,
+        Option<u8>,
+    )> {
+        let ledger = AllocationLedger::new(8 << 20, 0);
+        let (evidence, atlas) =
+            evidence_and_atlas_for_records(&ledger, &[record], layout_contract());
+        let page = page_with_style(
+            &ledger,
+            &evidence,
+            &atlas,
+            0,
+            lod,
+            reference,
+            style,
+            AlignmentPageFamily::SpecialistOverlay,
+        );
+        page.primitives()
+            .iter()
+            .map(|primitive| match primitive.component {
+                AlignmentComponent::ModifiedBase {
+                    code,
+                    probability,
+                    state,
+                    ..
+                } => (primitive.start_offset, state, code, probability),
+                other => panic!("unexpected overlay {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_record_without_usable_modification_calls_is_an_ordinary_read() {
+        const SUPPLEMENTARY: u16 = 0x800;
+        // A supplementary alignment with no MM/ML at all, and one whose MM was copied from
+        // its primary onto the hard-clipped sequence (no MN), as aligners commonly do.
+        let mut tagless = record(
+            b"tagless-supplementary",
+            40,
+            46,
+            &[(CigarOpKind::Match, 6)],
+            b"ACGCAC",
+        );
+        tagless.flags = AlignmentFlags::from_bits(SUPPLEMENTARY);
+        let copied = modified_read(
+            b"copied-mm-supplementary",
+            40,
+            &[
+                (CigarOpKind::HardClip, 3),
+                (CigarOpKind::Match, 6),
+                (CigarOpKind::HardClip, 2),
+            ],
+            SUPPLEMENTARY,
+            "C+m,1;",
+            vec![250],
+            None,
+        );
+        for record in [tagless, copied] {
+            let name = String::from_utf8_lossy(&record.read_name).into_owned();
+            for mode in [
+                ModifiedBaseColorMode::ByType,
+                ModifiedBaseColorMode::Mono,
+                ModifiedBaseColorMode::ModifiedVsUnmodified,
+            ] {
+                let style = crate::AlignmentStyleContract {
+                    color_mode: AlignmentColorMode::None,
+                    modified_base_color_mode: mode,
+                    ..crate::AlignmentStyleContract::default()
+                };
+                let ledger = AllocationLedger::new(8 << 20, 0);
+                let (evidence, atlas) = evidence_and_atlas_for_records(
+                    &ledger,
+                    std::slice::from_ref(&record),
+                    layout_contract(),
+                );
+                for (family, lod) in [
+                    (AlignmentPageFamily::SpecialistOverlay, GeometryLod::Read),
+                    (AlignmentPageFamily::SpecialistOverlay, GeometryLod::Base),
+                    (AlignmentPageFamily::ReadGeometry, GeometryLod::Read),
+                    (AlignmentPageFamily::ReadGeometry, GeometryLod::Base),
+                ] {
+                    let page =
+                        page_with_style(&ledger, &evidence, &atlas, 0, lod, None, style, family);
+                    for primitive in page.primitives() {
+                        assert!(
+                            !matches!(
+                                primitive.component,
+                                AlignmentComponent::SpecialistUnavailable { .. }
+                                    | AlignmentComponent::ModifiedBase { .. }
+                            ),
+                            "{name} {mode:?} {family:?} {lod:?}: {:?}",
+                            primitive.component
+                        );
+                        assert_eq!(
+                            primitive.style.body,
+                            AlignmentBodyColorToken::Neutral,
+                            "{name}: the body keeps the active colour mode"
+                        );
+                    }
+                    if family == AlignmentPageFamily::ReadGeometry {
+                        assert!(
+                            page.primitives().iter().any(|primitive| matches!(
+                                primitive.component,
+                                AlignmentComponent::ReadSpan
+                                    | AlignmentComponent::AlignedSegment { .. }
+                            )),
+                            "{name}: the read body is drawn"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_cell_shows_the_likelier_state_of_its_base() {
+        const M: rgv_model::ModificationCode = rgv_model::ModificationCode::Letter(b'm');
+        const H: rgv_model::ModificationCode = rgv_model::ModificationCode::Letter(b'h');
+        let style = crate::AlignmentStyleContract::default();
+        // ACGCAC at 40: cytosines at 41, 43 and 45. `C+m?,0,0,0` calls all three.
+        let read = |mm: &str, ml: Vec<u64>| {
+            modified_read(b"calls", 40, &[(CigarOpKind::Match, 6)], 0, mm, ml, None)
+        };
+        assert_eq!(
+            modification_cells(
+                read("C+m?,0,0,0;", vec![250, 128, 20]),
+                GeometryLod::Read,
+                None,
+                style
+            ),
+            vec![
+                (41, ModificationState::Modified, M, Some(250)),
+                (43, ModificationState::Modified, M, Some(128)),
+                // 20/255 modified: unmodified is likelier. The cell keeps the summed
+                // modification probability.
+                (45, ModificationState::Canonical, M, Some(20)),
+            ]
+        );
+        // Two codes at one base: the likeliest is drawn when it beats "no modification"; two
+        // modest calls together still make the base more likely modified than not.
+        assert_eq!(
+            modification_cells(
+                read("C+h?,0,0;C+m?,0,0;", vec![30, 100, 200, 100]),
+                GeometryLod::Read,
+                None,
+                style
+            ),
+            vec![
+                (41, ModificationState::Modified, M, Some(200)),
+                (43, ModificationState::Modified, H, Some(100)),
+            ]
+        );
+        // A hidden code that is the likeliest state hides the cell; it still counts against
+        // "unmodified".
+        let hidden = crate::AlignmentStyleContract {
+            hidden_modification_codes: {
+                let mut codes = [None; crate::MAXIMUM_HIDDEN_MODIFICATION_CODES];
+                codes[0] = Some(H);
+                codes
+            },
+            ..style
+        };
+        assert_eq!(
+            modification_cells(
+                read("C+h?,0;C+m?,0;", vec![200, 40]),
+                GeometryLod::Read,
+                None,
+                hidden
+            ),
+            Vec::new()
+        );
+        // The minimum probability applies to the shown state, modified or not.
+        let minimum = crate::AlignmentStyleContract {
+            minimum_modification_probability: 200,
+            ..style
+        };
+        assert_eq!(
+            modification_cells(
+                read("C+m?,0,0,0;", vec![250, 128, 20]),
+                GeometryLod::Read,
+                None,
+                minimum
+            ),
+            vec![
+                (41, ModificationState::Modified, M, Some(250)),
+                (45, ModificationState::Canonical, M, Some(20)),
+            ]
+        );
+        // Every modification cell is coloured by type in the by-type mode only.
+        for (mode, by_type) in [
+            (ModifiedBaseColorMode::ByType, true),
+            (ModifiedBaseColorMode::Mono, false),
+            (ModifiedBaseColorMode::ModifiedVsUnmodified, false),
+        ] {
+            let ledger = AllocationLedger::new(8 << 20, 0);
+            let (evidence, atlas) = evidence_and_atlas_for_records(
+                &ledger,
+                &[read("C+m?,0;", vec![250])],
+                layout_contract(),
+            );
+            let page = page_with_style(
+                &ledger,
+                &evidence,
+                &atlas,
+                0,
+                GeometryLod::Read,
+                None,
+                crate::AlignmentStyleContract {
+                    modified_base_color_mode: mode,
+                    ..style
+                },
+                AlignmentPageFamily::SpecialistOverlay,
+            );
+            assert!(page.primitives().iter().all(|primitive| matches!(
+                primitive.component,
+                AlignmentComponent::ModifiedBase { color_by_type, .. } if color_by_type == by_type
+            )));
+        }
+    }
+
+    #[test]
+    fn a_mismatch_takes_priority_over_a_modification_on_the_same_base() {
+        const M: rgv_model::ModificationCode = rgv_model::ModificationCode::Letter(b'm');
+        // ACGCAC at 40 with all three cytosines called; the reference has T at 43, so the read's
+        // C there is a mismatch.
+        let read = modified_read(
+            b"mismatch",
+            40,
+            &[(CigarOpKind::Match, 6)],
+            0,
+            "C+m?,0,0,0;",
+            vec![250, 250, 250],
+            None,
+        );
+        let mut bases = vec![b'A'; 300];
+        bases[40..46].copy_from_slice(b"ACGTAC");
+        let reference = ReferenceSlice {
+            interval: GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+            bases,
+        };
+        let style = crate::AlignmentStyleContract::default();
+        let modified = |positions: &[u64]| {
+            positions
+                .iter()
+                .map(|position| (*position, ModificationState::Modified, M, Some(250)))
+                .collect::<Vec<_>>()
+        };
+        // At base detail the mismatch cell is drawn and the modification cell is not.
+        assert_eq!(
+            modification_cells(read.clone(), GeometryLod::Base, Some(&reference), style),
+            modified(&[41, 45])
+        );
+        // Without a reference only `X` operations are mismatches: nothing gives way here.
+        assert_eq!(
+            modification_cells(read.clone(), GeometryLod::Base, None, style),
+            modified(&[41, 43, 45])
+        );
+        // With bases hidden, or zoomed out where no mismatch cell is drawn, the modification
+        // is drawn.
+        let hidden_bases = crate::AlignmentStyleContract {
+            base_display: ReadBaseDisplayMode::Hidden,
+            ..style
+        };
+        assert_eq!(
+            modification_cells(
+                read.clone(),
+                GeometryLod::Base,
+                Some(&reference),
+                hidden_bases
+            ),
+            modified(&[41, 43, 45])
+        );
+        assert_eq!(
+            modification_cells(read, GeometryLod::Read, Some(&reference), style),
+            modified(&[41, 43, 45])
+        );
+        // The overlay page reads the reference exactly when the rule needs it.
+        assert!(style.modification_overlay_reads_reference(GeometryLod::Base));
+        assert!(!style.modification_overlay_reads_reference(GeometryLod::Read));
+        assert!(!hidden_bases.modification_overlay_reads_reference(GeometryLod::Base));
+        assert_ne!(
+            PresentationContract {
+                geometry_lod: GeometryLod::Base,
+                style,
+                reference: None,
+                annotation: None,
+            }
+            .page_fingerprint(AlignmentPageFamily::SpecialistOverlay),
+            PresentationContract {
+                geometry_lod: GeometryLod::Base,
+                style: hidden_bases,
+                reference: None,
+                annotation: None,
+            }
+            .page_fingerprint(AlignmentPageFamily::SpecialistOverlay),
+        );
     }
 
     #[test]

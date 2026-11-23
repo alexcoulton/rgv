@@ -58,9 +58,10 @@ struct ModificationInput {
     @location(0) start_offset: vec2<f32>,
     @location(1) end_offset: vec2<f32>,
     @location(2) fractions: vec2<f32>,
-    @location(3) by_type_color: vec4<f32>,
-    @location(4) identity: vec4<u32>,
-    @location(5) shape: u32,
+    @location(3) identity: vec4<u32>,
+    // x: 0 for a modification bar, 1 for the unmodified background band; y: the palette slot
+    // of the bar's by-type colour.
+    @location(4) shape_token: vec2<u32>,
 };
 
 struct JunctionInput {
@@ -228,9 +229,9 @@ fn modification_vertex(input: ModificationInput) -> VertexOutput {
     if frame.quality_weighted != 0u {
         fraction = input.fractions.y;
     }
-    var color = input.by_type_color;
+    var color = palette_slot(input.shape_token.y);
     var height = max(clamp(fraction, 0.0, 1.0) * frame.clip_size.y, 1.0);
-    if input.shape == 1u {
+    if input.shape_token.x == 1u {
         visible = select(
             0u,
             1u,

@@ -41,7 +41,7 @@ const SCISSOR: AlignmentGpuScissor = AlignmentGpuScissor {
     height: 97,
 };
 const DEPTH_COLOUR: [f32; 4] = [0.48, 0.48, 0.48, 1.0];
-const MONO_MODIFICATION_COLOUR: [f32; 4] = [0.90, 0.24, 0.92, 0.92];
+
 const JUNCTION_BASELINE_COLOUR: [f32; 4] = [0.36, 0.38, 0.42, 0.24];
 
 fn scissor() -> [u32; 4] {
@@ -407,7 +407,12 @@ fn summary_modification_pixels_match_the_cpu_oracle_by_type_and_against_unmodifi
                         CoverageScaleTransform::Linear,
                     )
                     .unwrap();
-                    paint_solid(&mut oracle, quad(bounds), instance.by_type_color);
+                    paint_solid(
+                        &mut oracle,
+                        quad(bounds),
+                        crate::palette::AlignmentPalette::light()
+                            .color(crate::palette::PaletteToken::SUMMARY_MODIFICATION_BACKGROUND),
+                    );
                     painted += 1;
                 }
             }
@@ -426,9 +431,15 @@ fn summary_modification_pixels_match_the_cpu_oracle_by_type_and_against_unmodifi
                     0,
                 ) {
                     let colour = if color_mode == ModifiedBaseColorMode::ByType {
-                        instance.by_type_color
+                        crate::palette::AlignmentPalette::light().resolve(
+                            crate::palette::PaletteColor::decode(
+                                u8::try_from(instance.by_type_token).unwrap(),
+                                0,
+                            ),
+                        )
                     } else {
-                        MONO_MODIFICATION_COLOUR
+                        crate::palette::AlignmentPalette::light()
+                            .color(crate::palette::PaletteToken::SUMMARY_MODIFICATION)
                     };
                     paint_solid(&mut oracle, quad(projected.bounds), colour);
                     painted += 1;

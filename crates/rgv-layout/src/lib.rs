@@ -11,8 +11,7 @@ mod track_layout;
 mod track_world_layout;
 
 pub use alignment_style::{
-    MAX_HIDDEN_MODIFICATION_CODES, alignment_read_name_hash, modification_code_color,
-    ultima_quality_color,
+    MAX_HIDDEN_MODIFICATION_CODES, alignment_read_name_hash, ultima_quality_color,
 };
 pub use display::{
     Direction, DisplayList, JunctionArcGeometrySample, RectPrimitive, RectShape, Rgba,

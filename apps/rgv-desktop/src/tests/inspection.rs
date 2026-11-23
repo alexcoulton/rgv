@@ -9,7 +9,8 @@ use crate::inspection::read::{
     SubstitutionCountSource, aligned_event_sequence, alignment_edit_fields, alignment_edit_summary,
     alignment_inspector_document, auxiliary_tags_text, bounded_aligned_sequence_copy,
     bounded_auxiliary_value, bounded_oriented_sequence_copy, bounded_sequence_copy, format_cigar,
-    inspector_cigar_value, read_event_details, sequence_copy_hover, truncate_string_to_bytes,
+    inspector_cigar_value, modified_base_calls_text, read_event_details, sequence_copy_hover,
+    truncate_string_to_bytes,
 };
 use crate::inspection::rna::{
     JunctionAnnotationContext, SashimiExportBundle, SashimiExportTrack,
@@ -1264,5 +1265,87 @@ fn variant_document_preserves_custom_info_multiallelic_copy_and_large_sample_bou
             ("QUAL".to_owned(), "missing".to_owned()),
             ("FILTER".to_owned(), "PASS".to_owned()),
         ]
+    );
+}
+
+#[test]
+fn the_read_inspector_says_why_an_alignment_has_no_modification_calls() {
+    let aux = |tag: &[u8; 2], value: rgv_hts::AuxValue| rgv_hts::AuxField { tag: *tag, value };
+    let alignment = |flags: u16, cigar: Vec<rgv_hts::CigarOp>, fields: Vec<rgv_hts::AuxField>| {
+        AlignmentRecord {
+            contig: ContigId::new(0),
+            start: 100,
+            end: 106,
+            flags: rgv_hts::AlignmentFlags::from_bits(flags),
+            mapping_quality: Some(60),
+            mate_contig: None,
+            mate_start: None,
+            template_length: 0,
+            read_name: b"modified".to_vec(),
+            cigar,
+            sequence: SequenceData::Present {
+                bases: b"ACGCAC".to_vec(),
+                qualities: None,
+            },
+            auxiliary_fields: fields,
+        }
+    };
+    let matched = || {
+        vec![rgv_hts::CigarOp {
+            kind: CigarOpKind::Match,
+            len: 6,
+        }]
+    };
+    let tags = |mm: &str, ml: Vec<u64>| {
+        vec![
+            aux(b"MM", rgv_hts::AuxValue::String(mm.to_owned())),
+            aux(b"ML", rgv_hts::AuxValue::UnsignedArray(ml)),
+        ]
+    };
+    // A primary with calls names how many and of what.
+    assert_eq!(
+        modified_base_calls_text(&alignment(
+            0,
+            matched(),
+            tags("C+m?,0,0;A+a?,0;", vec![200, 10, 30])
+        )),
+        "3 calls (5mC, 6mA)"
+    );
+    // A tag-less supplementary alignment.
+    assert_eq!(
+        modified_base_calls_text(&alignment(0x800, matched(), Vec::new())),
+        "No base-modification calls on this alignment (supplementary alignments often omit \
+         MM/ML tags)"
+    );
+    assert_eq!(
+        modified_base_calls_text(&alignment(0, matched(), Vec::new())),
+        "No base-modification calls on this alignment"
+    );
+    // MM copied onto a hard-clipped supplementary alignment cannot be placed.
+    let mut clipped = matched();
+    clipped.insert(
+        0,
+        rgv_hts::CigarOp {
+            kind: CigarOpKind::HardClip,
+            len: 4,
+        },
+    );
+    let text = modified_base_calls_text(&alignment(0x800, clipped, tags("C+m?,0;", vec![200])));
+    assert!(
+        text.starts_with("No base-modification calls on this alignment: its MM/ML tags describe")
+            && text.contains("hard-clipped")
+            && text.ends_with("(supplementary alignments often omit MM/ML tags)"),
+        "{text}"
+    );
+    // A tag that assesses a modification but calls no base, and an unreadable one.
+    assert_eq!(
+        modified_base_calls_text(&alignment(0, matched(), tags("C+m?;", Vec::new()))),
+        "No base-modification calls on this alignment (its MM tag assesses 5mC but calls no base)"
+    );
+    assert!(
+        modified_base_calls_text(&alignment(0, matched(), tags("C+m?,0;", vec![1, 2])))
+            .starts_with(
+                "No base-modification calls on this alignment: its MM/ML tags are unreadable"
+            )
     );
 }

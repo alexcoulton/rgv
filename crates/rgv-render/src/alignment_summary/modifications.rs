@@ -18,25 +18,26 @@ pub struct AlignmentSummaryGpuModificationInstance {
     pub end_offset: [f32; 2],
     /// `[raw modified fraction, probability-weighted modified fraction]`.
     pub fractions: [f32; 2],
-    pub by_type_color: [f32; 4],
     pub code_index: u32,
     pub later_code_mask: u32,
     pub modified_calls: u32,
     pub canonical_observations: u32,
     /// `0` is a modification bar and `1` is the optional unmodified-background band.
     pub shape: u32,
-    pub(super) padding: [u32; 3],
+    /// Palette slot of a bar coloured by modification type (the read stack's type colour, see
+    /// [`crate::modification_style::modification_type_token`]); zero for a background band.
+    pub by_type_token: u32,
+    pub(super) padding: [u32; 2],
 }
 
 impl AlignmentSummaryGpuModificationInstance {
     pub(super) fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+        const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
             0 => Float32x2,
             1 => Float32x2,
             2 => Float32x2,
-            3 => Float32x4,
-            4 => Uint32x4,
-            5 => Uint32
+            3 => Uint32x4,
+            4 => Uint32x2
         ];
         wgpu::VertexBufferLayout {
             array_stride: size_of::<Self>() as wgpu::BufferAddress,
@@ -152,7 +153,7 @@ pub(super) struct ModificationPackingCandidate {
     pub(super) raw_fraction: f64,
     pub(super) weighted_fraction: f64,
     pub(super) code_index: u32,
-    pub(super) by_type_color: [f32; 4],
+    pub(super) by_type_token: u32,
 }
 
 pub(super) fn pack_modification_page(
@@ -207,7 +208,6 @@ pub(super) fn pack_modification_page(
                 .expect("semantic modification code belongs to the page dictionary"),
         )
         .expect("page modification code dictionary is bounded to u32 bits");
-        let color = modification_code_color(series.code);
         groups
             .entry((start_offset, end_offset))
             .or_default()
@@ -219,7 +219,9 @@ pub(super) fn pack_modification_page(
                 raw_fraction,
                 weighted_fraction,
                 code_index,
-                by_type_color: [color.red, color.green, color.blue, color.alpha],
+                by_type_token: u32::from(
+                    crate::modification_style::modification_type_token(series.code).index(),
+                ),
             });
     }
 
@@ -238,13 +240,13 @@ pub(super) fn pack_modification_page(
             start_offset: split_f64(start_offset as f64),
             end_offset: split_f64(end_offset as f64),
             fractions: [0.0; 2],
-            by_type_color: [0.14, 0.44, 0.82, 0.20],
             code_index: 0,
             later_code_mask: modified_code_mask,
             modified_calls: 0,
             canonical_observations: 0,
             shape: 1,
-            padding: [0; 3],
+            by_type_token: 0,
+            padding: [0; 2],
         });
     }
     let background_end = u32::try_from(instances.len())
@@ -303,13 +305,13 @@ pub(super) fn append_sorted_modification_candidates(
                     candidate.raw_fraction as f32,
                     candidate.weighted_fraction as f32,
                 ],
-                by_type_color: candidate.by_type_color,
                 code_index: candidate.code_index,
                 later_code_mask,
                 modified_calls: candidate.bin.modified_calls,
                 canonical_observations: candidate.bin.canonical_observations,
                 shape: 0,
-                padding: [0; 3],
+                by_type_token: candidate.by_type_token,
+                padding: [0; 2],
             });
         }
     }

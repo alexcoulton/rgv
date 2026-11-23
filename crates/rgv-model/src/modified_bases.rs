@@ -151,6 +151,28 @@ pub fn decode_modified_bases_parts(
     Ok(calls)
 }
 
+/// The modification codes an `MM` tag declares in its group headers, in tag order and without
+/// repeats, without locating any call. Malformed groups are skipped. A cheap way to learn which
+/// modifications a record was assessed for (a legend, a code list) without decoding it.
+#[must_use]
+pub fn modification_codes_in_tag(mm: &AuxValue) -> Vec<ModificationCode> {
+    let AuxValue::String(mm) = mm else {
+        return Vec::new();
+    };
+    let mut codes = Vec::new();
+    for group in mm.split(';').filter(|group| !group.is_empty()) {
+        let header = group.split_once(',').map_or(group, |(header, _)| header);
+        if let Ok(group) = parse_group_header(header) {
+            for code in group.codes {
+                if !codes.contains(&code) {
+                    codes.push(code);
+                }
+            }
+        }
+    }
+    codes
+}
+
 struct ModificationGroup {
     canonical_base: u8,
     strand: BaseModificationStrand,
@@ -502,5 +524,20 @@ mod tests {
     fn canonical_n_counts_every_sequencer_base() {
         let calls = decode_modified_bases(&record("N+n,2;", vec![200])).unwrap();
         assert_eq!(calls[0].sequencer_position, 2);
+    }
+
+    #[test]
+    fn tag_codes_are_read_from_the_group_headers_alone() {
+        let mm = AuxValue::String("C+hm?,0,1;A+a.,3;C+m?;C+76792,0;bogus;".to_owned());
+        assert_eq!(
+            modification_codes_in_tag(&mm),
+            vec![
+                ModificationCode::Letter(b'h'),
+                ModificationCode::Letter(b'm'),
+                ModificationCode::Letter(b'a'),
+                ModificationCode::Chebi(76_792),
+            ]
+        );
+        assert!(modification_codes_in_tag(&AuxValue::Unsigned(1)).is_empty());
     }
 }

@@ -133,6 +133,87 @@ fn md_substitution_count(md: &str) -> Option<u64> {
     Some(substitutions)
 }
 
+/// What a record without base-modification calls says first.
+pub(crate) const NO_MODIFICATION_CALLS: &str = "No base-modification calls on this alignment";
+
+/// The read inspector's "Modified-base calls" value: how many calls the record's `MM`/`ML` tags
+/// make and of which modifications, or why it has none. A record without calls is drawn as an
+/// ordinary read; this is where the reason is given.
+pub(crate) fn modified_base_calls_text(record: &AlignmentRecord) -> String {
+    let note = if record.flags.is_supplementary() {
+        " (supplementary alignments often omit MM/ML tags)"
+    } else if record.flags.is_secondary() {
+        " (secondary alignments often omit MM/ML tags)"
+    } else {
+        ""
+    };
+    let tag = |names: [&[u8; 2]; 2]| {
+        record
+            .auxiliary_fields
+            .iter()
+            .find(|field| names.contains(&&field.tag))
+            .map(|field| &field.value)
+    };
+    let Some(mm) = tag([b"MM", b"Mm"]) else {
+        return format!("{NO_MODIFICATION_CALLS}{note}");
+    };
+    let calls = match rgv_hts::decode_modified_bases(record) {
+        Ok(calls) => calls,
+        Err(error) => {
+            return format!("{NO_MODIFICATION_CALLS}: its MM/ML tags are unreadable ({error})");
+        }
+    };
+    if calls.is_empty() {
+        let placeable = match &record.sequence {
+            SequenceData::Present { bases, .. } => rgv_hts::modified_bases_resolvable(
+                bases.len(),
+                tag([b"MN", b"MN"]),
+                record
+                    .cigar
+                    .iter()
+                    .any(|operation| operation.kind == CigarOpKind::HardClip),
+            ),
+            SequenceData::Missing | SequenceData::NotLoaded => true,
+        };
+        return if placeable {
+            let declared = rgv_hts::modification_codes_in_tag(mm);
+            if declared.is_empty() {
+                NO_MODIFICATION_CALLS.to_owned()
+            } else {
+                format!(
+                    "{NO_MODIFICATION_CALLS} (its MM tag assesses {} but calls no base)",
+                    modification_names(&declared)
+                )
+            }
+        } else {
+            format!(
+                "{NO_MODIFICATION_CALLS}: its MM/ML tags describe the unclipped read and cannot \
+                 be placed on this hard-clipped alignment (no matching MN tag){note}"
+            )
+        };
+    }
+    let mut codes = Vec::new();
+    for call in &calls {
+        if !codes.contains(&call.code) {
+            codes.push(call.code);
+        }
+    }
+    format!(
+        "{} call{} ({})",
+        calls.len(),
+        if calls.len() == 1 { "" } else { "s" },
+        modification_names(&codes)
+    )
+}
+
+fn modification_names(codes: &[rgv_hts::ModificationCode]) -> String {
+    codes
+        .iter()
+        .map(|code| rgv_render::modification_style::modification_code_name(*code))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub(crate) fn alignment_edit_fields(record: &AlignmentRecord) -> Vec<(String, String)> {
     let summary = alignment_edit_summary(record);
     let substitutions = match (summary.substitutions, summary.substitution_source) {

@@ -4048,7 +4048,8 @@ fn color_for(primitive: AlignmentSemanticPrimitive) -> PaletteColor {
     semantic_alignment_color(primitive.component, primitive.style)
 }
 
-/// The semantic colour of one read component. Closed categories are palette tokens; only
+/// The semantic colour of one read component. Closed categories are palette tokens, continuous
+/// quantities (mapping quality, modification-call confidence) ramps between two slots; only
 /// hashed open-ended categories carry an inline colour.
 pub(crate) fn semantic_alignment_color(
     component: AlignmentComponent,
@@ -4057,10 +4058,20 @@ pub(crate) fn semantic_alignment_color(
     use PaletteToken as T;
     PaletteColor::Token(match component {
         AlignmentComponent::Base { base, .. } => T::base(base),
-        AlignmentComponent::ModifiedBase { state, .. } => match state {
-            rgv_alignment_scene::ModificationState::Modified => T::MODIFIED_BASE,
-            rgv_alignment_scene::ModificationState::Canonical => T::CANONICAL_BASE,
-        },
+        AlignmentComponent::ModifiedBase {
+            code,
+            probability,
+            state,
+            color_by_type,
+            ..
+        } => {
+            return crate::modification_style::modification_cell_color(
+                code,
+                probability,
+                state,
+                color_by_type,
+            );
+        }
         AlignmentComponent::BisulfiteBase { observation, .. } => match observation {
             rgv_alignment_scene::BisulfiteObservationToken::Protected => T::BISULFITE_PROTECTED,
             rgv_alignment_scene::BisulfiteObservationToken::Converted => T::BISULFITE_CONVERTED,

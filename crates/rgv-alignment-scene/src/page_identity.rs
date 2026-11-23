@@ -240,7 +240,8 @@ impl PageDigest {
 }
 
 /// Whether a page of this family reads the reference slice at all. This is the exact gate the
-/// builder applies: base cells in read geometry, and the bisulfite and Ultima overlays.
+/// builder applies: base cells in read geometry, the bisulfite and Ultima overlays, and the
+/// modification overlay at base detail (where a mismatch takes priority over a modification).
 pub(crate) fn page_reads_reference(
     family: AlignmentPageFamily,
     lod: GeometryLod,
@@ -248,13 +249,7 @@ pub(crate) fn page_reads_reference(
 ) -> bool {
     match family {
         AlignmentPageFamily::ReadGeometry => lod == GeometryLod::Base,
-        AlignmentPageFamily::SpecialistOverlay => {
-            matches!(lod, GeometryLod::Read | GeometryLod::Base)
-                && matches!(
-                    style.color_mode,
-                    AlignmentColorMode::Bisulfite(_) | AlignmentColorMode::Ultima(_)
-                )
-        }
+        AlignmentPageFamily::SpecialistOverlay => style.specialist_overlay_reads_reference(lod),
         AlignmentPageFamily::Labels => false,
     }
 }

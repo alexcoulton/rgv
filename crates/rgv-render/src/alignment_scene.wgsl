@@ -128,7 +128,9 @@ fn interaction_color(color: vec4<f32>, flags: u32) -> vec4<f32> {
         target_color = palette_slot(TOKEN_INTERACTION_HIGHLIGHTED).rgb;
         amount = 0.46;
     }
-    return vec4<f32>(mix(color.rgb, target_color, amount), 1.0);
+    // The alpha is kept, so a faint modification cell on a selected read stays faint; mirrored
+    // by `AlignmentPalette::interaction_color`.
+    return vec4<f32>(mix(color.rgb, target_color, amount), color.a);
 }
 
 fn instance_color(packed: vec2<u32>) -> vec4<f32> {
