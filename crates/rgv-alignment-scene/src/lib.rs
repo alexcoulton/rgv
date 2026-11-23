@@ -58,11 +58,13 @@ pub use coverage::{
     CertifiedCoverageSet, CompleteCoverage, CoverageError, FilteredRecordProvenance,
 };
 pub use cpu_projector::{
-    ARROWHEAD_LENGTH_FRACTION, AlignmentCamera, AlignmentHit, CpuAlignmentFrame,
-    CpuAlignmentLabelFrame, CpuAlignmentProjector, CpuArrowhead, CpuClipRect, CpuFrameCoverage,
-    CpuInteractionError, CpuPrimitiveShape, CpuProjectedPrimitive, CpuProjectionError,
-    EVENT_LABEL_MINIMUM_POINTS_PER_BASE, arrowhead_covers, arrowhead_length, clip_edge_covers,
-    clip_edge_extent, directional_extent, point_marker_extent,
+    ARROWHEAD_LENGTH_FRACTION, ARROWHEAD_MAXIMUM_BASES, ARROWHEAD_MINIMUM_LENGTH, AlignmentCamera,
+    AlignmentHit, BOUNDARY_MARK_FULL_POINTS_PER_BASE, BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE,
+    BOUNDARY_MARK_HAIRLINE_WIDTH, BoundaryMarkDetail, CpuAlignmentFrame, CpuAlignmentLabelFrame,
+    CpuAlignmentProjector, CpuArrowhead, CpuClipRect, CpuFrameCoverage, CpuInteractionError,
+    CpuPrimitiveShape, CpuProjectedPrimitive, CpuProjectionError,
+    EVENT_LABEL_MINIMUM_POINTS_PER_BASE, arrowhead_covers, arrowhead_length, boundary_mark_detail,
+    clip_edge_covers, clip_edge_extent, directional_extent, point_marker_extent,
 };
 pub use cpu_summary_projector::{
     CoverageAlleleInterpretation, CpuAlleleProjectionOptions, CpuAlleleToken,

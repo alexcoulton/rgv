@@ -84,13 +84,19 @@ fn fixture_reads(origin: u64) -> Vec<TestRead> {
 
 /// The quad the vertex stage emits for one instance, before the scissor: the same arithmetic as
 /// [`project_alignment_gpu_instance`] without its clamp to the camera clip, which the fragment
-/// shape rules need because they are evaluated in unclipped local coordinates.
+/// shape rules need because they are evaluated in unclipped local coordinates. Also returns the
+/// shape the fragment stage sees: a clip edge drawn as a hairline is a plain rectangle.
 fn unclipped_quad(
     instance: AlignmentGpuInstance,
     page_start: u64,
     page_row_start: u32,
     camera: AlignmentCamera,
-) -> Quad {
+) -> (Quad, u32) {
+    // Written out independently of `boundary_mark_detail`: full marks from one point per base,
+    // one-point hairlines from 0.1, nothing (a zero-width quad) below.
+    let points_per_base = 1.0 / camera.bases_per_pixel();
+    let (full_marks, hidden_marks) = (points_per_base >= 1.0, points_per_base < 0.1);
+    let mut fragment_shape = instance.shape();
     let project = |offset: u64| {
         camera.clip().x
             + (page_start as f64 + offset as f64 - camera.exact_start()) / camera.bases_per_pixel()
@@ -110,23 +116,33 @@ fn unclipped_quad(
     if at_end || instance.shape() == AlignmentGpuShape::PointMarker as u32 {
         // Written out independently of `point_marker_extent`: a bar a quarter of a base wide,
         // within [2, 6] points, centred on the start (or end) edge of the base.
-        let width = ((right - left) * 0.25).clamp(2.0, 6.0);
+        let width = if full_marks {
+            ((right - left) * 0.25).clamp(2.0, 6.0)
+        } else {
+            1.0
+        };
         let boundary = if at_end { right } else { left };
         left = boundary - width * 0.5;
-        right = left + width;
+        right = if hidden_marks { left } else { left + width };
     } else if (6..=13).contains(&instance.shape()) {
         // Written out independently of `clip_edge_extent`. Shape bits: 1 end edge, 2 hard clip,
         // 4 behind the arrowhead. A soft clip's edge is half a base wide within [2, 6] points, a
         // hard clip's two; behind an arrowhead it moves inward from the boundary (the read's
-        // tip) by the head length, 0.55 x height.
+        // tip) by the head length, min(0.55 x height, 10 x points per base), or nothing when
+        // that is under half a point. Zoomed out either edge is a plain one-point hairline.
         let bits = instance.shape() - 6;
         let base = right - left;
-        let width = if bits & 2 == 0 {
+        let width = if !full_marks {
+            fragment_shape = AlignmentGpuShape::Rectangle as u32;
+            1.0
+        } else if bits & 2 == 0 {
             (base * 0.5).clamp(2.0, 6.0)
         } else {
             2.0
         };
-        let inset = if bits & 4 == 0 { 0.0 } else { height * 0.55 };
+        let head = (height * 0.55).min(points_per_base * 10.0);
+        let head = if head < 0.5 { 0.0 } else { head };
+        let inset = if bits & 4 == 0 { 0.0 } else { head };
         if bits & 1 == 0 {
             left += inset;
             right = left + width;
@@ -134,23 +150,29 @@ fn unclipped_quad(
             right -= inset;
             left = right - width;
         }
+        if hidden_marks {
+            right = left;
+        }
     } else if instance.shape() == AlignmentGpuShape::DirectionTerminalRight as u32 {
         // The tip stays on the read's end: the one-point minimum grows leftwards.
         left = left.min(right - 1.0);
     } else {
         right = right.max(left + 1.0);
     }
-    Quad {
-        x: left,
-        y: top,
-        width: right - left,
-        height,
-    }
+    (
+        Quad {
+            x: left,
+            y: top,
+            width: right - left,
+            height,
+        },
+        fragment_shape,
+    )
 }
 
 /// Mirror of `alignment_scene.wgsl`'s fragment stage: direction terminals are cut to an
 /// arrowhead and a soft clip's edge to a zigzag stroke; everything else is solid.
-fn fragment_is_kept(shape: u32, local: [f64; 2], size: [f64; 2]) -> bool {
+fn fragment_is_kept(shape: u32, local: [f64; 2], size: [f64; 2], points_per_base: f64) -> bool {
     if (6..=13).contains(&shape) && (shape - 6) & 2 == 0 {
         // Written out independently of `clip_edge_covers`: a 1.5-point stroke zigzagging
         // between the boundary side and the inner side, round(height / 4) teeth (at least one).
@@ -176,8 +198,10 @@ fn fragment_is_kept(shape: u32, local: [f64; 2], size: [f64; 2]) -> bool {
     } else {
         size[0] - local[0]
     };
-    // The head length depends on the read height only, whatever the shape's own width.
-    let head_width = size[1] * 0.55;
+    // The head length depends on the read height and the zoom only, whatever the shape's own
+    // width: 0.55 x height, at most ten bases, and no head at all under half a point.
+    let head_width = (size[1] * 0.55).min(points_per_base * 10.0);
+    let head_width = if head_width < 0.5 { 0.0 } else { head_width };
     if distance_from_tip < head_width {
         let half_height = size[1] * 0.5;
         let allowed = half_height * (distance_from_tip / head_width).clamp(0.0, 1.0);
@@ -217,7 +241,8 @@ fn oracle_with_palette(
         {
             let page_start = page.interval().start();
             let page_row_start = page.row_range().start;
-            let quad = unclipped_quad(instance, page_start, page_row_start, camera);
+            let (quad, fragment_shape) =
+                unclipped_quad(instance, page_start, page_row_start, camera);
             // Tie the unclipped mirror to the crate's public oracle: clipped to the camera
             // clip, the two must describe the same rectangle.
             let clip = camera.clip();
@@ -257,12 +282,18 @@ fn oracle_with_palette(
             }
             .map(f64::from);
             let shape = instance.shape();
+            let points_per_base = 1.0 / camera.bases_per_pixel();
             oracle.paint(quad, scissor, |x, y| match quad.classify(x, y) {
                 Some(false) => Shade::Outside,
                 None => Shade::Uncertain,
                 Some(true) => shade_with_probe(x, y, |x, y| {
-                    fragment_is_kept(shape, [x - quad.x, y - quad.y], [quad.width, quad.height])
-                        .then_some(colour)
+                    fragment_is_kept(
+                        fragment_shape,
+                        [x - quad.x, y - quad.y],
+                        [quad.width, quad.height],
+                        points_per_base,
+                    )
+                    .then_some(colour)
                 }),
             });
             expected.push(ExpectedInstance { quad, shape });
@@ -1312,6 +1343,220 @@ fn read_tips_are_one_clean_arrowhead_on_the_gpu_when_zoomed_out() {
                     .iter()
                     .map(|(_, height)| *height)
                     .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+/// Zoomed out, the marks on a read scale with it on the real GPU: at 0.4 points per base a
+/// 101-base read keeps a 4-point arrowhead (ten bases, not 0.55 x its 24-point height) and its
+/// insertion is a one-point hairline; at 0.08 the head is 0.8 points and the insertion is not
+/// drawn; at 0.04 the head would be under half a point, so the read ends square. Every frame
+/// matches the CPU oracle pixel for pixel, and the arrow's columns match the CPU projector.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn zoomed_out_reads_keep_a_short_arrowhead_and_a_hairline_insertion_on_the_gpu() {
+    use rgv_alignment_scene::AlignmentComponent;
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20);
+    // A forward 50M 2I 51M read at 100 (its insertion between 149 and 150), a reverse 101M
+    // read at 300 and a forward 101M 5S read at 500, whose soft clip shares the arrow's end.
+    let reads = [
+        TestRead {
+            start: 100,
+            reverse: false,
+            cigar: cigar(&[
+                (CigarOpKind::Match, 50),
+                (CigarOpKind::Insertion, 2),
+                (CigarOpKind::Match, 51),
+            ]),
+        },
+        TestRead {
+            start: 300,
+            reverse: true,
+            cigar: cigar(&[(CigarOpKind::Match, 101)]),
+        },
+        TestRead {
+            start: 500,
+            reverse: false,
+            cigar: cigar(&[(CigarOpKind::Match, 101), (CigarOpKind::SoftClip, 5)]),
+        },
+    ];
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 8_000).unwrap();
+    let scene = test_scene_over(
+        &ledger,
+        interval,
+        8_000,
+        NonZeroU64::new(2_000).unwrap(),
+        &reads,
+        NonZeroU32::new(2).unwrap(),
+    );
+    let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    // (camera end over the 256-point pane, points per base, head length, insertion width)
+    let cases = [
+        (640, 0.4, 4.0, Some(1.0)),
+        (3_200, 0.08, 0.8, None),
+        (6_400, 0.04, 0.0, None),
+    ];
+    for (index, (end, points_per_base, head, insertion_width)) in cases.into_iter().enumerate() {
+        let label = format!("{points_per_base} points per base");
+        let camera = AlignmentCamera::new(
+            GenomicInterval::new(ContigId::new(0), 0, end).unwrap(),
+            0.0,
+            30.0,
+            24.0,
+            CLIP,
+        )
+        .unwrap();
+        assert!((1.0 / camera.bases_per_pixel() - points_per_base).abs() < 1.0e-12);
+        let image = render_scene(
+            &gpu,
+            &mut renderer,
+            &scene,
+            camera,
+            &ledger,
+            index as u64 + 1,
+        );
+        let (oracle, expected) = oracle_for(&scene, camera);
+        let comparison = oracle.assert_matches(&image, &label);
+
+        // The insertion: a one-point hairline on its boundary, or no quad at all.
+        let markers = expected
+            .iter()
+            .filter(|instance| instance.shape == AlignmentGpuShape::PointMarker as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 1, "{label}");
+        let boundary = CLIP.x + 150.0 * points_per_base;
+        let frame = rgv_alignment_scene::CpuAlignmentProjector::project(&scene, 1, camera).unwrap();
+        let cpu_insertion = frame
+            .primitives
+            .iter()
+            .find(|primitive| matches!(primitive.component, AlignmentComponent::Insertion { .. }));
+        if let Some(width) = insertion_width {
+            let quad = markers[0].quad;
+            assert!((quad.width - width).abs() < 1.0e-9, "{label}: {quad:?}");
+            assert!((quad.x + width * 0.5 - boundary).abs() < 1.0e-9);
+            let cpu = cpu_insertion.expect("the hairline is projected for picking");
+            assert!((cpu.x - quad.x).abs() < 1.0e-9 && (cpu.width - width).abs() < 1.0e-9);
+            // On the GPU the hairline's pixel column differs from the read body beside it.
+            let column = boundary.floor() as u32;
+            let middle = (quad.y + quad.height * 0.5) as u32;
+            assert_ne!(
+                image.get_pixel(column, middle).0,
+                image.get_pixel(column - 4, middle).0,
+                "{label}: no hairline at column {column}"
+            );
+        } else {
+            assert!(markers[0].quad.width.abs() < f64::EPSILON, "{label}");
+            assert!(cpu_insertion.is_none(), "{label}: {cpu_insertion:?}");
+        }
+        // The soft clip behind the arrowhead: a one-point plain hairline just inside the head's
+        // base (the oracle above checks it is solid, not a sawtooth), or nothing.
+        let clip = expected
+            .iter()
+            .find(|instance| instance.shape == AlignmentGpuShape::SoftClipEdgeEndBehindArrow as u32)
+            .expect("the clip edge instance");
+        let cpu_clip = frame
+            .primitives
+            .iter()
+            .find(|primitive| matches!(primitive.component, AlignmentComponent::SoftClip { .. }));
+        if let Some(width) = insertion_width {
+            let tip = CLIP.x + 601.0 * points_per_base;
+            assert!((clip.quad.width - width).abs() < 1.0e-9, "{label}");
+            assert!(
+                (clip.quad.x + width - (tip - head)).abs() < 1.0e-9,
+                "{label}"
+            );
+            let cpu = cpu_clip.expect("the hairline is projected for picking");
+            assert_eq!(
+                cpu.shape,
+                rgv_alignment_scene::CpuPrimitiveShape::BoundaryHairline
+            );
+            assert!((cpu.x - clip.quad.x).abs() < 1.0e-9, "{label}");
+        } else {
+            assert!(clip.quad.width.abs() < f64::EPSILON, "{label}");
+            assert!(cpu_clip.is_none(), "{label}: {cpu_clip:?}");
+        }
+
+        // One arrow per read, `head` points long, column for column what the CPU projector
+        // covers; within the head the painted height grows from the tip, and a zero head is a
+        // square end.
+        let mut arrows = Vec::new();
+        for primitive in frame.primitives.iter() {
+            if let Some(arrow) = primitive.arrow
+                && !arrows.iter().any(|(handle, _)| *handle == primitive.handle)
+            {
+                arrows.push((primitive.handle, arrow));
+            }
+        }
+        assert_eq!(arrows.len(), 3, "{label}");
+        for (handle, arrow) in arrows {
+            assert!((arrow.length() - head).abs() < 1.0e-9, "{label}: {arrow:?}");
+            let top = arrow.centre_y - 12.0;
+            let band = (top.floor() as u32).saturating_sub(2)..((top + 24.0).ceil() as u32 + 2);
+            let mut heights = Vec::new();
+            for step in 0..4_i64 {
+                let column = if arrow.points_right {
+                    (arrow.tip_x - 0.5).floor() as i64 - step
+                } else {
+                    (arrow.tip_x - 0.5).ceil() as i64 + step
+                };
+                let column = u32::try_from(column).unwrap();
+                let centre_x = f64::from(column) + 0.5;
+                let distance = arrow.distance_from_tip(centre_x);
+                let painted = band
+                    .clone()
+                    .filter(|row| image.get_pixel(column, *row).0 != [255, 255, 255, 255])
+                    .count();
+                let mut ambiguous = false;
+                let cpu = band
+                    .clone()
+                    .filter(|row| {
+                        let centre_y = f64::from(*row) + 0.5;
+                        if let Some(outline) = arrow.outline_distance_at(centre_y) {
+                            ambiguous |= (outline - distance).abs() < 1.0e-3;
+                        }
+                        frame
+                            .primitives
+                            .iter()
+                            .filter(|primitive| primitive.handle == handle)
+                            .any(|primitive| primitive.contains(centre_x, centre_y))
+                    })
+                    .count();
+                if !ambiguous {
+                    assert_eq!(painted, cpu, "{label}: column {column} ({distance:.2})");
+                }
+                heights.push((distance, painted));
+            }
+            for pair in heights.windows(2) {
+                assert!(pair[0].1 <= pair[1].1, "{label}: {heights:?}");
+            }
+            if head == 0.0 {
+                // Square: the first column inside the tip is already full height.
+                assert_eq!(heights[0].1, 24, "{label}: {heights:?}");
+            } else {
+                // A short head: cut within `head` of the tip (a head under a pixel may have no
+                // column centre inside it), full height from `head` inwards.
+                for (distance, height) in &heights {
+                    if *distance > head {
+                        assert_eq!(*height, 24, "{label}: {heights:?}");
+                    } else {
+                        assert!(*height < 24, "{label}: {heights:?}");
+                    }
+                }
+            }
+            eprintln!(
+                "{label} on {}: head {head}, tip at {:.2}, column heights {:?}; {} pixels \
+                 compared",
+                gpu.description,
+                arrow.tip_x,
+                heights
+                    .iter()
+                    .map(|(_, height)| *height)
+                    .collect::<Vec<_>>(),
+                comparison.compared
             );
         }
     }

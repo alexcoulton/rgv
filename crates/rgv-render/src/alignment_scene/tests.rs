@@ -4343,9 +4343,13 @@ fn agreed_marker(
     assert_eq!(cpu.len(), 1, "{cpu:?}");
     let (primitive, bounds) = gpu[0];
     let projected = &cpu[0];
-    assert_eq!(
-        projected.shape,
-        rgv_alignment_scene::CpuPrimitiveShape::PointMarker
+    assert!(
+        matches!(
+            projected.shape,
+            rgv_alignment_scene::CpuPrimitiveShape::PointMarker
+                | rgv_alignment_scene::CpuPrimitiveShape::BoundaryHairline
+        ),
+        "{projected:?}"
     );
     assert!(
         (bounds.x - projected.x).abs() < 1.0e-9,
@@ -4398,8 +4402,17 @@ fn insertion_markers_are_narrow_bars_centred_on_the_start_edge_of_their_base() {
     assert!(marker.left > boundary_x(zoomed_in, 21) + 50.0);
     assert!(marker.left + marker.width < boundary_x(zoomed_in, 23) - 50.0);
 
-    // 100,000 bases over 1,000 points: 0.01 points per base. The bar keeps its two-point
-    // minimum, still centred on the boundary.
+    // From one point per base down to 0.1 the bar is a one-point hairline on the same
+    // boundary: here 2,500 bases over 1,000 points, 0.4 points per base.
+    let hairline = boundary_camera(0, 2_500, 1_000.0);
+    assert!((1.0 / hairline.bases_per_pixel() - 0.4).abs() < 1.0e-12);
+    let marker = agreed_marker(&scene, hairline, is_insertion_of_read_at(20));
+    assert!((marker.width - 1.0).abs() < 1.0e-9, "{marker:?}");
+    assert!((marker.centre() - boundary_x(hairline, 22)).abs() < 1.0e-9);
+    assert!((marker.height - 11.0).abs() < 1.0e-9);
+
+    // 100,000 bases over 1,000 points: 0.01 points per base. Below 0.1 the marker is not drawn
+    // by either projection.
     let zoomed_out = AlignmentCamera::new(
         GenomicInterval::new(ContigId::new(0), 0, 100_000).unwrap(),
         0.0,
@@ -4414,9 +4427,19 @@ fn insertion_markers_are_narrow_bars_centred_on_the_start_edge_of_their_base() {
     )
     .unwrap();
     assert!((1.0 / zoomed_out.bases_per_pixel() - 0.01).abs() < 1.0e-12);
-    let marker = agreed_marker(&scene, zoomed_out, is_insertion_of_read_at(20));
-    assert!((marker.width - 2.0).abs() < 1.0e-9, "{marker:?}");
-    assert!((marker.centre() - boundary_x(zoomed_out, 22)).abs() < 1.0e-9);
+    let is_insertion = is_insertion_of_read_at(20);
+    assert!(
+        oracle_bounds(&scene, zoomed_out, |primitive| is_insertion(
+            primitive.component
+        ))
+        .is_empty()
+    );
+    assert!(
+        cpu_primitives(&scene, zoomed_out, |primitive| is_insertion(
+            primitive.component
+        ))
+        .is_empty()
+    );
 }
 
 /// One clip cut edge as projected by both the GPU oracle and the CPU projector, which must
@@ -4433,7 +4456,11 @@ fn agreed_clip_edge(
     });
     let cpu = cpu_primitives(scene, camera, |primitive| {
         component_matches(primitive.component)
-            && primitive.shape == rgv_alignment_scene::CpuPrimitiveShape::ClipEdge
+            && matches!(
+                primitive.shape,
+                rgv_alignment_scene::CpuPrimitiveShape::ClipEdge
+                    | rgv_alignment_scene::CpuPrimitiveShape::BoundaryHairline
+            )
     });
     assert_eq!(gpu.len(), 1, "{gpu:?}");
     assert_eq!(cpu.len(), 1, "{cpu:?}");
@@ -4464,6 +4491,7 @@ fn agreed_clip_edge(
 /// within [2, 6] points and a hard clip's two, and a clip on the arrowhead's boundary sits just
 /// inside the arrowhead's base.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn clip_edges_and_terminal_insertion_markers_sit_on_the_read_boundaries() {
     use rgv_alignment_scene::ClipEdgeToken;
     let ledger = boundary_ledger();
@@ -4482,7 +4510,7 @@ fn clip_edges_and_terminal_insertion_markers_sit_on_the_read_boundaries() {
         (1200, 0, 1200, edge(false, true, true)),
         (1600, 1, 1607, edge(true, false, false)),
     ];
-    for points_per_base in [0.5_f64, 2.0, 10.0, 64.0, 112.0] {
+    for points_per_base in [0.05_f64, 0.2, 0.5, 2.0, 10.0, 64.0, 112.0] {
         for (read, cigar_index, boundary, geometry) in clips {
             // Twenty points of margin around the boundary base.
             let span = (40.0 / points_per_base).ceil() as u64;
@@ -4504,24 +4532,43 @@ fn clip_edges_and_terminal_insertion_markers_sit_on_the_read_boundaries() {
                 },
             )
             .unwrap();
-            let marker = agreed_clip_edge(&scene, camera, |component| {
+            let is_clip = |component| {
                 matches!(component,
                     AlignmentComponent::SoftClip { cigar_index: index, .. }
                     | AlignmentComponent::HardClip { cigar_index: index, .. }
                         if index == cigar_index)
-            });
+            };
+            if points_per_base < 0.1 {
+                // Not drawn (nor picked) below 0.1 points per base.
+                assert!(
+                    oracle_bounds(&scene, camera, |primitive| is_clip(primitive.component)
+                        && matches!(primitive.geometry, AlignmentGeometryToken::ClipEdge(_)))
+                    .is_empty()
+                );
+                assert!(
+                    cpu_primitives(&scene, camera, |primitive| is_clip(primitive.component)
+                        && primitive.shape != rgv_alignment_scene::CpuPrimitiveShape::TextLabel)
+                    .is_empty()
+                );
+                continue;
+            }
+            let marker = agreed_clip_edge(&scene, camera, is_clip);
             assert_eq!(marker.geometry, geometry, "read {read}");
             let AlignmentGeometryToken::ClipEdge(token) = geometry else {
                 unreachable!()
             };
-            let width = if token.hard {
+            // Below one point per base either edge is a one-point hairline.
+            let width = if points_per_base < 1.0 {
+                1.0
+            } else if token.hard {
                 2.0
             } else {
                 (points_per_base * 0.5).clamp(2.0, 6.0)
             };
-            // The head length depends on the read height alone, at every zoom.
+            // The head length depends on the read height and the zoom alone: 0.55 x height, at
+            // most ten bases.
             let arrowhead = if token.behind_arrow {
-                11.0_f64 * 0.55
+                (11.0_f64 * 0.55).min(points_per_base * 10.0)
             } else {
                 0.0
             };
@@ -4726,8 +4773,17 @@ fn picking_follows_the_boundary_bar() {
         );
     }
 
-    // Zoomed far out the two-point bar spans ~200 bases; a click on it away from the
-    // insertion's own base still selects it (its leading clip, two bases left, draws first).
+    // At 0.4 points per base the one-point hairline spans 2.5 bases; a click on it past the
+    // insertion's own base still selects it.
+    let hairline = boundary_camera(0, 2_500, 1_000.0);
+    let frame = CpuAlignmentProjector::project(&scene, 1, hairline).unwrap();
+    let x = boundary_x(hairline, 22) + 0.4;
+    let hit = CpuAlignmentProjector::pick(&scene, track, &frame, x, y + height * 0.5)
+        .unwrap()
+        .map(|hit| hit.component);
+    assert!(hit.is_some_and(is_insertion_of_read_at(20)), "{hit:?}");
+
+    // Zoomed far out (0.01 points per base) the marker is not drawn, so it is not picked.
     let zoomed_out = AlignmentCamera::new(
         GenomicInterval::new(ContigId::new(0), 0, 100_000).unwrap(),
         0.0,
@@ -4742,9 +4798,63 @@ fn picking_follows_the_boundary_bar() {
     )
     .unwrap();
     let frame = CpuAlignmentProjector::project(&scene, 1, zoomed_out).unwrap();
-    let x = boundary_x(zoomed_out, 22) + 0.9;
+    let x = boundary_x(zoomed_out, 22) + 0.4;
     let hit = CpuAlignmentProjector::pick(&scene, track, &frame, x, y + height * 0.5)
         .unwrap()
         .map(|hit| hit.component);
-    assert!(hit.is_some_and(is_insertion_of_read_at(20)), "{hit:?}");
+    assert!(
+        !hit.is_some_and(|component| matches!(
+            component,
+            AlignmentComponent::Insertion { .. } | AlignmentComponent::SoftClip { .. }
+        )),
+        "{hit:?}"
+    );
+}
+
+/// The shader's zoom-dependent mark constants are the ones the Rust oracle, CPU projector and
+/// export use.
+#[test]
+fn shader_mark_scaling_constants_match_the_cpu_projector() {
+    let shader = include_str!("../alignment_scene.wgsl");
+    let constant = |name: &str| {
+        let line = shader
+            .lines()
+            .find(|line| line.starts_with(&format!("const {name}: f32 = ")))
+            .unwrap_or_else(|| panic!("{name} is not declared"));
+        line.split('=')
+            .nth(1)
+            .unwrap()
+            .trim()
+            .trim_end_matches(';')
+            .parse::<f64>()
+            .unwrap()
+    };
+    for (name, value) in [
+        (
+            "ARROWHEAD_LENGTH",
+            rgv_alignment_scene::ARROWHEAD_LENGTH_FRACTION,
+        ),
+        (
+            "ARROWHEAD_MAXIMUM_BASES",
+            rgv_alignment_scene::ARROWHEAD_MAXIMUM_BASES,
+        ),
+        (
+            "ARROWHEAD_MINIMUM_LENGTH",
+            rgv_alignment_scene::ARROWHEAD_MINIMUM_LENGTH,
+        ),
+        (
+            "BOUNDARY_MARK_FULL",
+            rgv_alignment_scene::BOUNDARY_MARK_FULL_POINTS_PER_BASE,
+        ),
+        (
+            "BOUNDARY_MARK_HAIRLINE",
+            rgv_alignment_scene::BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE,
+        ),
+        (
+            "BOUNDARY_MARK_HAIRLINE_WIDTH",
+            rgv_alignment_scene::BOUNDARY_MARK_HAIRLINE_WIDTH,
+        ),
+    ] {
+        assert!((constant(name) - value).abs() < 1.0e-12, "{name}");
+    }
 }

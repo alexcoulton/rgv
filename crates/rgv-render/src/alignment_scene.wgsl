@@ -20,9 +20,20 @@ var<uniform> camera: Camera;
 // colour; mirrored by `CLIP_GHOST_TINT` in `palette.rs`.
 const CLIP_GHOST_TINT: f32 = 0.5;
 
-// The direction arrowhead's length along the read, as a fraction of the read height; mirrored by
-// `ARROWHEAD_LENGTH_FRACTION` in `rgv-alignment-scene`.
+// The direction arrowhead's length along the read, as a fraction of the read height, at most
+// `ARROWHEAD_MAXIMUM_BASES` bases; a head shorter than `ARROWHEAD_MINIMUM_LENGTH` points is not
+// drawn. Mirrored by `ARROWHEAD_LENGTH_FRACTION`, `ARROWHEAD_MAXIMUM_BASES` and
+// `ARROWHEAD_MINIMUM_LENGTH` in `rgv-alignment-scene`.
 const ARROWHEAD_LENGTH: f32 = 0.55;
+const ARROWHEAD_MAXIMUM_BASES: f32 = 10.0;
+const ARROWHEAD_MINIMUM_LENGTH: f32 = 0.5;
+
+// Point markers and clip cut edges: full size from `BOUNDARY_MARK_FULL` points per base, a plain
+// `BOUNDARY_MARK_HAIRLINE_WIDTH`-point hairline from `BOUNDARY_MARK_HAIRLINE`, hidden below.
+// Mirrored by `boundary_mark_detail` in `rgv-alignment-scene`.
+const BOUNDARY_MARK_FULL: f32 = 1.0;
+const BOUNDARY_MARK_HAIRLINE: f32 = 0.1;
+const BOUNDARY_MARK_HAIRLINE_WIDTH: f32 = 1.0;
 
 // One sixteen-byte instance (`AlignmentGpuInstance`):
 //   span.x     whole bases from the page start to the primitive's start
@@ -48,7 +59,21 @@ struct VertexOutput {
     @location(1) local_point: vec2<f32>,
     @location(2) @interpolate(flat) size: vec2<f32>,
     @location(3) @interpolate(flat) shape: u32,
+    // The read's arrowhead length, for direction terminals; see `arrowhead_length`.
+    @location(4) @interpolate(flat) head: f32,
 };
+
+fn camera_points_per_base() -> f32 {
+    return camera.points_per_base.x + camera.points_per_base.y;
+}
+
+// The direction arrowhead's length for a read drawn `height` points tall: camera-global, never
+// the width of the primitive being cut, so every tip primitive shares one diagonal. Zero means
+// the read ends square. Mirrored by `arrowhead_length` in `rgv-alignment-scene`.
+fn arrowhead_length(height: f32) -> f32 {
+    let length = min(height * ARROWHEAD_LENGTH, camera_points_per_base() * ARROWHEAD_MAXIMUM_BASES);
+    return select(length, 0.0, length < ARROWHEAD_MINIMUM_LENGTH);
+}
 
 // `page_offset` is a whole number of bases from the page start; see `page_offset_words`.
 fn project_x(page_offset: u32) -> f32 {
@@ -109,29 +134,45 @@ fn project_instance(
         top = row_top + camera.read_height * 0.45;
         height = max(camera.read_height * 0.10, 1.0);
     }
+    let points_per_base = camera_points_per_base();
+    let full_marks = points_per_base >= BOUNDARY_MARK_FULL;
+    let hidden_marks = points_per_base < BOUNDARY_MARK_HAIRLINE;
+    var output_shape = shape;
     // Point markers (2: start edge, 5: end edge of the one-base span) are narrow bars centred on
-    // that base boundary, a quarter of a base wide but within [2, 6] points; mirrored by
-    // `point_marker_extent` in `rgv-alignment-scene`.
+    // that base boundary, a quarter of a base wide but within [2, 6] points (a one-point
+    // hairline when zoomed out, nothing further out); mirrored by `point_marker_extent` in
+    // `rgv-alignment-scene`.
     if shape == 2u || shape == 5u {
-        let marker_width = clamp((right - left) * 0.25, 2.0, 6.0);
+        var marker_width = BOUNDARY_MARK_HAIRLINE_WIDTH;
+        if full_marks {
+            marker_width = clamp((right - left) * 0.25, 2.0, 6.0);
+        }
         let boundary = select(left, right, shape == 5u);
         left = boundary - marker_width * 0.5;
         right = left + marker_width;
+        if hidden_marks {
+            right = left;
+        }
     } else if shape >= 6u && shape <= 13u {
         // Clip cut edges (6 + at_end + 2 hard + 4 behind_arrow), just inside the start (or end)
         // edge of the one-base span: a soft clip's sawtooth is half a base wide within [2, 6]
-        // points, a hard clip's bar two. Behind an arrowhead on the same boundary (the read's
-        // tip) the edge moves inward by the arrowhead's length, `ARROWHEAD_LENGTH` of the
-        // height (see `fragment_main`). Mirrored by `clip_edge_extent` in `rgv-alignment-scene`.
+        // points, a hard clip's bar two; zoomed out either is a plain one-point hairline (drawn
+        // as a rectangle, shape 0), and further out nothing. Behind an arrowhead on the same
+        // boundary (the read's tip) the edge moves inward by the arrowhead's length (see
+        // `arrowhead_length`). Mirrored by `clip_edge_extent` in `rgv-alignment-scene`.
         let bits = shape - 6u;
         let cell = right - left;
-        var edge_width = 2.0;
-        if (bits & 2u) == 0u {
+        var edge_width = BOUNDARY_MARK_HAIRLINE_WIDTH;
+        if !full_marks {
+            output_shape = 0u;
+        } else if (bits & 2u) == 0u {
             edge_width = clamp(cell * 0.5, 2.0, 6.0);
+        } else {
+            edge_width = 2.0;
         }
         var inset = 0.0;
         if (bits & 4u) != 0u {
-            inset = height * ARROWHEAD_LENGTH;
+            inset = arrowhead_length(height);
         }
         if (bits & 1u) != 0u {
             right = right - inset;
@@ -139,6 +180,9 @@ fn project_instance(
         } else {
             left = left + inset;
             right = left + edge_width;
+        }
+        if hidden_marks {
+            right = left;
         }
     } else if shape == 3u {
         // A right-pointing direction terminal keeps its tip on the read's end: its one-point
@@ -163,7 +207,8 @@ fn project_instance(
     }
     output.local_point = corner * vec2<f32>(right - left, height);
     output.size = vec2<f32>(right - left, height);
-    output.shape = shape;
+    output.shape = output_shape;
+    output.head = arrowhead_length(height);
     return output;
 }
 
@@ -193,13 +238,14 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // The read's one arrowhead. Every primitive at the tip (aligned block, one-base terminal,
         // base cell) ends on the read's tip and is cut by this same diagonal: the head's length
         // depends on the read height only, never on the primitive's own width, so a primitive
-        // narrower than the head is trimmed rather than re-pointed at its own scale. Mirrored by
-        // `arrowhead_covers` in `rgv-alignment-scene`.
+        // narrower than the head is trimmed rather than re-pointed at its own scale. A zero head
+        // (far zoomed out) leaves the read's end square. Mirrored by `arrowhead_covers` in
+        // `rgv-alignment-scene`.
         var distance_from_tip = input.size.x - input.local_point.x;
         if input.shape == 4u {
             distance_from_tip = input.local_point.x;
         }
-        let head_width = input.size.y * ARROWHEAD_LENGTH;
+        let head_width = input.head;
         if distance_from_tip < head_width {
             let half_height = input.size.y * 0.5;
             let allowed = half_height * clamp(distance_from_tip / head_width, 0.0, 1.0);

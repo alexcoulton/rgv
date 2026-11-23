@@ -275,6 +275,9 @@ pub fn project_alignment_gpu_instance(
         height = (camera.read_height() * 0.10).max(1.0);
     }
     let shape = instance.shape();
+    // Point markers and clip edges are hairlines, then hidden, as the camera zooms out (see
+    // `rgv_alignment_scene::boundary_mark_detail`); a hidden mark emits no quad.
+    let points_per_base = 1.0 / camera.bases_per_pixel();
     if shape == AlignmentGpuShape::PointMarker as u32
         || shape == AlignmentGpuShape::PointMarkerAtEnd as u32
     {
@@ -282,11 +285,13 @@ pub fn project_alignment_gpu_instance(
             x,
             right,
             shape == AlignmentGpuShape::PointMarkerAtEnd as u32,
-        );
+            points_per_base,
+        )?;
         x = left;
         right = left + width;
     } else if let Some(edge) = AlignmentGpuShape::clip_edge_token(shape) {
-        let (left, width) = rgv_alignment_scene::clip_edge_extent(x, right, height, edge);
+        let (left, width) =
+            rgv_alignment_scene::clip_edge_extent(x, right, height, edge, points_per_base)?;
         x = left;
         right = left + width;
     } else if shape == AlignmentGpuShape::DirectionTerminalRight as u32

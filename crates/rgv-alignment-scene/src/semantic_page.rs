@@ -453,15 +453,7 @@ pub const fn primitive_paint_layer(
 /// The within-page paint order of one primitive; see [`primitive_paint_layer`].
 fn page_paint_key(
     primitive: &AlignmentSemanticPrimitive,
-) -> (
-    u32,
-    u8,
-    u64,
-    u64,
-    u32,
-    AlignmentHandle,
-    AlignmentComponent,
-) {
+) -> (u32, u8, u64, u64, u32, AlignmentHandle, AlignmentComponent) {
     (
         primitive.row_offset,
         primitive_paint_layer(primitive.component, primitive.geometry),
@@ -6081,10 +6073,10 @@ mod tests {
     /// The reported defect: zoomed out from base detail, a read grew a second, smaller point
     /// past its arrowhead, because the aligned block, the one-base direction terminal and the
     /// base cell at the tip each sized their head from their own width. All of them are now cut
-    /// by the read's one diagonal (0.55 x read height long, from the read's tip), so at every
-    /// zoom the union of the read's primitives is exactly one arrow: covered height grows
-    /// monotonically from the tip, nothing of the read is inside the cut-away corners, and
-    /// picking there does not select the read.
+    /// by the read's one diagonal (min(0.55 x read height, 10 bases) long, from the read's tip;
+    /// none under half a point), so at every zoom the union of the read's primitives is exactly
+    /// one arrow (or one square end): covered height grows monotonically from the tip, nothing
+    /// of the read is inside the cut-away corners, and picking there does not select the read.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn tip_primitives_share_one_diagonal_so_the_read_has_one_clean_arrowhead_at_every_zoom() {
@@ -6127,9 +6119,11 @@ mod tests {
         );
         // (record, tip position, points right)
         for (ordinal, tip_position, points_right) in [(0, 160, true), (1, 150, false)] {
-            for points_per_base in [0.5_f64, 2.0, 10.0, 40.0] {
-                // About forty points either side of the tip.
-                let span = (40.0 / points_per_base).ceil() as u64;
+            // Down to 0.04 points per base, where the head (ten bases) is under half a point
+            // and the read ends square.
+            for points_per_base in [0.04_f64, 0.06, 0.2, 0.5, 2.0, 10.0, 40.0] {
+                // About forty points either side of the tip, but at most 100 bases.
+                let span = ((40.0 / points_per_base).ceil() as u64).min(100);
                 let width = 2.0 * span as f64 * points_per_base;
                 let camera = clip_camera(tip_position - span, tip_position + span, width);
                 let frame = crate::CpuAlignmentProjector::project(&scene, 0, camera).unwrap();
@@ -6172,23 +6166,36 @@ mod tests {
                     assert!((edge - tip_x).abs() < 1.0e-9, "{context}: {primitive:?}");
                 }
 
-                // Written out independently: the head is 0.55 x 11 points long whatever the
-                // zoom, and the read is covered where |y - centre| <= 5.5 x min(d / head, 1).
-                let head = 11.0 * 0.55;
+                // Written out independently: the head is 0.55 x 11 points long, but at most
+                // ten bases, and none under half a point; the read is covered where
+                // |y - centre| <= 5.5 x min(d / head, 1).
+                let head = (11.0_f64 * 0.55).min(points_per_base * 10.0);
+                let head = if head < 0.5 { 0.0 } else { head };
+                assert!((arrow.length() - head).abs() < 1.0e-9, "{context}");
                 let (centre, half) = (arrow.centre_y, 5.5);
-                let into_read = |x: f64| if points_right { tip_x - x } else { x - tip_x };
+                // From a point outside the tip to the end of the sampled read (its 60 bases, or
+                // the pane, or twenty points, whichever is nearest).
+                let reach = (60.0 * points_per_base)
+                    .min(span as f64 * points_per_base)
+                    .min(20.0)
+                    - 0.01;
                 let mut columns = Vec::new();
                 // Off-grid steps, so no sample sits exactly on an outline.
                 for column in 0..400 {
-                    let x = tip_x - 2.5 * head + f64::from(column) * 0.0503 + 0.0011;
-                    let distance = into_read(x);
+                    let distance = -1.0 + f64::from(column) * (reach + 1.0) / 400.0 + 0.0011;
+                    let x = if points_right {
+                        tip_x - distance
+                    } else {
+                        tip_x + distance
+                    };
                     let mut covered_height = 0;
                     for row in 0..300 {
                         let y = centre - half - 1.0 + f64::from(row) * 0.0437 + 0.0007;
                         let covered = read.iter().any(|primitive| primitive.contains(x, y));
                         let expected = distance > 0.0
                             && (y - centre).abs() < half
-                            && (y - centre).abs() <= half * (distance / head).min(1.0);
+                            && (head == 0.0
+                                || (y - centre).abs() <= half * (distance / head).min(1.0));
                         assert_eq!(
                             covered, expected,
                             "{context}: ({x}, {y}) is {distance} from the tip"
@@ -6202,31 +6209,44 @@ mod tests {
                 for pair in columns.windows(2) {
                     assert!(pair[0].1 <= pair[1].1, "{context}: step at {pair:?}");
                 }
-                assert!(columns.iter().any(|(distance, height)| *distance > 0.0
-                    && *distance < head
-                    && *height > 0
-                    && *height < 250));
+                if head > 0.0 {
+                    assert!(columns.iter().any(|(distance, height)| *distance > 0.0
+                        && *distance < head
+                        && *height > 0
+                        && *height < 250));
+                } else {
+                    // A square end: every sampled column inside the read is full height.
+                    let full = columns.iter().map(|(_, height)| *height).max().unwrap();
+                    assert!(
+                        columns
+                            .iter()
+                            .all(|(distance, height)| *distance <= 0.0 || *height == full),
+                        "{context}: {columns:?}"
+                    );
+                }
 
                 // Hit-testing: inside the cut-away corner nothing is picked; on the centre line
                 // just inside the tip the read is.
                 let track = rgv_core::TrackId::new(3);
-                let corner_x = if points_right {
-                    tip_x - head * 0.4
-                } else {
-                    tip_x + head * 0.4
-                };
-                let corner = crate::CpuAlignmentProjector::pick(
-                    &scene,
-                    track,
-                    &frame,
-                    corner_x,
-                    centre - half + 0.5,
-                )
-                .unwrap();
-                assert!(
-                    corner.is_none_or(|hit| hit.handle != handle_of(ordinal)),
-                    "{context}: picked {corner:?} in the cut-away corner"
-                );
+                if head > 0.0 {
+                    let corner_x = if points_right {
+                        tip_x - head * 0.4
+                    } else {
+                        tip_x + head * 0.4
+                    };
+                    let corner = crate::CpuAlignmentProjector::pick(
+                        &scene,
+                        track,
+                        &frame,
+                        corner_x,
+                        centre - half + 0.5,
+                    )
+                    .unwrap();
+                    assert!(
+                        corner.is_none_or(|hit| hit.handle != handle_of(ordinal)),
+                        "{context}: picked {corner:?} in the cut-away corner"
+                    );
+                }
                 let inside_x = if points_right {
                     tip_x - 0.2
                 } else {
@@ -6310,8 +6330,10 @@ mod tests {
                 }
             }
         }
-        // 0.5, 4, 12 and 40 points per base.
+        // 0.05, 0.2, 0.5, 4, 12 and 40 points per base.
         for (start, end, width) in [
+            (0, 300, 15.0),
+            (0, 300, 60.0),
             (0, 300, 150.0),
             (90, 180, 360.0),
             (95, 175, 960.0),
@@ -6331,22 +6353,37 @@ mod tests {
                             && primitive.shape != crate::CpuPrimitiveShape::TextLabel
                     })
                     .collect::<Vec<_>>();
+                if points_per_base < 0.1 {
+                    // Neither drawn nor picked so far out.
+                    assert!(projected.is_empty(), "{points_per_base} {token:?}");
+                    continue;
+                }
                 assert_eq!(projected.len(), 1, "{points_per_base} {token:?}");
                 let projected = projected[0];
-                assert_eq!(projected.shape, crate::CpuPrimitiveShape::ClipEdge);
+                assert_eq!(
+                    projected.shape,
+                    if points_per_base < 1.0 {
+                        crate::CpuPrimitiveShape::BoundaryHairline
+                    } else {
+                        crate::CpuPrimitiveShape::ClipEdge
+                    }
+                );
                 assert_eq!(
                     matches!(projected.component, AlignmentComponent::SoftClip { .. }),
                     soft
                 );
-                // Written out independently of `clip_edge_extent`.
-                let expected_width = if token.hard {
+                // Written out independently of `clip_edge_extent`: a one-point hairline below
+                // one point per base.
+                let expected_width = if points_per_base < 1.0 {
+                    1.0
+                } else if token.hard {
                     2.0
                 } else {
                     (points_per_base * 0.5).clamp(2.0, 6.0)
                 };
-                // The head length depends on the read height alone, at every zoom.
+                // The head length depends on the read height and the zoom alone.
                 let arrowhead = if token.behind_arrow {
-                    11.0_f64 * 0.55
+                    (11.0_f64 * 0.55).min(points_per_base * 10.0)
                 } else {
                     0.0
                 };
@@ -6387,7 +6424,8 @@ mod tests {
                                 && primitive.component == AlignmentComponent::DirectionTerminal
                         })
                         .unwrap();
-                    let head = terminal.height * 0.55;
+                    let head = terminal.arrow.unwrap().length();
+                    assert!((head - arrowhead).abs() < 1.0e-9);
                     if token.at_end {
                         let terminal_tip = terminal.x + terminal.width;
                         assert!((terminal_tip - tip).abs() < 1.0e-9);
@@ -6522,10 +6560,25 @@ mod tests {
             ),
         ];
         let style = crate::AlignmentStyleContract::default();
-        for lod in [GeometryLod::Span, GeometryLod::Read] {
+        // Outside base detail no page of any family carries a ghost cell or a ghost letter,
+        // so nothing pale is drawn where the letters could not be.
+        for lod in [GeometryLod::Overview, GeometryLod::Span, GeometryLod::Read] {
             let scene = scene_for_records(&ledger, &records, lod, style);
             for ordinal in 0..records.len() {
                 assert!(ghosts_of(&scene, handle_of(ordinal)).is_empty(), "{lod:?}");
+            }
+            for page in scene.pages() {
+                assert!(
+                    page.primitives().iter().all(|primitive| {
+                        primitive.geometry != AlignmentGeometryToken::ClipGhost
+                            && !matches!(
+                                primitive.component,
+                                AlignmentComponent::ClipGhostBase { .. }
+                            )
+                    }),
+                    "{lod:?} {:?}",
+                    page.key()
+                );
             }
         }
         let hidden = scene_for_records(
@@ -6934,8 +6987,10 @@ mod tests {
             .iter()
             .copied()
             .find(|primitive| {
-                matches!(primitive.component, AlignmentComponent::AlignedSegment { .. })
-                    && primitive.end_offset > primitive.start_offset + 1
+                matches!(
+                    primitive.component,
+                    AlignmentComponent::AlignedSegment { .. }
+                ) && primitive.end_offset > primitive.start_offset + 1
             })
             .expect("the fixture has a multi-base aligned block");
         let mut base = primitives
@@ -6949,8 +7004,10 @@ mod tests {
         let mut ordered = vec![base, segment];
         ordered.sort_unstable_by_key(page_paint_key);
         assert!(
-            matches!(ordered[0].component, AlignmentComponent::AlignedSegment { .. })
-                && matches!(ordered[1].component, AlignmentComponent::Base { .. }),
+            matches!(
+                ordered[0].component,
+                AlignmentComponent::AlignedSegment { .. }
+            ) && matches!(ordered[1].component, AlignmentComponent::Base { .. }),
             "the base cell must paint after (over) the block it sits on"
         );
 

@@ -341,7 +341,9 @@ fn directional_part_count(primitive: &rgv_alignment_scene::CpuProjectedPrimitive
 
 /// Exports a primitive at a read's tip as exactly the outline the GPU's `fragment_main` paints
 /// (`rgv_alignment_scene::arrowhead_covers`): every tip primitive is cut by the read's one
-/// diagonal, whose length depends on the read height alone, measured from the read's tip.
+/// diagonal, whose length depends on the read height and the camera scale alone
+/// (`rgv_alignment_scene::arrowhead_length`), measured from the read's tip. A zero-length head
+/// (far zoomed out) leaves a plain rectangle.
 ///
 /// The display list's `DirectionalTerminal` shapes size their head from the rectangle's own
 /// width (other tracks rely on that) and `rgv-layout` is outside this change, so the cut is
@@ -787,15 +789,22 @@ mod tests {
                 (low.min(*centre), high.max(*centre))
             });
         assert!(high - low > 3.0, "{centres:?}");
+        // Zoomed out (below one point per base) the projector draws the edge as a plain
+        // hairline: exported as one rectangle, not sliced.
+        edge.shape = CpuPrimitiveShape::BoundaryHairline;
+        edge.width = 1.0;
+        assert_eq!(sawtooth_slice_count(&edge), 0);
+        edge.shape = CpuPrimitiveShape::ClipEdge;
         edge.geometry = AlignmentGeometryToken::ClipEdge(ClipEdgeToken { hard: true, ..soft });
         assert_eq!(sawtooth_slice_count(&edge), 0);
     }
 
     /// A primitive at a read's tip is exported as exactly the outline the GPU paints and the
-    /// CPU projector picks: the read's one diagonal (0.55 x height from the read's tip), whatever
-    /// the primitive's own width, so a one-base terminal or base cell narrower than the head is
-    /// a trimmed triangle, not a smaller arrow of its own. Unclipped it is at most a rectangle
-    /// and a chevron; clipped by the pane it is traced with slices.
+    /// CPU projector picks: the read's one diagonal (min(0.55 x height, 10 bases) from the
+    /// read's tip, none under half a point), whatever the primitive's own width, so a one-base
+    /// terminal or base cell narrower than the head is a trimmed triangle, not a smaller arrow
+    /// of its own. Unclipped it is at most a rectangle and a chevron; clipped by the pane it is
+    /// traced with slices.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn primitives_at_a_read_tip_export_the_shared_arrowhead_outline() {
@@ -840,18 +849,23 @@ mod tests {
                 row: 0,
                 arrow: Some(arrow),
             };
-        // A read 11 points tall whose tip is at x = 100 (right) or x = 20 (left); the head is
-        // 6.05 points long.
+        // A read 11 points tall whose tip is at x = 100 (right) or x = 20 (left); at 2 points
+        // per base the head is 0.55 x 11 = 6.05 points long.
         let right = CpuArrowhead {
             tip_x: 100.0,
             centre_y: 15.5,
             height: 11.0,
+            points_per_base: 2.0,
             points_right: true,
         };
         let left = CpuArrowhead {
             tip_x: 20.0,
             points_right: false,
             ..right
+        };
+        let zoomed_out = |arrow: CpuArrowhead, points_per_base: f64| CpuArrowhead {
+            points_per_base,
+            ..arrow
         };
         // (primitive, exported exactly, most parts)
         let cases = [
@@ -866,7 +880,31 @@ mod tests {
             (primitive(20.0, 10.0, 10.0, 11.0, left), true, 2),
             // Clipped by the pane: the tip (3 points beyond its right edge) and the top row.
             (primitive(40.0, 12.0, 57.0, 9.0, right), false, 1 + 18),
+            // Zoomed out to 0.4 points per base the head is ten bases, 4 points long ...
+            (
+                primitive(60.0, 10.0, 40.0, 11.0, zoomed_out(right, 0.4)),
+                true,
+                2,
+            ),
+            (
+                primitive(20.0, 10.0, 1.0, 11.0, zoomed_out(left, 0.4)),
+                true,
+                1,
+            ),
+            // ... and at 0.04 points per base under half a point: no head, a plain rectangle.
+            (
+                primitive(60.0, 10.0, 40.0, 11.0, zoomed_out(right, 0.04)),
+                true,
+                1,
+            ),
+            (
+                primitive(20.0, 10.0, 1.0, 11.0, zoomed_out(left, 0.04)),
+                true,
+                1,
+            ),
         ];
+        assert!((zoomed_out(right, 0.4).length() - 4.0).abs() < 1.0e-9);
+        assert!(zoomed_out(right, 0.04).length().abs() < f64::EPSILON);
         for (index, (primitive, exact, most)) in cases.into_iter().enumerate() {
             let arrow = primitive.arrow.unwrap();
             let mut parts = Vec::new();

@@ -190,6 +190,11 @@ pub enum CpuPrimitiveShape {
     TextLabel,
     /// A clip's cut edge (see [`clip_edge_extent`]); its `geometry` says which kind.
     ClipEdge,
+    /// A point marker or clip cut edge drawn as a plain one-point hairline on its boundary,
+    /// because the camera is between [`BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE`] and
+    /// [`BOUNDARY_MARK_FULL_POINTS_PER_BASE`] (see [`boundary_mark_detail`]); its `geometry`
+    /// says which mark. No sawtooth.
+    BoundaryHairline,
     /// A soft-clipped ghost base cell, drawn translucent beneath every other read of its row.
     ClipGhostCell,
 }
@@ -241,6 +246,8 @@ pub struct CpuArrowhead {
     pub centre_y: f64,
     /// Unclipped height of the read, in points (at least one point).
     pub height: f64,
+    /// The camera's horizontal scale, in points per base, which caps the head's length.
+    pub points_per_base: f64,
     pub points_right: bool,
 }
 
@@ -248,7 +255,7 @@ impl CpuArrowhead {
     /// Length of the head along the read; see [`arrowhead_length`].
     #[must_use]
     pub fn length(self) -> f64 {
-        arrowhead_length(self.height)
+        arrowhead_length(self.height, self.points_per_base)
     }
 
     /// Distance of `x` from the tip, measured into the read.
@@ -274,26 +281,81 @@ impl CpuArrowhead {
     /// beyond the head is).
     #[must_use]
     pub fn covers(self, x: f64, y: f64) -> bool {
-        arrowhead_covers(self.distance_from_tip(x), y - self.centre_y, self.height)
+        arrowhead_covers(
+            self.distance_from_tip(x),
+            y - self.centre_y,
+            self.height,
+            self.points_per_base,
+        )
     }
 }
 
-/// The direction arrowhead's length along the read, for a read drawn `height` points tall:
-/// [`ARROWHEAD_LENGTH_FRACTION`] of the height, and nothing else. It never depends on the width
-/// of the primitive being cut, so the block, the one-base terminal and a base cell at the tip
-/// share one diagonal; a read shorter on screen than this is drawn as (part of) the arrow.
+/// The direction arrowhead's length along the read, for a read drawn `height` points tall
+/// under a camera of `points_per_base`: [`ARROWHEAD_LENGTH_FRACTION`] of the height, but at
+/// most [`ARROWHEAD_MAXIMUM_BASES`] bases, so zoomed out the head shrinks with the read instead
+/// of swallowing it. A head shorter than [`ARROWHEAD_MINIMUM_LENGTH`] (under one physical pixel
+/// at a 2x scale factor) is not drawn at all: the length is zero and the read ends square.
+///
+/// It depends on camera-global quantities only, never on the width of the primitive being cut,
+/// so the block, the one-base terminal and a base cell at the tip share one diagonal; a read
+/// shorter on screen than this is drawn as (part of) the arrow. Mirrors `arrowhead_length` in
+/// `rgv-render`'s `alignment_scene.wgsl`.
 #[must_use]
-pub fn arrowhead_length(height: f64) -> f64 {
-    height * ARROWHEAD_LENGTH_FRACTION
+pub fn arrowhead_length(height: f64, points_per_base: f64) -> f64 {
+    let length =
+        (height * ARROWHEAD_LENGTH_FRACTION).min(points_per_base * ARROWHEAD_MAXIMUM_BASES);
+    if length < ARROWHEAD_MINIMUM_LENGTH {
+        0.0
+    } else {
+        length
+    }
+}
+
+/// How point markers and clip cut edges are drawn at a camera scale (keep in lockstep with
+/// `boundary_mark_detail` in `rgv-render`'s `alignment_scene.wgsl`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundaryMarkDetail {
+    /// From [`BOUNDARY_MARK_FULL_POINTS_PER_BASE`]: the full marker bar, sawtooth or clip bar.
+    Full,
+    /// From [`BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE`]: a plain hairline
+    /// [`BOUNDARY_MARK_HAIRLINE_WIDTH`] wide at the same boundary position.
+    Hairline,
+    /// Coarser still: not drawn, and not picked.
+    Hidden,
+}
+
+/// Points per base from which point markers and clip cut edges are drawn at full size.
+pub const BOUNDARY_MARK_FULL_POINTS_PER_BASE: f64 = 1.0;
+/// Points per base from which they are drawn at all (as hairlines below the full scale).
+pub const BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE: f64 = 0.1;
+/// Width, in points, of a hairline mark (the minimum-size policy's one point).
+pub const BOUNDARY_MARK_HAIRLINE_WIDTH: f64 = 1.0;
+
+/// How point markers and clip cut edges are drawn under a camera of `points_per_base`.
+#[must_use]
+pub fn boundary_mark_detail(points_per_base: f64) -> BoundaryMarkDetail {
+    if points_per_base >= BOUNDARY_MARK_FULL_POINTS_PER_BASE {
+        BoundaryMarkDetail::Full
+    } else if points_per_base >= BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE {
+        BoundaryMarkDetail::Hairline
+    } else {
+        BoundaryMarkDetail::Hidden
+    }
 }
 
 /// Whether a point `distance_from_tip` into the read from its tip and `offset_from_centre`
 /// from its centre line is inside the arrow outline of a read `height` points tall: within the
 /// head the half-height allowed grows linearly from zero at the tip to the full half-height at
-/// [`arrowhead_length`]. Mirrors `fragment_main` in `alignment_scene.wgsl`.
+/// [`arrowhead_length`] (zero: no head, the read ends square). Mirrors `fragment_main` in
+/// `alignment_scene.wgsl`.
 #[must_use]
-pub fn arrowhead_covers(distance_from_tip: f64, offset_from_centre: f64, height: f64) -> bool {
-    let length = arrowhead_length(height);
+pub fn arrowhead_covers(
+    distance_from_tip: f64,
+    offset_from_centre: f64,
+    height: f64,
+    points_per_base: f64,
+) -> bool {
+    let length = arrowhead_length(height, points_per_base);
     if distance_from_tip >= length || length <= f64::EPSILON {
         return true;
     }
@@ -830,14 +892,25 @@ const POINT_MARKER_MINIMUM_WIDTH: f64 = 2.0;
 const POINT_MARKER_MAXIMUM_WIDTH: f64 = 6.0;
 
 /// Horizontal extent `(left, width)` of a point marker whose one-base span projects to
-/// `cell_left..cell_right`: centred on the cell's start edge, or on its end edge when `at_end`
-/// (`AlignmentGeometryToken::PointMarkerAtEnd`).
+/// `cell_left..cell_right`, under a camera of `points_per_base`: centred on the cell's start
+/// edge, or on its end edge when `at_end` (`AlignmentGeometryToken::PointMarkerAtEnd`). Below
+/// [`BOUNDARY_MARK_FULL_POINTS_PER_BASE`] it is a one-point hairline on that boundary, and below
+/// [`BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE`] it is not drawn (`None`).
 #[must_use]
-pub fn point_marker_extent(cell_left: f64, cell_right: f64, at_end: bool) -> (f64, f64) {
-    let width = ((cell_right - cell_left) * POINT_MARKER_BASE_FRACTION)
-        .clamp(POINT_MARKER_MINIMUM_WIDTH, POINT_MARKER_MAXIMUM_WIDTH);
+pub fn point_marker_extent(
+    cell_left: f64,
+    cell_right: f64,
+    at_end: bool,
+    points_per_base: f64,
+) -> Option<(f64, f64)> {
+    let width = match boundary_mark_detail(points_per_base) {
+        BoundaryMarkDetail::Full => ((cell_right - cell_left) * POINT_MARKER_BASE_FRACTION)
+            .clamp(POINT_MARKER_MINIMUM_WIDTH, POINT_MARKER_MAXIMUM_WIDTH),
+        BoundaryMarkDetail::Hairline => BOUNDARY_MARK_HAIRLINE_WIDTH,
+        BoundaryMarkDetail::Hidden => return None,
+    };
     let boundary = if at_end { cell_right } else { cell_left };
-    (boundary - width * 0.5, width)
+    Some((boundary - width * 0.5, width))
 }
 
 /// Clip cut edges (shapes 6..=13 of `project_instance` and `fragment_main` in `rgv-render`'s
@@ -851,8 +924,11 @@ const HARD_CLIP_EDGE_WIDTH: f64 = 2.0;
 const CLIP_EDGE_STROKE: f64 = 1.5;
 const CLIP_EDGE_TOOTH_HEIGHT: f64 = 4.0;
 /// The direction arrowhead of `fragment_main` (shapes 3 and 4): its length along the read is
-/// this fraction of the read height; see [`arrowhead_length`].
+/// this fraction of the read height, but at most this many bases, and a head shorter than this
+/// many points is not drawn; see [`arrowhead_length`].
 pub const ARROWHEAD_LENGTH_FRACTION: f64 = 0.55;
+pub const ARROWHEAD_MAXIMUM_BASES: f64 = 10.0;
+pub const ARROWHEAD_MINIMUM_LENGTH: f64 = 0.5;
 
 /// Horizontal extent `(left, width)` of a clip's cut edge whose one-base span (the aligned base
 /// at the clipped boundary) projects to `cell_left..cell_right`, for a read drawn `height`
@@ -861,36 +937,42 @@ pub const ARROWHEAD_LENGTH_FRACTION: f64 = 0.55;
 ///
 /// When the read's direction arrowhead is on the same boundary (`edge.behind_arrow`) the edge
 /// is moved inward from that boundary (the read's tip) by exactly the arrowhead's length,
-/// [`arrowhead_length`] of `height`. The edge then starts where the arrowhead's base is, so
-/// tip and cut both stay visible.
+/// [`arrowhead_length`] of `height` at `points_per_base`. The edge then starts where the
+/// arrowhead's base is, so tip and cut both stay visible.
+///
+/// Below [`BOUNDARY_MARK_FULL_POINTS_PER_BASE`] either kind of edge is a one-point hairline in
+/// the same place (drawn plain, see [`CpuPrimitiveShape::BoundaryHairline`]); below
+/// [`BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE`] it is not drawn (`None`).
 #[must_use]
 pub fn clip_edge_extent(
     cell_left: f64,
     cell_right: f64,
     height: f64,
     edge: ClipEdgeToken,
-) -> (f64, f64) {
+    points_per_base: f64,
+) -> Option<(f64, f64)> {
     let cell = cell_right - cell_left;
-    let width = if edge.hard {
-        HARD_CLIP_EDGE_WIDTH
-    } else {
-        (cell * SOFT_CLIP_EDGE_BASE_FRACTION)
-            .clamp(SOFT_CLIP_EDGE_MINIMUM_WIDTH, SOFT_CLIP_EDGE_MAXIMUM_WIDTH)
+    let width = match boundary_mark_detail(points_per_base) {
+        BoundaryMarkDetail::Full if edge.hard => HARD_CLIP_EDGE_WIDTH,
+        BoundaryMarkDetail::Full => (cell * SOFT_CLIP_EDGE_BASE_FRACTION)
+            .clamp(SOFT_CLIP_EDGE_MINIMUM_WIDTH, SOFT_CLIP_EDGE_MAXIMUM_WIDTH),
+        BoundaryMarkDetail::Hairline => BOUNDARY_MARK_HAIRLINE_WIDTH,
+        BoundaryMarkDetail::Hidden => return None,
     };
     if !edge.behind_arrow {
-        return if edge.at_end {
+        return Some(if edge.at_end {
             (cell_right - width, width)
         } else {
             (cell_left, width)
-        };
+        });
     }
     // Direction terminals keep their tip on the read's boundary (see `directional_extent`).
-    let arrowhead = arrowhead_length(height);
-    if edge.at_end {
+    let arrowhead = arrowhead_length(height, points_per_base);
+    Some(if edge.at_end {
         (cell_right - arrowhead - width, width)
     } else {
         (cell_left + arrowhead, width)
-    }
+    })
 }
 
 /// Whether the point `(local_x, local_y)`, relative to the top-left of a clip edge of `width` x
@@ -948,6 +1030,7 @@ fn project_primitive(
         + (f64::from(global_row) - camera.row_scroll) * camera.row_height
         + (camera.row_height - camera.read_height) * 0.5;
     let body_height = camera.read_height.max(MINIMUM_PRIMITIVE_EXTENT);
+    let points_per_base = 1.0 / camera.bases_per_pixel();
     let mut arrow = None;
     let (shape, y, height) = match primitive.geometry {
         AlignmentGeometryToken::EventLine => {
@@ -968,8 +1051,12 @@ fn project_primitive(
                 x = boundary - width * 0.5;
                 (CpuPrimitiveShape::TextLabel, row_top, body_height)
             } else {
-                (x, width) = point_marker_extent(x, x + width, at_end);
-                (CpuPrimitiveShape::PointMarker, row_top, body_height)
+                (x, width) = point_marker_extent(x, x + width, at_end, points_per_base)?;
+                let shape = match boundary_mark_detail(points_per_base) {
+                    BoundaryMarkDetail::Full => CpuPrimitiveShape::PointMarker,
+                    _ => CpuPrimitiveShape::BoundaryHairline,
+                };
+                (shape, row_top, body_height)
             }
         }
         AlignmentGeometryToken::ClipEdge(edge) => {
@@ -979,8 +1066,12 @@ fn project_primitive(
                 width = width.max(MINIMUM_PRIMITIVE_EXTENT);
                 (CpuPrimitiveShape::TextLabel, row_top, body_height)
             } else {
-                (x, width) = clip_edge_extent(x, x + width, body_height, edge);
-                (CpuPrimitiveShape::ClipEdge, row_top, body_height)
+                (x, width) = clip_edge_extent(x, x + width, body_height, edge, points_per_base)?;
+                let shape = match boundary_mark_detail(points_per_base) {
+                    BoundaryMarkDetail::Full => CpuPrimitiveShape::ClipEdge,
+                    _ => CpuPrimitiveShape::BoundaryHairline,
+                };
+                (shape, row_top, body_height)
             }
         }
         AlignmentGeometryToken::ClipGhost => {
@@ -993,6 +1084,7 @@ fn project_primitive(
                 tip_x: x,
                 centre_y: row_top + body_height * 0.5,
                 height: body_height,
+                points_per_base,
                 points_right: false,
             });
             (
@@ -1007,6 +1099,7 @@ fn project_primitive(
                 tip_x: x + width,
                 centre_y: row_top + body_height * 0.5,
                 height: body_height,
+                points_per_base,
                 points_right: true,
             });
             (
@@ -1374,8 +1467,22 @@ mod tests {
         // thousandth of a point wide and every read is shorter than a pixel.
         let camera = camera(100_000, 0.25, 0.2);
         for geometry in GEOMETRIES {
-            let projected = project(primitive(50_000, 50_001, geometry), 8, camera)
-                .unwrap_or_else(|| panic!("{geometry:?} vanished below one point"));
+            let projected = project(primitive(50_000, 50_001, geometry), 8, camera);
+            if matches!(
+                geometry,
+                AlignmentGeometryToken::PointMarker
+                    | AlignmentGeometryToken::PointMarkerAtEnd
+                    | AlignmentGeometryToken::ClipEdge(_)
+            ) {
+                // Boundary marks are exempt: below 0.1 points per base they are not drawn.
+                assert!(
+                    projected.is_none(),
+                    "{geometry:?} drawn at 0.001 points per base"
+                );
+                continue;
+            }
+            let projected =
+                projected.unwrap_or_else(|| panic!("{geometry:?} vanished below one point"));
             assert!(
                 projected.width >= 1.0 - 1.0e-9,
                 "{geometry:?} is {} points wide",
@@ -1387,15 +1494,169 @@ mod tests {
                 projected.height
             );
         }
-        // Point markers keep a two-point minimum (it was 1.5 when a marker filled its base cell)
-        // so a boundary bar stays visible when zoomed out, centred on its boundary.
-        for (geometry, boundary) in [
-            (AlignmentGeometryToken::PointMarker, 50_000.0),
-            (AlignmentGeometryToken::PointMarkerAtEnd, 50_001.0),
-        ] {
-            let marker = project(primitive(50_000, 50_001, geometry), 8, camera).unwrap();
-            assert!((marker.width - 2.0).abs() < 1.0e-9);
-            assert!((marker.x + 1.0 - (10.0 + boundary / 1_000.0)).abs() < 1.0e-9);
+    }
+
+    /// Marks drawn on a read scale with the zoom by camera-global bands: the arrowhead is
+    /// `min(0.55 x height, 10 x points per base)` long and absent below half a point; point
+    /// markers and clip edges are full size from one point per base, one-point plain hairlines
+    /// on the same boundary from 0.1, and neither drawn nor picked below that.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn read_marks_scale_with_the_zoom_in_bands() {
+        let soft_start = ClipEdgeToken {
+            at_end: false,
+            hard: false,
+            behind_arrow: false,
+        };
+        let soft_behind_end = ClipEdgeToken {
+            at_end: true,
+            hard: false,
+            behind_arrow: true,
+        };
+        let hard_behind_start = ClipEdgeToken {
+            at_end: false,
+            hard: true,
+            behind_arrow: true,
+        };
+        // (points per base, head, marker width, soft clip width, hard clip width, shape); a
+        // width of zero means the mark is not drawn. Reads are 11 points tall.
+        let bands = [
+            (0.0625, 0.625, 0.0, 0.0, 0.0, None),
+            // Under half a point the read ends square.
+            (0.04, 0.0, 0.0, 0.0, 0.0, None),
+            (
+                0.4,
+                4.0,
+                1.0,
+                1.0,
+                1.0,
+                Some(CpuPrimitiveShape::BoundaryHairline),
+            ),
+            (
+                0.1,
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                Some(CpuPrimitiveShape::BoundaryHairline),
+            ),
+            (
+                2.0,
+                6.05,
+                2.0,
+                2.0,
+                2.0,
+                Some(CpuPrimitiveShape::PointMarker),
+            ),
+            (
+                40.0,
+                6.05,
+                6.0,
+                6.0,
+                2.0,
+                Some(CpuPrimitiveShape::PointMarker),
+            ),
+        ];
+        for (points_per_base, head, marker, soft, hard, shape) in bands {
+            let context = format!("{points_per_base} points per base");
+            assert!(
+                (arrowhead_length(11.0, points_per_base) - head).abs() < 1.0e-9,
+                "{context}: head {}",
+                arrowhead_length(11.0, points_per_base)
+            );
+            // Exactly 1,000 points wide, so the scale is exact.
+            let bases = (1_000.0 / points_per_base).round() as u64;
+            let camera = AlignmentCamera::new(
+                GenomicInterval::new(ContigId::new(0), 1_000, 1_000 + bases).unwrap(),
+                0.0,
+                14.0,
+                11.0,
+                CpuClipRect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 1_000.0,
+                    height: 50.0,
+                },
+            )
+            .unwrap();
+            let base = bases / 2;
+            let start_edge = 10.0 + base as f64 * points_per_base;
+            let end_edge = start_edge + points_per_base;
+
+            // The arrowhead every tip primitive is cut by.
+            let terminal = project(
+                primitive(
+                    base,
+                    base + 1,
+                    AlignmentGeometryToken::DirectionalTerminalRight,
+                ),
+                0,
+                camera,
+            )
+            .unwrap();
+            let arrow = terminal.arrow.unwrap();
+            assert!((arrow.length() - head).abs() < 1.0e-9, "{context}");
+            let centre = arrow.centre_y;
+            // Just inside the tip, off the centre line: cut away unless the head is gone.
+            assert_eq!(
+                arrow.covers(arrow.tip_x - 0.01, centre + 5.0),
+                head == 0.0,
+                "{context}"
+            );
+
+            for (geometry, boundary) in [
+                (AlignmentGeometryToken::PointMarker, start_edge),
+                (AlignmentGeometryToken::PointMarkerAtEnd, end_edge),
+            ] {
+                let projected = project(primitive(base, base + 1, geometry), 0, camera);
+                assert_eq!(
+                    point_marker_extent(start_edge, end_edge, false, points_per_base)
+                        .map(|(_, width)| width),
+                    (marker > 0.0).then_some(marker),
+                    "{context}"
+                );
+                if marker == 0.0 {
+                    assert!(projected.is_none(), "{context}: {projected:?}");
+                    continue;
+                }
+                let projected = projected.unwrap();
+                assert_eq!(Some(projected.shape), shape, "{context}");
+                assert!((projected.width - marker).abs() < 1.0e-9, "{context}");
+                assert!(
+                    (projected.x + marker * 0.5 - boundary).abs() < 1.0e-9,
+                    "{context}: {projected:?}"
+                );
+            }
+            for edge in [soft_start, soft_behind_end, hard_behind_start] {
+                let width = if edge.hard { hard } else { soft };
+                let projected = project(
+                    primitive(base, base + 1, AlignmentGeometryToken::ClipEdge(edge)),
+                    0,
+                    camera,
+                );
+                if width == 0.0 {
+                    assert!(projected.is_none(), "{context}: {projected:?}");
+                    continue;
+                }
+                let projected = projected.unwrap();
+                let expected_shape = match shape {
+                    Some(CpuPrimitiveShape::PointMarker) => CpuPrimitiveShape::ClipEdge,
+                    _ => CpuPrimitiveShape::BoundaryHairline,
+                };
+                assert_eq!(projected.shape, expected_shape, "{context}");
+                assert!((projected.width - width).abs() < 1.0e-9, "{context}");
+                // On the boundary, moved behind the (new) head where the arrow shares it.
+                let inset = if edge.behind_arrow { head } else { 0.0 };
+                let expected_left = if edge.at_end {
+                    end_edge - inset - width
+                } else {
+                    start_edge + inset
+                };
+                assert!(
+                    (projected.x - expected_left).abs() < 1.0e-9,
+                    "{context} {edge:?}: {projected:?}"
+                );
+            }
         }
     }
 
