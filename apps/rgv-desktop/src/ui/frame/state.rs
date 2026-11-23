@@ -385,4 +385,6 @@ pub(super) struct ShellFrame {
         Option<crate::inspection::gene_transcripts::GeneTranscriptsTarget>,
     /// A Sashimi filter chip was clicked: clear that panel's junction filters.
     pub(super) sashimi_clear_filters: Option<PanelId>,
+    /// Retry was clicked on a read panel's failure banner: request that view again.
+    pub(super) read_notice_retry: Option<(PanelId, TrackId)>,
 }

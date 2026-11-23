@@ -711,6 +711,13 @@ struct LocalPositionedStreamState {
     later_record_seen: bool,
     /// Receipt of the block the last checkpoint returned.
     receipt: Option<PositionedChunkReceipt>,
+    /// Virtual offset through which this transaction has consumed the file: every record
+    /// ending at or before it was processed or belongs to a skipped run. The `HTSlib` region
+    /// iterator does not know that a skip moved the reader forward, so when the skip leaves
+    /// the iterator's current index chunk it seeks back to the start of its next chunk and
+    /// reads records again. A record ending here or earlier is such a repeat and is dropped:
+    /// one physical record reaches the transaction once.
+    consumed_through: u64,
 }
 
 pub struct LocalAlignmentSource {
@@ -922,6 +929,7 @@ impl LocalAlignmentSource {
             block_end: 0,
             later_record_seen: false,
             receipt: None,
+            consumed_through: 0,
         });
         Ok(())
     }
@@ -1014,6 +1022,7 @@ impl LocalAlignmentSource {
                 .positioned_stream
                 .as_mut()
                 .and_then(|state| state.pending.take());
+            let replayed = pending.is_some();
             let next = if let Some(pending) = pending {
                 Some(Ok(pending))
             } else {
@@ -1056,6 +1065,17 @@ impl LocalAlignmentSource {
                 .positioned_stream
                 .as_mut()
                 .expect("active positioned stream was checked");
+            if !replayed && record_end <= state.consumed_through {
+                // The iterator stepped back over what this transaction already consumed (see
+                // `consumed_through`): drop the repeat and return to where reading stopped.
+                if record_end < state.consumed_through {
+                    self.reader.seek(
+                        i64::try_from(state.consumed_through)
+                            .map_err(|_| AlignmentError::CoordinateOverflow)?,
+                    )?;
+                }
+                continue;
+            }
             if state.admission.resume().has_skipped()
                 && let Some(resume_at) = state
                     .admission
@@ -1064,6 +1084,7 @@ impl LocalAlignmentSource {
                 // The record belongs to a chunk the caller already holds: drop it and seek
                 // past that chunk and the skipped chunks directly following it.
                 state.later_record_seen = true;
+                state.consumed_through = state.consumed_through.max(resume_at).max(record_end);
                 self.reader.seek(
                     i64::try_from(resume_at).map_err(|_| AlignmentError::CoordinateOverflow)?,
                 )?;
@@ -1085,6 +1106,7 @@ impl LocalAlignmentSource {
             }
             state.current_block = Some(compressed_offset);
             state.block_end = record_end;
+            state.consumed_through = record_end;
             state.admission.process(
                 &record,
                 source_position,

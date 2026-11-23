@@ -156,6 +156,7 @@ impl Viewer {
                 .with_clip_rect(geometry.genomic)
                 .add(ui::presented_text::presented_text_slot(geometry.genomic));
             self.paint_sashimi_overlays(ui, st, geometry.genomic);
+            self.paint_read_notice_banners(ui, st, geometry.genomic);
             // Labels of lanes drawn by the experimental tile pipeline; none under `Legacy`.
             let tile_label_texts = self.track_tiles.label_texts().cloned().collect::<Vec<_>>();
             if !tile_label_texts.is_empty() {

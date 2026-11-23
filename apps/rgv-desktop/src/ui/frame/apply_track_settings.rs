@@ -431,6 +431,10 @@ impl Viewer {
         if let Some(panel_id) = st.sashimi_clear_filters.take() {
             self.clear_sashimi_filters(panel_id);
         }
+        if let Some((panel_id, track_id)) = st.read_notice_retry.take() {
+            self.request_alignment_scene_camera_update(panel_id, track_id);
+            self.mark_display_dirty("read panel retry requested");
+        }
         if let Some(target) = st.gene_transcripts_action.take() {
             self.set_gene_transcripts_expanded(target.track_id, &target.gene_key, !target.expanded);
         }

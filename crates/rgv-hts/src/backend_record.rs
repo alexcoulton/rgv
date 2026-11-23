@@ -1158,6 +1158,8 @@ pub(crate) struct PositionedBlockBuilder {
     /// An eligible record was not retained (the Complete-read limit was crossed), or a record
     /// had no placement: the block is not the chunk's whole contribution.
     incomplete: bool,
+    /// Receipt ordinal reserved when the block's first record was read.
+    ordinal: Option<u64>,
 }
 
 impl PositionedBlockBuilder {
@@ -1321,6 +1323,7 @@ impl PositionedAdmission {
             self.interval,
             std::mem::take(&mut block.entries),
             complete,
+            block.ordinal.take(),
         )
     }
 
@@ -1345,6 +1348,9 @@ impl PositionedAdmission {
     where
         R: BackendRecord + ?Sized,
     {
+        if block.ordinal.is_none() {
+            block.ordinal = Some(self.resume.reserve_ordinal());
+        }
         let mut cigar = std::mem::take(&mut self.cigar);
         let result = self.process_decoded(record, &mut cigar, source_position, owner, block);
         self.cigar = cigar;

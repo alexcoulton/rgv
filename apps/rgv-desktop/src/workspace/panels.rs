@@ -55,6 +55,48 @@ pub(crate) struct ReadPanelDisplayCache {
     pub(crate) actual_content_bottom: f32,
     pub(crate) clip_top: f32,
     pub(crate) clip_bottom: f32,
+    /// Top of the panel's read rows, below its header.
+    pub(crate) content_top: f32,
+    /// What the panel says instead of, or over, its reads. A banner notice is painted by the UI
+    /// over the GPU reads; any other is part of `scrollable`.
+    pub(crate) notice: Option<ReadPanelNotice>,
+}
+
+/// What a read panel says instead of, or over, its reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReadPanelNotice {
+    pub(crate) kind: ReadPanelNoticeKind,
+    /// Short text for the panel and its gutter row.
+    pub(crate) summary: String,
+    /// The full explanation (for a failure, the error chain), shown on hover. Failures are
+    /// also reported to the notification log.
+    pub(crate) detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadPanelNoticeKind {
+    /// Progress or a limit (opening, preparing, too many alignments), drawn in the read stack.
+    Status,
+    /// Reads cannot be shown here (the contig is not in the file, the cache is too small).
+    Unavailable,
+    /// Loading failed. `retry` when the read panel can ask for the view again.
+    Failure { retry: bool },
+}
+
+impl ReadPanelNotice {
+    /// Painted by the UI as an opaque banner over the (dimmed) reads rather than drawn into
+    /// the read stack, where the GPU reads would paint over it.
+    pub(crate) const fn is_banner(&self) -> bool {
+        !matches!(self.kind, ReadPanelNoticeKind::Status)
+    }
+
+    pub(crate) fn status(summary: impl Into<String>) -> Self {
+        Self {
+            kind: ReadPanelNoticeKind::Status,
+            summary: summary.into(),
+            detail: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

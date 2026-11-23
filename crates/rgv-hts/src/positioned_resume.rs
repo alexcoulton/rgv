@@ -278,16 +278,26 @@ impl ResumeLedger {
         }
     }
 
-    /// Issues the receipt of a finished chunk.
+    /// The ordinal of a chunk the stream starts reading now. Ordinals follow file order:
+    /// two chunks a stream returns are consecutive only when it read nothing and skipped
+    /// nothing between them.
+    pub(crate) fn reserve_ordinal(&mut self) -> u64 {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal += 1;
+        ordinal
+    }
+
+    /// Issues the receipt of a finished chunk, with the ordinal reserved when its first
+    /// record was read (one is reserved now when none was).
     pub(crate) fn issue(
         &mut self,
         completion: ChunkCompletion,
         target: GenomicInterval,
         entries: Vec<ChunkEntry>,
         records_complete: bool,
+        ordinal: Option<u64>,
     ) -> PositionedChunkReceipt {
-        let ordinal = self.next_ordinal;
-        self.next_ordinal += 1;
+        let ordinal = ordinal.unwrap_or_else(|| self.reserve_ordinal());
         let left_complete = completion.left_complete.unwrap_or_else(|| {
             target.start() == 0
                 || self
@@ -367,6 +377,12 @@ impl ResumeLedger {
         for chunk in index..=last {
             self.account(chunk, target, admission, stats, maximum_records);
         }
+        // The chunks this stream returns on either side of the skipped run are not
+        // consecutive: the run lies between them. Leaving an ordinal out records that, so a
+        // later stream offered those two receipts without the run's never treats them as one
+        // run and seeks over records it does not hold. (A chunk being built when the skip
+        // happened reserved its ordinal at its first record, before this gap.)
+        self.next_ordinal += 1;
         self.skipped[last].receipt.extent.map(|extent| extent.end)
     }
 

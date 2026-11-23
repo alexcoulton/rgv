@@ -2141,6 +2141,75 @@ mod tests {
         records.iter().map(|(position, _)| *position).collect()
     }
 
+    /// The EPI2ME `wf-human-variation` demo: HG002 nanopore reads up to ~31 kb with CIGARs of
+    /// ~1,000 operations and MM/ML tags. It is not in the repository.
+    const ONT_DEMO_BAM: &str = "/Volumes/Extreme SSD/rgv_test_data/long-read-alignments/\
+                                wf-human-variation-demo-download/wf-human-variation-demo/demo.bam";
+
+    /// An actor over the ONT demo BAM as the desktop opens it, and the id of `chr20`.
+    fn ont_demo_actor() -> (ResumeActor, ContigId) {
+        let source = rgv_hts::ProductionAlignmentSource::open(
+            Path::new(ONT_DEMO_BAM),
+            &AlignmentOpenOptions::default(),
+        )
+        .unwrap();
+        let chr20 = source.reference_dictionary().id_by_name("chr20").unwrap();
+        let backend = PositionedAlignmentBackend::new(source, QueryOptions::default()).unwrap();
+        let store = EvidenceStore::new(
+            backend.source_revision(),
+            backend.record_contract(),
+            AllocationLedger::new(2 << 30, 0),
+        );
+        let actor = AlignmentSourceActor::new(
+            backend,
+            store,
+            NonZeroUsize::new(4).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        (actor, chr20)
+    }
+
+    /// The reported failure: browsing around chr20:187,097-225,104 of the ONT demo failed with
+    /// "record N repeats an existing physical source position". The desktop fetches the
+    /// window, then (speculatively) the uncached windows beside it; a later pan across held
+    /// chunks resumed from them and decoded a read twice. Every window must load, hold each
+    /// read once, and hold what a fresh load holds.
+    #[test]
+    #[ignore = "needs the EPI2ME ONT demo BAM on the external test-data drive"]
+    fn browsing_the_ont_demo_bam_loads_every_window_with_each_read_once() {
+        let payload = sequence_payload();
+        let (mut actor, chr20) = ont_demo_actor();
+        for (start, end) in [
+            (187_097, 225_104),
+            (225_104, 263_111),
+            (149_090, 187_097),
+            (263_111, 301_118),
+            (111_083, 149_090),
+            // This pan failed before the fix.
+            (230_473, 306_055),
+            (200_000, 240_000),
+            (150_000, 260_000),
+            (187_097, 225_104),
+        ] {
+            let target = GenomicInterval::new(chr20, start, end).unwrap();
+            acquire(&mut actor, target, &payload);
+            let held = positions(&population(&mut actor, target, &payload));
+            let unique = held.iter().collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(
+                unique.len(),
+                held.len(),
+                "{start}..{end}: a read is held twice"
+            );
+            let (mut fresh_actor, _) = ont_demo_actor();
+            acquire(&mut fresh_actor, target, &payload);
+            assert_eq!(
+                held,
+                positions(&population(&mut fresh_actor, target, &payload)),
+                "{start}..{end}: the resumed window differs from a fresh load"
+            );
+        }
+    }
+
     #[test]
     fn a_receipt_for_an_evicted_chunk_is_not_used_and_the_result_is_still_complete() {
         let payload = no_payload();

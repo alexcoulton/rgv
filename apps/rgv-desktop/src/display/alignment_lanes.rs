@@ -3,11 +3,14 @@ use crate::display::{
     alignment_scene_read_extent, collapsed_alignment_subtrack,
 };
 use crate::ui::{AlignmentSubtrack, TrackFrame, TrackFrameKey, TrackSubtrack};
+use crate::workspace::alignment_navigation::AlignmentNavigationPhase;
 use crate::workspace::alignments::{
     AlignmentPanelProjection, AlignmentTrackController, AlignmentTrackLifecycle,
     alignment_active_filter_count,
 };
-use crate::workspace::panels::{ReadPanelDisplayCache, ReadRowCoordinateAuthority};
+use crate::workspace::panels::{
+    ReadPanelDisplayCache, ReadPanelNotice, ReadPanelNoticeKind, ReadRowCoordinateAuthority,
+};
 use crate::{MAX_ALIGNMENT_ROW_HEIGHT, PresentedAlignmentLane, Viewer, ui};
 use rgv_alignment_scene::AlignmentRowActivityProfile;
 use rgv_core::PanelId;
@@ -350,9 +353,9 @@ impl Viewer {
                 },
                 |profile| ReadRowCoordinateAuthority::Exact(profile.row_coordinate_space()),
             );
-            let read_state_message = (!index_only_overview)
+            let read_notice = (!index_only_overview)
                 .then(|| {
-                    read_panel_state_message(
+                    read_panel_notice(
                         projection,
                         &track.lifecycle,
                         committed_read_capability,
@@ -360,6 +363,7 @@ impl Viewer {
                     )
                 })
                 .flatten();
+            let read_state_message = read_notice.as_ref().map(|notice| notice.summary.clone());
             let bottom = bounds.bottom.max(bounds.top + READ_PANE_HEADER_HEIGHT);
             let content_top = bounds.top + READ_PANE_HEADER_HEIGHT;
             let density = self.alignment_density_for_panel_track(panel_id, track_id);
@@ -387,14 +391,16 @@ impl Viewer {
                         mapped_record_count,
                     )
                 } else {
-                    read_state_message
-                        .clone()
-                        .map_or_else(DisplayList::default, |message| {
+                    // A banner notice is painted by the UI above the GPU reads instead.
+                    read_notice
+                        .as_ref()
+                        .filter(|notice| !notice.is_banner())
+                        .map_or_else(DisplayList::default, |notice| {
                             alignment::read_state_display(
                                 self.panel_rect(panel_id).width(),
                                 content_top,
                                 bottom,
-                                message,
+                                notice.summary.clone(),
                             )
                         })
                 };
@@ -437,6 +443,8 @@ impl Viewer {
                     actual_content_bottom: scene_content_bottom.max(bottom),
                     clip_top: bounds.top.max(read_clip_top),
                     clip_bottom: bottom.min(scroll_clip_bottom),
+                    content_top,
+                    notice: read_notice,
                 });
             }
             let read_frame_name = self.read_panel_frame_name(panel_id, track, presented);
@@ -553,40 +561,152 @@ impl Viewer {
     }
 }
 
-/// Status line shown in a read panel while complete reads are not drawn.
-fn read_panel_state_message(
+/// What a read panel shows while complete reads are not drawn, or when loading them failed.
+fn read_panel_notice(
     projection: Option<&AlignmentPanelProjection>,
     lifecycle: &AlignmentTrackLifecycle,
     committed_read_capability: Option<AlignmentIndividualReadCapability>,
     native_reads_present: bool,
-) -> Option<String> {
-    if let Some(message) = projection.and_then(|projection| projection.unavailable.as_deref()) {
-        Some(format!("Complete reads unavailable: {message}"))
-    } else {
-        match lifecycle {
-            AlignmentTrackLifecycle::Opening => Some("Opening read source…".to_owned()),
-            AlignmentTrackLifecycle::Ready => match committed_read_capability
-                .unwrap_or(AlignmentIndividualReadCapability::Pending)
-            {
-                AlignmentIndividualReadCapability::Complete { .. } if native_reads_present => None,
-                AlignmentIndividualReadCapability::Complete { .. } => {
-                    Some("Preparing complete reads…".to_owned())
+) -> Option<ReadPanelNotice> {
+    if let AlignmentTrackLifecycle::Failed(message) = lifecycle {
+        return Some(ReadPanelNotice {
+            kind: ReadPanelNoticeKind::Failure { retry: false },
+            summary: "Couldn't open the read source".to_owned(),
+            detail: Some(message.clone()),
+        });
+    }
+    if let Some(projection) = projection
+        && let Some(message) = projection.unavailable.as_deref()
+    {
+        let phase = projection.navigation.phase();
+        return Some(match phase {
+            AlignmentNavigationPhase::Unavailable => ReadPanelNotice {
+                kind: ReadPanelNoticeKind::Unavailable,
+                summary: message.to_owned(),
+                detail: Some(message.to_owned()),
+            },
+            // The view is being requested again; the failure stands until that settles.
+            phase if !phase.is_terminal() => ReadPanelNotice {
+                kind: ReadPanelNoticeKind::Failure { retry: false },
+                summary: "Couldn't load reads here · retrying…".to_owned(),
+                detail: Some(message.to_owned()),
+            },
+            _ => ReadPanelNotice {
+                kind: ReadPanelNoticeKind::Failure {
+                    retry: matches!(lifecycle, AlignmentTrackLifecycle::Ready),
+                },
+                summary: "Couldn't load reads here".to_owned(),
+                detail: Some(message.to_owned()),
+            },
+        });
+    }
+    match lifecycle {
+        AlignmentTrackLifecycle::Opening => Some(ReadPanelNotice::status("Opening read source…")),
+        AlignmentTrackLifecycle::Ready => {
+            match committed_read_capability.unwrap_or(AlignmentIndividualReadCapability::Pending) {
+                AlignmentIndividualReadCapability::Complete { .. }
+                | AlignmentIndividualReadCapability::Pending
+                    if native_reads_present =>
+                {
+                    None
                 }
-                AlignmentIndividualReadCapability::Pending if native_reads_present => None,
-                AlignmentIndividualReadCapability::Pending => {
-                    Some("Preparing complete reads…".to_owned())
+                AlignmentIndividualReadCapability::Complete { .. }
+                | AlignmentIndividualReadCapability::Pending => {
+                    Some(ReadPanelNotice::status("Preparing complete reads…"))
                 }
                 AlignmentIndividualReadCapability::Refused {
                     complete_read_limit,
                     eligible_records,
                     ..
-                } => Some(format!(
+                } => Some(ReadPanelNotice::status(format!(
                     "{eligible_records} eligible alignments exceed the Complete read limit of {complete_read_limit}"
-                )),
-            },
-            AlignmentTrackLifecycle::Failed(message) => {
-                Some(format!("Read source failed: {message}"))
+                ))),
             }
         }
+        // Returned above as a failure.
+        AlignmentTrackLifecycle::Failed(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHAIN: &str = "alignment source work failed: alignment source backend failed: record 1 \
+                         repeats an existing physical source position";
+
+    #[test]
+    fn a_read_loading_failure_is_a_short_banner_carrying_the_error_chain() {
+        let mut projection = AlignmentPanelProjection::default();
+        projection.settle_failed(CHAIN);
+        let notice = read_panel_notice(
+            Some(&projection),
+            &AlignmentTrackLifecycle::Ready,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(notice.summary, "Couldn't load reads here");
+        assert_eq!(notice.detail.as_deref(), Some(CHAIN));
+        assert_eq!(notice.kind, ReadPanelNoticeKind::Failure { retry: true });
+        assert!(notice.is_banner());
+
+        // Once the view is requested again the banner says so and offers no second retry.
+        projection
+            .navigation
+            .transition(AlignmentNavigationPhase::Queued, "retry requested");
+        assert_eq!(
+            projection.navigation.phase(),
+            AlignmentNavigationPhase::Queued
+        );
+        let retrying = read_panel_notice(
+            Some(&projection),
+            &AlignmentTrackLifecycle::Ready,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(retrying.summary, "Couldn't load reads here · retrying…");
+        assert_eq!(retrying.kind, ReadPanelNoticeKind::Failure { retry: false });
+
+        // A source that never opened has nothing to retry here.
+        let open_failure = read_panel_notice(
+            Some(&projection),
+            &AlignmentTrackLifecycle::Failed("no index".to_owned()),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(open_failure.summary, "Couldn't open the read source");
+        assert_eq!(open_failure.detail.as_deref(), Some("no index"));
+        assert_eq!(
+            open_failure.kind,
+            ReadPanelNoticeKind::Failure { retry: false }
+        );
+    }
+
+    #[test]
+    fn unavailable_and_progress_notices_keep_their_text() {
+        let mut projection = AlignmentPanelProjection::default();
+        projection.settle_unavailable("chrM is not available in this alignment".to_owned());
+        let notice = read_panel_notice(
+            Some(&projection),
+            &AlignmentTrackLifecycle::Ready,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(notice.kind, ReadPanelNoticeKind::Unavailable);
+        assert_eq!(notice.summary, "chrM is not available in this alignment");
+        assert!(notice.is_banner());
+
+        let opening =
+            read_panel_notice(None, &AlignmentTrackLifecycle::Opening, None, false).unwrap();
+        assert_eq!(opening, ReadPanelNotice::status("Opening read source…"));
+        assert!(!opening.is_banner());
+        assert!(
+            read_panel_notice(None, &AlignmentTrackLifecycle::Ready, None, true).is_none(),
+            "reads on screen need no notice"
+        );
     }
 }
