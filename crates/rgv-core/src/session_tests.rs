@@ -2679,6 +2679,44 @@ fn session_json_never_contains_remote_credentials() {
 }
 
 #[test]
+fn modification_display_defaults_to_modified_only_and_round_trips() {
+    // A session saved before the setting existed, with the old by-type default: it loads
+    // modified-only, plotting 5mC in the lane.
+    let json = r#"{"schema_version":1,"locus":{"contig":"chr1","start":0,"end":1},"alignment":{"Local":{"path":"reads.bam"}},"reference":null,"tracks":[],"filters":{"minimum_mapping_quality":null,"include_secondary":true,"include_supplementary":true,"auxiliary_predicates":[],"show_modified_bases":true,"modified_base_color_mode":"by_type"},"maximum_alignments":1}"#;
+    let document = SessionDocument::from_json(json).unwrap();
+    let filters = &document.alignment_tracks[0].filters;
+    assert!(!filters.show_unmodified_calls);
+    assert!(!filters.draws_unmodified_calls());
+    assert_eq!(filters.modification_lane_code, None);
+    assert!(!SessionFilters::default().draws_unmodified_calls());
+
+    let mut document = SessionDocument::new(SessionLocus {
+        contig: "chr1".to_owned(),
+        start: 100,
+        end: 200,
+    });
+    let filters = &mut add_test_alignment(&mut document).filters;
+    filters.set_draws_unmodified_calls(true);
+    filters.modification_lane_code = Some("h".to_owned());
+    let reopened = SessionDocument::from_json(&document.to_json().unwrap()).unwrap();
+    let filters = &reopened.alignment_tracks[0].filters;
+    assert!(filters.show_unmodified_calls);
+    assert!(filters.draws_unmodified_calls());
+    assert_eq!(filters.modification_lane_code.as_deref(), Some("h"));
+
+    // The legacy modified-versus-unmodified colouring always drew unmodified calls; switching
+    // the 2-colour display off leaves it for the single colour.
+    let mut legacy = SessionFilters {
+        modified_base_color_mode: ModifiedBaseColorMode::ModifiedVsUnmodified,
+        ..SessionFilters::default()
+    };
+    assert!(legacy.draws_unmodified_calls());
+    legacy.set_draws_unmodified_calls(false);
+    assert!(!legacy.draws_unmodified_calls());
+    assert_eq!(legacy.modified_base_color_mode, ModifiedBaseColorMode::Mono);
+}
+
+#[test]
 fn bisulfite_context_round_trips_without_changing_older_defaults() {
     let mut document = SessionDocument::new(SessionLocus {
         contig: "chr1".to_owned(),

@@ -258,8 +258,15 @@ pub fn poll_alignment_events<H: PresentationHost>(host: &mut H) {
                         session.navigation_stale_result_rejections.saturating_add(1);
                     continue;
                 }
+                let modification_calls = frame.snapshot.as_ref().is_some_and(|snapshot| {
+                    crate::alignment::track::scene_has_modification_calls(snapshot)
+                });
                 let track = &mut session.alignment_tracks[track_index];
+                let newly_observed = modification_calls && !track.modification_tags_observed();
                 let projection = track.projection_mut(panel_id);
+                projection.modification_tags_observed |= modification_calls;
+                // The Modifications lane joins the layout the first time calls arrive.
+                rebuild_display |= newly_observed;
                 if !projection
                     .navigation
                     .worker_frame_is_admissible(request_token, frame.camera)

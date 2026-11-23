@@ -204,8 +204,10 @@ including `{"bisulfite": "cg"}`, `{"smrt_kinetics": "subread_ipd"}`, `{"ultima":
 Some settings are narrower than their names suggest. `show_reference`, `show_coverage`,
 `show_junctions`, `view_as_pairs`, `include_secondary`, `include_supplementary`,
 `coverage_scale_transform`, `read_base_display_mode`, `shade_read_bases_by_quality`,
-`show_modified_bases`, `modified_base_color_mode` and `overlapping_mate_policy` are stored in the
-first (primary) alignment track's settings. `show_reads`, `alignment_density` and
+`show_modified_bases`, `modified_base_color_mode`, `show_unmodified_modification_calls`
+(false by default: only modified calls are drawn; true is IGV's 2-colour display),
+`modification_lane_code` (the code the Modifications lane plots, such as `"h"`, or `null` for
+5mC) and `overlapping_mate_policy` are stored in the first (primary) alignment track's settings. `show_reads`, `alignment_density` and
 `vertical_scroll_points` take an optional `track_id` naming the alignment track to change; when it
 is omitted they act on the primary alignment track, as before. `track_height`,
 `track_collapsed` and `track_visible` address a track's annotation-channel row, and

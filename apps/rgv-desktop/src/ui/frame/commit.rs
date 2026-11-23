@@ -110,6 +110,7 @@ impl Viewer {
         self.apply_reference_presentation(st);
         self.apply_auxiliary_track_settings(st);
         self.commit_alignment_settings(st);
+        self.apply_modification_legend_request();
         self.apply_bulk_and_deferred_track_actions(
             st,
             alignment_subtracks_to_toggle,

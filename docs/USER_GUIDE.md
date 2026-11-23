@@ -414,17 +414,25 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   provenance. Expanded, Squished, and Collapsed buttons set useful read-row
   densities, while the right overview remains available for continuous adjustment. Lane visibility,
   fixed scale, and the exact continuous density survive session round trips.
-- Modified-base calls (`MM`/`ML`) are drawn on reads in IGV's convention: each called base shows
-  its likelier state, a modification in its type's colour (5mC red, 5hmC amber, 6mA teal, any other
-  code cream) or, when no modification is likelier, blue. Colour strength is the call probability:
-  low-confidence calls fade towards the read. Single-colour and modified-versus-unmodified modes
-  draw every modification red. A mismatch takes priority: a base drawn as a mismatch at base detail
-  shows no modification. These colours stay clear of the insertion purple, the mismatch colours and
-  the selection blue in every theme, colour-blind ones included.
+- Modified-base calls (`MM`/`ML`) are drawn on reads in IGV's convention. By default
+  (**Modification display: Modified only**, as IGV's default 5mC mode) a base whose likelier state
+  is a modification is drawn in its type's colour (5mC red, 5hmC amber, 6mA teal, any other code
+  cream), and a base whose likelier state is unmodified is the plain read body, exactly like a base
+  without a call. Colour strength is the call probability: a low-confidence modified call (just over
+  even odds) is a faint tint that fades towards the read and never turns blue. **Modified and
+  unmodified (2-colour)**, IGV's optional mode, also draws every unmodified base (including the
+  implicit ones of a `.` group) in blue. Single-colour and modified-versus-unmodified colourings
+  draw every modification red; the latter always draws unmodified bases too. A mismatch takes
+  priority: a base drawn as a mismatch at base detail shows no modification. These colours stay
+  clear of the insertion purple, the mismatch colours and the selection blue in every theme,
+  colour-blind ones included.
 - When modification colouring is on, a compact legend at the right of the read panel's header row
-  (above the first read) lists the codes present in the loaded reads; hover it for an explanation.
-  Track settings list the same codes with per-code visibility and a `ML` probability threshold.
-  Exports draw the same legend.
+  (above the first read) lists the modified codes present in the loaded reads (for example
+  `5mC ■ 5hmC ■`); in 2-colour it adds `unmodified ■`. Hover it for an explanation; click it, or use
+  its context menu, to switch the track between modified-only and 2-colour. The same switch is the
+  **Modification display** control in track settings (with per-code visibility and a `ML`
+  probability threshold) and the `show_unmodified_modification_calls` automation setting. Sessions
+  saved before the switch existed open in modified-only. Exports draw the same legend.
 - A read without usable modification calls (no `MM`/`ML` tags, as on most supplementary or
   secondary alignments, or tags that cannot be placed on a hard-clipped alignment without a matching
   `MN`) is drawn as an ordinary read. The read inspector's **Modified-base calls** field says why it
@@ -734,21 +742,46 @@ of the consensus. The reference action is also available from the read inspector
 
 ### Modified-base frequency
 
-When enabled, the pinned **Modifications** lane appears beneath coverage at regional, read, and base
-detail. Its bars show the dominant visible modification type at each exact site or bounded genomic
-bin. Bar height is the raw modified/canonical fraction when the `MM` skipped-base mode establishes a
-canonical denominator; otherwise it uses mean call probability only as a display score and the
-fraction remains explicitly unavailable. By type, bars use the read colours (5mC red, 5hmC amber,
-6mA teal, others cream); in the other modes modified evidence is red and, in
-modified-versus-unmodified mode, blue is canonical evidence.
+The pinned **Modifications** lane beneath coverage and Sashimi shows per-site methylation
+frequency. It is laid out automatically for a track once its loaded reads carry modification calls
+(`MM`/`ML` tags that decode to at least one code); a file without them gets no lane at all, so
+nothing is wasted on an empty row. Untick **Modifications** in track settings (or in the gutter) to
+hide it; a collapsed header then stays so it can be shown again.
 
-Click the lane to inspect every modification series in that bin, including canonical base,
-modification code and strand, optional `HP`, raw and probability-weighted fractions, alignment
-strand counts, missing `ML` calls, and evidence provenance. The inspector reports malformed tags,
-unavailable sequences, incomplete queries, and the bounded 32-series cap. Its details are copyable.
-The aggregate is calculated from every eligible record independently of individual-read admission,
-so lowering the Complete read limit does not change its counts. The per-read probability threshold does
-not rewrite the aggregate; the inspector exposes both raw and probability-weighted evidence.
+At each site the lane plots the fraction of *called* reads that are modified, as a bar from 0 to
+100% of the lane height in the code's read colour (5mC red; with single-colour modes, red), over a
+faint full-height band that marks a site with called reads. A read is called at a site when its
+`MM` group assessed the base: every base of the canonical base under a `.` group, only the listed
+bases under a `?` group (as Dorado writes). It counts as modified for the code whose call is
+likeliest when that call is at least as likely as no modification, the same state the read stack
+draws, so a low-probability call is a called, unmodified read. Reads without usable tags
+(tag-less, or a hard-clipped supplementary without a matching `MN`) are not counted. A reverse-strand
+read's cytosine call on the G of a `CpG` (in the read's own sequence) is counted on the `CpG`'s C,
+so both strands of a `CpG` are one site, as `modkit pileup --combine-strands` reports it; the read
+stack still draws that call on the G.
+
+The lane plots one code: 5mC wherever 5mC was called (otherwise the code with the highest
+fraction), or the code chosen under **Modifications lane plots** in track settings when the reads
+carry several codes (automation: `modification_lane_code`, for example `"h"`, or `null` for
+automatic). Hidden codes are never plotted.
+
+When a base is narrower than a pixel the lane pools its sites into bins of 4, 16, 64, 256 or 1,024
+bases (the narrowest width at least a pixel wide, aligned to the summary tile), and a bin's height
+is the total modified reads over the total called reads of its sites, so deeply covered sites
+weigh more than shallow ones. The lane is computed from the loaded reads, at read, regional and
+base detail; at overview zoom no reads are loaded and the lane says **Zoom in to see methylation**.
+
+Hover (or click) the lane to inspect a site or bin. The first line reads, for example,
+`chr20:219,219 CpG · 5mC 12/40 reads (30%) · 5hmC 1/40 · unmodified 27/40`: the plotted code's
+modified/called reads and percentage, the other codes, and the called reads modified by no code
+(`CpG` when the loaded reference reads `CG` there). Below it every modification series in that bin is
+listed, including canonical base, modification code and strand, optional `HP`, raw and
+probability-weighted fractions, alignment strand counts, missing `ML` calls, and evidence
+provenance. The inspector reports malformed tags, unavailable sequences, incomplete queries, and
+the bounded 32-series cap. Its details are copyable. The aggregate is calculated from every eligible
+record independently of individual-read admission, so lowering the Complete read limit does not
+change its counts. The per-read probability threshold does not rewrite the aggregate. SVG and PNG
+exports draw the same bands and bars as the screen.
 Insertions and deletions are reported separately and are not incorporated into this consensus.
 
 ## Tracks, sessions, and export

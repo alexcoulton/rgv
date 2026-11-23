@@ -119,6 +119,10 @@ pub(super) struct AlignmentSettingsFrame {
     pub(super) show_modification_frequency: bool,
     pub(super) minimum_modification_probability: u8,
     pub(super) modified_base_color_mode: ModifiedBaseColorMode,
+    /// The 2-colour display: unmodified calls drawn too.
+    pub(super) show_unmodified_calls: bool,
+    /// The code the Modifications lane plots; `None` is automatic (5mC).
+    pub(super) modification_lane_code: Option<ModificationCode>,
     pub(super) hidden_modification_codes: Vec<ModificationCode>,
     pub(super) include_secondary: bool,
     pub(super) include_supplementary: bool,

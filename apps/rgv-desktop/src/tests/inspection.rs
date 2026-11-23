@@ -1349,3 +1349,84 @@ fn the_read_inspector_says_why_an_alignment_has_no_modification_calls() {
             )
     );
 }
+
+#[test]
+fn the_modifications_lane_hover_names_the_site_its_context_and_every_state() {
+    use crate::inspection::inspector_controller::{grouped_position, modification_lane_site};
+    use rgv_hts::{
+        BaseModificationStrand, ImplicitModificationMode, ModificationBin, ModificationCode,
+        ModificationSeries, ModificationSeriesKey, ModificationSummary, ReferenceSlice,
+    };
+    const M: ModificationCode = ModificationCode::Letter(b'm');
+    const H: ModificationCode = ModificationCode::Letter(b'h');
+    let interval =
+        rgv_core::GenomicInterval::new(rgv_core::ContigId::new(0), 219_200, 219_264).unwrap();
+    let series = |code, haplotype, bins: Vec<(usize, u32, u32)>| {
+        let mut dense = vec![ModificationBin::default(); 64];
+        for (index, modified, called) in bins {
+            dense[index] = ModificationBin {
+                modified_calls: modified,
+                canonical_observations: called,
+                ..ModificationBin::default()
+            };
+        }
+        ModificationSeries {
+            key: ModificationSeriesKey {
+                canonical_base: b'C',
+                code,
+                modification_strand: BaseModificationStrand::Forward,
+                implicit_mode: ImplicitModificationMode::Unknown,
+                haplotype,
+            },
+            bins: dense,
+        }
+    };
+    // chr20:219,219 (offset 18): 40 called reads over two haplotypes, 12 5mC and one 5hmC.
+    // Offset 30: 10 called, 8 5mC.
+    let summary = ModificationSummary {
+        bin_count: 64,
+        series: vec![
+            series(M, Some(1), vec![(18, 7, 20), (30, 8, 10)]),
+            series(M, Some(2), vec![(18, 5, 20)]),
+            series(H, Some(1), vec![(18, 1, 20)]),
+            series(H, Some(2), vec![(18, 0, 20)]),
+        ],
+        provenance: rgv_hts::ModificationProvenance::default(),
+    };
+    let mut bases = vec![b'A'; 64];
+    bases[18] = b'C';
+    bases[19] = b'g';
+    let reference = ReferenceSlice { interval, bases };
+    let options = rgv_alignment_scene::CpuModificationProjectionOptions {
+        probability_weighted: false,
+        hidden_codes: Vec::new(),
+        shown_code: None,
+    };
+    let text = |position, bin_bases| {
+        let (locus, context, tally) = modification_lane_site(
+            "chr20",
+            interval,
+            &summary,
+            position,
+            bin_bases,
+            Some(&reference),
+        )
+        .unwrap();
+        let shown = rgv_alignment_scene::modification_lane_code(&tally, &options)
+            .and_then(|entry| entry.code);
+        rgv_render::modification_style::modification_site_text(&locus, context, &tally, shown)
+    };
+    assert_eq!(
+        text(219_218, 1).as_deref(),
+        Some("chr20:219,219 CpG · 5mC 12/40 reads (30%) · 5hmC 1/40 · unmodified 27/40")
+    );
+    // Zoomed out: the 16-base bin pools its sites (total modified over total called).
+    assert_eq!(
+        text(219_230, 16).as_deref(),
+        Some("chr20:219,217-219,232 · 5mC 20/50 reads (40%) · 5hmC 1/40 · unmodified 29/50")
+    );
+    // Nothing called there.
+    assert_eq!(text(219_201, 1), None);
+    assert_eq!(grouped_position(1_234_567), "1,234,567");
+    assert_eq!(grouped_position(999), "999");
+}

@@ -677,3 +677,79 @@ fn sashimi_presentation_fields_ask_for_a_new_presentation_not_a_query() {
     assert!(change.sashimi_presentation_changed());
     assert!(!change.query_changed());
 }
+
+#[test]
+fn the_modification_display_and_lane_code_are_typed_configure_settings() {
+    let both = [(TUMOUR, "tumour"), (NORMAL, "normal")];
+    assert!(
+        !Headless::new(&both)
+            .session
+            .alignment_settings(TUMOUR)
+            .unwrap()
+            .filters
+            .draws_unmodified_calls(),
+        "modified-only is the default"
+    );
+    assert_same_document(
+        &both,
+        &configure(AutomationSetting::ShowUnmodifiedModificationCalls { value: true }),
+        &|window| {
+            window.window(TUMOUR, |settings| {
+                settings.filters.set_draws_unmodified_calls(true);
+            });
+        },
+    );
+    assert_same_document(
+        &both,
+        &configure(AutomationSetting::ModificationLaneCode {
+            value: Some("h".to_owned()),
+        }),
+        &|window| {
+            window.window(TUMOUR, |settings| {
+                settings.filters.modification_lane_code = Some("h".to_owned());
+            });
+        },
+    );
+    // The setting reaches the lane: a chosen code, and the fraction of called reads.
+    let mut headless = Headless::new(&both);
+    headless.automation(&configure(AutomationSetting::ModificationLaneCode {
+        value: Some("CHEBI:76792".to_owned()),
+    }));
+    let options = crate::alignment::track::alignment_scene_modification_lane_options(
+        &headless.session.alignment_settings(TUMOUR).unwrap().filters,
+        None,
+    );
+    assert_eq!(
+        options.projection.shown_code,
+        Some(rgv_model::ModificationCode::Chebi(76_792))
+    );
+    assert!(!options.projection.probability_weighted);
+    // Not a modification code.
+    assert!(
+        automation_alignment_settings_actions(
+            &headless.session,
+            &configure(AutomationSetting::ModificationLaneCode {
+                value: Some("5mC".to_owned()),
+            }),
+        )
+        .expect("the command is on the alignment settings path")
+        .is_err()
+    );
+    // The 2-colour switch, and back.
+    headless.automation(&configure(
+        AutomationSetting::ShowUnmodifiedModificationCalls { value: true },
+    ));
+    let filters = headless.session.alignment_settings(TUMOUR).unwrap().filters;
+    assert!(filters.show_unmodified_calls && filters.draws_unmodified_calls());
+    headless.automation(&configure(
+        AutomationSetting::ShowUnmodifiedModificationCalls { value: false },
+    ));
+    assert!(
+        !headless
+            .session
+            .alignment_settings(TUMOUR)
+            .unwrap()
+            .filters
+            .draws_unmodified_calls()
+    );
+}

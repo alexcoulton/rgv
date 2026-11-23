@@ -2,6 +2,8 @@
 //! header strip (the row above its first read, beside the track's name in the gutter), listing
 //! the modification codes present in the loaded reads and the colours they are drawn in. It
 //! never covers a read; its hover text explains that colour strength is the call probability.
+//! By default only modified calls are drawn and the chip lists only the modified codes; a click
+//! (or its context menu) switches the track to the 2-colour display, which adds "unmodified".
 //! An export of the window draws the same chip at the same place.
 
 use std::collections::HashMap;
@@ -12,7 +14,7 @@ use rgv_core::{PanelId, TrackId};
 use rgv_hts::ModificationCode;
 use rgv_layout::{DisplayList, RectPrimitive, RectShape, Rgba, TextPrimitive};
 use rgv_render::modification_style::{
-    MODIFICATION_LEGEND_HELP, ModificationLegendEntry, modification_legend,
+    ModificationLegendEntry, modification_legend, modification_legend_help,
 };
 use rgv_render::palette::{AlignmentPalette, PaletteToken};
 
@@ -108,6 +110,8 @@ pub(crate) fn modification_legend_layout(
 #[derive(Debug, Default)]
 pub(crate) struct ModificationLegendCodes {
     entries: HashMap<(PanelId, TrackId), (Arc<AlignmentSceneSnapshot>, Vec<ModificationCode>)>,
+    /// A chip's request to switch its track's 2-colour display, committed after the frame.
+    requested_two_colour: Option<(TrackId, bool)>,
 }
 
 impl ModificationLegendCodes {
@@ -151,6 +155,8 @@ pub(crate) struct PlacedModificationLegend {
     pub(crate) panel_id: PanelId,
     pub(crate) track_id: TrackId,
     pub(crate) layout: ModificationLegendLayout,
+    /// Whether the track draws unmodified calls (the 2-colour display).
+    pub(crate) two_colour: bool,
 }
 
 impl Viewer {
@@ -207,12 +213,15 @@ impl Viewer {
                     .into_iter()
                     .filter(|code| !style.hidden_modification_codes.contains(&Some(*code)))
                     .collect::<Vec<_>>();
-                let entries = modification_legend(&codes, style.modified_base_color_mode);
+                let two_colour = style.draws_unmodified_calls();
+                let entries =
+                    modification_legend(&codes, style.modified_base_color_mode, two_colour);
                 if let Some(layout) = modification_legend_layout(&entries, header) {
                     legends.push(PlacedModificationLegend {
                         panel_id: panel.id,
                         track_id: read_panel.track_id,
                         layout,
+                        two_colour,
                     });
                 }
             }
@@ -222,7 +231,8 @@ impl Viewer {
     }
 
     /// Paints every read panel's modification legend over the canvas, with its explanation on
-    /// hover.
+    /// hover. A click on a chip, or its context menu, asks to switch the track's 2-colour
+    /// display; [`Self::apply_modification_legend_request`] commits it.
     pub(crate) fn paint_modification_legends(&self, ui: &mut egui::Ui, genomic: egui::Rect) {
         let theme = crate::theme::active();
         let palette = theme.palette();
@@ -248,17 +258,69 @@ impl Viewer {
                     theme.text(),
                 );
             }
-            ui.interact(
-                layout.chip,
-                egui::Id::new((
-                    "modification-legend",
-                    legend.panel_id.get(),
-                    legend.track_id.get(),
-                )),
-                egui::Sense::hover(),
-            )
-            .on_hover_text(MODIFICATION_LEGEND_HELP);
+            let response = ui
+                .interact(
+                    layout.chip,
+                    egui::Id::new((
+                        "modification-legend",
+                        legend.panel_id.get(),
+                        legend.track_id.get(),
+                    )),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(format!(
+                    "{}\n\n{}",
+                    modification_legend_help(legend.two_colour),
+                    modification_legend_toggle_label(legend.two_colour)
+                ));
+            let mut request = response.clicked().then_some(!legend.two_colour);
+            response.context_menu(|ui| {
+                let mut two_colour = legend.two_colour;
+                if ui
+                    .checkbox(&mut two_colour, "Modified and unmodified (2-colour)")
+                    .changed()
+                {
+                    request = Some(two_colour);
+                    ui.close();
+                }
+            });
+            if let Some(two_colour) = request {
+                self.modification_legend_codes
+                    .borrow_mut()
+                    .requested_two_colour = Some((legend.track_id, two_colour));
+            }
         }
+    }
+
+    /// Commits a legend chip's 2-colour request as an ordinary (undoable) settings change.
+    pub(crate) fn apply_modification_legend_request(&mut self) {
+        let Some((track_id, two_colour)) = self
+            .modification_legend_codes
+            .borrow_mut()
+            .requested_two_colour
+            .take()
+        else {
+            return;
+        };
+        let Some(mut settings) = self.session.alignment_settings(track_id) else {
+            return;
+        };
+        if settings.filters.draws_unmodified_calls() == two_colour {
+            return;
+        }
+        settings.filters.set_draws_unmodified_calls(two_colour);
+        if let Err(error) = self.set_alignment_settings(vec![(track_id, settings)]) {
+            self.report_error(error.to_string());
+        }
+    }
+}
+
+/// What a click on the legend chip does.
+pub(crate) const fn modification_legend_toggle_label(two_colour: bool) -> &'static str {
+    if two_colour {
+        "Click to draw modified calls only."
+    } else {
+        "Click to switch to 2-colour (modified and unmodified)."
     }
 }
 
@@ -322,7 +384,31 @@ mod tests {
                 ModificationCode::Letter(b'a'),
             ],
             rgv_core::ModifiedBaseColorMode::ByType,
+            true,
         )
+    }
+
+    #[test]
+    fn the_default_chip_lists_only_the_modified_codes() {
+        let header = egui::Rect::from_min_max(egui::pos2(100.0, 200.0), egui::pos2(900.0, 222.0));
+        let entries = modification_legend(
+            &[
+                ModificationCode::Letter(b'm'),
+                ModificationCode::Letter(b'h'),
+            ],
+            rgv_core::ModifiedBaseColorMode::ByType,
+            false,
+        );
+        let layout = modification_legend_layout(&entries, header).unwrap();
+        assert_eq!(
+            layout
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["5mC", "5hmC"]
+        );
+        assert!(modification_legend_toggle_label(false).contains("2-colour"));
     }
 
     #[test]
@@ -370,6 +456,7 @@ mod tests {
                 panel_id: PanelId::new(1),
                 track_id: TrackId::new(1),
                 layout: layout.clone(),
+                two_colour: true,
             }],
             &palette,
             [0.1, 0.1, 0.1, 1.0],

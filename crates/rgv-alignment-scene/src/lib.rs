@@ -78,7 +78,8 @@ pub use cpu_summary_projector::{
     CpuJunctionScaleMeasurement, CpuJunctionStrandToken, CpuModificationProjectionOptions,
     CpuSummaryCamera, CpuSummaryFrame, CpuSummaryPrimitiveShape, CpuSummaryProjectedComponent,
     CpuSummaryProjectedPrimitive, CpuSummaryProjectionError, CpuSummaryProjectionOptions,
-    CpuSummaryProjector,
+    CpuSummaryProjector, MODIFICATION_LANE_BIN_LEVELS, modification_lane_bin_bases,
+    modification_lane_bins, modification_lane_code,
 };
 pub use depth_pyramid::{
     DEPTH_PYRAMID_MAXIMUM_DERIVATION_DEPTH, DEPTH_PYRAMID_MINIMUM_RESIDENT_BYTES,

@@ -149,15 +149,22 @@ fn apply_alignment_annotation_height(
 
 /// Query-independent annotation-lane layout for the unified scene.
 ///
-/// Visibility and geometry are presentation contracts, so Coverage, Sashimi and modification
-/// rows must exist before (and independently from) any source publication. Their eventual pixels
-/// are projected from the captured scene snapshot; this function deliberately reads no
-/// query-local evidence object and invents no data-availability decision from an empty summary.
+/// Visibility and geometry are presentation contracts, so Coverage and Sashimi rows must exist
+/// before (and independently from) any source publication. Their eventual pixels are projected
+/// from the captured scene snapshot; this function deliberately reads no query-local evidence
+/// object and invents no data-availability decision from an empty summary.
+///
+/// The Modifications row is the one exception, decided by `modification_data`: whether any scene
+/// of the track has carried modification calls (sticky for the track, never one query's empty
+/// summary). Without it the row takes no room, so a file without `MM`/`ML` tags never shows an
+/// empty lane; with it the row is laid out at every zoom (an overview says to zoom in).
+#[allow(clippy::too_many_lines)]
 pub(crate) fn alignment_scene_annotation_frame(
     config: &SessionAlignmentTrack,
     viewport: Viewport,
     frame_top: f32,
     requested_height: Option<f32>,
+    modification_data: bool,
 ) -> TrackFrame {
     let filters = &config.filters;
     let heights = alignment_annotation_lane_heights(filters);
@@ -185,13 +192,13 @@ pub(crate) fn alignment_scene_annotation_frame(
     };
     options.modification_top = lane_top;
     options.modification_height = heights.modification;
-    let modifications_supported = viewport.detail_level() != DetailLevel::Overview;
-    lane_top += if filters.show_modification_frequency && modifications_supported {
-        heights.modification + 8.0
-    } else if modifications_supported {
-        COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT
-    } else {
+    let overview = viewport.detail_level() == DetailLevel::Overview;
+    lane_top += if !modification_data {
         0.0
+    } else if filters.show_modification_frequency {
+        heights.modification + 8.0
+    } else {
+        COLLAPSED_ALIGNMENT_SUBTRACK_HEIGHT
     };
     let frame_bottom = apply_alignment_annotation_height(
         &mut options,
@@ -233,12 +240,13 @@ pub(crate) fn alignment_scene_annotation_frame(
             options.junction_top,
         ));
     }
-    if modifications_supported {
+    if modification_data {
         if filters.show_modification_frequency {
             subtracks.push(TrackSubtrack {
                 alignment_subtrack: Some(AlignmentSubtrack::Modifications),
                 label: "Modifications".to_owned(),
-                detail: None,
+                // The summary is built from loaded reads, which an overview does not load.
+                detail: overview.then(|| "Zoom in to see methylation".to_owned()),
                 top: options.modification_top,
                 bottom: options.modification_top + options.modification_height,
                 collapsed: false,
@@ -491,4 +499,18 @@ pub(crate) fn persisted_style_tag(
         _ => *b"NM",
     };
     String::from_utf8_lossy(&tag).into_owned()
+}
+
+impl crate::Viewer {
+    /// Whether the alignment track's loaded reads have carried modification calls, which lays
+    /// out its Modifications lane (see [`alignment_scene_annotation_frame`]).
+    pub(crate) fn alignment_track_has_modification_calls(&self, track_id: TrackId) -> bool {
+        self.session
+            .alignment_tracks
+            .iter()
+            .find(|track| track.config.id == track_id)
+            .is_some_and(
+                rgv_session::alignment::track::AlignmentTrackController::modification_tags_observed,
+            )
+    }
 }

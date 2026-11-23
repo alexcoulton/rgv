@@ -101,6 +101,8 @@ fn drafted_alignment_settings(
     filters.show_modification_frequency = align.show_modification_frequency;
     filters.minimum_modification_probability = align.minimum_modification_probability;
     filters.modified_base_color_mode = align.modified_base_color_mode;
+    filters.set_draws_unmodified_calls(align.show_unmodified_calls);
+    filters.modification_lane_code = align.modification_lane_code.map(modification_code_label);
     filters.hidden_modification_codes = align
         .hidden_modification_codes
         .iter()

@@ -198,8 +198,6 @@ pub fn project_semantic_alignment_export_with_presentations<
                     if !projected.normalization_available {
                         return Err(export_error("summary normalization is unavailable"));
                     }
-                    let modification_background = matches!(&derived.options,
-                        AlignmentDerivedLaneOptions::Modifications(options) if options.color_mode == ModifiedBaseColorMode::ModifiedVsUnmodified);
                     let clip = camera.clip();
                     // Arc bounds are unclamped; the visible part of an arc that leaves the lane
                     // is exported as thin slices, which need their own reservation.
@@ -210,27 +208,8 @@ pub fn project_semantic_alignment_export_with_presentations<
                         .fold(0_usize, usize::saturating_add);
                     output.reserve(
                         ledger,
-                        projected
-                            .primitives
-                            .len()
-                            .saturating_mul(if modification_background { 2 } else { 1 })
-                            .saturating_add(arc_slices),
+                        projected.primitives.len().saturating_add(arc_slices),
                     )?;
-                    if modification_background {
-                        for primitive in projected.primitives.iter() {
-                            output.display.rectangles.push(RectPrimitive {
-                                x: primitive.x as f32,
-                                y: camera.clip().y as f32,
-                                width: primitive.width as f32,
-                                height: camera.clip().height as f32,
-                                color: rgba(
-                                    palette.color(PaletteToken::SUMMARY_MODIFICATION_BACKGROUND),
-                                ),
-                                object_id: 0,
-                                shape: RectShape::Rectangle,
-                            });
-                        }
-                    }
                     for primitive in projected
                         .primitives
                         .iter()
@@ -723,6 +702,8 @@ fn summary_color(
             JunctionAnnotationStatus::Novel => T::JUNCTION_NOVEL,
             JunctionAnnotationStatus::Unknown => T::SUMMARY_NEUTRAL,
         },
+        // The Modifications lane's "called" band, behind its bars.
+        C::ModificationCalled { .. } => T::SUMMARY_MODIFICATION_BACKGROUND,
         C::Modification { series, .. } => match options {
             // The read stack's type colour, so the lane and the reads agree under every theme.
             AlignmentDerivedLaneOptions::Modifications(options)

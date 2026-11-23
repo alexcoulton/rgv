@@ -592,6 +592,7 @@ pub(crate) fn modification_options(
         projection: CpuModificationProjectionOptions {
             probability_weighted,
             hidden_codes,
+            shown_code: None,
         },
         color_mode,
         selected_position: None,
@@ -1122,22 +1123,95 @@ fn semantic_export_contains_committed_read_and_depth_geometry_and_pins_its_captu
     }
 }
 
+/// A forward read `CGACGACGAC` at 10 (cytosines at 10, 13, 16 and 19) with `MM`/`ML`.
+fn cpg_record(name: &[u8], mm: &str, ml: Vec<u64>) -> AlignmentRecord {
+    let mut record = summary_record();
+    record.read_name = name.to_vec();
+    record.flags = AlignmentFlags::from_bits(0);
+    record.mate_contig = None;
+    record.mate_start = None;
+    record.template_length = 0;
+    record.end = 20;
+    record.cigar = vec![CigarOp {
+        kind: CigarOpKind::Match,
+        len: 10,
+    }];
+    record.sequence = SequenceData::Present {
+        bases: b"CGACGACGAC".to_vec(),
+        qualities: Some(vec![35; 10]),
+    };
+    record.auxiliary_fields = vec![
+        AuxField {
+            tag: *b"MM",
+            value: AuxValue::String(mm.to_owned()),
+        },
+        AuxField {
+            tag: *b"ML",
+            value: AuxValue::UnsignedArray(ml),
+        },
+    ];
+    record
+}
+
+/// Three reads: at 10, 5mC 1/3 called reads and 5hmC 1/2; at 13, 5mC 2/3 and 5hmC 0/2; at 16,
+/// 5mC 1/1. The fourth cytosine is never called.
+fn methylation_snapshot(ledger: &AllocationLedger) -> Arc<AlignmentSceneSnapshot> {
+    let records = [
+        cpg_record(b"one", "C+h?,0,0;C+m?,0,0;", vec![200, 10, 20, 240]),
+        cpg_record(b"two", "C+h?,0,0;C+m?,0,0;", vec![10, 10, 30, 30]),
+        cpg_record(b"three", "C+m?,0,0,0;", vec![250, 250, 250]),
+    ];
+    test_snapshot_from_authority(
+        ledger,
+        None,
+        exact_authority_with_records(ledger, NonZeroU64::new(64).unwrap(), 0, &records),
+        None,
+    )
+}
+
 #[test]
-fn packed_modifications_match_the_dominant_cpu_oracle_for_live_lane_options() {
+fn a_scene_has_modification_calls_only_when_its_reads_carry_tags() {
     let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
-    let scene = test_snapshot(&ledger);
-    let camera = camera(scene.prepared_interval());
+    assert!(
+        methylation_snapshot(&ledger)
+            .summaries()
+            .has_modification_calls()
+    );
+    let mut tagless = cpg_record(b"tagless", "C+m?,0;", vec![255]);
+    tagless.auxiliary_fields.clear();
+    let scene = test_snapshot_from_authority(
+        &ledger,
+        None,
+        exact_authority_with_records(&ledger, NonZeroU64::new(64).unwrap(), 0, &[tagless]),
+        None,
+    );
+    assert!(!scene.summaries().has_modification_calls());
+}
+
+/// A lane projection case: camera, weighted, hidden codes, shown code, and the plotted
+/// `(code, fraction)` of each bar left to right.
+type LaneCase = (
+    CpuSummaryCamera,
+    bool,
+    Vec<ModificationCode>,
+    Option<ModificationCode>,
+    Vec<(ModificationCode, f64)>,
+);
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn packed_modifications_match_the_cpu_lane_at_every_zoom_and_option() {
+    const M: ModificationCode = ModificationCode::Letter(b'm');
+    const H: ModificationCode = ModificationCode::Letter(b'h');
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let scene = methylation_snapshot(&ledger);
     let page = scene
         .summary_pages()
         .iter()
-        .find(|page| page.key().family() == SummaryPageFamily::Modifications)
+        .find(|page| {
+            page.key().family() == SummaryPageFamily::Modifications && page.interval().start() == 0
+        })
         .unwrap();
-    assert!(page.primitives().iter().any(|primitive| {
-        matches!(
-            primitive.component,
-            SummarySemanticComponent::Modification { bin, .. } if bin.modified_calls == 0
-        )
-    }));
     let PackedAlignmentSummaryPage::Modifications {
         instances,
         metadata,
@@ -1148,68 +1222,79 @@ fn packed_modifications_match_the_dominant_cpu_oracle_for_live_lane_options() {
     else {
         unreachable!();
     };
-    assert_eq!(
-        metadata.codes(),
-        &[
-            ModificationCode::Letter(b'a'),
-            ModificationCode::Letter(b'h'),
-            ModificationCode::Letter(b'm'),
-        ]
-    );
-    assert!(
-        instances
-            .iter()
-            .filter(|instance| instance.shape == 0)
-            .all(|instance| { instance.modified_calls > 0 && instance.canonical_observations > 0 })
-    );
-    assert_eq!(metadata.background_range().len(), 1);
-    assert_eq!(metadata.raw_range().len(), 3);
-    assert_eq!(metadata.weighted_range().len(), 3);
+    assert_eq!(metadata.codes(), &[H, M]);
+    // Per base: a called band at each of the three called sites.
+    assert_eq!(metadata.background_range().len(), 3);
 
-    let cases = [
-        (false, Vec::new(), Some(ModificationCode::Letter(b'a'))),
+    let fine = camera(scene.prepared_interval());
+    // Ten bases a pixel: 16-base bins.
+    let coarse = CpuSummaryCamera::new(
+        scene.prepared_interval(),
+        rgv_alignment_scene::CpuClipRect {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 96.0,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        rgv_alignment_scene::modification_lane_bin_bases(fine.bases_per_pixel()),
+        1
+    );
+    assert_eq!(
+        rgv_alignment_scene::modification_lane_bin_bases(coarse.bases_per_pixel()),
+        16
+    );
+    let third = 1.0 / 3.0;
+    let cases: [LaneCase; 6] = [
+        // 5mC is plotted wherever it was called, though 5hmC's fraction is higher at 10.
         (
+            fine,
             false,
-            vec![ModificationCode::Letter(b'a')],
-            Some(ModificationCode::Letter(b'h')),
-        ),
-        (true, Vec::new(), Some(ModificationCode::Letter(b'm'))),
-        (
-            true,
-            vec![ModificationCode::Letter(b'm')],
-            Some(ModificationCode::Letter(b'h')),
-        ),
-        (
-            true,
-            vec![
-                ModificationCode::Letter(b'm'),
-                ModificationCode::Letter(b'h'),
-            ],
-            Some(ModificationCode::Letter(b'a')),
-        ),
-        (
-            true,
-            vec![
-                ModificationCode::Letter(b'm'),
-                ModificationCode::Letter(b'h'),
-                ModificationCode::Letter(b'a'),
-            ],
+            Vec::new(),
             None,
+            vec![(M, third), (M, 2.0 * third), (M, 1.0)],
+        ),
+        // Hidden 5mC: the most frequent remaining code; 13 has no modified 5hmC read.
+        (fine, false, vec![M], None, vec![(H, 0.5)]),
+        // A chosen code.
+        (fine, false, Vec::new(), Some(H), vec![(H, 0.5)]),
+        // Pooled 16-base bins: 3 of 6 called reads, then 1 of 1.
+        (coarse, false, Vec::new(), None, vec![(M, 0.5), (M, 1.0)]),
+        (coarse, false, Vec::new(), Some(H), vec![(H, 0.25)]),
+        // The mean probability of the 5mC calls.
+        (
+            fine,
+            true,
+            Vec::new(),
+            None,
+            vec![
+                (M, f64::from(20 + 30 + 250) / (3.0 * 255.0)),
+                (M, f64::from(240 + 30 + 250) / (3.0 * 255.0)),
+                (M, 250.0 / 255.0),
+            ],
         ),
     ];
-    for (probability_weighted, hidden_codes, expected_code) in cases {
+    for (camera, probability_weighted, hidden_codes, shown_code, expected) in cases {
+        let label = format!(
+            "bpp {} weighted {probability_weighted} hidden {hidden_codes:?} shown {shown_code:?}",
+            camera.bases_per_pixel()
+        );
         let options = CpuModificationProjectionOptions {
             probability_weighted,
             hidden_codes: hidden_codes.clone(),
+            shown_code,
         };
         let cpu = CpuSummaryProjector::project_dominant_modifications(&scene, 1, camera, &options)
             .unwrap();
+        let level = metadata.level(camera.bases_per_pixel());
         let range = if probability_weighted {
-            metadata.weighted_range()
+            level.weighted_range.clone()
         } else {
-            metadata.raw_range()
+            level.raw_range.clone()
         };
-        let hidden_mask = metadata.hidden_code_mask(&hidden_codes);
+        let hidden_mask = metadata.hidden_code_mask(&hidden_codes, shown_code);
         let mut gpu = instances[range.start as usize..range.end as usize]
             .iter()
             .filter_map(|instance| {
@@ -1222,7 +1307,7 @@ fn packed_modifications_match_the_dominant_cpu_oracle_for_live_lane_options() {
                 )
             })
             .collect::<Vec<_>>();
-        let mut cpu = cpu
+        let mut cpu_bars = cpu
             .primitives
             .iter()
             .filter_map(|primitive| {
@@ -1237,62 +1322,93 @@ fn packed_modifications_match_the_dominant_cpu_oracle_for_live_lane_options() {
                 Some((primitive, series, bin, f64::from_bits(fraction_bits)))
             })
             .collect::<Vec<_>>();
+        cpu_bars.sort_by(|left, right| left.0.x.total_cmp(&right.0.x));
         gpu.sort_by(|left, right| left.bounds.x.total_cmp(&right.bounds.x));
-        cpu.sort_by(|left, right| left.0.x.total_cmp(&right.0.x));
-        assert_eq!(gpu.len(), cpu.len());
         assert_eq!(
-            gpu.first()
-                .map(|projected| metadata.codes()[projected.code_index as usize]),
-            expected_code
+            cpu_bars
+                .iter()
+                .map(|(_, series, _, fraction)| (series.code, *fraction))
+                .collect::<Vec<_>>()
+                .len(),
+            expected.len(),
+            "{label}"
         );
-        for (gpu, (cpu, series, bin, fraction)) in gpu.iter().zip(cpu) {
+        for ((_, series, _, fraction), (code, value)) in cpu_bars.iter().zip(&expected) {
+            assert_eq!(series.code, *code, "{label}");
+            assert!(
+                (fraction - value).abs() < 1.0e-6,
+                "{label}: {fraction} {value}"
+            );
+        }
+        assert_eq!(gpu.len(), cpu_bars.len(), "{label}");
+        for (gpu, (cpu, series, bin, fraction)) in gpu.iter().zip(&cpu_bars) {
             assert_eq!(metadata.codes()[gpu.code_index as usize], series.code);
             assert_eq!(gpu.modified_calls, bin.modified_calls);
             assert_eq!(gpu.canonical_observations, bin.canonical_observations);
-            assert_near(gpu.fraction, fraction);
+            assert_near(gpu.fraction, *fraction);
             assert_near(gpu.bounds.x, cpu.x);
             assert_near(gpu.bounds.y, cpu.y);
             assert_near(gpu.bounds.width, cpu.width);
             assert_near(gpu.bounds.height, cpu.height);
         }
+        // The called bands: one per bin with called reads of a plotted code, on both paths.
+        let cpu_bands = cpu
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(
+                    primitive.component,
+                    CpuSummaryProjectedComponent::ModificationCalled { .. }
+                )
+            })
+            .count();
+        let gpu_bands = instances
+            [level.background_range.start as usize..level.background_range.end as usize]
+            .iter()
+            .filter(|instance| instance.later_code_mask & !hidden_mask != 0)
+            .count();
+        assert_eq!(gpu_bands, cpu_bands, "{label}");
+        // Bins with called reads of a plotted code: every called site, the 5hmC-called sites
+        // (10 and 13), or the pooled bins.
+        let expected_bands = if camera.bases_per_pixel() > 1.0 {
+            if shown_code.is_some() { 1 } else { 2 }
+        } else if shown_code.is_some() || !hidden_codes.is_empty() {
+            2
+        } else {
+            3
+        };
+        assert_eq!(cpu_bands, expected_bands, "{label}");
     }
 
-    let raw_style = summary_draw_style(
-        &AlignmentSummaryGpuLaneOptions::Modifications(modification_options(
-            false,
-            vec![ModificationCode::Letter(b'a')],
-            ModifiedBaseColorMode::ByType,
-        )),
-        AlignmentSummaryGpuPageKey::modifications(page).unwrap(),
-        &GpuSummaryPageMetadata::Modifications(metadata.clone()),
-        instances.len() as u32,
-    )
-    .unwrap();
-    assert_eq!(raw_style.background_range, 0..0);
-    assert_eq!(raw_style.foreground_range, metadata.raw_range());
-    assert_eq!(
-        raw_style.hidden_modification_mask,
-        metadata.hidden_code_mask(&[ModificationCode::Letter(b'a')])
-    );
-    let weighted_background_style = summary_draw_style(
-        &AlignmentSummaryGpuLaneOptions::Modifications(modification_options(
-            true,
-            Vec::new(),
-            ModifiedBaseColorMode::ModifiedVsUnmodified,
-        )),
-        AlignmentSummaryGpuPageKey::modifications(page).unwrap(),
-        &GpuSummaryPageMetadata::Modifications(metadata.clone()),
-        instances.len() as u32,
-    )
-    .unwrap();
-    assert_eq!(
-        weighted_background_style.background_range,
-        metadata.background_range()
-    );
-    assert_eq!(
-        weighted_background_style.foreground_range,
-        metadata.weighted_range()
-    );
+    let style = |options, bases_per_pixel| {
+        summary_draw_style(
+            &AlignmentSummaryGpuLaneOptions::Modifications(options),
+            AlignmentSummaryGpuPageKey::modifications(page).unwrap(),
+            &GpuSummaryPageMetadata::Modifications(metadata.clone()),
+            instances.len() as u32,
+            bases_per_pixel,
+        )
+        .unwrap()
+    };
+    // The band is drawn in every colouring; the zoom picks the level.
+    for color_mode in [
+        ModifiedBaseColorMode::ByType,
+        ModifiedBaseColorMode::Mono,
+        ModifiedBaseColorMode::ModifiedVsUnmodified,
+    ] {
+        let fine_style = style(modification_options(false, vec![H], color_mode), 0.5);
+        assert_eq!(fine_style.background_range, metadata.background_range());
+        assert_eq!(fine_style.foreground_range, metadata.raw_range());
+        assert_eq!(
+            fine_style.hidden_modification_mask,
+            metadata.hidden_code_mask(&[H], None)
+        );
+        let coarse_style = style(modification_options(true, Vec::new(), color_mode), 100.0);
+        let level = metadata.level(100.0);
+        assert_eq!(level.bases, 256);
+        assert_eq!(coarse_style.background_range, level.background_range);
+        assert_eq!(coarse_style.foreground_range, level.weighted_range);
+    }
 }
 
 #[test]

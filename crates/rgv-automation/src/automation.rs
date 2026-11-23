@@ -1259,6 +1259,21 @@ pub enum AutomationSetting {
         /// The colouring mode to apply.
         value: ModifiedBaseColorMode,
     },
+    /// Draw unmodified base-modification calls too, in blue (the 2-colour display), or only
+    /// modified calls (the default, as IGV's 5mC mode). Stored in the first (primary) alignment
+    /// track's display settings. False also leaves the `modified_vs_unmodified` colouring for
+    /// the single colour.
+    ShowUnmodifiedModificationCalls {
+        /// True draws unmodified calls as well, false draws modified calls only.
+        value: bool,
+    },
+    /// Choose the modification code the Modifications lane plots, as the `MM` tag spells it
+    /// (`m`, `h`, `a`, `CHEBI:76792`); `null` plots 5mC wherever it was called. Stored in the
+    /// first (primary) alignment track's display settings.
+    ModificationLaneCode {
+        /// The code, or `null` for automatic.
+        value: Option<String>,
+    },
     /// Expand or collapse a whole presentation section without changing its members' own
     /// visibility, grouping, or heights.
     PresentationSectionExpanded {

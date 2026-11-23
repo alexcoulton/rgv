@@ -662,7 +662,7 @@ mod tests {
         config.filters.show_coverage = show_coverage;
         let viewport = Viewport::new(interval(0, 0, 1_000 * bases_per_pixel), 1_000.0).unwrap();
         let frame = crate::display::alignment::alignment_scene_annotation_frame(
-            &config, viewport, 50.0, None,
+            &config, viewport, 50.0, None, true,
         );
         let row = egui::Rect::from_min_max(
             egui::pos2(0.0, frame.top),

@@ -988,7 +988,7 @@ fn unified_annotation_lane_layout_exists_without_a_legacy_query() {
     )
     .unwrap();
 
-    let frame = alignment_scene_annotation_frame(&config, viewport, 30.0, None);
+    let frame = alignment_scene_annotation_frame(&config, viewport, 30.0, None, true);
     assert_eq!(frame.key, TrackFrameKey::Alignment(config.id));
     assert!(frame.bottom > frame.top + 22.0);
     assert_eq!(
@@ -1003,6 +1003,72 @@ fn unified_annotation_lane_layout_exists_without_a_legacy_query() {
             (Some(AlignmentSubtrack::Modifications), false),
         ]
     );
+}
+
+#[test]
+fn the_modifications_lane_is_laid_out_only_for_tracks_whose_reads_carry_calls() {
+    let config = SessionAlignmentTrack::new(
+        TrackId::new(78),
+        "ONT".to_owned(),
+        TrackSource::Local {
+            path: "ont.bam".to_owned(),
+        },
+    );
+    assert!(config.filters.show_modification_frequency);
+    let regional = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 100, 10_100).unwrap(),
+        800.0,
+    )
+    .unwrap();
+    let lanes = |frame: &crate::ui::TrackFrame| {
+        frame
+            .subtracks
+            .iter()
+            .map(|subtrack| (subtrack.alignment_subtrack, subtrack.collapsed))
+            .collect::<Vec<_>>()
+    };
+    // No modification calls seen: no lane, not even a collapsed header.
+    let tagless = alignment_scene_annotation_frame(&config, regional, 30.0, None, false);
+    let tagged = alignment_scene_annotation_frame(&config, regional, 30.0, None, true);
+    assert!(
+        !lanes(&tagless)
+            .iter()
+            .any(|(lane, _)| *lane == Some(AlignmentSubtrack::Modifications))
+    );
+    assert!(tagged.bottom > tagless.bottom);
+    assert_eq!(
+        lanes(&tagged).last(),
+        Some(&(Some(AlignmentSubtrack::Modifications), false))
+    );
+    // Hidden by the user: a collapsed header to show it again.
+    let mut hidden = config.clone();
+    hidden.filters.show_modification_frequency = false;
+    assert_eq!(
+        lanes(&alignment_scene_annotation_frame(
+            &hidden, regional, 30.0, None, true
+        ))
+        .last(),
+        Some(&(Some(AlignmentSubtrack::Modifications), true))
+    );
+    // At overview zoom no reads are loaded: the lane stays, saying to zoom in.
+    let overview = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 0, 10_000_000).unwrap(),
+        800.0,
+    )
+    .unwrap();
+    let frame = alignment_scene_annotation_frame(&config, overview, 30.0, None, true);
+    let lane = frame
+        .subtracks
+        .iter()
+        .find(|subtrack| subtrack.alignment_subtrack == Some(AlignmentSubtrack::Modifications))
+        .unwrap();
+    assert_eq!(lane.detail.as_deref(), Some("Zoom in to see methylation"));
+    let regional_lane = tagged
+        .subtracks
+        .iter()
+        .find(|subtrack| subtrack.alignment_subtrack == Some(AlignmentSubtrack::Modifications))
+        .unwrap();
+    assert_eq!(regional_lane.detail, None);
 }
 
 #[test]

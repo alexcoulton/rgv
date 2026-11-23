@@ -701,7 +701,9 @@ fn scene_modification_options_capture_style_selection_and_normalized_hidden_code
         ..SessionFilters::default()
     };
     let options = alignment_scene_modification_lane_options(&filters, Some(123));
-    assert!(options.projection.probability_weighted);
+    // The lane plots the fraction of called reads that are modified, 5mC by default.
+    assert!(!options.projection.probability_weighted);
+    assert_eq!(options.projection.shown_code, None);
     assert_eq!(options.projection.hidden_codes.len(), 2);
     assert!(
         options

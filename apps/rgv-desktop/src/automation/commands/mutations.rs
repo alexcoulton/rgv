@@ -568,6 +568,8 @@ impl Viewer {
             | AutomationSetting::ShowModifiedBases { .. }
             | AutomationSetting::OverlappingMatePolicy { .. }
             | AutomationSetting::ModifiedBaseColorMode { .. }
+            | AutomationSetting::ShowUnmodifiedModificationCalls { .. }
+            | AutomationSetting::ModificationLaneCode { .. }
             | AutomationSetting::AlignmentColorMode { .. }
             | AutomationSetting::AlignmentViewFilter { .. }
             | AutomationSetting::AlignmentHighlightFilter { .. }

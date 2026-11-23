@@ -488,6 +488,30 @@ fn configure_alignment_setting<P: Panel>(
                 Ok(())
             })
         }
+        AutomationSetting::ShowUnmodifiedModificationCalls { value } => {
+            edit_alignment_tracks(session, &[primary], |settings| {
+                settings.filters.set_draws_unmodified_calls(*value);
+                Ok(())
+            })
+        }
+        AutomationSetting::ModificationLaneCode { value } => {
+            edit_alignment_tracks(session, &[primary], |settings| {
+                let code = value
+                    .as_deref()
+                    .map(|value| {
+                        crate::alignment::track::parse_modification_code(value)
+                            .map(|_| value.to_owned())
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "modification_lane_code must be one letter or CHEBI:<number>, not {value:?}"
+                                )
+                            })
+                    })
+                    .transpose()?;
+                settings.filters.modification_lane_code = code;
+                Ok(())
+            })
+        }
         AutomationSetting::AlignmentColorMode { track_ids, value } => {
             ensure_alignment_tracks(session, track_ids).and_then(|()| {
                 edit_alignment_tracks(

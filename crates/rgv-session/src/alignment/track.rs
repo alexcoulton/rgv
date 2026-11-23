@@ -283,8 +283,14 @@ pub fn alignment_scene_modification_lane_options(
     hidden_codes.dedup();
     AlignmentModificationLaneOptions {
         projection: CpuModificationProjectionOptions {
-            probability_weighted: true,
+            // The lane plots the fraction of called reads that are modified, not the mean call
+            // probability.
+            probability_weighted: false,
             hidden_codes,
+            shown_code: filters
+                .modification_lane_code
+                .as_deref()
+                .and_then(parse_modification_code),
         },
         color_mode: filters.modified_base_color_mode,
         selected_position,
@@ -971,6 +977,19 @@ pub struct AlignmentPanelProjection {
     pub scene_highlight_key: Option<AlignmentHighlightCacheKey>,
     pub scene_highlighted: Arc<[AlignmentHandle]>,
     pub scene_highlight_status: Option<String>,
+    /// A scene published for this panel carried modification calls (`MM`/`ML` decoded into at
+    /// least one series). Sticky: the Modifications lane is laid out for the track from then
+    /// on, so tag-less files never spend room on an empty lane.
+    pub modification_tags_observed: bool,
+}
+
+/// Whether a published scene's summaries hold any modification series: the loaded records
+/// carry usable `MM`/`ML` tags.
+#[must_use]
+pub fn scene_has_modification_calls(
+    snapshot: &rgv_alignment_scene::AlignmentSceneSnapshot,
+) -> bool {
+    snapshot.summaries().has_modification_calls()
 }
 
 impl AlignmentPanelProjection {
@@ -1149,6 +1168,15 @@ pub struct AlignmentSettingsOutcome {
 }
 
 impl AlignmentTrackController {
+    /// Whether any panel's scene of this track carried modification calls; see
+    /// [`AlignmentPanelProjection::modification_tags_observed`].
+    #[must_use]
+    pub fn modification_tags_observed(&self) -> bool {
+        self.projections
+            .values()
+            .any(|projection| projection.modification_tags_observed)
+    }
+
     pub fn mark_unavailable(&mut self, panel_id: PanelId, message: String) {
         let projection = self.projections.entry(panel_id).or_default();
         projection.settle_unavailable(message);
@@ -1582,6 +1610,7 @@ pub fn alignment_scene_build_contract(
                 show_modified_bases: filters.show_modified_bases,
                 minimum_modification_probability: filters.minimum_modification_probability,
                 modified_base_color_mode: filters.modified_base_color_mode,
+                show_unmodified_calls: filters.show_unmodified_calls,
                 hidden_modification_codes,
             },
             // Base semantics name the currently open immutable FASTA authority. The actual slice
@@ -1843,6 +1872,10 @@ pub fn copy_compatible_alignment_appearance(target: &mut SessionFilters, source:
     target.show_modification_frequency = source.show_modification_frequency;
     target.minimum_modification_probability = source.minimum_modification_probability;
     target.modified_base_color_mode = source.modified_base_color_mode;
+    target.show_unmodified_calls = source.show_unmodified_calls;
+    target
+        .modification_lane_code
+        .clone_from(&source.modification_lane_code);
     target
         .hidden_modification_codes
         .clone_from(&source.hidden_modification_codes);

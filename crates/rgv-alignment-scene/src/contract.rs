@@ -546,6 +546,8 @@ pub struct AlignmentStyleContract {
     pub show_modified_bases: bool,
     pub minimum_modification_probability: u8,
     pub modified_base_color_mode: ModifiedBaseColorMode,
+    /// Draw bases whose likelier state is unmodified (blue). Off draws modified calls only.
+    pub show_unmodified_calls: bool,
     pub hidden_modification_codes: [Option<ModificationCode>; MAXIMUM_HIDDEN_MODIFICATION_CODES],
 }
 
@@ -562,12 +564,21 @@ impl Default for AlignmentStyleContract {
             show_modified_bases: true,
             minimum_modification_probability: 0,
             modified_base_color_mode: ModifiedBaseColorMode::ByType,
+            show_unmodified_calls: false,
             hidden_modification_codes: [None; MAXIMUM_HIDDEN_MODIFICATION_CODES],
         }
     }
 }
 
 impl AlignmentStyleContract {
+    /// Whether the read stack draws unmodified calls: the 2-colour display, or the legacy
+    /// modified-versus-unmodified colouring, which always drew them.
+    #[must_use]
+    pub fn draws_unmodified_calls(self) -> bool {
+        self.show_unmodified_calls
+            || self.modified_base_color_mode == ModifiedBaseColorMode::ModifiedVsUnmodified
+    }
+
     /// Whether a specialist-overlay page at `lod` reads the reference for its modification
     /// cells: at base detail, with bases shown, a modification cell gives way to the mismatch
     /// cell the read geometry draws on the same base.
@@ -609,6 +620,7 @@ impl AlignmentStyleContract {
                 ModifiedBaseColorMode::Mono => 1,
                 ModifiedBaseColorMode::ModifiedVsUnmodified => 2,
             },
+            u8::from(self.draws_unmodified_calls()),
         ]);
         hash.write(&self.minimum_indel_size.to_le_bytes());
         hash.write(&self.minimum_event_label_size.to_le_bytes());
@@ -771,6 +783,7 @@ impl PresentationContract {
                         ModifiedBaseColorMode::Mono => 1,
                         ModifiedBaseColorMode::ModifiedVsUnmodified => 2,
                     },
+                    u8::from(self.style.draws_unmodified_calls()),
                 ]);
                 write_hidden_modification_codes(&mut hash, self.style.hidden_modification_codes);
                 if self

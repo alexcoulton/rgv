@@ -151,6 +151,15 @@ pub fn decode_modified_bases_parts(
     Ok(calls)
 }
 
+/// Whether `code` is 5-methylcytosine (`m`, or its `ChEBI` identifier 27551).
+#[must_use]
+pub const fn is_five_methylcytosine(code: ModificationCode) -> bool {
+    matches!(
+        code,
+        ModificationCode::Letter(b'm') | ModificationCode::Chebi(27_551)
+    )
+}
+
 /// The modification codes an `MM` tag declares in its group headers, in tag order and without
 /// repeats, without locating any call. Malformed groups are skipped. A cheap way to learn which
 /// modifications a record was assessed for (a legend, a code list) without decoding it.

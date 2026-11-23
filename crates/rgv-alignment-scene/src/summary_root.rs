@@ -423,6 +423,15 @@ impl ExactSummaryRoot {
         &self.modifications
     }
 
+    /// Whether any modification tile holds a series: the loaded records carry usable
+    /// `MM`/`ML` calls.
+    #[must_use]
+    pub fn has_modification_calls(&self) -> bool {
+        self.modifications
+            .iter()
+            .any(|tile| !tile.summary().series.is_empty())
+    }
+
     /// Exact modification summary and canonical owner interval containing `position`.
     #[must_use]
     pub fn modification_summary_at(

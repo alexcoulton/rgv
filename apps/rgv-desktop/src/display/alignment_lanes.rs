@@ -88,6 +88,7 @@ impl Viewer {
                         .track_presentation
                         .pane_track_state(ui::TrackPane::Annotation, primary_alignment_id)
                         .and_then(|node| node.preferred_height),
+                    self.alignment_track_has_modification_calls(primary_alignment_id),
                 )
             } else {
                 unreachable!("the primary source exists only with a primary track")
@@ -190,6 +191,7 @@ impl Viewer {
                         .track_presentation
                         .pane_track_state(ui::TrackPane::Annotation, track_id)
                         .and_then(|node| node.preferred_height),
+                    self.alignment_track_has_modification_calls(track_id),
                 )
             } else {
                 let bottom = top + 48.0;

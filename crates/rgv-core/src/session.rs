@@ -273,12 +273,13 @@ pub enum ReadBaseDisplayMode {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ModifiedBaseColorMode {
-    /// One colour per modification type (exact palette unverified).
+    /// One colour per modification type (5mC red, 5hmC amber, 6mA teal, others pale yellow).
     #[default]
     ByType,
-    /// A single colour for every modification call (exact rendering unverified).
+    /// The 5mC red for every modification call.
     Mono,
-    /// Contrast modified calls with unmodified canonical bases.
+    /// The 5mC red for every modification call, with unmodified bases (including the implicit
+    /// ones of a `.` group) drawn in blue whatever `show_unmodified_calls` says.
     ModifiedVsUnmodified,
 }
 
@@ -1035,6 +1036,16 @@ pub struct SessionFilters {
     pub minimum_modification_probability: u8,
     #[serde(default)]
     pub modified_base_color_mode: ModifiedBaseColorMode,
+    /// Draw a base whose likelier state is unmodified as a blue cell ("2-colour", IGV's
+    /// optional mode). Off by default: only modified calls are drawn and an unmodified base is
+    /// the plain read body, as in IGV's default 5mC mode. Sessions saved before the setting
+    /// existed load with it off.
+    #[serde(default)]
+    pub show_unmodified_calls: bool,
+    /// The modification code the Modifications lane plots, as the settings spell it (`m`,
+    /// `CHEBI:76792`). `None` plots 5mC wherever it was called (else the most frequent code).
+    #[serde(default)]
+    pub modification_lane_code: Option<String>,
     #[serde(default)]
     pub hidden_modification_codes: Vec<String>,
     pub include_secondary: bool,
@@ -1047,6 +1058,25 @@ pub struct SessionFilters {
     /// Uses the same predicate vocabulary without changing evidence membership or summaries.
     #[serde(default)]
     pub alignment_highlight_filter: AlignmentPredicateExpression,
+}
+
+impl SessionFilters {
+    /// Whether the read stack draws unmodified calls (the 2-colour display).
+    #[must_use]
+    pub fn draws_unmodified_calls(&self) -> bool {
+        self.show_unmodified_calls
+            || self.modified_base_color_mode == ModifiedBaseColorMode::ModifiedVsUnmodified
+    }
+
+    /// Switches the 2-colour display on or off. Off also leaves the legacy
+    /// modified-versus-unmodified colouring (which always draws unmodified calls) for its
+    /// single-colour equivalent.
+    pub fn set_draws_unmodified_calls(&mut self, value: bool) {
+        self.show_unmodified_calls = value;
+        if !value && self.modified_base_color_mode == ModifiedBaseColorMode::ModifiedVsUnmodified {
+            self.modified_base_color_mode = ModifiedBaseColorMode::Mono;
+        }
+    }
 }
 
 impl Default for SessionFilters {
@@ -1096,6 +1126,8 @@ impl Default for SessionFilters {
             show_modification_frequency: true,
             minimum_modification_probability: 0,
             modified_base_color_mode: ModifiedBaseColorMode::ByType,
+            show_unmodified_calls: false,
+            modification_lane_code: None,
             hidden_modification_codes: Vec::new(),
             include_secondary: false,
             include_supplementary: true,

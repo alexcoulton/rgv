@@ -61,14 +61,15 @@ pub use local::{
     derive_alignment_query_with_summary_index_and_phase,
 };
 pub use modification_summary::{
-    MAX_MODIFICATION_SERIES, ModificationBin, ModificationProvenance, ModificationSeries,
-    ModificationSeriesKey, ModificationSummary, ModificationSummaryBuilder,
+    MAX_MODIFICATION_SERIES, ModificationBin, ModificationCodeTally, ModificationProvenance,
+    ModificationSeries, ModificationSeriesKey, ModificationSiteTally, ModificationSummary,
+    ModificationSummaryBuilder,
 };
 pub use modified_bases::{
     BaseModificationStrand, ImplicitModificationMode, ModificationCode, ModifiedBaseCall,
     ModifiedBaseError, aligned_position_for_sequencer_position, decode_modified_bases,
-    decode_modified_bases_parts, decode_modified_bases_parts_checked, modification_codes_in_tag,
-    modified_bases_resolvable, sequencer_base_matches,
+    decode_modified_bases_parts, decode_modified_bases_parts_checked, is_five_methylcytosine,
+    modification_codes_in_tag, modified_bases_resolvable, sequencer_base_matches,
 };
 pub use pair::{
     MAX_TEMPLATE_LENGTH_SAMPLES, MIN_TEMPLATE_LENGTH_SAMPLES, MateVisibility, PairClassification,

@@ -1231,18 +1231,23 @@ impl Viewer {
                 position.checked_add(1)?,
             )
             .ok()?;
+            // The lane's bin under the cursor at this zoom (one base when zoomed in).
+            let bin_bases = rgv_alignment_scene::modification_lane_bin_bases(
+                self.session.panels.active().viewport.bases_per_pixel(),
+            );
             let present = scene
                 .summary_pages_for(SummaryPageFamily::Modifications, interval)
                 .iter()
                 .any(|page| {
+                    let page_start = page.interval().start();
+                    let bin_start =
+                        page_start.saturating_add((position - page_start) / bin_bases * bin_bases);
+                    let bin_end = bin_start.saturating_add(bin_bases);
                     page.primitives().iter().any(|primitive| {
-                        let start = page
-                            .interval()
-                            .start()
-                            .saturating_add(primitive.start_offset);
-                        let end = page.interval().start().saturating_add(primitive.end_offset);
-                        start <= position
-                            && position < end
+                        let start = page_start.saturating_add(primitive.start_offset);
+                        let end = page_start.saturating_add(primitive.end_offset);
+                        start < bin_end
+                            && bin_start < end
                             && matches!(
                                 primitive.component,
                                 SummarySemanticComponent::Modification { .. }

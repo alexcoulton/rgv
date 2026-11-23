@@ -342,7 +342,8 @@ fn summary_allele_pixels_match_the_cpu_oracle_over_depth() {
 }
 
 #[test]
-fn summary_modification_pixels_match_the_cpu_oracle_by_type_and_against_unmodified() {
+#[allow(clippy::too_many_lines)]
+fn summary_modification_pixels_match_the_cpu_oracle_with_called_bands_in_every_mode() {
     let Some(gpu) = test_gpu() else {
         return;
     };
@@ -380,11 +381,12 @@ fn summary_modification_pixels_match_the_cpu_oracle_by_type_and_against_unmodifi
                 unreachable!();
             };
             let page_start = page.interval().start();
-            if color_mode == ModifiedBaseColorMode::ModifiedVsUnmodified {
-                // Background bands (shape 1) fill the lane height wherever any series exists.
-                // No public oracle projects them; a full-scale depth instance over the same
-                // span has exactly the band's rectangle.
-                for index in metadata.background_range() {
+            let level = metadata.level(camera().bases_per_pixel());
+            {
+                // The called bands (shape 1) fill the lane height wherever a code was called,
+                // in every colouring. No public oracle projects them; a full-scale depth
+                // instance over the same span has exactly the band's rectangle.
+                for index in level.background_range.clone() {
                     let instance = instances[index as usize];
                     assert_eq!(instance.shape, 1);
                     if instance.later_code_mask == 0 {
@@ -417,9 +419,9 @@ fn summary_modification_pixels_match_the_cpu_oracle_by_type_and_against_unmodifi
                 }
             }
             let foreground = if probability_weighted {
-                metadata.weighted_range()
+                level.weighted_range.clone()
             } else {
-                metadata.raw_range()
+                level.raw_range.clone()
             };
             for index in foreground {
                 let instance = instances[index as usize];

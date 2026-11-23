@@ -1,11 +1,14 @@
 //! How base-modification calls (`MM`/`ML` tags) are coloured and named: the read-stack cells,
 //! the modification summary lane, the exports and the legends all take their colours from here.
 //!
-//! The convention follows IGV. A cell shows the likelier state of its base: a modification in
-//! its type's colour (5mC red, 5hmC amber, 6mA teal, any other code cream; every modification
-//! red outside the by-type mode), or no modification in blue. The colour's strength is the
+//! The convention follows IGV. By default only modified bases are drawn (IGV's default 5mC
+//! mode): a base whose likelier state is a modification is a cell in its type's colour (5mC
+//! red, 5hmC amber, 6mA teal, any other code cream; every modification red outside the by-type
+//! mode), and a base whose likelier state is unmodified is the plain read body. The optional
+//! 2-colour display also draws the unmodified bases, in blue. The colour's strength is the
 //! call's confidence: a call whose two states are equally likely is a faint tint that fades
-//! towards the read body beneath it, and a certain call is the full colour.
+//! towards the read body beneath it, and a certain call is the full colour, so a weak
+//! modification call fades towards the body and never turns blue.
 //!
 //! A mismatch takes priority over a modification on the same base: the semantic page emits no
 //! modification cell on a base drawn as a mismatch, so a cell is never two marks at once.
@@ -153,19 +156,40 @@ pub struct ModificationLegendEntry {
     pub label: String,
 }
 
-/// What the read stack's modification colours mean, for a legend's hover text.
-pub const MODIFICATION_LEGEND_HELP: &str = "Base modifications from the MM/ML tags. Each cell shows the likelier state of its base; \
-its colour strength is the call probability (ML), so low-confidence calls fade towards the \
-read. A mismatch is drawn instead of a modification on the same base. Reads without MM/ML \
-tags (often supplementary alignments) are drawn normally.";
+/// What the read stack's modification colours mean, for a legend's hover text, when only
+/// modified calls are drawn (the default).
+pub const MODIFICATION_LEGEND_HELP: &str = "Base modifications from the MM/ML tags. A base whose likelier state is modified is \
+coloured by its modification; its colour strength is the call probability (ML), so \
+low-confidence calls fade towards the read. Unmodified calls are not drawn; switch to \
+2-colour to show them. A mismatch is drawn instead of a modification on the same base. Reads \
+without MM/ML tags (often supplementary alignments) are drawn normally.";
+
+/// [`MODIFICATION_LEGEND_HELP`] for the 2-colour display.
+pub const MODIFICATION_LEGEND_TWO_COLOUR_HELP: &str = "Base modifications from the MM/ML tags, 2-colour: each called base shows its likelier \
+state, modified in its modification's colour or unmodified in blue. Colour strength is the \
+call probability (ML), so low-confidence calls fade towards the read. A mismatch is drawn \
+instead of a modification on the same base. Reads without MM/ML tags (often supplementary \
+alignments) are drawn normally.";
+
+/// The legend's hover text for the display that draws unmodified calls (`two_colour`) or not.
+#[must_use]
+pub const fn modification_legend_help(two_colour: bool) -> &'static str {
+    if two_colour {
+        MODIFICATION_LEGEND_TWO_COLOUR_HELP
+    } else {
+        MODIFICATION_LEGEND_HELP
+    }
+}
 
 /// The legend of the read stack's modification colours for the codes `codes` present in the
-/// data (in their order, hidden codes already removed) under `mode`. Empty when there is
-/// nothing to explain.
+/// data (in their order, hidden codes already removed) under `mode`. The unmodified swatch is
+/// listed only when unmodified calls are drawn (`two_colour`). Empty when there is nothing to
+/// explain.
 #[must_use]
 pub fn modification_legend(
     codes: &[ModificationCode],
     mode: ModifiedBaseColorMode,
+    two_colour: bool,
 ) -> Vec<ModificationLegendEntry> {
     if codes.is_empty() {
         return Vec::new();
@@ -192,11 +216,63 @@ pub fn modification_legend(
             });
         }
     }
-    entries.push(ModificationLegendEntry {
-        token: PaletteToken::MODIFICATION_UNMODIFIED,
-        label: "unmodified".to_owned(),
-    });
+    if two_colour {
+        entries.push(ModificationLegendEntry {
+            token: PaletteToken::MODIFICATION_UNMODIFIED,
+            label: "unmodified".to_owned(),
+        });
+    }
     entries
+}
+
+/// One line describing a Modifications lane site or bin, e.g.
+/// `chr20:219,219 CpG · 5mC 12/40 reads (30%) · 5hmC 1/40 · unmodified 27/40`. `locus` is
+/// already formatted; `context` (such as `CpG`) follows it when known. The first code is the
+/// one the lane plots (`shown`), with its percentage; the others follow in code order, then
+/// the called reads modified by no code. `None` when no read was called.
+#[must_use]
+pub fn modification_site_text(
+    locus: &str,
+    context: Option<&str>,
+    tally: &rgv_model::ModificationSiteTally,
+    shown: Option<ModificationCode>,
+) -> Option<String> {
+    let called = tally.called();
+    if called == 0 {
+        return None;
+    }
+    let mut parts = vec![match context {
+        Some(context) => format!("{locus} {context}"),
+        None => locus.to_owned(),
+    }];
+    let shown = shown.and_then(|code| tally.code(code));
+    if let Some(entry) = shown
+        && let Some(code) = entry.code
+    {
+        let percent = (entry.fraction().unwrap_or(0.0) * 100.0).round();
+        parts.push(format!(
+            "{} {}/{} reads ({percent:.0}%)",
+            modification_code_name(code),
+            entry.modified,
+            entry.called
+        ));
+    }
+    for entry in &tally.codes {
+        let Some(code) = entry.code else {
+            continue;
+        };
+        if entry.called == 0 || shown.is_some_and(|shown| shown.code == Some(code)) {
+            continue;
+        }
+        parts.push(format!(
+            "{} {}/{}",
+            modification_code_name(code),
+            entry.modified,
+            entry.called
+        ));
+    }
+    parts.push(format!("unmodified {}/{called}", tally.unmodified()));
+    Some(parts.join(" · "))
 }
 
 #[cfg(test)]
@@ -300,8 +376,84 @@ mod tests {
     }
 
     #[test]
-    fn the_legend_lists_only_the_codes_present() {
-        let legend = modification_legend(&[M, A], ModifiedBaseColorMode::ByType);
+    fn the_default_legend_lists_only_the_modified_codes_present() {
+        let legend = modification_legend(&[M, H], ModifiedBaseColorMode::ByType, false);
+        assert_eq!(
+            legend,
+            vec![
+                ModificationLegendEntry {
+                    token: PaletteToken::MODIFICATION_5MC,
+                    label: "5mC".to_owned()
+                },
+                ModificationLegendEntry {
+                    token: PaletteToken::MODIFICATION_5HMC,
+                    label: "5hmC".to_owned()
+                },
+            ]
+        );
+        assert!(
+            modification_legend(&[M], ModifiedBaseColorMode::Mono, false)
+                .iter()
+                .all(|entry| entry.token != PaletteToken::MODIFICATION_UNMODIFIED)
+        );
+        assert!(
+            modification_legend_help(false)
+                .contains("Unmodified calls are not drawn; switch to 2-colour to show them")
+        );
+        assert!(modification_legend_help(true).contains("unmodified in blue"));
+    }
+
+    #[test]
+    fn a_weak_modified_call_fades_towards_the_body_and_never_turns_blue() {
+        let palette = AlignmentPalette::light();
+        let red = palette.color(PaletteToken::MODIFICATION_5MC);
+        let blue = palette.color(PaletteToken::MODIFICATION_UNMODIFIED);
+        let strong = resolved(modification_cell_color(
+            M,
+            Some(250),
+            ModificationState::Modified,
+            true,
+        ));
+        // Just over one half: the likelier state is modified, so the cell is a faint red tint.
+        let weak = resolved(modification_cell_color(
+            M,
+            Some(135),
+            ModificationState::Modified,
+            true,
+        ));
+        assert_eq!(weak[..3], red[..3]);
+        assert_ne!(weak[..3], blue[..3]);
+        assert!(weak[3] < 0.3 && weak[3] < strong[3], "{weak:?}");
+    }
+
+    #[test]
+    fn site_text_lists_the_plotted_code_the_others_and_the_unmodified_reads() {
+        use rgv_model::{ModificationBin, ModificationSiteTally};
+        let mut tally = ModificationSiteTally::default();
+        let bin = |modified, called| ModificationBin {
+            modified_calls: modified,
+            canonical_observations: called,
+            ..ModificationBin::default()
+        };
+        tally.add(M, bin(12, 40));
+        tally.add(H, bin(1, 40));
+        assert_eq!(
+            modification_site_text("chr20:219,219", Some("CpG"), &tally, Some(M)).as_deref(),
+            Some("chr20:219,219 CpG · 5mC 12/40 reads (30%) · 5hmC 1/40 · unmodified 27/40")
+        );
+        assert_eq!(
+            modification_site_text("chr20:219,219-219,234", None, &tally, Some(H)).as_deref(),
+            Some("chr20:219,219-219,234 · 5hmC 1/40 reads (3%) · 5mC 12/40 · unmodified 27/40")
+        );
+        assert_eq!(
+            modification_site_text("x", None, &ModificationSiteTally::default(), Some(M)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_two_colour_legend_adds_unmodified() {
+        let legend = modification_legend(&[M, A], ModifiedBaseColorMode::ByType, true);
         assert_eq!(
             legend,
             vec![
@@ -319,12 +471,13 @@ mod tests {
                 },
             ]
         );
-        let two_colour = modification_legend(&[M, H], ModifiedBaseColorMode::ModifiedVsUnmodified);
+        let two_colour =
+            modification_legend(&[M, H], ModifiedBaseColorMode::ModifiedVsUnmodified, true);
         assert_eq!(two_colour.len(), 2);
         assert_eq!(two_colour[0].label, "5mC, 5hmC modified");
         assert_eq!(two_colour[0].token, PaletteToken::MODIFICATION_5MC);
         assert_eq!(two_colour[1].token, PaletteToken::MODIFICATION_UNMODIFIED);
-        assert!(modification_legend(&[], ModifiedBaseColorMode::ByType).is_empty());
+        assert!(modification_legend(&[], ModifiedBaseColorMode::ByType, true).is_empty());
     }
 
     #[test]

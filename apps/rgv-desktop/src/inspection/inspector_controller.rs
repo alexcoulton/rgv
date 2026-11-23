@@ -12,7 +12,7 @@ use crate::ui::alignment_settings::{
 use crate::{HoverInspectorTarget, Viewer};
 use rgv_alignment_scene::AlignmentComponent;
 use rgv_automation::AutomationSelectionKind;
-use rgv_core::{GenomicInterval, OverlappingMatePolicy, SashimiCountMode};
+use rgv_core::{GenomicInterval, OverlappingMatePolicy, SashimiCountMode, TrackId};
 use rgv_hts::{
     AlignmentRecord, AuxValue, CigarOpKind, QUALITY_WEIGHT_SCALE, SequenceData,
     UltimaTagOrientation, analyze_ultima_record_with_tag_orientation, bisulfite_strand_is_reverse,
@@ -862,6 +862,8 @@ impl Viewer {
                 interval.end()
             )
         };
+        let methylation =
+            self.modification_lane_text(track_id, summary_interval, summary, position);
         let mut fields = vec![
             (
                 "Track".to_owned(),
@@ -869,6 +871,9 @@ impl Viewer {
             ),
             ("Locus".to_owned(), locus),
         ];
+        if let Some(methylation) = methylation {
+            fields.insert(0, ("Methylation".to_owned(), methylation));
+        }
         for series in &summary.series {
             let Some(bin) = series.bins.get(index).copied() else {
                 continue;
@@ -938,6 +943,36 @@ impl Viewer {
             cigar: None,
             read_sequence: None,
         })
+    }
+
+    /// The Modifications lane's one-line summary of the bin under `position` at the active
+    /// panel's zoom, as the lane plots it: the site itself when zoomed in, else the pooled bin.
+    fn modification_lane_text(
+        &self,
+        track_id: TrackId,
+        summary_interval: GenomicInterval,
+        summary: &rgv_hts::ModificationSummary,
+        position: u64,
+    ) -> Option<String> {
+        let panel = self.session.panels.active();
+        let bin_bases =
+            rgv_alignment_scene::modification_lane_bin_bases(panel.viewport.bases_per_pixel());
+        let options = rgv_session::alignment::track::alignment_scene_modification_lane_options(
+            &self.alignment_filters_for_track(track_id),
+            None,
+        )
+        .projection;
+        let (locus, context, tally) = modification_lane_site(
+            &panel.contig_name,
+            summary_interval,
+            summary,
+            position,
+            bin_bases,
+            panel.reference_slice.as_deref(),
+        )?;
+        let shown = rgv_alignment_scene::modification_lane_code(&tally, &options)
+            .and_then(|entry| entry.code);
+        rgv_render::modification_style::modification_site_text(&locus, context, &tally, shown)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1375,4 +1410,72 @@ mod scene_inspection_tests {
             Some((0, None))
         );
     }
+}
+
+/// A position with thousands separators, as loci are written: `219219` is `219,219`.
+pub(crate) fn grouped_position(position: u64) -> String {
+    let digits = position.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// The Modifications lane bin holding `position` at `bin_bases` (bins start at multiples of
+/// the width from the summary tile's start), with its locus, its sequence context (`CpG` for a
+/// single site whose reference reads `CG` from it) and every code's reads pooled over its
+/// sites. `None` when the position is outside the summary.
+pub(crate) fn modification_lane_site(
+    contig_name: &str,
+    summary_interval: GenomicInterval,
+    summary: &rgv_hts::ModificationSummary,
+    position: u64,
+    bin_bases: u64,
+    reference: Option<&rgv_hts::ReferenceSlice>,
+) -> Option<(String, Option<&'static str>, rgv_hts::ModificationSiteTally)> {
+    if !summary_interval.contains(position) {
+        return None;
+    }
+    let bin_bases = bin_bases.max(1);
+    let start =
+        summary_interval.start() + (position - summary_interval.start()) / bin_bases * bin_bases;
+    let end = start.saturating_add(bin_bases).min(summary_interval.end());
+    let mut tally = rgv_hts::ModificationSiteTally::default();
+    let mut previous = None;
+    for site in start..end {
+        let Some(index) = summary.bin_index_at(summary_interval, site) else {
+            continue;
+        };
+        if previous != Some(index) {
+            tally.merge(&summary.site_tally(index));
+            previous = Some(index);
+        }
+    }
+    let locus = if end - start == 1 {
+        format!("{contig_name}:{}", grouped_position(start + 1))
+    } else {
+        format!(
+            "{contig_name}:{}-{}",
+            grouped_position(start + 1),
+            grouped_position(end)
+        )
+    };
+    let base = |site: u64| {
+        reference
+            .filter(|slice| slice.interval.contig() == summary_interval.contig())
+            .filter(|slice| slice.interval.contains(site))
+            .and_then(|slice| {
+                slice
+                    .bases
+                    .get(usize::try_from(site - slice.interval.start()).ok()?)
+                    .map(u8::to_ascii_uppercase)
+            })
+    };
+    let context = (end - start == 1 && base(start) == Some(b'C') && base(start + 1) == Some(b'G'))
+        .then_some("CpG");
+    Some((locus, context, tally))
 }

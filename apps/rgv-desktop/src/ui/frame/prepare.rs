@@ -273,6 +273,11 @@ impl Viewer {
         let show_modification_frequency = settings_filters.show_modification_frequency;
         let minimum_modification_probability = settings_filters.minimum_modification_probability;
         let modified_base_color_mode = settings_filters.modified_base_color_mode;
+        let show_unmodified_calls = settings_filters.draws_unmodified_calls();
+        let modification_lane_code = settings_filters
+            .modification_lane_code
+            .as_deref()
+            .and_then(parse_modification_code);
         let hidden_modification_codes = settings_filters
             .hidden_modification_codes
             .iter()
@@ -406,6 +411,8 @@ impl Viewer {
             show_modification_frequency,
             minimum_modification_probability,
             modified_base_color_mode,
+            show_unmodified_calls,
+            modification_lane_code,
             hidden_modification_codes,
             include_secondary,
             include_supplementary,

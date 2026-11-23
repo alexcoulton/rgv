@@ -5,8 +5,8 @@ use rgv_core::{
     SashimiCountMode, Viewport,
 };
 use rgv_model::{
-    JunctionEvidence, ModificationBin, ModificationCode, ModificationSeriesKey, PairSummary,
-    PileupBin,
+    JunctionEvidence, ModificationBin, ModificationCode, ModificationCodeTally,
+    ModificationSeriesKey, ModificationSiteTally, PairSummary, PileupBin,
 };
 use thiserror::Error;
 
@@ -185,8 +185,13 @@ pub struct CpuJunctionScaleMeasurement {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CpuModificationProjectionOptions {
+    /// Plot the mean call probability of the called reads instead of the fraction of them
+    /// that are modified.
     pub probability_weighted: bool,
     pub hidden_codes: Vec<ModificationCode>,
+    /// The one code the lane plots; `None` plots 5mC wherever it was called and otherwise the
+    /// code with the highest fraction.
+    pub shown_code: Option<ModificationCode>,
 }
 
 impl Default for CpuModificationProjectionOptions {
@@ -194,8 +199,100 @@ impl Default for CpuModificationProjectionOptions {
         Self {
             probability_weighted: true,
             hidden_codes: Vec::new(),
+            shown_code: None,
         }
     }
+}
+
+/// The bin widths, in bases, the Modifications lane aggregates its sites into. Bins start at
+/// multiples of the width from the start of the summary tile they belong to.
+pub const MODIFICATION_LANE_BIN_LEVELS: [u64; 6] = [1, 4, 16, 64, 256, 1_024];
+
+/// The Modifications lane's bin width at `bases_per_pixel`: one base while a base is at least a
+/// pixel wide, else the narrowest level at least a pixel wide (so a bin is one to four pixels),
+/// capped at the widest level. A bin's value is the total modified reads over the total called
+/// reads of its sites, so a deeply covered site weighs more than a shallow one.
+#[must_use]
+pub fn modification_lane_bin_bases(bases_per_pixel: f64) -> u64 {
+    MODIFICATION_LANE_BIN_LEVELS
+        .iter()
+        .copied()
+        .find(|bases| bases_per_pixel <= *bases as f64)
+        .unwrap_or(MODIFICATION_LANE_BIN_LEVELS[MODIFICATION_LANE_BIN_LEVELS.len() - 1])
+}
+
+/// The code the Modifications lane plots for a site or bin, with its reads: the shown code when
+/// one is chosen, else 5mC when it was called, else the code with the highest fraction (ties to
+/// the lower code). Hidden codes are never plotted.
+#[must_use]
+pub fn modification_lane_code(
+    tally: &ModificationSiteTally,
+    options: &CpuModificationProjectionOptions,
+) -> Option<ModificationCodeTally> {
+    let visible = || {
+        tally.codes.iter().copied().filter(|entry| {
+            entry.called > 0
+                && entry
+                    .code
+                    .is_some_and(|code| !options.hidden_codes.contains(&code))
+        })
+    };
+    if let Some(shown) = options.shown_code {
+        return visible().find(|entry| entry.code == Some(shown));
+    }
+    if let Some(methyl) =
+        visible().find(|entry| entry.code.is_some_and(rgv_model::is_five_methylcytosine))
+    {
+        return Some(methyl);
+    }
+    let fraction = |entry: ModificationCodeTally| {
+        if options.probability_weighted {
+            entry.weighted_fraction()
+        } else {
+            entry.fraction()
+        }
+        .unwrap_or(0.0)
+    };
+    visible().fold(
+        None,
+        |best: Option<ModificationCodeTally>, entry| match best {
+            Some(best) if fraction(best) >= fraction(entry) => Some(best),
+            _ => Some(entry),
+        },
+    )
+}
+
+/// The Modifications lane's bins over `covered` at `bin_bases`: each bin's sites pooled, keyed
+/// by the bin's genomic `(start, end)`.
+#[must_use]
+pub fn modification_lane_bins(
+    scene: &AlignmentSceneSnapshot,
+    covered: GenomicInterval,
+    bin_bases: u64,
+) -> BTreeMap<(u64, u64), ModificationSiteTally> {
+    let bin_bases = bin_bases.max(1);
+    let mut bins = BTreeMap::<(u64, u64), ModificationSiteTally>::new();
+    for page in scene.summary_pages_for(SummaryPageFamily::Modifications, covered) {
+        let page_start = page.interval().start();
+        let page_end = page.interval().end();
+        for primitive in page.primitives() {
+            let SummarySemanticComponent::Modification { series, bin } = primitive.component else {
+                continue;
+            };
+            let start = page_start.saturating_add(primitive.start_offset / bin_bases * bin_bases);
+            let end = if bin_bases == 1 {
+                page_start.saturating_add(primitive.end_offset)
+            } else {
+                start.saturating_add(bin_bases)
+            }
+            .min(page_end);
+            if end <= covered.start() || start >= covered.end() {
+                continue;
+            }
+            bins.entry((start, end)).or_default().add(series.code, bin);
+        }
+    }
+    bins
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -303,6 +400,10 @@ pub enum CpuSummaryProjectedComponent {
         series: ModificationSeriesKey,
         bin: ModificationBin,
         fraction_bits: u64,
+    },
+    /// The faint full-height band behind a Modifications lane bin with called reads.
+    ModificationCalled {
+        called: u32,
     },
     PairCandidate {
         handle: AlignmentHandle,
@@ -1202,21 +1303,38 @@ fn project_modifications(
     options: &CpuModificationProjectionOptions,
     frame: &mut CpuSummaryFrame,
 ) {
-    for (start, end, component) in summary_facts(scene, SummaryPageFamily::Modifications, covered) {
-        let SummarySemanticComponent::Modification { series, bin } = component else {
+    let bin_bases = modification_lane_bin_bases(camera.bases_per_pixel());
+    for ((start, end), tally) in modification_lane_bins(scene, covered, bin_bases) {
+        let Some(shown) = modification_lane_code(&tally, options) else {
             continue;
         };
-        if options.hidden_codes.contains(&series.code) {
+        let start = start.max(covered.start());
+        let end = end.min(covered.end());
+        let (x, width) = horizontal(camera, start, end);
+        push(
+            frame,
+            x,
+            camera.clip.y,
+            width,
+            camera.clip.height,
+            CpuSummaryPrimitiveShape::Bar,
+            CpuSummaryProjectedComponent::ModificationCalled {
+                called: shown.called,
+            },
+            None,
+        );
+        let fraction = if options.probability_weighted {
+            shown.weighted_fraction()
+        } else {
+            shown.fraction()
+        };
+        let (Some(fraction), Some(code)) = (fraction, shown.code) else {
+            continue;
+        };
+        // A bin with called reads and none modified is the band alone.
+        if shown.modified == 0 {
             continue;
         }
-        let fraction = if options.probability_weighted {
-            bin.weighted_fraction()
-        } else {
-            bin.raw_fraction()
-        };
-        let Some(fraction) = fraction else {
-            continue;
-        };
         push_bar(
             frame,
             camera,
@@ -1224,8 +1342,20 @@ fn project_modifications(
             end,
             fraction.clamp(0.0, 1.0),
             CpuSummaryProjectedComponent::Modification {
-                series,
-                bin,
+                series: ModificationSeriesKey {
+                    canonical_base: 0,
+                    code,
+                    modification_strand: rgv_model::BaseModificationStrand::Forward,
+                    implicit_mode: rgv_model::ImplicitModificationMode::Unknown,
+                    haplotype: None,
+                },
+                bin: ModificationBin {
+                    modified_calls: shown.modified,
+                    canonical_observations: shown.called,
+                    probability_sum: shown.probability_sum,
+                    probability_observations: shown.probability_observations,
+                    ..ModificationBin::default()
+                },
                 fraction_bits: fraction.to_bits(),
             },
         );
@@ -1233,8 +1363,11 @@ fn project_modifications(
     frame.scale_maximum = Some(1.0);
 }
 
+/// Keeps one bar per projected bin (the lane already plots one code per bin; this guards
+/// against bins that project onto the same pixels) and every other primitive.
 fn retain_dominant_modification_primitives(frame: &mut CpuSummaryFrame) {
     let mut dominant = BTreeMap::<(u64, u64), CpuSummaryProjectedPrimitive>::new();
+    let mut others = Vec::new();
     for primitive in frame.primitives.iter() {
         let CpuSummaryProjectedComponent::Modification {
             series,
@@ -1242,6 +1375,7 @@ fn retain_dominant_modification_primitives(frame: &mut CpuSummaryFrame) {
             fraction_bits,
         } = primitive.component
         else {
+            others.push(primitive.clone());
             continue;
         };
         if bin.modified_calls == 0 {
@@ -1266,7 +1400,8 @@ fn retain_dominant_modification_primitives(frame: &mut CpuSummaryFrame) {
             dominant.insert(key, primitive.clone());
         }
     }
-    let mut primitives = dominant.into_values().collect::<Vec<_>>();
+    let mut primitives = others;
+    primitives.extend(dominant.into_values());
     primitives.sort_by(|left, right| {
         left.y
             .total_cmp(&right.y)
@@ -1460,9 +1595,9 @@ fn maximum_summary_output(facts: usize, options: &CpuSummaryProjectionOptions) -
         CpuSummaryProjectionOptions::Depth(_) => facts.saturating_add(2),
         CpuSummaryProjectionOptions::Alleles(_) => facts.saturating_mul(5),
         CpuSummaryProjectionOptions::Junctions(_) => facts.saturating_mul(6),
-        CpuSummaryProjectionOptions::Modifications(_)
-        | CpuSummaryProjectionOptions::Pairs
-        | CpuSummaryProjectionOptions::FilterProvenance => facts,
+        // A called band and a bar per bin, at most one bin per fact.
+        CpuSummaryProjectionOptions::Modifications(_) => facts.saturating_mul(2),
+        CpuSummaryProjectionOptions::Pairs | CpuSummaryProjectionOptions::FilterProvenance => facts,
     }
 }
 

@@ -232,11 +232,8 @@ fn modification_vertex(input: ModificationInput) -> VertexOutput {
     var color = palette_slot(input.shape_token.y);
     var height = max(clamp(fraction, 0.0, 1.0) * frame.clip_size.y, 1.0);
     if input.shape_token.x == 1u {
-        visible = select(
-            0u,
-            1u,
-            frame.modification_color_mode == 2u && (input.identity.y & unhidden_mask) != 0u,
-        );
+        // The called band: drawn behind every bin with called reads of a plotted code.
+        visible = select(0u, 1u, (input.identity.y & unhidden_mask) != 0u);
         color = palette_slot(TOKEN_SUMMARY_MODIFICATION_BACKGROUND);
         height = frame.clip_size.y;
     } else {

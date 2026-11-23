@@ -1754,6 +1754,9 @@ fn prepare_modified_base_overlays(
         return Ok(());
     };
     let color_by_type = style.modified_base_color_mode == ModifiedBaseColorMode::ByType;
+    // Modified-only (the default) leaves a base whose likelier state is unmodified as the plain
+    // read body; the 2-colour display draws it blue.
+    let draw_unmodified = style.draws_unmodified_calls();
     let minimum = style.minimum_modification_probability;
     let hidden = |code| style.hidden_modification_codes.contains(&Some(code));
     let mut called = std::collections::BTreeMap::<usize, BaseModificationCalls>::new();
@@ -1776,9 +1779,7 @@ fn prepare_modified_base_overlays(
         if base.best_shown.is_none_or(|(_, _, best)| effective > best) {
             base.best_shown = Some((call.code, call.probability, effective));
         }
-        if style.modified_base_color_mode == ModifiedBaseColorMode::ModifiedVsUnmodified
-            && call.implicit_mode == ImplicitModificationMode::Canonical
-        {
+        if draw_unmodified && call.implicit_mode == ImplicitModificationMode::Canonical {
             canonical_groups.insert((call.canonical_base, call.code));
         }
     }
@@ -1841,7 +1842,11 @@ fn prepare_modified_base_overlays(
                     ModificationState::Modified,
                 )?;
             }
-        } else if unmodified > best && unmodified >= base.best_hidden && unmodified >= minimum {
+        } else if draw_unmodified
+            && unmodified > best
+            && unmodified >= base.best_hidden
+            && unmodified >= minimum
+        {
             push(
                 sequencer_position,
                 base.canonical_base,
@@ -1852,7 +1857,7 @@ fn prepare_modified_base_overlays(
         }
     }
     // Under `.` (implicitly unmodified) groups, every uncalled base of the canonical base is
-    // unmodified; the modified-versus-unmodified mode draws those too.
+    // unmodified; the 2-colour display draws those too.
     for (canonical_base, code) in canonical_groups {
         for sequencer_position in 0..bases.len() {
             if called.contains_key(&sequencer_position)
@@ -3690,9 +3695,7 @@ fn semantic_page_dynamic_scratch_bytes(
                     // series marks one read position at most once.
                     let tile_series_slots = bound.series.saturating_mul(tile_aligned_bases);
                     let explicit = bound.calls.min(tile_series_slots);
-                    let canonical = if presentation.style.modified_base_color_mode
-                        == ModifiedBaseColorMode::ModifiedVsUnmodified
-                    {
+                    let canonical = if presentation.style.draws_unmodified_calls() {
                         tile_series_slots
                     } else {
                         0
@@ -5086,10 +5089,10 @@ mod tests {
                     &soft_clipped,
                     0,
                     "C+m,1;",
-                    vec![90],
+                    vec![200],
                     None,
                 ),
-                ModificationOutcome::Calls(vec![(41, 3, Some(90))]),
+                ModificationOutcome::Calls(vec![(41, 3, Some(200))]),
             ),
             (
                 modified_read(
@@ -5119,6 +5122,8 @@ mod tests {
         ];
         for (record, expected) in cases {
             let name = String::from_utf8_lossy(&record.read_name).into_owned();
+            // Stored ACGCAC: a reverse read's cytosine calls land on its G, the G of a CpG.
+            let reverse_cpg = record.flags.is_reverse();
             let ledger = AllocationLedger::new(8 << 20, 0);
             let (evidence, atlas) =
                 evidence_and_atlas_for_records(&ledger, &[record], layout_contract());
@@ -5189,16 +5194,20 @@ mod tests {
                         .map(|(position, bin)| {
                             assert_eq!(bin.modified_calls, 1, "{name}");
                             // The summary keeps no read index; take it from the expectation
-                            // so position and probability are what is compared.
+                            // so position and probability are what is compared. A reverse
+                            // read's call on the G of a CpG is summarised on the CpG's C.
                             let read_index = match &expected {
                                 ModificationOutcome::Calls(expected) => expected
                                     .iter()
-                                    .find(|(start, _, _)| *start == position as u64)
+                                    .find(|(start, _, _)| {
+                                        *start == position as u64
+                                            || (reverse_cpg && *start == position as u64 + 1)
+                                    })
                                     .map_or(u32::MAX, |(_, read_index, _)| *read_index),
                                 _ => u32::MAX,
                             };
                             (
-                                position as u64,
+                                position as u64 + u64::from(reverse_cpg),
                                 read_index,
                                 (bin.probability_observations == 1)
                                     .then(|| u8::try_from(bin.probability_sum).unwrap()),
@@ -5340,10 +5349,96 @@ mod tests {
     }
 
     #[test]
+    fn modified_only_is_the_default_and_draws_unmodified_bases_as_the_read_body() {
+        const M: rgv_model::ModificationCode = rgv_model::ModificationCode::Letter(b'm');
+        let style = crate::AlignmentStyleContract::default();
+        assert!(!style.show_unmodified_calls);
+        assert!(!style.draws_unmodified_calls());
+        // ACGCAC at 40: cytosines at 41, 43 and 45. A certain call, a barely-modified call and
+        // a likely-unmodified call; then an implicit `.` group calling only the first C.
+        let read = |mm: &str, ml: Vec<u64>| {
+            modified_read(b"calls", 40, &[(CigarOpKind::Match, 6)], 0, mm, ml, None)
+        };
+        // Modified-only: a cell only where a modification is likelier, whatever its strength;
+        // a low-probability modified call stays a (faint) modified cell, never an unmodified
+        // one, and the likely-unmodified base and the implicit ones get no cell at all.
+        for lod in [GeometryLod::Read, GeometryLod::Base] {
+            assert_eq!(
+                modification_cells(read("C+m?,0,0,0;", vec![250, 140, 20]), lod, None, style),
+                vec![
+                    (41, ModificationState::Modified, M, Some(250)),
+                    (43, ModificationState::Modified, M, Some(140)),
+                ],
+                "{lod:?}"
+            );
+            assert_eq!(
+                modification_cells(read("C+m.,0;", vec![30]), lod, None, style),
+                Vec::new(),
+                "{lod:?}"
+            );
+        }
+        // The 2-colour display restores the blue unmodified cells, explicit and implicit, in
+        // every colouring; the legacy modified-versus-unmodified colouring always draws them.
+        for (mode, show_unmodified_calls) in [
+            (ModifiedBaseColorMode::ByType, true),
+            (ModifiedBaseColorMode::Mono, true),
+            (ModifiedBaseColorMode::ModifiedVsUnmodified, false),
+        ] {
+            let two_colour = crate::AlignmentStyleContract {
+                modified_base_color_mode: mode,
+                show_unmodified_calls,
+                ..style
+            };
+            assert!(two_colour.draws_unmodified_calls());
+            assert_ne!(
+                two_colour.fingerprint(),
+                crate::AlignmentStyleContract {
+                    show_unmodified_calls: false,
+                    modified_base_color_mode: ModifiedBaseColorMode::Mono,
+                    ..style
+                }
+                .fingerprint()
+            );
+            assert_eq!(
+                modification_cells(
+                    read("C+m?,0,0,0;", vec![250, 140, 20]),
+                    GeometryLod::Read,
+                    None,
+                    two_colour
+                ),
+                vec![
+                    (41, ModificationState::Modified, M, Some(250)),
+                    (43, ModificationState::Modified, M, Some(140)),
+                    (45, ModificationState::Canonical, M, Some(20)),
+                ],
+                "{mode:?}"
+            );
+            assert_eq!(
+                modification_cells(
+                    read("C+m.,0;", vec![30]),
+                    GeometryLod::Read,
+                    None,
+                    two_colour
+                ),
+                vec![
+                    (41, ModificationState::Canonical, M, Some(30)),
+                    (43, ModificationState::Canonical, M, None),
+                    (45, ModificationState::Canonical, M, None),
+                ],
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_cell_shows_the_likelier_state_of_its_base() {
         const M: rgv_model::ModificationCode = rgv_model::ModificationCode::Letter(b'm');
         const H: rgv_model::ModificationCode = rgv_model::ModificationCode::Letter(b'h');
-        let style = crate::AlignmentStyleContract::default();
+        // The 2-colour display, which draws both states.
+        let style = crate::AlignmentStyleContract {
+            show_unmodified_calls: true,
+            ..crate::AlignmentStyleContract::default()
+        };
         // ACGCAC at 40: cytosines at 41, 43 and 45. `C+m?,0,0,0` calls all three.
         let read = |mm: &str, ml: Vec<u64>| {
             modified_read(b"calls", 40, &[(CigarOpKind::Match, 6)], 0, mm, ml, None)

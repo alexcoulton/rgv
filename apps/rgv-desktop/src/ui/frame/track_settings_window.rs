@@ -760,19 +760,72 @@ impl Viewer {
                         ModifiedBaseColorMode::Mono,
                         ModifiedBaseColorMode::ModifiedVsUnmodified,
                     ] {
-                        ui.selectable_value(
-                            &mut st.align.modified_base_color_mode,
-                            mode,
-                            modified_base_color_mode_label(mode),
-                        );
+                        if ui
+                            .selectable_value(
+                                &mut st.align.modified_base_color_mode,
+                                mode,
+                                modified_base_color_mode_label(mode),
+                            )
+                            .clicked()
+                            && mode == ModifiedBaseColorMode::ModifiedVsUnmodified
+                        {
+                            // That colouring always draws unmodified calls.
+                            st.align.show_unmodified_calls = true;
+                        }
                     }
                 })
                 .response
                 .labelled_by(label.id);
         });
+        ui.horizontal(|ui| {
+            let label = ui.label("Modification display");
+            egui::ComboBox::from_id_salt("modification-display")
+                .selected_text(modification_display_label(st.align.show_unmodified_calls))
+                .show_ui(ui, |ui| {
+                    for two_colour in [false, true] {
+                        ui.selectable_value(
+                            &mut st.align.show_unmodified_calls,
+                            two_colour,
+                            modification_display_label(two_colour),
+                        );
+                    }
+                })
+                .response
+                .labelled_by(label.id)
+                .on_hover_text(rgv_render::modification_style::modification_legend_help(
+                    st.align.show_unmodified_calls,
+                ));
+        });
+        if st.align.available_modification_codes.len() > 1 {
+            ui.horizontal(|ui| {
+                let label = ui.label("Modifications lane plots");
+                let name = |code: Option<rgv_hts::ModificationCode>| {
+                    code.map_or_else(
+                        || "Automatic (5mC)".to_owned(),
+                        rgv_render::modification_style::modification_code_name,
+                    )
+                };
+                egui::ComboBox::from_id_salt("modification-lane-code")
+                    .selected_text(name(st.align.modification_lane_code))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut st.align.modification_lane_code, None, name(None));
+                        for code in st.align.available_modification_codes.clone() {
+                            ui.selectable_value(
+                                &mut st.align.modification_lane_code,
+                                Some(code),
+                                name(Some(code)),
+                            );
+                        }
+                    })
+                    .response
+                    .labelled_by(label.id);
+            });
+        }
         if !st.align.available_modification_codes.is_empty() {
             ui.label("Modification legend and visibility")
-                .on_hover_text(rgv_render::modification_style::MODIFICATION_LEGEND_HELP);
+                .on_hover_text(rgv_render::modification_style::modification_legend_help(
+                    st.align.show_unmodified_calls,
+                ));
             let palette = *crate::theme::active().palette();
             let swatch = |ui: &mut egui::Ui, token| {
                 let (rect, _) =
@@ -815,13 +868,17 @@ impl Viewer {
                     }
                 }
             }
-            ui.horizontal(|ui| {
-                swatch(
-                    ui,
-                    rgv_render::palette::PaletteToken::MODIFICATION_UNMODIFIED,
-                );
-                ui.label("unmodified (no modification is likelier)");
-            });
+            if st.align.show_unmodified_calls {
+                ui.horizontal(|ui| {
+                    swatch(
+                        ui,
+                        rgv_render::palette::PaletteToken::MODIFICATION_UNMODIFIED,
+                    );
+                    ui.label("unmodified (no modification is likelier)");
+                });
+            } else {
+                ui.small("Unmodified calls are not drawn; switch to 2-colour to show them.");
+            }
             ui.small(
                 "Colour strength is the call probability (ML): faint cells are low-confidence \
                  calls. Reads without MM/ML tags are drawn normally.",
@@ -1295,5 +1352,14 @@ const fn sashimi_label_mode_label(value: SashimiLabelMode) -> &'static str {
         SashimiLabelMode::Counts => "Read counts",
         SashimiLabelMode::Psi => "PSI at donor / acceptor",
         SashimiLabelMode::None => "None",
+    }
+}
+
+/// The modification display's name in the settings window.
+const fn modification_display_label(two_colour: bool) -> &'static str {
+    if two_colour {
+        "Modified and unmodified (2-colour)"
+    } else {
+        "Modified only"
     }
 }

@@ -27,10 +27,7 @@ use rgv_core::{
     ModifiedBaseColorMode, SashimiCountMode, SashimiLabelMode,
 };
 use rgv_layout::MAX_RENDERED_JUNCTION_LABELS;
-use rgv_model::{
-    JunctionEvidence, ModificationBin, ModificationCode, ModificationSeriesKey,
-    SashimiPresentationTable,
-};
+use rgv_model::{JunctionEvidence, ModificationCode, SashimiPresentationTable};
 use thiserror::Error;
 
 use crate::paged_cache::{self, CachedFrameSlot, CachedGpuPage, PageTableError, PagedGpuCache};
@@ -2189,6 +2186,7 @@ impl AlignmentSummaryGpuRenderer {
                     page_request.key,
                     metadata,
                     instance_count,
+                    request.camera.bases_per_pixel(),
                 )?;
                 match page_request.key.family() {
                     SummaryPageFamily::Depth => {
@@ -3245,6 +3243,7 @@ impl AlignmentSummaryGpuRenderer {
                     page_request.key,
                     &page.metadata,
                     page.instance_count,
+                    request.camera.bases_per_pixel(),
                 )?;
                 pending_draws.push(PendingSummaryDraw {
                     page: page_request.key,
@@ -4923,8 +4922,9 @@ fn summary_page_maximum_retained_bytes(
             >(maximum_instances)?)
         }
         SummaryPageFamily::Modifications => {
+            // Per bin level: at most a band and two candidate bars per primitive.
             let maximum_instances = primitive_count
-                .checked_mul(3)
+                .checked_mul(3 * rgv_alignment_scene::MODIFICATION_LANE_BIN_LEVELS.len())
                 .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?;
             let buffer = summary_gpu_buffer_capacity::<AlignmentSummaryGpuModificationInstance>(
                 maximum_instances,
@@ -4979,7 +4979,10 @@ fn summary_page_maximum_packing_bytes(
                     .checked_mul(
                         size_of::<ModificationPackingCandidate>()
                             .saturating_mul(3)
-                            .saturating_add(size_of::<(u64, u64)>()),
+                            .saturating_add(size_of::<(u64, u64)>())
+                            .saturating_add(size_of::<rgv_model::ModificationSiteTally>())
+                            .saturating_add(size_of::<rgv_model::ModificationCodeTally>())
+                            .saturating_mul(2),
                     )
                     .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?,
             )
@@ -5521,6 +5524,7 @@ fn summary_draw_style(
     key: AlignmentSummaryGpuPageKey,
     metadata: &GpuSummaryPageMetadata,
     instance_count: u32,
+    bases_per_pixel: f64,
 ) -> Result<SummaryDrawStyle, AlignmentSummaryGpuPrepareError> {
     match (options, key.family(), metadata) {
         (
@@ -5560,14 +5564,14 @@ fn summary_draw_style(
             SummaryPageFamily::Modifications,
             GpuSummaryPageMetadata::Modifications(metadata),
         ) => {
-            let background_range = match options.color_mode {
-                ModifiedBaseColorMode::ModifiedVsUnmodified => metadata.background_range(),
-                ModifiedBaseColorMode::ByType | ModifiedBaseColorMode::Mono => 0..0,
-            };
+            // The bin level of the camera's zoom, as the CPU projection bins it; the called
+            // band is always drawn behind the bars.
+            let level = metadata.level(bases_per_pixel);
+            let background_range = level.background_range.clone();
             let foreground_range = if options.projection.probability_weighted {
-                metadata.weighted_range()
+                level.weighted_range.clone()
             } else {
-                metadata.raw_range()
+                level.raw_range.clone()
             };
             if background_range.end > instance_count || foreground_range.end > instance_count {
                 return Err(AlignmentSummaryGpuPrepareError::ResidentMetadataMismatch(
@@ -5579,8 +5583,10 @@ fn summary_draw_style(
                 transform: CoverageScaleTransform::Linear,
                 quality_weighted: options.projection.probability_weighted,
                 allele_interpretation: CoverageAlleleInterpretation::GenericReferenceAware,
-                hidden_modification_mask: metadata
-                    .hidden_code_mask(&options.projection.hidden_codes),
+                hidden_modification_mask: metadata.hidden_code_mask(
+                    &options.projection.hidden_codes,
+                    options.projection.shown_code,
+                ),
                 modification_color_mode: options.color_mode,
                 junction_normalization: 1.0,
                 junction_row_count: 1,
