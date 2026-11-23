@@ -252,6 +252,20 @@ annotation tracks. Nothing in this wave has been checked in the running applicat
 - [~] ARCH-9 reference bases delivered engine-to-engine
       — direct sink connected; the UI relay is kept alongside it
 
+## Found in hands-on testing (2026-11-23)
+
+Fixed and committed: bounded-policy semantic retirement (cc6092f), base letters sliding while
+scrolling (393247f), insertion boundary bars (79f3447), clip cut edges, ghost bases, one arrowhead
+per read and sized event labels (b130a45), idle CPU spin with a selected read and labels trailing
+by one frame (bc5de51), mismatch fill hidden under the following aligned block (e3ff513).
+
+- [ ] Automation `select_alignment` with `reveal: center|fit` moves the view horizontally but
+      never scrolls the read stack to the record's row, so in a deep stack the selected read can
+      be off-screen. Setting `reveal_when_resolved` on the pending selection and preparing the
+      frame again did not make it scroll; cause not found. Needed for MCP agents to show a read.
+- [ ] Short insertions (below `minimum_event_label_size`, default 10) never show their length,
+      even when zoomed in far enough for the text to fit.
+
 ## Wave 4 — product reach
 
 Ordered by adoption impact. Each needs its own design note.
