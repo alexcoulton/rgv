@@ -330,6 +330,15 @@ pub const BOUNDARY_MARK_FULL_POINTS_PER_BASE: f64 = 1.0;
 pub const BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE: f64 = 0.1;
 /// Width, in points, of a hairline mark (the minimum-size policy's one point).
 pub const BOUNDARY_MARK_HAIRLINE_WIDTH: f64 = 1.0;
+/// Points per base from which soft-clip ghost cells are drawn: the base-letter glyph width, so a
+/// ghost cell appears only together with its lowercase letter, never as a pale letterless block.
+pub const CLIP_GHOST_MINIMUM_POINTS_PER_BASE: f64 = 7.0;
+
+/// Whether soft-clip ghost cells are drawn (and picked) under a camera of `points_per_base`.
+#[must_use]
+pub fn clip_ghost_visible(points_per_base: f64) -> bool {
+    points_per_base >= CLIP_GHOST_MINIMUM_POINTS_PER_BASE
+}
 
 /// How point markers and clip cut edges are drawn under a camera of `points_per_base`.
 #[must_use]
@@ -1075,6 +1084,9 @@ fn project_primitive(
             }
         }
         AlignmentGeometryToken::ClipGhost => {
+            if !clip_ghost_visible(points_per_base) {
+                return None;
+            }
             width = width.max(MINIMUM_PRIMITIVE_EXTENT);
             (CpuPrimitiveShape::ClipGhostCell, row_top, body_height)
         }
@@ -1184,7 +1196,7 @@ fn reconcile_labels(
     camera: AlignmentCamera,
 ) {
     const MIN_TEXT_HEIGHT: f64 = 5.0;
-    const MINIMUM_BASE_GLYPH_WIDTH: f64 = 7.0;
+    const MINIMUM_BASE_GLYPH_WIDTH: f64 = CLIP_GHOST_MINIMUM_POINTS_PER_BASE;
     const HORIZONTAL_PADDING: f64 = 2.0;
     const COLLISION_GAP: f64 = 2.0;
     const GLYPH_ASPECT_RATIO: f64 = 0.56;

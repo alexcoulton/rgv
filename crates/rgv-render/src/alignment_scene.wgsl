@@ -34,6 +34,9 @@ const ARROWHEAD_MINIMUM_LENGTH: f32 = 0.5;
 const BOUNDARY_MARK_FULL: f32 = 1.0;
 const BOUNDARY_MARK_HAIRLINE: f32 = 0.1;
 const BOUNDARY_MARK_HAIRLINE_WIDTH: f32 = 1.0;
+// Soft-clip ghost cells are drawn only once their lowercase letters fit (the CPU label
+// projector's minimum base glyph width), so no pale letterless blocks appear zoomed out.
+const CLIP_GHOST_MINIMUM_POINTS_PER_BASE: f32 = 7.0;
 
 // One sixteen-byte instance (`AlignmentGpuInstance`):
 //   span.x     whole bases from the page start to the primitive's start
@@ -188,6 +191,9 @@ fn project_instance(
         // A right-pointing direction terminal keeps its tip on the read's end: its one-point
         // minimum grows leftwards. Mirrored by `directional_extent` in `rgv-alignment-scene`.
         left = min(left, right - 1.0);
+    } else if shape == 14u && points_per_base < CLIP_GHOST_MINIMUM_POINTS_PER_BASE {
+        // Ghost cells appear only together with their letters. Mirrored by `clip_ghost_visible`.
+        right = left;
     } else {
         right = max(right, left + 1.0);
     }

@@ -60,7 +60,8 @@ pub use coverage::{
 pub use cpu_projector::{
     ARROWHEAD_LENGTH_FRACTION, ARROWHEAD_MAXIMUM_BASES, ARROWHEAD_MINIMUM_LENGTH, AlignmentCamera,
     AlignmentHit, BOUNDARY_MARK_FULL_POINTS_PER_BASE, BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE,
-    BOUNDARY_MARK_HAIRLINE_WIDTH, BoundaryMarkDetail, CpuAlignmentFrame, CpuAlignmentLabelFrame,
+    BOUNDARY_MARK_HAIRLINE_WIDTH, BoundaryMarkDetail, CLIP_GHOST_MINIMUM_POINTS_PER_BASE,
+    CpuAlignmentFrame, CpuAlignmentLabelFrame, clip_ghost_visible,
     CpuAlignmentProjector, CpuArrowhead, CpuClipRect, CpuFrameCoverage, CpuInteractionError,
     CpuPrimitiveShape, CpuProjectedPrimitive, CpuProjectionError,
     EVENT_LABEL_MINIMUM_POINTS_PER_BASE, arrowhead_covers, arrowhead_length, boundary_mark_detail,

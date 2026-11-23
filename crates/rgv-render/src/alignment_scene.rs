@@ -305,6 +305,11 @@ pub fn project_alignment_gpu_instance(
         );
         x = left;
         right = left + width;
+    } else if shape == AlignmentGpuShape::ClipGhostCell as u32
+        && !rgv_alignment_scene::clip_ghost_visible(points_per_base)
+    {
+        // Ghost cells appear only together with their letters; zoomed out they emit no quad.
+        return None;
     } else {
         right = right.max(x + 1.0);
     }

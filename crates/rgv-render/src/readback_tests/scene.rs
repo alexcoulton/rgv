@@ -156,6 +156,11 @@ fn unclipped_quad(
     } else if instance.shape() == AlignmentGpuShape::DirectionTerminalRight as u32 {
         // The tip stays on the read's end: the one-point minimum grows leftwards.
         left = left.min(right - 1.0);
+    } else if instance.shape() == AlignmentGpuShape::ClipGhostCell as u32
+        && !rgv_alignment_scene::clip_ghost_visible(points_per_base)
+    {
+        // Ghost cells appear only together with their letters.
+        right = left;
     } else {
         right = right.max(left + 1.0);
     }
@@ -1021,6 +1026,68 @@ fn hard_clip_bar_is_solid_and_sits_inside_the_arrowhead_on_the_gpu() {
 
 /// Soft-clipped ghost bases on the real GPU at base detail: translucent cells beyond the cut
 /// edge where the row is empty, and covered by a neighbouring read that starts on one of them.
+#[test]
+fn ghost_bases_are_not_drawn_until_their_letters_fit_on_the_gpu() {
+    use crate::alignment_scene::tests::test_scene_detailed;
+    use rgv_alignment_scene::GeometryLod;
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20);
+    // `M7 S3` over [10, 17): three ghost cells at base LOD, as in the zoomed-in test above.
+    let reads = [TestRead {
+        start: 10,
+        reverse: false,
+        cigar: cigar(&[(CigarOpKind::Match, 7), (CigarOpKind::SoftClip, 3)]),
+    }];
+    let scene = test_scene_detailed(
+        &ledger,
+        GenomicInterval::new(ContigId::new(0), 0, 100).unwrap(),
+        100,
+        NonZeroU64::new(8).unwrap(),
+        &reads,
+        NonZeroU32::new(4).unwrap(),
+        None,
+        GeometryLod::Base,
+    );
+    // 256 points over 50 bases: 5.12 points per base, base LOD but too narrow for letters.
+    let camera = AlignmentCamera::new(
+        GenomicInterval::new(ContigId::new(0), 0, 50).unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        CLIP,
+    )
+    .unwrap();
+    assert!(
+        !rgv_alignment_scene::clip_ghost_visible(5.12),
+        "5.12 points per base is below the ghost threshold"
+    );
+    let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    let image = render_scene(&gpu, &mut renderer, &scene, camera, &ledger, 1);
+    let (oracle, expected) = oracle_for(&scene, camera);
+    // The ghost instances are still packed (packing does not depend on the zoom) but each
+    // projects to an empty quad, so the GPU and the oracle draw nothing for them.
+    let ghosts = expected
+        .iter()
+        .filter(|instance| instance.shape == AlignmentGpuShape::ClipGhostCell as u32)
+        .collect::<Vec<_>>();
+    assert_eq!(ghosts.len(), 3, "the page still carries the three ghost cells");
+    assert!(
+        ghosts.iter().all(|ghost| ghost.quad.width <= 0.0),
+        "no ghost quad has area below the letter threshold"
+    );
+    oracle.assert_matches(&image, "ghost bases hidden while their letters do not fit");
+    let frame = rgv_alignment_scene::CpuAlignmentProjector::project(&scene, 1, camera).unwrap();
+    assert!(
+        frame
+            .primitives
+            .iter()
+            .all(|primitive| primitive.shape != rgv_alignment_scene::CpuPrimitiveShape::ClipGhostCell),
+        "the CPU projector (picking and export) hides ghost cells too"
+    );
+}
+
 #[test]
 fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
     use crate::alignment_scene::tests::test_scene_detailed;

@@ -4847,6 +4847,10 @@ fn shader_mark_scaling_constants_match_the_cpu_projector() {
             rgv_alignment_scene::BOUNDARY_MARK_FULL_POINTS_PER_BASE,
         ),
         (
+            "CLIP_GHOST_MINIMUM_POINTS_PER_BASE",
+            rgv_alignment_scene::CLIP_GHOST_MINIMUM_POINTS_PER_BASE,
+        ),
+        (
             "BOUNDARY_MARK_HAIRLINE",
             rgv_alignment_scene::BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE,
         ),
