@@ -129,6 +129,11 @@ impl Viewer {
                             == self.session.reference_revision
                     })
                     .filter(|slice| retained_data_overlaps(slice.interval, viewport_interval))
+                    .filter(|_| {
+                        reference_sequence_is_drawn(
+                            self.session.panels.panel(panel_id).viewport.bases_per_pixel(),
+                        )
+                    })
             {
                 let source_viewport =
                     prepared_context_viewport(reference.interval, target_viewport);
@@ -378,5 +383,30 @@ impl Viewer {
             top = bottom;
         }
         pass.top = top;
+    }
+}
+
+/// Whether the reference lane draws sequence at `bases_per_pixel`: the same zoom up to which the
+/// session fetches reference for display (`MAXIMUM_BASE_MARK_BASES_PER_PIXEL`). Further out the
+/// lane reads "zoom in to see sequence", and a slice still held from a closer view (or fetched for
+/// the alignment scene's mismatch evidence) must not be drawn as a partial colour band.
+fn reference_sequence_is_drawn(bases_per_pixel: f64) -> bool {
+    bases_per_pixel <= MAXIMUM_BASE_MARK_BASES_PER_PIXEL
+}
+
+#[cfg(test)]
+mod reference_zoom_tests {
+    use super::reference_sequence_is_drawn;
+    use rgv_core::MAXIMUM_BASE_MARK_BASES_PER_PIXEL;
+
+    #[test]
+    fn retained_reference_is_drawn_only_while_sequence_is_fetched_for_display() {
+        assert!(reference_sequence_is_drawn(0.01));
+        assert!(reference_sequence_is_drawn(MAXIMUM_BASE_MARK_BASES_PER_PIXEL));
+        // The screenshot's 133 kb view: a retained 11 kb slice must not be drawn there.
+        assert!(!reference_sequence_is_drawn(96.159));
+        assert!(!reference_sequence_is_drawn(
+            MAXIMUM_BASE_MARK_BASES_PER_PIXEL * 1.0001
+        ));
     }
 }
