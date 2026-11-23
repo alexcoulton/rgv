@@ -9,10 +9,11 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use rgv_alignment_scene::{ReferenceRevision, RevisionFingerprint};
-use rgv_core::{GenerationClock, GenomicInterval, PanelGeneration, ReferenceDictionary};
+use rgv_core::{ContigId, GenerationClock, GenomicInterval, PanelGeneration, ReferenceDictionary};
 use rgv_hts::{
     FastaOpenOptions, FastaReference, ReferenceSlice, RemoteCancellation, RemoteIoStats,
 };
+use rgv_model::SpliceMotif;
 
 use crate::{
     EngineQueueError,
@@ -85,11 +86,29 @@ impl ReferenceQueryIdentity {
 static NEXT_REFERENCE_OPEN_INSTANCE: AtomicU64 = AtomicU64::new(1);
 const REFERENCE_OPEN_INSTANCE_DOMAIN: u64 = u64::from_le_bytes(*b"RGVREF01");
 
+/// Most introns one splice-motif lookup may name. Each costs two two-base reads.
+pub const MAX_SPLICE_MOTIF_QUERY_INTRONS: usize = 4_096;
+
+/// Reference bases bounding a batch of introns, to give splice junctions a strand from their
+/// canonical motif. Answered with [`ReferenceEngineEvent::SpliceMotifs`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpliceMotifQuery {
+    /// The open FASTA authority the caller expects; another revision's handle is not read.
+    pub revision: ReferenceRevision,
+    /// The alignment contig the introns belong to, echoed back for the caller's cache.
+    pub contig: ContigId,
+    /// The FASTA's own name for that contig.
+    pub contig_name: String,
+    /// Half-open `(start, end)` intron extents, zero-based.
+    pub introns: Vec<(u64, u64)>,
+}
+
 enum ReferenceEngineRequest {
     Open {
         path: PathBuf,
         options: FastaOpenOptions,
     },
+    SpliceMotifs(SpliceMotifQuery),
     Query {
         query: ReferenceQueryIdentity,
         clock: GenerationClock,
@@ -113,6 +132,13 @@ pub enum ReferenceEngineEvent {
         /// `None` identifies an open failure; every query failure carries its complete identity.
         query: Option<ReferenceQueryIdentity>,
         message: String,
+    },
+    /// The motif of every intron of one [`SpliceMotifQuery`], in its order. An intron whose
+    /// bases could not be read is `SpliceMotif::Unavailable`.
+    SpliceMotifs {
+        revision: ReferenceRevision,
+        contig: ContigId,
+        motifs: Vec<((u64, u64), SpliceMotif)>,
     },
 }
 
@@ -257,6 +283,16 @@ impl ReferenceEngine {
         })
     }
 
+    /// Queues one splice-motif lookup (at most [`MAX_SPLICE_MOTIF_QUERY_INTRONS`] introns; any
+    /// beyond are dropped). The bases are read on the reference actor, never on the caller.
+    pub fn try_query_splice_motifs(
+        &self,
+        mut query: SpliceMotifQuery,
+    ) -> Result<(), EngineQueueError> {
+        query.introns.truncate(MAX_SPLICE_MOTIF_QUERY_INTRONS);
+        self.try_send(ReferenceEngineRequest::SpliceMotifs(query))
+    }
+
     pub fn try_receive(&self) -> Result<Option<ReferenceEngineEvent>, EngineQueueError> {
         self.output
             .try_receive()
@@ -370,6 +406,26 @@ fn worker_loop(
                     },
                 }
             }
+            ReferenceEngineRequest::SpliceMotifs(query) => {
+                let Some((reference, revision)) = reference.as_ref() else {
+                    continue;
+                };
+                if query.revision != *revision {
+                    continue;
+                }
+                let motif_shutdown = Arc::clone(shutdown);
+                let cancellation: RemoteCancellation =
+                    Arc::new(move || !motif_shutdown.load(Ordering::Acquire));
+                reference.set_remote_cancellation(Some(cancellation));
+                let Some(motifs) = fetch_splice_motifs(reference, &query, shutdown) else {
+                    continue;
+                };
+                ReferenceEngineEvent::SpliceMotifs {
+                    revision: query.revision,
+                    contig: query.contig,
+                    motifs,
+                }
+            }
             ReferenceEngineRequest::Query {
                 query,
                 clock,
@@ -449,6 +505,41 @@ fn worker_loop(
         };
         send_event(output, event);
     }
+}
+
+/// Reads the first and last two bases of each intron. `None` when the actor is shutting down.
+fn fetch_splice_motifs(
+    reference: &FastaReference,
+    query: &SpliceMotifQuery,
+    shutdown: &AtomicBool,
+) -> Option<Vec<((u64, u64), SpliceMotif)>> {
+    let two_bases = |start: u64| -> Option<[u8; 2]> {
+        let interval = GenomicInterval::new(query.contig, start, start.checked_add(2)?).ok()?;
+        let slice = reference
+            .fetch_slice_by_name(&query.contig_name, interval)
+            .ok()
+            .flatten()?;
+        match slice.bases.as_slice() {
+            [first, second] => Some([*first, *second]),
+            _ => None,
+        }
+    };
+    let mut motifs = Vec::with_capacity(query.introns.len());
+    for (start, end) in query.introns.iter().copied() {
+        if shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        let motif = if end >= start.saturating_add(4) {
+            match (two_bases(start), two_bases(end - 2)) {
+                (Some(first), Some(last)) => SpliceMotif::classify(first, last),
+                _ => SpliceMotif::Unavailable,
+            }
+        } else {
+            SpliceMotif::NonCanonical
+        };
+        motifs.push(((start, end), motif));
+    }
+    Some(motifs)
 }
 
 enum ReferenceQueryFetch {
@@ -714,6 +805,55 @@ mod tests {
         assert_eq!(completed_query, query);
         assert_eq!(slice.interval, interval);
         assert_eq!(slice.bases, b"CGTA");
+    }
+
+    #[test]
+    fn splice_motifs_are_read_on_the_reference_actor_for_both_strands() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("genome.fa");
+        // 0         1         2         3
+        // 0123456789012345678901234567890123456789
+        // AAGTCCCCAGAACTGGGGACAAAA
+        let sequence = b"AAGTCCCCAGAACTGGGGACAAAAAAAATTTTTTTTTTTT";
+        let mut fasta = b">chr1\n".to_vec();
+        fasta.extend_from_slice(sequence);
+        fasta.push(b'\n');
+        fs::write(&path, &fasta).unwrap();
+        fs::write(path.with_extension("fa.fai"), b"chr1\t40\t6\t40\t41\n").unwrap();
+        let engine = ReferenceEngine::spawn(4);
+        engine.try_open(path).unwrap();
+        let ReferenceEngineEvent::Opened { revision, .. } = wait_for_event(&engine) else {
+            panic!("reference did not open");
+        };
+        engine
+            .try_query_splice_motifs(SpliceMotifQuery {
+                revision,
+                contig: ContigId::new(0),
+                contig_name: "chr1".to_owned(),
+                // GT..AG on +, CT..AC (GT-AG on -), a non-canonical intron, and one past the
+                // contig end.
+                introns: vec![(2, 10), (12, 20), (24, 32), (36, 48)],
+            })
+            .unwrap();
+        let ReferenceEngineEvent::SpliceMotifs {
+            revision: answered,
+            contig,
+            motifs,
+        } = wait_for_event(&engine)
+        else {
+            panic!("splice motifs were not answered");
+        };
+        assert_eq!(answered, revision);
+        assert_eq!(contig, ContigId::new(0));
+        assert_eq!(
+            motifs,
+            vec![
+                ((2, 10), SpliceMotif::GtAg),
+                ((12, 20), SpliceMotif::CtAc),
+                ((24, 32), SpliceMotif::NonCanonical),
+                ((36, 48), SpliceMotif::Unavailable),
+            ]
+        );
     }
 
     #[test]

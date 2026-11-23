@@ -383,4 +383,6 @@ pub(super) struct ShellFrame {
     /// The gene whose transcripts the feature menu or the properties panel toggled.
     pub(super) gene_transcripts_action:
         Option<crate::inspection::gene_transcripts::GeneTranscriptsTarget>,
+    /// A Sashimi filter chip was clicked: clear that panel's junction filters.
+    pub(super) sashimi_clear_filters: Option<PanelId>,
 }

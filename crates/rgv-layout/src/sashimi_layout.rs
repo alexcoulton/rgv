@@ -8,8 +8,14 @@ use std::{cmp::Reverse, collections::BTreeSet};
 use crate::{
     DisplayList, RectPrimitive, RectShape, Rgba, TextPrimitive, junction_arc_stroke_width,
 };
-use rgv_core::{JunctionDisplayMode, SashimiCountMode, Viewport};
-use rgv_model::{JunctionEvidence, JunctionSummary};
+use rgv_core::{
+    JunctionDisplayMode, LibraryStrandedness, SashimiCountMode, SashimiLabelMode, Viewport,
+};
+use rgv_model::{
+    JunctionEvidence, JunctionStrand, JunctionSummary, SashimiPresentationOptions,
+    SashimiPresentationTable, SpliceMotif, place_labels_by_priority, psi_label, sashimi_arc_height,
+    sashimi_available_height, sashimi_stroke_width,
+};
 
 pub const MAX_ANNOTATED_JUNCTIONS: usize = 100_000;
 pub const MAX_RENDERED_JUNCTIONS: usize = 4_096;
@@ -94,12 +100,19 @@ pub enum JunctionArcComponent {
 pub struct SashimiLayoutOptions {
     pub top: f32,
     pub height: f32,
+    /// Absolute weak-junction threshold.
     pub minimum_depth: u32,
+    /// Relative weak-junction threshold, in percent of the strongest junction at a shared site.
+    pub relative_threshold_percent: f32,
+    /// Ignore both weak-junction thresholds.
+    pub show_all: bool,
+    pub library: LibraryStrandedness,
     pub display_mode: JunctionDisplayMode,
     /// Fixed or shared maximum in the selected count units. `None` uses this track's maximum.
     pub scale_maximum: Option<f64>,
     pub count_mode: SashimiCountMode,
     pub show_labels: bool,
+    pub label_mode: SashimiLabelMode,
 }
 
 impl Default for SashimiLayoutOptions {
@@ -108,10 +121,29 @@ impl Default for SashimiLayoutOptions {
             top: 0.0,
             height: 90.0,
             minimum_depth: 1,
+            relative_threshold_percent: 0.0,
+            show_all: false,
+            library: LibraryStrandedness::Unstranded,
             display_mode: JunctionDisplayMode::Collapsed,
             scale_maximum: None,
             count_mode: SashimiCountMode::Raw,
             show_labels: true,
+            label_mode: SashimiLabelMode::Counts,
+        }
+    }
+}
+
+impl SashimiLayoutOptions {
+    /// The presentation options these layout options describe (no site or transcript filter).
+    #[must_use]
+    pub fn presentation_options(&self) -> SashimiPresentationOptions {
+        SashimiPresentationOptions {
+            minimum_depth: self.minimum_depth.max(1),
+            relative_threshold_percent: self.relative_threshold_percent,
+            show_all: self.show_all,
+            library: self.library,
+            site_filter: None,
+            intron_filter: None,
         }
     }
 }
@@ -131,6 +163,8 @@ pub struct SashimiLayout {
     pub stats: SashimiLayoutStats,
 }
 
+/// [`layout_sashimi_with_presentation`] with strands from tags and library only (no reference
+/// motifs) and the weak-junction thresholds of `options`.
 #[must_use]
 pub fn layout_sashimi(
     summary: &JunctionSummary,
@@ -138,6 +172,34 @@ pub fn layout_sashimi(
     options: SashimiLayoutOptions,
     annotations: Option<&JunctionAnnotationLookup>,
 ) -> SashimiLayout {
+    layout_sashimi_with_presentation(summary, viewport, options, annotations, None)
+}
+
+/// Lays out one Sashimi lane as the interactive renderer draws it: one arc per junction on its
+/// resolved strand (`+` above the baseline in red, `-` below in blue, unknown above in grey),
+/// rising with its on-screen span, weak junctions hidden, and count (or PSI) labels on chips
+/// where the stronger junction keeps its label on collision. `presentation` supplies resolved
+/// strands (with reference motifs) and filters; without one it is built from `options`.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn layout_sashimi_with_presentation(
+    summary: &JunctionSummary,
+    viewport: Viewport,
+    options: SashimiLayoutOptions,
+    annotations: Option<&JunctionAnnotationLookup>,
+    presentation: Option<&SashimiPresentationTable>,
+) -> SashimiLayout {
+    let built;
+    let presentation = if let Some(presentation) = presentation {
+        presentation
+    } else {
+        built = SashimiPresentationTable::build(
+            &summary.junctions,
+            |_, _| SpliceMotif::Unavailable,
+            &options.presentation_options(),
+        );
+        &built
+    };
     let interval = viewport.interval();
     let candidate_count = summary
         .junctions
@@ -151,7 +213,7 @@ pub fn layout_sashimi(
         .filter(|(_, junction)| {
             junction.start < interval.end()
                 && junction.end > interval.start()
-                && junction.depth >= options.minimum_depth
+                && !presentation.resolve(junction).hidden()
         })
         .collect::<Vec<_>>();
     if visible.len() > MAX_RENDERED_JUNCTIONS {
@@ -185,6 +247,7 @@ pub fn layout_sashimi(
     let row_count = rows.iter().copied().max().unwrap_or(0) + 1;
     let width = viewport.pixel_width() as f32;
     let band_height = options.height / row_count.max(1) as f32;
+    let labels = options.show_labels && options.label_mode != SashimiLabelMode::None;
     let mut display = DisplayList::default();
     for row in 0..row_count {
         display.rectangles.push(RectPrimitive {
@@ -198,81 +261,71 @@ pub fn layout_sashimi(
         });
     }
 
-    let mut rendered_labels = 0_usize;
-    let mut occupied_label_bounds = Vec::<(f32, f32, f32, f32)>::new();
+    let mut label_candidates = Vec::<(TextPrimitive, [f64; 4], u64)>::new();
     for ((_, junction), row) in visible.iter().zip(rows) {
-        let left = (viewport.pixel_at_genomic(junction.start) as f32).clamp(0.0, width);
-        let right = (viewport.pixel_at_genomic(junction.end) as f32).clamp(0.0, width);
+        let full_left = viewport.pixel_at_genomic(junction.start) as f32;
+        let full_right = viewport.pixel_at_genomic(junction.end) as f32;
+        let left = full_left.clamp(0.0, width);
+        let right = full_right.clamp(0.0, width);
         if right <= left {
             continue;
         }
+        let resolved = presentation.resolve(junction);
         let band_top = options.top + row as f32 * band_height;
         let band_bottom = band_top + band_height;
         let baseline = band_top + band_height * 0.5;
-        let apex_clearance = if options.show_labels { 11.0 } else { 1.5 };
-        let available_height = (band_height * 0.5 - apex_clearance).max(3.0);
-        let components = [
-            (
-                junction.positive_depth,
+        let value = junction_count_value(summary, junction, options.count_mode);
+        let stroke = sashimi_stroke_width(value, scale_maximum);
+        let available = sashimi_available_height(f64::from(band_height), labels);
+        let arc_height = sashimi_arc_height(
+            f64::from((full_right - full_left).max(1.0)),
+            available,
+            stroke,
+        ) as f32;
+        let (arc_shape, color, direction_shape) = match resolved.strand {
+            JunctionStrand::Positive => (
                 RectShape::JunctionArcUp,
-                Rgba::new(0.84, 0.30, 0.38, 0.82),
+                Rgba::new(0.84, 0.30, 0.38, 0.86),
                 Some(RectShape::ChevronRight),
             ),
-            (
-                junction.negative_depth,
+            JunctionStrand::Negative => (
                 RectShape::JunctionArcDown,
-                Rgba::new(0.25, 0.45, 0.82, 0.82),
+                Rgba::new(0.25, 0.45, 0.82, 0.86),
                 Some(RectShape::ChevronLeft),
             ),
-            (
-                junction.unknown_depth,
+            JunctionStrand::Unknown => (
                 RectShape::JunctionArcUp,
-                Rgba::new(0.42, 0.45, 0.50, 0.76),
+                Rgba::new(0.42, 0.45, 0.50, 0.80),
                 None,
             ),
-        ];
-        let mut component_apices = Vec::with_capacity(3);
-        for (depth, arc_shape, color, direction_shape) in components {
-            if depth == 0 {
-                continue;
-            }
-            let value = junction_component_value(summary, junction, depth, options.count_mode);
-            let fraction = (value / scale_maximum).clamp(0.0, 1.0).sqrt() as f32;
-            let arc_height =
-                (available_height * (0.18 + 0.82 * fraction)).clamp(3.0, available_height);
-            let arc_top = if arc_shape == RectShape::JunctionArcUp {
-                baseline - arc_height
-            } else {
-                baseline
-            };
-            display.rectangles.push(RectPrimitive {
-                x: left,
-                y: arc_top,
-                width: right - left,
-                height: arc_height,
+        };
+        let arc_top = if arc_shape == RectShape::JunctionArcUp {
+            baseline - arc_height
+        } else {
+            baseline
+        };
+        // The export keeps the arc on its full span (clipped by the page), so an end beyond the
+        // view stays beyond it.
+        display.rectangles.push(RectPrimitive {
+            x: full_left,
+            y: arc_top,
+            width: (full_right - full_left).max(1.0),
+            height: arc_height,
+            color,
+            object_id: 0,
+            shape: arc_shape,
+        });
+        if let Some(direction_shape) = direction_shape {
+            add_direction_marker(
+                &mut display,
+                full_left,
+                full_right,
+                arc_top,
+                arc_height,
+                arc_shape,
+                direction_shape,
                 color,
-                object_id: 0,
-                shape: arc_shape,
-            });
-            if let Some(direction_shape) = direction_shape {
-                add_direction_marker(
-                    &mut display,
-                    left,
-                    right,
-                    arc_top,
-                    arc_height,
-                    arc_shape,
-                    direction_shape,
-                    color,
-                );
-            }
-            let stroke = junction_arc_stroke_width(arc_height);
-            let apex = if arc_shape == RectShape::JunctionArcUp {
-                arc_top + stroke * 0.5
-            } else {
-                arc_top + arc_height - stroke * 0.5
-            };
-            component_apices.push((depth, arc_shape, apex));
+            );
         }
         if let Some(annotations) = annotations {
             let color = match annotations.status(junction.start, junction.end) {
@@ -290,50 +343,70 @@ pub fn layout_sashimi(
                 shape: RectShape::Rectangle,
             });
         }
-        if options.show_labels
-            && rendered_labels < MAX_RENDERED_JUNCTION_LABELS
-            && right - left >= 30.0
-            && band_height >= 28.0
-        {
-            let label = junction_count_label(summary, junction, options.count_mode);
-            let label_width = (label.chars().count() as f32 * 6.2 + 2.0).clamp(10.0, right - left);
-            let label_y = component_apices
-                .iter()
-                .max_by_key(|(depth, _, _)| *depth)
-                .map_or(baseline - 7.0, |(_, shape, apex)| {
-                    if *shape == RectShape::JunctionArcUp {
-                        *apex - 7.0
-                    } else {
-                        *apex + 7.0
-                    }
-                })
-                .clamp(band_top + 5.5, band_bottom - 5.5);
-            let label_left =
-                ((left + right - label_width) * 0.5).clamp(0.0, (width - label_width).max(0.0));
-            let bounds = (
-                label_left,
-                label_y - 5.5,
-                label_left + label_width,
-                label_y + 5.5,
-            );
-            if occupied_label_bounds.iter().any(|other| {
-                bounds.0 < other.2 + 2.0
-                    && bounds.2 > other.0 - 2.0
-                    && bounds.1 < other.3 + 2.0
-                    && bounds.3 > other.1 - 2.0
-            }) {
-                continue;
+        if labels && right - left >= 18.0 && band_height >= 28.0 {
+            let label = match options.label_mode {
+                SashimiLabelMode::Psi => psi_label(&resolved, junction.depth),
+                SashimiLabelMode::Counts | SashimiLabelMode::None => {
+                    junction_count_label(summary, junction, options.count_mode)
+                }
+            };
+            let label_width = label.chars().count() as f32 * 6.0 + 6.0;
+            let x = (left + right) * 0.5;
+            let fraction = if full_right > full_left {
+                (x - full_left) / (full_right - full_left)
+            } else {
+                0.5
+            };
+            let parabola = 4.0 * (fraction - 0.5).powi(2);
+            let curve = stroke as f32 * 0.5 + (arc_height - stroke as f32).max(0.0) * parabola;
+            let offset = stroke as f32 * 0.5 + 6.5;
+            let label_y = if arc_shape == RectShape::JunctionArcUp {
+                arc_top + curve - offset
+            } else {
+                arc_top + arc_height - curve + offset
             }
-            occupied_label_bounds.push(bounds);
-            display.texts.push(TextPrimitive {
-                x: (left + right) * 0.5,
-                y: label_y,
-                text: label,
-                font_size: 10.0,
-                color: Rgba::new(0.10, 0.10, 0.12, 0.94),
-            });
-            rendered_labels = rendered_labels.saturating_add(1);
+            .clamp(band_top + 6.0, band_bottom - 6.0);
+            let label_left = (x - label_width * 0.5).clamp(0.0, (width - label_width).max(0.0));
+            label_candidates.push((
+                TextPrimitive {
+                    x: label_left + label_width * 0.5,
+                    y: label_y,
+                    text: label,
+                    font_size: 10.0,
+                    color: Rgba::new(0.10, 0.10, 0.12, 0.94),
+                },
+                [
+                    f64::from(label_left),
+                    f64::from(label_y - 6.0),
+                    f64::from(label_left + label_width),
+                    f64::from(label_y + 6.0),
+                ],
+                u64::from(junction.depth),
+            ));
         }
+    }
+    let boxes = label_candidates
+        .iter()
+        .map(|(_, bounds, depth)| (*bounds, *depth))
+        .collect::<Vec<_>>();
+    let mut kept = place_labels_by_priority(&boxes, 1.0);
+    if kept.len() > MAX_RENDERED_JUNCTION_LABELS {
+        kept.sort_by_key(|index| Reverse(boxes[*index].1));
+        kept.truncate(MAX_RENDERED_JUNCTION_LABELS);
+        kept.sort_unstable();
+    }
+    for index in kept {
+        let (text, bounds, _) = &label_candidates[index];
+        display.rectangles.push(RectPrimitive {
+            x: bounds[0] as f32,
+            y: bounds[1] as f32,
+            width: (bounds[2] - bounds[0]) as f32,
+            height: (bounds[3] - bounds[1]) as f32,
+            color: Rgba::new(1.0, 1.0, 1.0, 0.88),
+            object_id: 0,
+            shape: RectShape::Rectangle,
+        });
+        display.texts.push(text.clone());
     }
 
     SashimiLayout {
@@ -365,19 +438,6 @@ pub fn junction_count_value(
                 |total| f64::from(junction.depth) * 1_000_000.0 / total as f64,
             ),
     }
-}
-
-fn junction_component_value(
-    summary: &JunctionSummary,
-    junction: &JunctionEvidence,
-    component_depth: u32,
-    mode: SashimiCountMode,
-) -> f64 {
-    if junction.depth == 0 {
-        return 0.0;
-    }
-    junction_count_value(summary, junction, mode) * f64::from(component_depth)
-        / f64::from(junction.depth)
 }
 
 fn junction_count_label(
@@ -472,6 +532,135 @@ mod tests {
     use rgv_core::{ContigId, GenomicInterval};
 
     #[test]
+    fn export_layout_draws_one_arc_per_junction_on_its_resolved_strand() {
+        let interval = GenomicInterval::new(ContigId::new(1), 100, 500).unwrap();
+        let viewport = Viewport::new(interval, 800.0).unwrap();
+        // Untagged mates in both orientations: no arc may be drawn below the baseline.
+        let summary = JunctionSummary {
+            junctions: vec![
+                JunctionEvidence {
+                    start: 180,
+                    end: 360,
+                    depth: 10,
+                    unknown_depth: 10,
+                    fallback_positive_depth: 6,
+                    fallback_negative_depth: 4,
+                    ..JunctionEvidence::default()
+                },
+                JunctionEvidence {
+                    start: 200,
+                    end: 240,
+                    depth: 4,
+                    tagged_negative_depth: 4,
+                    negative_depth: 4,
+                    ..JunctionEvidence::default()
+                },
+            ],
+            ..JunctionSummary::default()
+        };
+        let layout = layout_sashimi(&summary, viewport, SashimiLayoutOptions::default(), None);
+        let arcs = layout
+            .display_list
+            .rectangles
+            .iter()
+            .filter(|primitive| primitive.shape.is_junction_arc())
+            .collect::<Vec<_>>();
+        assert_eq!(arcs.len(), 2);
+        let long = arcs.iter().find(|arc| arc.width > 300.0).unwrap();
+        let short = arcs.iter().find(|arc| arc.width < 100.0).unwrap();
+        assert_eq!(long.shape, RectShape::JunctionArcUp);
+        assert_eq!(short.shape, RectShape::JunctionArcDown);
+        // Height follows span: the long intron rises higher than the short one.
+        assert!(long.height > short.height);
+    }
+
+    /// Regression modelled on TM4SF1 in an ENCODE paired-end RNA-seq BAM without `XS` tags:
+    /// every junction's untagged reads split about 50/50 between alignment orientations, which
+    /// used to draw each junction twice (a red arc above and a blue arc below).
+    #[test]
+    fn untagged_paired_end_junctions_draw_once_each_and_weak_ones_hide() {
+        let interval = GenomicInterval::new(ContigId::new(2), 149_360_523, 149_388_249).unwrap();
+        let viewport = Viewport::new(interval, 1_200.0).unwrap();
+        let untagged = |start: u64, end: u64, depth: u32| JunctionEvidence {
+            start,
+            end,
+            depth,
+            unknown_depth: depth,
+            fallback_positive_depth: depth.div_ceil(2),
+            fallback_negative_depth: depth / 2,
+            first_of_pair_forward_depth: depth,
+            ..JunctionEvidence::default()
+        };
+        let base = 149_362_000_u64;
+        let mut junctions = vec![
+            untagged(base, base + 4_000, 21_757),
+            untagged(base + 4_100, base + 8_000, 20_341),
+            untagged(base + 8_100, base + 12_000, 14_687),
+            untagged(base + 12_100, base + 16_000, 12_300),
+        ];
+        // Single-read junctions: 11 sharing a strong junction's donor, 10 elsewhere.
+        for index in 0..11 {
+            junctions.push(untagged(base, base + 5_000 + index * 37, 1));
+        }
+        for index in 0..10 {
+            junctions.push(untagged(
+                base + 17_000 + index * 300,
+                base + 17_100 + index * 300,
+                1,
+            ));
+        }
+        // Two-read junctions sharing the strongest junction's acceptor: far below 1 % of it.
+        for index in 0..7 {
+            junctions.push(untagged(base + 1_000 + index * 13, base + 4_000, 2));
+        }
+        let summary = JunctionSummary {
+            junctions,
+            ..JunctionSummary::default()
+        };
+        let options = SashimiLayoutOptions {
+            minimum_depth: 2,
+            relative_threshold_percent: 1.0,
+            ..SashimiLayoutOptions::default()
+        };
+        let arcs = |layout: &SashimiLayout| {
+            layout
+                .display_list
+                .rectangles
+                .iter()
+                .filter(|primitive| primitive.shape.is_junction_arc())
+                .map(|primitive| primitive.shape)
+                .collect::<Vec<_>>()
+        };
+        // Without a reference motif the strand is unknown: one grey arc above per junction.
+        let layout = layout_sashimi(&summary, viewport, options, None);
+        assert_eq!(layout.stats.rendered_junctions, 4);
+        assert_eq!(layout.stats.hidden_junctions, 28);
+        assert_eq!(arcs(&layout), vec![RectShape::JunctionArcUp; 4]);
+        // With the reference's CT..AC motif (TM4SF1 is a minus-strand gene) every arc is drawn
+        // once, below the baseline.
+        let presentation = SashimiPresentationTable::build(
+            &summary.junctions,
+            |_, _| SpliceMotif::CtAc,
+            &options.presentation_options(),
+        );
+        let layout = layout_sashimi_with_presentation(
+            &summary,
+            viewport,
+            options,
+            None,
+            Some(&presentation),
+        );
+        assert_eq!(arcs(&layout), vec![RectShape::JunctionArcDown; 4]);
+        // Showing all junctions draws all 32, still once each.
+        let all = SashimiLayoutOptions {
+            show_all: true,
+            ..options
+        };
+        let layout = layout_sashimi(&summary, viewport, all, None);
+        assert_eq!(arcs(&layout).len(), 32);
+    }
+
+    #[test]
     fn bounded_export_layout_preserves_components_labels_and_annotation() {
         let interval = GenomicInterval::new(ContigId::new(1), 100, 500).unwrap();
         let viewport = Viewport::new(interval, 800.0).unwrap();
@@ -480,6 +669,8 @@ mod tests {
                 start: 180,
                 end: 360,
                 depth: 10,
+                tagged_positive_depth: 6,
+                tagged_negative_depth: 4,
                 positive_depth: 6,
                 negative_depth: 4,
                 ..JunctionEvidence::default()
@@ -494,20 +685,22 @@ mod tests {
             Some(&annotations),
         );
         assert_eq!(layout.stats.rendered_junctions, 1);
-        assert!(
+        // One arc, on the tagged majority strand; the minority strand is not drawn separately.
+        assert_eq!(
             layout
                 .display_list
                 .rectangles
                 .iter()
-                .any(|primitive| primitive.shape == RectShape::JunctionArcUp)
+                .filter(|primitive| primitive.shape.is_junction_arc())
+                .map(|primitive| primitive.shape)
+                .collect::<Vec<_>>(),
+            vec![RectShape::JunctionArcUp]
         );
-        assert!(
-            layout
-                .display_list
-                .rectangles
-                .iter()
-                .any(|primitive| primitive.shape == RectShape::JunctionArcDown)
-        );
+        // The annotation marker is kept.
+        assert!(layout.display_list.rectangles.iter().any(|primitive| {
+            primitive.shape == RectShape::Rectangle
+                && primitive.color == Rgba::new(0.16, 0.58, 0.28, 1.0)
+        }));
         assert!(!layout.display_list.texts.is_empty());
     }
 }

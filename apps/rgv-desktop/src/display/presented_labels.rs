@@ -92,6 +92,42 @@ pub(crate) fn presented_label_backdrops(
     backdrops
 }
 
+/// The chip behind one junction label: its collision box, filled so the count stays legible
+/// over the arcs it overlaps.
+pub(crate) fn junction_label_backdrop(
+    label: &AlignmentSummaryGpuJunctionLabel,
+    fill: Rgba,
+) -> RectPrimitive {
+    let [left, top, right, bottom] = label.chip;
+    RectPrimitive {
+        x: left as f32,
+        y: top as f32,
+        width: (right - left).max(0.0) as f32,
+        height: (bottom - top).max(0.0) as f32,
+        color: fill,
+        object_id: 0,
+        shape: RectShape::Rectangle,
+    }
+}
+
+/// The junction-label chips of every panel accepted by the caller, in panel order.
+pub(crate) fn presented_junction_label_backdrops(
+    labels: &[AlignmentSummaryGpuJunctionLabel],
+    panels: impl IntoIterator<Item = PanelId>,
+    fill: Rgba,
+) -> Vec<RectPrimitive> {
+    let mut backdrops = Vec::new();
+    for panel_id in panels {
+        backdrops.extend(
+            labels
+                .iter()
+                .filter(|label| label.coherence_scope == panel_id.get())
+                .map(|label| junction_label_backdrop(label, fill)),
+        );
+    }
+    backdrops
+}
+
 /// Styles one junction-count label of the summary frame.
 fn junction_text_primitive(label: &AlignmentSummaryGpuJunctionLabel) -> TextPrimitive {
     TextPrimitive {
@@ -219,11 +255,26 @@ impl Viewer {
         let [red, green, blue, alpha] = crate::theme::active()
             .palette()
             .color(rgv_render::palette::PaletteToken::INSERTION);
-        presented_label_backdrops(
+        let junction_labels = bundle
+            .summaries
+            .as_ref()
+            .map(|frame| self.alignment_summary_gpu_renderer.junction_labels(frame))
+            .unwrap_or_default();
+        // A canvas-coloured chip, slightly translucent, keeps a count legible over other arcs.
+        let [chip_red, chip_green, chip_blue, chip_alpha] =
+            crate::theme::adapt(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 225))
+                .to_normalized_gamma_f32();
+        let mut backdrops = presented_junction_label_backdrops(
+            &junction_labels,
+            self.included_panels(&include),
+            Rgba::new(chip_red, chip_green, chip_blue, chip_alpha),
+        );
+        backdrops.extend(presented_label_backdrops(
             &Self::presented_read_label_frames(bundle),
             self.included_panels(include),
             Rgba::new(red, green, blue, alpha),
-        )
+        ));
+        backdrops
     }
 
     /// Lays out every panel's read-level text from the bundle the GPU pass draws this frame and
@@ -325,7 +376,22 @@ mod tests {
             x: 50.0,
             y: 60.0,
             text: text.to_owned(),
+            chip: [40.0, 54.0, 60.0, 66.0],
         }
+    }
+
+    #[test]
+    fn junction_labels_sit_on_a_chip_of_their_collision_box() {
+        let (a, b) = (PanelId::new(1), PanelId::new(2));
+        let labels = [junction(a.get(), "12"), junction(b.get(), "99")];
+        let fill = Rgba::new(1.0, 1.0, 1.0, 0.9);
+        let chips = presented_junction_label_backdrops(&labels, [a], fill);
+        assert_eq!(chips.len(), 1);
+        assert_eq!(
+            (chips[0].x, chips[0].y, chips[0].width, chips[0].height),
+            (40.0, 54.0, 20.0, 12.0)
+        );
+        assert_eq!(chips[0].color, fill);
     }
 
     #[test]

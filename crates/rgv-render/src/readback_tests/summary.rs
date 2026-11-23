@@ -21,7 +21,8 @@ use crate::{
     },
     palette::BASE_COLORS,
     project_alignment_summary_allele_instance, project_alignment_summary_depth_instance,
-    project_alignment_summary_junction_instance, project_alignment_summary_modification_instance,
+    project_alignment_summary_junction_instance_with_labels,
+    project_alignment_summary_modification_instance,
 };
 
 const TARGET: [u32; 2] = [300, 120];
@@ -92,6 +93,7 @@ fn render_lane(
         scissor: SCISSOR,
         options,
         overlays: AlignmentSummaryFrameOverlays::default(),
+        junction_presentation: None,
     }];
     let (frame, _, _) = renderer
         .prepare_with_admission(&gpu.device, &gpu.queue, &requests, ledger, sequence)
@@ -215,6 +217,7 @@ fn switching_palette_recolours_resident_summary_pages_without_any_geometry_uploa
             scissor: SCISSOR,
             options: options.into(),
             overlays: AlignmentSummaryFrameOverlays::default(),
+            junction_presentation: None,
         }];
         let (frame, stats, _) = renderer
             .prepare_with_admission(&gpu.device, &gpu.queue, &requests, &ledger, sequence)
@@ -573,7 +576,7 @@ fn summary_junction_arc_pixels_match_the_cpu_oracle_collapsed_and_expanded() {
                 unreachable!();
             };
             for instance in instances {
-                let Some(projected) = project_alignment_summary_junction_instance(
+                let Some(projected) = project_alignment_summary_junction_instance_with_labels(
                     instance,
                     page.interval().start(),
                     camera(),
@@ -583,6 +586,7 @@ fn summary_junction_arc_pixels_match_the_cpu_oracle_collapsed_and_expanded() {
                     options.projection.minimum_depth,
                     options.projection.minimum_flank,
                     display_mode,
+                    options.projection.show_labels,
                 ) else {
                     continue;
                 };

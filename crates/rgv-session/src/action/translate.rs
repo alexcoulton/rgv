@@ -418,6 +418,39 @@ fn configure_alignment_setting<P: Panel>(
         AutomationSetting::ShowJunctions { value } => {
             option(AlignmentOption::ShowJunctions(*value))
         }
+        AutomationSetting::SashimiJunctions {
+            minimum_depth,
+            relative_threshold_percent,
+            show_all,
+            library_strandedness,
+            label_mode,
+            track_id,
+        } => {
+            let target = track_id.unwrap_or(primary);
+            ensure_alignment_tracks(session, &[target]).and_then(|()| {
+                edit_alignment_tracks(session, &[target], |settings| {
+                    let filters = &mut settings.filters;
+                    if let Some(depth) = minimum_depth {
+                        anyhow::ensure!(*depth > 0, "minimum_depth must be positive");
+                        filters.minimum_junction_depth = *depth;
+                    }
+                    if let Some(percent) = relative_threshold_percent {
+                        filters.junction_relative_threshold_percent = *percent;
+                    }
+                    if let Some(show_all) = show_all {
+                        filters.show_all_junctions = *show_all;
+                    }
+                    if let Some(library) = library_strandedness {
+                        filters.junction_library_strandedness = *library;
+                    }
+                    if let Some(mode) = label_mode {
+                        filters.sashimi_label_mode = *mode;
+                        filters.show_junction_labels = *mode != rgv_core::SashimiLabelMode::None;
+                    }
+                    Ok(())
+                })
+            })
+        }
         AutomationSetting::ViewAsPairs { value } => option(AlignmentOption::ViewAsPairs(*value)),
         AutomationSetting::IncludeSecondary { value } => {
             option(AlignmentOption::IncludeSecondary(*value))

@@ -69,6 +69,7 @@ pub fn poll_reference_events<H: PresentationHost>(host: &mut H) {
     let active_panel_id = session.panels.active().state().id;
     let mut reference_panels_to_retry = BTreeSet::new();
     let mut highlight_panels_to_synchronize = BTreeSet::new();
+    let mut splice_motifs_arrived = false;
     for event in events {
         let session = host.session_mut();
         match event {
@@ -273,6 +274,21 @@ pub fn poll_reference_events<H: PresentationHost>(host: &mut H) {
                         session.navigation_stale_result_rejections.saturating_add(1);
                 }
             }
+            ReferenceEngineEvent::SpliceMotifs {
+                revision,
+                contig,
+                motifs,
+            } => {
+                let current = session.reference_revision;
+                if session
+                    .splice_motifs
+                    .accept(current, revision, contig, motifs)
+                {
+                    // Junction strands may change: the Sashimi presentation is rebuilt from the
+                    // published scene, with no source query.
+                    splice_motifs_arrived = true;
+                }
+            }
             ReferenceEngineEvent::Error { query, message } => {
                 if query.is_none() {
                     session.reference_open_error = Some(message.clone());
@@ -427,6 +443,8 @@ pub fn poll_reference_events<H: PresentationHost>(host: &mut H) {
             host.synchronize_alignment_scene_interactions(panel_id);
         }
         host.rebuild_all_panel_displays();
+        host.prepare_alignment_scene_frame();
+    } else if splice_motifs_arrived {
         host.prepare_alignment_scene_frame();
     }
     host.request_redraw();

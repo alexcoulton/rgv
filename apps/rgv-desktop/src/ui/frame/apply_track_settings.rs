@@ -428,6 +428,9 @@ impl Viewer {
         {
             self.report_error(error.to_string());
         }
+        if let Some(panel_id) = st.sashimi_clear_filters.take() {
+            self.clear_sashimi_filters(panel_id);
+        }
         if let Some(target) = st.gene_transcripts_action.take() {
             self.set_gene_transcripts_expanded(target.track_id, &target.gene_key, !target.expanded);
         }

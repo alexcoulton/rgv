@@ -1652,7 +1652,8 @@ fn early_version_one_sessions_receive_pileup_defaults() {
     assert!(filters.show_reference);
     assert!(filters.show_coverage);
     assert!(filters.show_junctions);
-    assert_eq!(filters.minimum_junction_depth, 1);
+    // Weak single-read junctions are hidden by default since the Sashimi redesign.
+    assert_eq!(filters.minimum_junction_depth, 2);
     assert_eq!(filters.minimum_junction_flank, 0);
     assert_eq!(
         filters.junction_display_mode,
@@ -2833,4 +2834,53 @@ fn igv_notices_truncate_at_utf8_boundaries_and_still_deduplicate() {
             .iter()
             .all(|notice| notice.len() <= 512)
     );
+}
+
+#[test]
+fn sashimi_presentation_settings_round_trip_and_default_for_older_projects() {
+    let filters = SessionFilters {
+        minimum_junction_depth: 5,
+        junction_relative_threshold_percent: 2.5,
+        show_all_junctions: true,
+        junction_library_strandedness: LibraryStrandedness::FirstOfPairAntisense,
+        sashimi_label_mode: SashimiLabelMode::Psi,
+        ..SessionFilters::default()
+    };
+    let json = serde_json::to_value(&filters).unwrap();
+    assert_eq!(
+        json["junction_library_strandedness"],
+        "first_of_pair_antisense"
+    );
+    assert_eq!(json["sashimi_label_mode"], "psi");
+    let restored: SessionFilters = serde_json::from_value(json.clone()).unwrap();
+    assert_eq!(restored, filters);
+    assert!(validate_filters(&restored).is_ok());
+
+    // A project written before these settings existed opens with the defaults: weak junctions
+    // (fewer than 2 reads, or under 1 % of a shared site) hidden, unstranded, count labels.
+    let mut legacy = json;
+    for key in [
+        "minimum_junction_depth",
+        "junction_relative_threshold_percent",
+        "show_all_junctions",
+        "junction_library_strandedness",
+        "sashimi_label_mode",
+    ] {
+        legacy.as_object_mut().unwrap().remove(key);
+    }
+    let legacy: SessionFilters = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.minimum_junction_depth, 2);
+    assert!((legacy.junction_relative_threshold_percent - 1.0).abs() < f32::EPSILON);
+    assert!(!legacy.show_all_junctions);
+    assert_eq!(
+        legacy.junction_library_strandedness,
+        LibraryStrandedness::Unstranded
+    );
+    assert_eq!(legacy.sashimi_label_mode, SashimiLabelMode::Counts);
+
+    let invalid = SessionFilters {
+        junction_relative_threshold_percent: 150.0,
+        ..SessionFilters::default()
+    };
+    assert!(validate_filters(&invalid).is_err());
 }

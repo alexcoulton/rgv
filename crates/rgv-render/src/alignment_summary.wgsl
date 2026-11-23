@@ -23,7 +23,9 @@ struct SummaryUniform {
     junction_display_mode: u32,
     allele_interpretation: u32,
     bisulfite_context_mask: u32,
-    padding: vec2<u32>,
+    // Bit 0: junction labels reserve room above each apex.
+    junction_flags: u32,
+    padding: u32,
     hovered_junction_span: vec4<f32>,
     selected_junction_span: vec4<f32>,
     junction_interaction: vec4<u32>,
@@ -330,10 +332,19 @@ fn junction_vertex(input: JunctionInput) -> VertexOutput {
             3u,
         );
     }
-    visible *= select(0u, 1u, input.evidence.x > 0u);
-    let component_value = f32(input.evidence.x) * frame.junction_normalization;
-    let fraction = sqrt(clamp(component_value / max(frame.scale_maximum, 0.000001), 0.0, 1.0));
-    let height = max(band_height * 0.45 * (0.18 + 0.82 * fraction), 3.0);
+    visible *= select(0u, 1u, input.evidence.y > 0u);
+    // One arc per junction on its resolved strand. Height grows with the arc's full on-screen
+    // span, so a short intron nests inside a long one; the stroke grows with read support.
+    // Mirrored by `rgv_model::sashimi_arc_height` / `sashimi_stroke_width` through
+    // `project_alignment_summary_junction_instance_with_labels`.
+    let value = f32(input.evidence.y) * frame.junction_normalization;
+    let support = sqrt(clamp(value / max(frame.scale_maximum, 0.000001), 0.0, 1.0));
+    let base_stroke = 1.0 + 5.0 * support;
+    let clearance = select(2.0, 12.0, (frame.junction_flags & 1u) != 0u);
+    let available = max(band_height * 0.5 - clearance, 3.0);
+    let full_span = max(full_right - full_left, 1.0);
+    let grown = available * (1.0 - exp(-full_span / (2.5 * available)));
+    let height = max(max(grown, min(4.0, available)), base_stroke + 1.0);
     let downward = component == 1u;
     let top = select(baseline - height, baseline, downward);
     var color = palette_slot(TOKEN_JUNCTION_UNKNOWN);
@@ -354,13 +365,16 @@ fn junction_vertex(input: JunctionInput) -> VertexOutput {
         frame.junction_interaction.z,
         frame.junction_interaction.w,
     );
-    var stroke = clamp(1.0 + height * 0.075, 1.25, 4.5);
+    var stroke = base_stroke;
     if selected {
         color = mix(color, palette_slot(TOKEN_JUNCTION_INTERACTION), 0.38);
-        stroke = min(stroke + 2.0, 6.5);
+        stroke = min(stroke + 2.0, 8.0);
     } else if hovered {
         color = mix(color, palette_slot(TOKEN_JUNCTION_INTERACTION), 0.22);
-        stroke = min(stroke + 1.25, 5.75);
+        stroke = min(stroke + 1.25, 7.25);
+    } else if frame.junction_interaction.y != 0u {
+        // Hover focus: every other arc fades while one is hovered.
+        color.a *= 0.25;
     }
     var output = junction_output(
         input.vertex_index,

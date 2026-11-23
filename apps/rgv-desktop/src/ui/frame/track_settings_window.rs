@@ -18,9 +18,10 @@ use crate::workspace::lists::sample_association_ui;
 use crate::{MIN_VERTICAL_DENSITY, Viewer, ui};
 use rgv_core::{
     AlignmentReadSampling, CoverageScaleTransform, FeatureDisplayMode, GeneticCode,
-    InspectorActivation, JunctionDisplayMode, LandmarkAssetRole, ModifiedBaseColorMode,
-    OverlappingMatePolicy, ReadBaseDisplayMode, ReadStackingMode, ReferenceTranslationFrame,
-    SashimiCountMode, SashimiScaleMode, TrackId, TranscriptDisplay,
+    InspectorActivation, JunctionDisplayMode, LandmarkAssetRole, LibraryStrandedness,
+    ModifiedBaseColorMode, OverlappingMatePolicy, ReadBaseDisplayMode, ReadStackingMode,
+    ReferenceTranslationFrame, SashimiCountMode, SashimiLabelMode, SashimiScaleMode, TrackId,
+    TranscriptDisplay,
 };
 use rgv_layout::{AlignmentSortMode, MAX_HIDDEN_MODIFICATION_CODES, modification_code_color};
 
@@ -228,6 +229,54 @@ impl Viewer {
                 );
             });
             ui.horizontal(|ui| {
+                ui.label("and ≥");
+                ui.add(
+                    egui::DragValue::new(
+                        &mut st
+                            .align
+                            .settings_filters
+                            .junction_relative_threshold_percent,
+                    )
+                    .range(0.0..=100.0)
+                    .speed(0.1)
+                    .max_decimals(1)
+                    .suffix(" %"),
+                );
+                ui.label("of the strongest junction at a shared splice site");
+            });
+            ui.checkbox(
+                &mut st.align.settings_filters.show_all_junctions,
+                "Show all junctions (ignore both thresholds)",
+            );
+            ui.small(
+                "Weak junctions are hidden from the Sashimi lane only: they still count toward splice-site totals (PSI) and stay in the junction export.",
+            );
+            ui.horizontal(|ui| {
+                let label = ui.label("Library strandedness");
+                egui::ComboBox::from_id_salt("junction-library-strandedness")
+                    .selected_text(library_strandedness_label(
+                        st.align.settings_filters.junction_library_strandedness,
+                    ))
+                    .show_ui(ui, |ui| {
+                        for value in [
+                            LibraryStrandedness::Unstranded,
+                            LibraryStrandedness::FirstOfPairSense,
+                            LibraryStrandedness::FirstOfPairAntisense,
+                        ] {
+                            ui.selectable_value(
+                                &mut st.align.settings_filters.junction_library_strandedness,
+                                value,
+                                library_strandedness_label(value),
+                            );
+                        }
+                    })
+                    .response
+                    .labelled_by(label.id);
+            });
+            ui.small(
+                "A junction's strand comes from XS/TS/ts tags, then the reference splice motif (GT-AG, GC-AG, AT-AC), then this library setting; otherwise it is drawn grey.",
+            );
+            ui.horizontal(|ui| {
                 ui.label("Aligned flank ≥");
                 ui.add(
                     egui::DragValue::new(&mut st.align.minimum_junction_flank)
@@ -320,7 +369,34 @@ impl Viewer {
                     );
                 }
             });
-            ui.checkbox(&mut st.align.show_junction_labels, "Show arc count labels");
+            ui.horizontal(|ui| {
+                let label = ui.label("Arc labels");
+                let shown = if st.align.show_junction_labels {
+                    st.align.settings_filters.sashimi_label_mode
+                } else {
+                    SashimiLabelMode::None
+                };
+                let mut mode = shown;
+                egui::ComboBox::from_id_salt("sashimi-label-mode")
+                    .selected_text(sashimi_label_mode_label(mode))
+                    .show_ui(ui, |ui| {
+                        for value in [
+                            SashimiLabelMode::Counts,
+                            SashimiLabelMode::Psi,
+                            SashimiLabelMode::None,
+                        ] {
+                            ui.selectable_value(&mut mode, value, sashimi_label_mode_label(value));
+                        }
+                    })
+                    .response
+                    .labelled_by(label.id);
+                // Only a choice made here is written, so an open window never rewrites the
+                // saved mode of hidden labels.
+                if mode != shown {
+                    st.align.settings_filters.sashimi_label_mode = mode;
+                    st.align.show_junction_labels = mode != SashimiLabelMode::None;
+                }
+            });
             if st.align.sashimi_count_mode == SashimiCountMode::CountsPerMillion {
                 ui.small(
                     "CPM uses the whole-file mapped-read count stored in the BAM index; unavailable metadata is shown explicitly and falls back to raw labels.",
@@ -1169,4 +1245,20 @@ fn gene_model_transcript_settings_ui(
             "Draw protein-coding genes only (gene or transcript biotype, else a coding \
              sequence). Search still finds the others.",
         );
+}
+
+const fn library_strandedness_label(value: LibraryStrandedness) -> &'static str {
+    match value {
+        LibraryStrandedness::Unstranded => "Unstranded",
+        LibraryStrandedness::FirstOfPairSense => "First read sense (fr-secondstrand)",
+        LibraryStrandedness::FirstOfPairAntisense => "First read antisense (fr-firststrand, dUTP)",
+    }
+}
+
+const fn sashimi_label_mode_label(value: SashimiLabelMode) -> &'static str {
+    match value {
+        SashimiLabelMode::Counts => "Read counts",
+        SashimiLabelMode::Psi => "PSI at donor / acceptor",
+        SashimiLabelMode::None => "None",
+    }
 }

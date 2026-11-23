@@ -60,6 +60,7 @@ impl Viewer {
         let mut request_alignments = false;
         let mut query_changed = false;
         let mut presentation_changed = false;
+        let mut sashimi_presentation_changed = false;
         for change in &applied.changes {
             let track_id = change.track_id;
             let query = change.query_changed();
@@ -113,6 +114,7 @@ impl Viewer {
                 );
             }
             presentation_changed |= change.presentation_changed();
+            sashimi_presentation_changed |= change.sashimi_presentation_changed();
             query_changed |= query;
             if change.primary {
                 refresh_query_options |= query || change.style_changed();
@@ -150,6 +152,9 @@ impl Viewer {
         if applied.changed() {
             self.rebuild_all_panel_displays();
             self.mark_display_dirty("explicit display invalidation");
+        }
+        if sashimi_presentation_changed {
+            self.prepare_alignment_scene_frame();
         }
     }
 }

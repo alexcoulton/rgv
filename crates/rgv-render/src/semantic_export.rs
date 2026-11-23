@@ -53,7 +53,6 @@ impl SemanticAlignmentExport {
 /// Call from an export worker with captured, committed panel frames. Capturing
 /// those frames pins the source/reference/style authority for the job lifetime. Colours come
 /// from `palette`, the same table the GPU renderers resolve their instances against.
-#[allow(clippy::too_many_lines)]
 pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
     panels: &[AlignmentPanelSceneFrame],
     ledger: &rgv_alignment_scene::AllocationLedger,
@@ -63,6 +62,36 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
         S,
     >,
     palette: &AlignmentPalette,
+) -> io::Result<SemanticAlignmentExport> {
+    project_semantic_alignment_export_with_presentations(
+        panels,
+        ledger,
+        interactions,
+        palette,
+        &HashMap::new(),
+    )
+}
+
+/// [`project_semantic_alignment_export`] drawing each Sashimi lane under its live presentation
+/// (resolved strands, hidden junctions, splice-site totals), as the viewer draws it.
+#[allow(clippy::too_many_lines)]
+pub fn project_semantic_alignment_export_with_presentations<
+    S: std::hash::BuildHasher,
+    T: std::hash::BuildHasher,
+>(
+    panels: &[AlignmentPanelSceneFrame],
+    ledger: &rgv_alignment_scene::AllocationLedger,
+    interactions: &HashMap<
+        (rgv_core::PanelId, rgv_core::TrackId),
+        rgv_alignment_scene::AlignmentInteractionState,
+        S,
+    >,
+    palette: &AlignmentPalette,
+    presentations: &HashMap<
+        (rgv_core::PanelId, rgv_core::TrackId),
+        std::sync::Arc<rgv_model::SashimiPresentationTable>,
+        T,
+    >,
 ) -> io::Result<SemanticAlignmentExport> {
     let mut output = SemanticAlignmentExport {
         display: DisplayList::default(),
@@ -141,11 +170,14 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                             }
                         };
                         projections.push(
-                            CpuSummaryProjector::project(
+                            CpuSummaryProjector::project_with_junction_presentation(
                                 scene,
                                 lane.source_camera_sequence,
                                 camera,
                                 &CpuSummaryProjectionOptions::Junctions(projection),
+                                presentations
+                                    .get(&(panel.panel_id, lane.track_id))
+                                    .map(std::convert::AsRef::as_ref),
                             )
                             .map_err(export_error)?,
                         );

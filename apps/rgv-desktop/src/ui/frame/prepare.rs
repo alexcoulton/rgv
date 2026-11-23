@@ -1337,6 +1337,20 @@ impl Viewer {
                 reference_configured: self
                     .compatible_alignment_reference_revision(track.dictionary.as_ref()?)
                     .is_some(),
+                junction_filter_active: self.session.panels.get(menu.target.panel_id).is_some_and(
+                    |panel| {
+                        panel
+                            .sashimi_site_filter
+                            .is_some_and(|(track_id, _)| track_id == menu.target.track_id)
+                            || panel
+                                .sashimi_intron_filter
+                                .as_ref()
+                                .is_some_and(|filter| filter.track_id == menu.target.track_id)
+                    },
+                ),
+                selected_transcript: self
+                    .selected_transcript_introns(menu.target.panel_id)
+                    .map(|(label, _)| label),
             })
         });
         (alignment_context_menu, alignment_context_menu_view)

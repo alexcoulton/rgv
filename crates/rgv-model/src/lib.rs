@@ -20,6 +20,7 @@ pub mod pair;
 pub mod pileup;
 pub mod query;
 pub mod reference;
+pub mod sashimi;
 pub mod sbx;
 pub mod smrt_kinetics;
 pub mod source_position;
@@ -80,6 +81,14 @@ pub use pileup::{
 };
 pub use query::{AlignmentQuery, IndividualReadStatus, QueryDetail, QueryOptions, QueryStats};
 pub use reference::ReferenceSlice;
+pub use sashimi::{
+    JunctionPresentation, JunctionStrandSource, ResolvedJunctionStrand, SASHIMI_HOVER_FADE_ALPHA,
+    SASHIMI_LABEL_CLEARANCE, SASHIMI_MAXIMUM_STROKE, SASHIMI_MINIMUM_ARC_HEIGHT,
+    SASHIMI_MINIMUM_STROKE, SASHIMI_UNLABELLED_CLEARANCE, SashimiPresentationOptions,
+    SashimiPresentationTable, SpliceMotif, SpliceSite, SpliceSiteSide, format_psi,
+    place_labels_by_priority, psi_label, resolve_junction_strand, sashimi_arc_height,
+    sashimi_available_height, sashimi_stroke_width,
+};
 pub use sbx::{
     SbxEvidenceError, SbxInsertionState, SbxSummary, SbxTailBounds, classify_sbx_insertion,
     sbx_tail_bounds, summarize_sbx_record,

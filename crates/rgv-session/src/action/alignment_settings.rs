@@ -76,6 +76,7 @@ const CONTINUOUS_FIELDS: &[&str] = &[
     "minimum_base_quality",
     "minimum_allele_fraction",
     "minimum_junction_depth",
+    "junction_relative_threshold_percent",
     "minimum_junction_flank",
     "sashimi_fixed_scale_maximum",
     "coverage_scale_maximum",
@@ -188,6 +189,20 @@ impl AlignmentSettingsChange {
         STYLE_FIELDS.iter().any(|field| self.changed(field))
     }
 
+    /// Weak-junction hiding, junction strand resolution or arc labels changed. These are drawn
+    /// from the published scene: the host owes a new Sashimi presentation, not a query.
+    pub fn sashimi_presentation_changed(&self) -> bool {
+        [
+            "minimum_junction_depth",
+            "junction_relative_threshold_percent",
+            "show_all_junctions",
+            "junction_library_strandedness",
+            "sashimi_label_mode",
+        ]
+        .iter()
+        .any(|field| self.changed(field))
+    }
+
     /// Anything beyond the hover-inspector trigger changed, so the track's lanes look different.
     pub fn presentation_changed(&self) -> bool {
         self.fields
@@ -258,6 +273,14 @@ fn normalized(mut settings: AlignmentSettings) -> AlignmentSettings {
     let filters = &mut settings.filters;
     filters.read_sampling = filters.read_sampling.normalized();
     filters.minimum_junction_depth = filters.minimum_junction_depth.max(1);
+    filters.junction_relative_threshold_percent =
+        if filters.junction_relative_threshold_percent.is_finite() {
+            filters
+                .junction_relative_threshold_percent
+                .clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
     filters.sashimi_fixed_scale_maximum = filters.sashimi_fixed_scale_maximum.max(1);
     if let (Some(minimum), Some(maximum)) = (
         filters.minimum_template_length,

@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use rgv_core::GenomicInterval;
 
+use crate::AlignmentFlags;
+
 /// Hard bound on distinct splice junctions retained by one regional query.
 pub const MAX_JUNCTIONS: usize = 100_000;
 /// Hard bound on splice operations retained from one alignment record.
@@ -17,9 +19,33 @@ pub enum JunctionStrand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JunctionStrandInput {
+    /// A reference-relative strand tag (`XS`, or `TS`).
     Tagged(JunctionStrand),
+    /// A read-relative transcript-strand tag (minimap2 `ts`): `+` means the transcript runs
+    /// along the read, so the reference strand flips for a reverse-strand alignment.
+    ReadRelative(JunctionStrand),
     Missing,
     Invalid,
+}
+
+impl JunctionStrandInput {
+    /// The reference strand this input names for an alignment in the given orientation.
+    #[must_use]
+    pub const fn reference_strand(self, alignment_reverse: bool) -> Option<JunctionStrand> {
+        match self {
+            Self::Tagged(strand) => Some(strand),
+            Self::ReadRelative(strand) => Some(match (strand, alignment_reverse) {
+                (JunctionStrand::Positive, false) | (JunctionStrand::Negative, true) => {
+                    JunctionStrand::Positive
+                }
+                (JunctionStrand::Negative, false) | (JunctionStrand::Positive, true) => {
+                    JunctionStrand::Negative
+                }
+                (JunctionStrand::Unknown, _) => JunctionStrand::Unknown,
+            }),
+            Self::Missing | Self::Invalid => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -37,9 +63,16 @@ pub struct JunctionEvidence {
     pub tagged_positive_depth: u32,
     pub tagged_negative_depth: u32,
     pub tagged_unknown_depth: u32,
+    /// Untagged observations by alignment orientation. Provenance only: mates of one fragment
+    /// align in opposite orientations, so these never decide the junction's strand.
     pub fallback_positive_depth: u32,
     pub fallback_negative_depth: u32,
     pub invalid_strand_depth: u32,
+    /// Observations whose first-of-pair orientation is forward: a forward first (or single-end)
+    /// read, or a reverse second read. A stranded library maps this to a transcribed strand.
+    pub first_of_pair_forward_depth: u32,
+    /// Observations whose first-of-pair orientation is reverse.
+    pub first_of_pair_reverse_depth: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -210,9 +243,13 @@ impl JunctionSummaryBuilder {
         &mut self,
         junctions: &[JunctionObservation],
         dropped_record_junctions: usize,
-        alignment_reverse: bool,
+        flags: AlignmentFlags,
         strand_input: JunctionStrandInput,
     ) {
+        let alignment_reverse = flags.is_reverse();
+        // A second read of a pair reports the fragment in the opposite orientation.
+        let first_of_pair_reverse =
+            alignment_reverse != (flags.is_paired() && flags.is_last_in_template());
         self.dropped_record_junction_observations = self
             .dropped_record_junction_observations
             .saturating_add(dropped_record_junctions);
@@ -248,20 +285,20 @@ impl JunctionSummaryBuilder {
                 self.dropped_distinct_junctions = self.dropped_distinct_junctions.saturating_add(1);
                 continue;
             }
+            let tagged_strand = strand_input.reference_strand(alignment_reverse);
             let strand = match strand_input {
-                JunctionStrandInput::Tagged(strand) => {
+                JunctionStrandInput::Tagged(_) | JunctionStrandInput::ReadRelative(_) => {
                     self.xs_tagged_observations = self.xs_tagged_observations.saturating_add(1);
-                    strand
+                    tagged_strand.unwrap_or_default()
                 }
+                // An untagged read's alignment orientation is not the transcript's strand: the
+                // two mates of one fragment align in opposite directions. The strand is resolved
+                // later from the splice motif or a declared library strandedness.
                 JunctionStrandInput::Missing => {
                     self.alignment_strand_fallback_observations = self
                         .alignment_strand_fallback_observations
                         .saturating_add(1);
-                    if alignment_reverse {
-                        JunctionStrand::Negative
-                    } else {
-                        JunctionStrand::Positive
-                    }
+                    JunctionStrand::Unknown
                 }
                 JunctionStrandInput::Invalid => {
                     self.invalid_xs_observations = self.invalid_xs_observations.saturating_add(1);
@@ -293,21 +330,26 @@ impl JunctionSummaryBuilder {
                 JunctionStrand::Unknown => &mut evidence.unknown_depth,
             };
             *strand_depth = strand_depth.saturating_add(1);
-            let source_depth = match strand_input {
-                JunctionStrandInput::Tagged(JunctionStrand::Positive) => {
-                    &mut evidence.tagged_positive_depth
-                }
-                JunctionStrandInput::Tagged(JunctionStrand::Negative) => {
-                    &mut evidence.tagged_negative_depth
-                }
-                JunctionStrandInput::Tagged(JunctionStrand::Unknown) => {
-                    &mut evidence.tagged_unknown_depth
-                }
-                JunctionStrandInput::Missing if alignment_reverse => {
+            let orientation_depth = if first_of_pair_reverse {
+                &mut evidence.first_of_pair_reverse_depth
+            } else {
+                &mut evidence.first_of_pair_forward_depth
+            };
+            *orientation_depth = orientation_depth.saturating_add(1);
+            let source_depth = match (strand_input, tagged_strand) {
+                (_, Some(JunctionStrand::Positive)) => &mut evidence.tagged_positive_depth,
+                (_, Some(JunctionStrand::Negative)) => &mut evidence.tagged_negative_depth,
+                (_, Some(JunctionStrand::Unknown)) => &mut evidence.tagged_unknown_depth,
+                (JunctionStrandInput::Missing, _) if alignment_reverse => {
                     &mut evidence.fallback_negative_depth
                 }
-                JunctionStrandInput::Missing => &mut evidence.fallback_positive_depth,
-                JunctionStrandInput::Invalid => &mut evidence.invalid_strand_depth,
+                (JunctionStrandInput::Missing, _) => &mut evidence.fallback_positive_depth,
+                (
+                    JunctionStrandInput::Invalid
+                    | JunctionStrandInput::Tagged(_)
+                    | JunctionStrandInput::ReadRelative(_),
+                    None,
+                ) => &mut evidence.invalid_strand_depth,
             };
             *source_depth = source_depth.saturating_add(1);
             self.junction_observations_retained =
@@ -381,27 +423,28 @@ mod tests {
         builder.add_record_junctions(
             &[observation(150, 250, 12, 18), observation(300, 400, 20, 25)],
             0,
-            false,
+            AlignmentFlags::from_bits(0),
             JunctionStrandInput::Tagged(JunctionStrand::Negative),
         );
         builder.add_record_junctions(
             &[observation(150, 250, 8, 30)],
             0,
-            false,
+            AlignmentFlags::from_bits(0),
             JunctionStrandInput::Missing,
         );
         builder.add_record_junctions(
             &[observation(150, 250, 40, 6)],
             0,
-            true,
+            AlignmentFlags::from_bits(0x10),
             JunctionStrandInput::Invalid,
         );
         let summary = builder.finish(10, true);
         assert_eq!(summary.junctions.len(), 2);
         assert_eq!(summary.junctions[0].depth, 3);
-        assert_eq!(summary.junctions[0].positive_depth, 1);
+        // The untagged read's alignment orientation no longer names a strand.
+        assert_eq!(summary.junctions[0].positive_depth, 0);
         assert_eq!(summary.junctions[0].negative_depth, 1);
-        assert_eq!(summary.junctions[0].unknown_depth, 1);
+        assert_eq!(summary.junctions[0].unknown_depth, 2);
         assert_eq!(summary.junctions[0].minimum_left_flank, 8);
         assert_eq!(summary.junctions[0].minimum_right_flank, 6);
         assert_eq!(summary.junctions[0].maximum_left_flank, 40);
@@ -424,13 +467,54 @@ mod tests {
     }
 
     #[test]
+    fn mates_in_opposite_orientations_count_one_fragment_orientation_and_no_strand() {
+        let interval = GenomicInterval::new(ContigId::new(0), 100, 500).unwrap();
+        let mut builder = JunctionSummaryBuilder::new(interval, 0, None);
+        // Read 1 forward and read 2 reverse of one fragment, untagged.
+        for flags in [0x1 | 0x40, 0x1 | 0x80 | 0x10] {
+            builder.add_record_junctions(
+                &[observation(150, 250, 10, 10)],
+                0,
+                AlignmentFlags::from_bits(flags),
+                JunctionStrandInput::Missing,
+            );
+        }
+        // A minimap2 `ts:+` tag on a reverse alignment names the reference's minus strand.
+        builder.add_record_junctions(
+            &[observation(300, 400, 10, 10)],
+            0,
+            AlignmentFlags::from_bits(0x10),
+            JunctionStrandInput::ReadRelative(JunctionStrand::Positive),
+        );
+        let summary = builder.finish(3, true);
+        let pair = summary.junctions[0];
+        assert_eq!(pair.depth, 2);
+        assert_eq!((pair.positive_depth, pair.negative_depth), (0, 0));
+        assert_eq!(pair.unknown_depth, 2);
+        assert_eq!(
+            (pair.fallback_positive_depth, pair.fallback_negative_depth),
+            (1, 1)
+        );
+        assert_eq!(
+            (
+                pair.first_of_pair_forward_depth,
+                pair.first_of_pair_reverse_depth
+            ),
+            (2, 0)
+        );
+        let minimap = summary.junctions[1];
+        assert_eq!(minimap.negative_depth, 1);
+        assert_eq!(minimap.tagged_negative_depth, 1);
+    }
+
+    #[test]
     fn out_of_query_junctions_are_not_retained() {
         let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
         let mut builder = JunctionSummaryBuilder::new(interval, 0, None);
         builder.add_record_junctions(
             &[observation(0, 50, 10, 10), observation(250, 300, 10, 10)],
             0,
-            false,
+            AlignmentFlags::from_bits(0),
             JunctionStrandInput::Missing,
         );
         assert!(builder.finish(1, true).junctions.is_empty());
@@ -443,13 +527,13 @@ mod tests {
         builder.add_record_junctions(
             &[observation(150, 250, 9, 100)],
             0,
-            false,
+            AlignmentFlags::from_bits(0),
             JunctionStrandInput::Missing,
         );
         builder.add_record_junctions(
             &[observation(150, 250, 10, 10)],
             0,
-            true,
+            AlignmentFlags::from_bits(0x10),
             JunctionStrandInput::Tagged(JunctionStrand::Negative),
         );
         let summary = builder.finish(2, true);

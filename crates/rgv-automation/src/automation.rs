@@ -1097,6 +1097,33 @@ pub enum AutomationSetting {
         /// True shows splice-junction arcs, false hides them.
         value: bool,
     },
+    /// Configure the Sashimi lane of one alignment track: which weak junctions it hides, how
+    /// an untagged junction gets a strand when its splice motif is not canonical, and what arc
+    /// labels say. Omitted fields keep their current value. Saved in the track's settings.
+    SashimiJunctions {
+        /// Hide junctions with fewer reads than this (at least 1; default 2).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "schema", schemars(range(min = 1)))]
+        minimum_depth: Option<u32>,
+        /// Hide junctions with fewer reads than this percentage of the strongest junction
+        /// sharing either splice site, 0 to 100 (default 1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "schema", schemars(range(min = 0.0, max = 100.0)))]
+        relative_threshold_percent: Option<f32>,
+        /// True shows every junction, ignoring both thresholds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show_all: Option<bool>,
+        /// `unstranded`, `first_of_pair_sense` or `first_of_pair_antisense`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library_strandedness: Option<rgv_core::LibraryStrandedness>,
+        /// `counts`, `psi` or `none`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label_mode: Option<rgv_core::SashimiLabelMode>,
+        /// Positive stable ID of the alignment track. Omitted or `null` addresses the first
+        /// (primary) alignment track.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        track_id: Option<TrackId>,
+    },
     /// Draw paired reads as linked templates. Stored in the first (primary) alignment track's
     /// display settings.
     ViewAsPairs {
@@ -1499,6 +1526,25 @@ impl AutomationSetting {
             }
             Self::AlignmentDensity { .. } => {
                 Err("alignment density must be finite and between 0.25 and 4".to_owned())
+            }
+            Self::SashimiJunctions {
+                minimum_depth,
+                relative_threshold_percent,
+                track_id,
+                ..
+            } => {
+                if *minimum_depth == Some(0) {
+                    return Err("Sashimi minimum depth must be at least 1".to_owned());
+                }
+                if relative_threshold_percent
+                    .is_some_and(|value| !value.is_finite() || !(0.0..=100.0).contains(&value))
+                {
+                    return Err(
+                        "Sashimi relative threshold must be finite and between 0 and 100"
+                            .to_owned(),
+                    );
+                }
+                track_id.map_or(Ok(()), validate_track_id)
             }
             Self::TrackHeight { track_id, value } => {
                 validate_track_id(*track_id)?;

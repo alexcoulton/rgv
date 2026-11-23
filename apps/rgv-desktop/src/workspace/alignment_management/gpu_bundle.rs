@@ -190,6 +190,15 @@ impl Viewer {
                             hovered_junction,
                             selected_junction,
                         },
+                        junction_presentation: matches!(
+                            capture.options,
+                            AlignmentDerivedLaneOptions::Sashimi(_)
+                        )
+                        .then(|| {
+                            self.sashimi_presentation(*panel_id, lane.track_id)
+                                .map(|presentation| Arc::clone(&presentation.table))
+                        })
+                        .flatten(),
                     });
                 }
             }

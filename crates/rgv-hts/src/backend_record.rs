@@ -733,6 +733,25 @@ where
     })
 }
 
+/// Splice-strand evidence from a record's tags: `XS`, then `TS` (both reference-relative), then
+/// minimap2's read-relative `ts`.
+pub(crate) fn junction_strand_from_tags(
+    xs: Option<&AuxValue>,
+    reference_ts: impl FnOnce() -> Option<AuxValue>,
+    read_ts: impl FnOnce() -> Option<AuxValue>,
+) -> JunctionStrandInput {
+    match junction_strand_input(xs) {
+        JunctionStrandInput::Missing => match junction_strand_input(reference_ts().as_ref()) {
+            JunctionStrandInput::Missing => match junction_strand_input(read_ts().as_ref()) {
+                JunctionStrandInput::Tagged(strand) => JunctionStrandInput::ReadRelative(strand),
+                other => other,
+            },
+            other => other,
+        },
+        other => other,
+    }
+}
+
 /// Splice-strand evidence carried by an `XS` field.
 pub(crate) fn junction_strand_input(value: Option<&AuxValue>) -> JunctionStrandInput {
     match value {
@@ -849,7 +868,7 @@ pub(crate) fn add_alignment_pileup(
     junctions.add_record_junctions(
         &record_junctions,
         dropped_record_junctions,
-        reverse,
+        alignment.flags,
         alignment.junction_strand,
     );
     collapsed_bases
@@ -1029,7 +1048,11 @@ impl<'o> RegionQueryAccumulator<'o> {
                     flags,
                     mapping_quality: record.mapping_quality()?,
                     observations,
-                    junction_strand: junction_strand_input(record.auxiliary(*b"XS")?.as_ref()),
+                    junction_strand: junction_strand_from_tags(
+                        record.auxiliary(*b"XS")?.as_ref(),
+                        || record.auxiliary(*b"TS").ok().flatten(),
+                        || record.auxiliary(*b"ts").ok().flatten(),
+                    ),
                 },
                 &mut self.pileup,
                 &mut self.junctions,

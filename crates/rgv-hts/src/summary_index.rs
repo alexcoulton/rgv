@@ -56,7 +56,7 @@ pub struct AlignmentSummaryIndex {
     junctions: Vec<JunctionObservation>,
     dropped_junctions: Vec<u32>,
     junction_strands: Vec<JunctionStrandInput>,
-    alignment_reverse: Vec<bool>,
+    alignment_flags: Vec<crate::AlignmentFlags>,
     spliced_record_indices: Vec<u32>,
     collapsed_offsets: Vec<u32>,
     collapsed_ranges: Vec<(u64, u64)>,
@@ -79,7 +79,7 @@ impl AlignmentSummaryIndex {
         let mut junctions = Vec::new();
         let mut dropped_junctions = Vec::with_capacity(batch.len());
         let mut junction_strands = Vec::with_capacity(batch.len());
-        let mut alignment_reverse = Vec::with_capacity(batch.len());
+        let mut alignment_flags = Vec::with_capacity(batch.len());
         let mut spliced_record_indices = Vec::new();
         let mut collapsed_offsets = Vec::with_capacity(batch.len().saturating_add(1));
         let mut collapsed_ranges = Vec::new();
@@ -200,7 +200,7 @@ impl AlignmentSummaryIndex {
             );
             dropped_junctions.push(u32::try_from(dropped).unwrap_or(u32::MAX));
             junction_strands.push(record_junction_strand(record)?);
-            alignment_reverse.push(reverse);
+            alignment_flags.push(record.flags());
             let pair_candidate = pair_candidate(record);
             if pair_candidate.eligible {
                 pair_candidate_indices.push(u32::try_from(index).unwrap_or(u32::MAX));
@@ -233,7 +233,7 @@ impl AlignmentSummaryIndex {
             junctions,
             dropped_junctions,
             junction_strands,
-            alignment_reverse,
+            alignment_flags,
             spliced_record_indices,
             collapsed_offsets,
             collapsed_ranges,
@@ -354,10 +354,10 @@ impl AlignmentSummaryIndex {
                 .get(index)
                 .copied()
                 .unwrap_or_default() as usize,
-            self.alignment_reverse
+            self.alignment_flags
                 .get(index)
                 .copied()
-                .unwrap_or_default(),
+                .unwrap_or(crate::AlignmentFlags::from_bits(0)),
             self.junction_strands
                 .get(index)
                 .copied()
@@ -410,7 +410,9 @@ impl AlignmentSummaryIndex {
             .saturating_add(
                 self.junction_strands.capacity() * std::mem::size_of::<JunctionStrandInput>(),
             )
-            .saturating_add(self.alignment_reverse.capacity() * std::mem::size_of::<bool>())
+            .saturating_add(
+                self.alignment_flags.capacity() * std::mem::size_of::<crate::AlignmentFlags>(),
+            )
             .saturating_add(self.spliced_record_indices.capacity() * std::mem::size_of::<u32>())
             .saturating_add(self.collapsed_offsets.capacity() * std::mem::size_of::<u32>())
             .saturating_add(self.collapsed_ranges.capacity() * std::mem::size_of::<(u64, u64)>())
@@ -517,7 +519,20 @@ fn record_junction_strand(
             }
             _ => JunctionStrandInput::Invalid,
         },
-        None => JunctionStrandInput::Missing,
+        None => match record.auxiliary_field(*b"TS")? {
+            Some(field) => crate::backend_record::junction_strand_input(Some(&field.value)),
+            None => match record.auxiliary_field(*b"ts")? {
+                Some(field) => {
+                    match crate::backend_record::junction_strand_input(Some(&field.value)) {
+                        JunctionStrandInput::Tagged(strand) => {
+                            JunctionStrandInput::ReadRelative(strand)
+                        }
+                        other => other,
+                    }
+                }
+                None => JunctionStrandInput::Missing,
+            },
+        },
     })
 }
 

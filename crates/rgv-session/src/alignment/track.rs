@@ -250,12 +250,21 @@ pub fn alignment_scene_sashimi_lane_options(
     };
     Some(AlignmentSashimiLaneOptions {
         projection: CpuJunctionProjectionOptions {
-            minimum_depth: filters.minimum_junction_depth,
+            // Weak junctions are hidden by the lane's Sashimi presentation, which applies this
+            // absolute threshold together with the relative one; showing every junction lifts
+            // both.
+            minimum_depth: if filters.show_all_junctions {
+                1
+            } else {
+                filters.minimum_junction_depth
+            },
             minimum_flank: filters.minimum_junction_flank,
             display_mode: filters.junction_display_mode,
             scale_maximum,
             count_mode: filters.sashimi_count_mode,
-            show_labels: filters.show_junction_labels,
+            show_labels: filters.show_junction_labels
+                && filters.sashimi_label_mode != rgv_core::SashimiLabelMode::None,
+            label_mode: filters.sashimi_label_mode,
         },
         scale,
     })
@@ -1812,6 +1821,9 @@ pub fn copy_compatible_alignment_appearance(target: &mut SessionFilters, source:
     target.show_coverage = source.show_coverage;
     target.show_junctions = source.show_junctions;
     target.minimum_junction_depth = source.minimum_junction_depth;
+    target.junction_relative_threshold_percent = source.junction_relative_threshold_percent;
+    target.show_all_junctions = source.show_all_junctions;
+    target.sashimi_label_mode = source.sashimi_label_mode;
     target.junction_display_mode = source.junction_display_mode;
     target.sashimi_scale_mode = source.sashimi_scale_mode;
     target.sashimi_fixed_scale_maximum = source.sashimi_fixed_scale_maximum;

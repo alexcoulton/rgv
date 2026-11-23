@@ -357,6 +357,11 @@ pub(crate) struct ViewPanelController {
     pub(crate) selected_modification_position: Option<u64>,
     pub(crate) selected_junction: Option<(u64, u64)>,
     pub(crate) selected_junction_component: Option<JunctionArcComponent>,
+    /// Sashimi splice-site filter: only junctions of this track using this site are drawn.
+    pub(crate) sashimi_site_filter: Option<(TrackId, rgv_model::SpliceSite)>,
+    /// Sashimi transcript filter: only junctions matching the transcript's introns are drawn.
+    pub(crate) sashimi_intron_filter:
+        Option<crate::workspace::alignment_management::sashimi_presentation::SashimiIntronFilter>,
     pub(crate) selected_chain: Option<SelectedSupplementaryChain>,
     pub(crate) retained_evidence: Option<RetainedEvidenceSnapshot>,
     /// Durable semantic identity used to resolve a read after cross-locus navigation.
@@ -544,6 +549,8 @@ impl Panel for ViewPanelController {
             selected_modification_position: None,
             selected_junction: None,
             selected_junction_component: None,
+            sashimi_site_filter: None,
+            sashimi_intron_filter: None,
             selected_chain: None,
             retained_evidence: None,
             pending_read_selection: None,
@@ -602,6 +609,33 @@ impl ViewPanelController {
             contig_name,
             contig_length,
         ))
+    }
+
+    /// Sets (`Some`) or clears (`None`) the Sashimi splice-site filter of one track's lane.
+    /// Returns whether it changed. Hover is dropped: the arc under the pointer may be gone.
+    pub(crate) fn set_sashimi_site_filter(
+        &mut self,
+        track_id: TrackId,
+        site: Option<rgv_model::SpliceSite>,
+    ) -> bool {
+        let next = site.map(|site| (track_id, site));
+        if self.sashimi_site_filter == next {
+            return false;
+        }
+        self.sashimi_site_filter = next;
+        self.hovered_junction_arc = None;
+        true
+    }
+
+    /// Clears the Sashimi splice-site and transcript filters. Returns whether one was set.
+    pub(crate) fn clear_sashimi_filters(&mut self) -> bool {
+        if self.sashimi_site_filter.is_none() && self.sashimi_intron_filter.is_none() {
+            return false;
+        }
+        self.sashimi_site_filter = None;
+        self.sashimi_intron_filter = None;
+        self.hovered_junction_arc = None;
+        true
     }
 
     pub(crate) fn clear_selection(&mut self) {
@@ -699,6 +733,35 @@ mod tests {
         // intentionally the only input here, so the lower part of the current panel stays a
         // valid scrollbar target while that cache catches up.
         assert_eq!(read_panel_allocation_at_y(&layout, 500.0), Some(track_id));
+    }
+
+    #[test]
+    fn sashimi_site_filter_is_set_once_and_cleared_with_the_transcript_filter() {
+        let interval = GenomicInterval::new(ContigId::new(0), 100, 200).unwrap();
+        let mut panel = ViewPanelController::new(
+            PanelId::new(1),
+            Viewport::new(interval, 800.0).unwrap(),
+            None,
+            "chr3".to_owned(),
+            10_000,
+        );
+        let track = TrackId::new(4);
+        let site = rgv_model::SpliceSite::end_of(149_371_868);
+        assert!(!panel.clear_sashimi_filters());
+        assert!(panel.set_sashimi_site_filter(track, Some(site)));
+        assert!(!panel.set_sashimi_site_filter(track, Some(site)));
+        assert_eq!(panel.sashimi_site_filter, Some((track, site)));
+        panel.sashimi_intron_filter = Some(
+            crate::workspace::alignment_management::sashimi_presentation::SashimiIntronFilter {
+                track_id: track,
+                introns: std::sync::Arc::new(std::collections::BTreeSet::from([(10, 20)])),
+                label: "ENST1".to_owned(),
+            },
+        );
+        assert!(panel.clear_sashimi_filters());
+        assert_eq!(panel.sashimi_site_filter, None);
+        assert!(panel.sashimi_intron_filter.is_none());
+        assert!(!panel.clear_sashimi_filters());
     }
 
     #[test]

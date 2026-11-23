@@ -1088,9 +1088,41 @@ impl Viewer {
             (
                 "Strand support".to_owned(),
                 format!(
-                    "+ {} · − {} · unknown {}",
-                    junction.positive_depth, junction.negative_depth, junction.unknown_depth
+                    "tagged + {} · − {} · untagged {} (first-of-pair forward {} / reverse {})",
+                    junction.positive_depth,
+                    junction.negative_depth,
+                    junction.unknown_depth,
+                    junction.first_of_pair_forward_depth,
+                    junction.first_of_pair_reverse_depth
                 ),
+            ),
+            (
+                "Sashimi".to_owned(),
+                self.sashimi_presentation(self.session.panels.active().id, track_id)
+                    .map(|presentation| presentation.table.resolve(&junction))
+                    .map_or_else(
+                        || "no Sashimi lane is drawn for this track".to_owned(),
+                        |presentation| {
+                            crate::workspace::alignment_management::sashimi_presentation::junction_tooltip_lines(
+                                &self.session.panels.active().contig_name,
+                                &junction,
+                                &presentation,
+                                &format!("{} reads", junction.depth),
+                                None,
+                            )
+                            .into_iter()
+                            .skip(2)
+                            .chain(presentation.hidden().then(|| {
+                                if presentation.filtered {
+                                    "hidden by a junction filter".to_owned()
+                                } else {
+                                    "hidden as weak (below a depth threshold)".to_owned()
+                                }
+                            }))
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                        },
+                    ),
             ),
             (
                 "Evidence".to_owned(),

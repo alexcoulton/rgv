@@ -188,6 +188,7 @@ impl Viewer {
         }
         if junction_arc_changed {
             self.session.panels.active_mut().hovered_junction_arc = hovered_junction_arc;
+            self.refresh_sashimi_hover_annotation();
             if junction_hit.native_authority {
                 // Hover is frame state for persistent junction pages. Recapture uniforms from the
                 // already-published scene; no source query or geometry upload is involved.

@@ -59,6 +59,8 @@ pub struct Session<P: Panel = PanelState> {
     /// this same revision; reopening an equivalent path still creates a distinct authority.
     pub reference_revision: Option<ReferenceRevision>,
     pub reference_open_error: Option<String>,
+    /// Splice motifs read from the open FASTA for the junctions Sashimi lanes draw.
+    pub splice_motifs: crate::splice_motifs::SpliceMotifCache,
     pub engine_retirement_tasks: Vec<JoinHandle<()>>,
     pub reference_source: Option<TrackSource>,
     pub remote_reference_index_url: Option<String>,
@@ -190,6 +192,7 @@ impl<P: Panel> Session<P> {
             reference_engine: None,
             reference_revision: None,
             reference_open_error: None,
+            splice_motifs: crate::splice_motifs::SpliceMotifCache::default(),
             engine_retirement_tasks: Vec::new(),
             reference_source: None,
             remote_reference_index_url: None,

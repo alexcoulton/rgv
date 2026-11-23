@@ -17,7 +17,10 @@ pub use gpu_export::{
     GpuExportError, GpuExportLayout, GpuExportTarget, GpuExportTile, PngExportBackend,
     export_png_scaled_prefer_gpu, render_display_list_gpu, render_gpu_export,
 };
-pub use semantic_export::{SemanticAlignmentExport, project_semantic_alignment_export};
+pub use semantic_export::{
+    SemanticAlignmentExport, project_semantic_alignment_export,
+    project_semantic_alignment_export_with_presentations,
+};
 pub use track_tile_renderer::{
     ProjectedTrackInstance, TRACK_LANE_UNIFORM_BYTES, TRACK_TILE_INSTANCE_BYTES, TrackBinStyle,
     TrackLaneDraw, TrackLanePage, TrackLaneProjection, TrackPalette, TrackTileFrame,
@@ -92,6 +95,7 @@ pub use alignment_summary::{
     AlignmentSummaryModificationPageMetadata, PackedAlignmentSummaryPage,
     project_alignment_summary_allele_instance, project_alignment_summary_bisulfite_instance,
     project_alignment_summary_depth_instance, project_alignment_summary_junction_instance,
+    project_alignment_summary_junction_instance_with_labels,
     project_alignment_summary_modification_instance,
 };
 pub use alignment_summary::{

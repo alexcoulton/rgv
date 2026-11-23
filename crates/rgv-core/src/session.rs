@@ -428,6 +428,37 @@ pub enum SashimiScaleMode {
     Shared,
 }
 
+/// How an RNA-seq library's reads relate to the transcribed strand. Used to give a splice
+/// junction a strand when no `XS`/`ts` tag names one and the splice motif is not canonical.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryStrandedness {
+    /// Read orientation says nothing about the transcribed strand.
+    #[default]
+    Unstranded,
+    /// The first read of a pair (or a single-end read) aligns on the transcribed strand
+    /// (e.g. ligation / "fr-secondstrand" libraries).
+    FirstOfPairSense,
+    /// The first read of a pair (or a single-end read) aligns opposite the transcribed strand
+    /// (e.g. dUTP / "fr-firststrand" libraries).
+    FirstOfPairAntisense,
+}
+
+/// What a Sashimi arc's label shows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SashimiLabelMode {
+    /// The junction's read count (or CPM).
+    #[default]
+    Counts,
+    /// Percent spliced in at the donor and the acceptor.
+    Psi,
+    /// No labels.
+    None,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SashimiCountMode {
@@ -942,8 +973,22 @@ pub struct SessionFilters {
     pub show_coverage: bool,
     #[serde(default = "default_true")]
     pub show_junctions: bool,
-    #[serde(default = "default_one")]
+    /// Absolute weak-junction threshold: a junction with fewer reads is hidden in the Sashimi
+    /// lane unless every junction is shown.
+    #[serde(default = "default_minimum_junction_depth")]
     pub minimum_junction_depth: u32,
+    /// Relative weak-junction threshold, in percent: a junction with fewer reads than this share
+    /// of the strongest junction using either of its splice sites is hidden.
+    #[serde(default = "default_junction_relative_threshold_percent")]
+    pub junction_relative_threshold_percent: f32,
+    /// Shows every junction, ignoring both weak-junction thresholds.
+    #[serde(default)]
+    pub show_all_junctions: bool,
+    /// Library strandedness used to give a junction a strand when no tag or motif does.
+    #[serde(default)]
+    pub junction_library_strandedness: LibraryStrandedness,
+    #[serde(default)]
+    pub sashimi_label_mode: SashimiLabelMode,
     #[serde(default)]
     pub minimum_junction_flank: u32,
     #[serde(default)]
@@ -1026,7 +1071,11 @@ impl Default for SessionFilters {
             show_reference: true,
             show_coverage: true,
             show_junctions: true,
-            minimum_junction_depth: 1,
+            minimum_junction_depth: default_minimum_junction_depth(),
+            junction_relative_threshold_percent: default_junction_relative_threshold_percent(),
+            show_all_junctions: false,
+            junction_library_strandedness: LibraryStrandedness::Unstranded,
+            sashimi_label_mode: SashimiLabelMode::Counts,
             minimum_junction_flank: 0,
             junction_display_mode: JunctionDisplayMode::Collapsed,
             sashimi_scale_mode: SashimiScaleMode::Automatic,
@@ -3191,6 +3240,14 @@ const fn default_one() -> u32 {
     1
 }
 
+const fn default_minimum_junction_depth() -> u32 {
+    2
+}
+
+const fn default_junction_relative_threshold_percent() -> f32 {
+    1.0
+}
+
 const fn default_alignment_density() -> f32 {
     1.0
 }
@@ -3245,6 +3302,11 @@ fn validate_filters(filters: &SessionFilters) -> Result<(), SessionError> {
     if filters.minimum_indel_size == 0
         || filters.minimum_event_label_size == 0
         || filters.minimum_junction_depth == 0
+    {
+        return Err(SessionError::InvalidAlignmentDisplayThreshold);
+    }
+    if !filters.junction_relative_threshold_percent.is_finite()
+        || !(0.0..=100.0).contains(&filters.junction_relative_threshold_percent)
     {
         return Err(SessionError::InvalidAlignmentDisplayThreshold);
     }

@@ -24,6 +24,7 @@ pub mod selection;
 pub mod session;
 pub mod settings_writer;
 pub mod sources;
+pub mod splice_motifs;
 pub mod status;
 pub mod track_diagnostics;
 pub mod track_events;

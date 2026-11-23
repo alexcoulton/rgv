@@ -91,6 +91,11 @@ impl Viewer {
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn select_at_cursor(&mut self) {
+        // Clicking an arc's end (or the coverage at a splice site) filters the Sashimi lane to
+        // the junctions using that site; clicking the arc's body still selects the junction.
+        if self.filter_sashimi_at_cursor() {
+            return;
+        }
         let scene_selection = self.alignment_scene_hit_at_cursor(self.session.panels.active().id);
         let scene_selected_chain = scene_selection.and_then(|hit| {
             let record =
@@ -1391,6 +1396,15 @@ impl Viewer {
                 interaction_token: native_junction_interaction_token(key),
                 distance_points: hit.distance as f32,
                 content_revision,
+                splice_site: crate::workspace::alignment_management::sashimi_presentation::splice_site_at_arc_end(
+                    hit.bounds.x,
+                    hit.bounds.width,
+                    x,
+                    hit.evidence.start,
+                    hit.evidence.end,
+                ),
+                evidence: hit.evidence,
+                presentation: hit.presentation,
             })
         });
         Some(JunctionArcHitTestResult {

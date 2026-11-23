@@ -49,6 +49,10 @@ pub(crate) struct AlignmentContextMenuView {
     pub(crate) eligible_records: Option<usize>,
     pub(crate) matching_records: Option<usize>,
     pub(crate) reference_configured: bool,
+    /// The panel's Sashimi lane of this track has a splice-site or transcript filter.
+    pub(crate) junction_filter_active: bool,
+    /// The selected transcript whose introns the Sashimi lane can be limited to.
+    pub(crate) selected_transcript: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,6 +106,12 @@ pub(crate) enum AlignmentContextAction {
     ClearFilters,
     ClearHighlights,
     OpenTrackSettings,
+    /// Show or hide weak junctions in the Sashimi lane.
+    ToggleShowAllJunctions,
+    /// Limit the Sashimi lane to the selected transcript's introns.
+    ShowTranscriptJunctions,
+    /// Clear the Sashimi lane's splice-site and transcript filters.
+    ClearJunctionFilters,
 }
 
 fn alignment_context_component_kind(component: AlignmentComponent) -> &'static str {
@@ -157,7 +167,10 @@ impl AlignmentContextAction {
             | Self::GoToMate
             | Self::OpenMateInNewPanel
             | Self::OpenSupplementarySegments
-            | Self::OpenTrackSettings => AlignmentContextEffect::ReadAction,
+            | Self::OpenTrackSettings
+            | Self::ToggleShowAllJunctions
+            | Self::ShowTranscriptJunctions
+            | Self::ClearJunctionFilters => AlignmentContextEffect::ReadAction,
         }
     }
 }
@@ -627,6 +640,38 @@ impl Viewer {
                     target.track_id,
                 )));
             }
+            AlignmentContextAction::ToggleShowAllJunctions => {
+                if let Some(mut settings) = self.session.alignment_settings(target.track_id) {
+                    settings.filters.show_all_junctions = !settings.filters.show_all_junctions;
+                    if let Err(error) =
+                        self.set_alignment_settings(vec![(target.track_id, settings)])
+                    {
+                        self.report_error(error.to_string());
+                        action_outcome = "failed";
+                        action_reason = Some("settings_rejected");
+                    }
+                }
+            }
+            AlignmentContextAction::ShowTranscriptJunctions => {
+                if let Some((label, introns)) = self.selected_transcript_introns(target.panel_id) {
+                    self.set_sashimi_intron_filter(
+                        target.panel_id,
+                        Some(crate::workspace::alignment_management::sashimi_presentation::SashimiIntronFilter {
+                            track_id: target.track_id,
+                            introns: std::sync::Arc::new(introns),
+                            label,
+                        }),
+                    );
+                } else {
+                    action_outcome = "no_op";
+                    action_reason = Some("no_selected_transcript");
+                }
+            }
+            AlignmentContextAction::ClearJunctionFilters => {
+                if self.session.panels.active().id == target.panel_id {
+                    self.clear_active_sashimi_filters();
+                }
+            }
             action => {
                 let highlight_action = matches!(
                     action,
@@ -762,7 +807,10 @@ impl Viewer {
                     | AlignmentContextAction::GoToMate
                     | AlignmentContextAction::OpenMateInNewPanel
                     | AlignmentContextAction::OpenSupplementarySegments
-                    | AlignmentContextAction::OpenTrackSettings => unreachable!(),
+                    | AlignmentContextAction::OpenTrackSettings
+                    | AlignmentContextAction::ToggleShowAllJunctions
+                    | AlignmentContextAction::ShowTranscriptJunctions
+                    | AlignmentContextAction::ClearJunctionFilters => unreachable!(),
                 }
                 if matches!(
                     action,
@@ -1458,6 +1506,34 @@ pub(crate) fn show_alignment_context_menu(
                     ui,
                     "Clear highlights",
                     AlignmentContextAction::ClearHighlights,
+                    action,
+                    menu.target,
+                );
+            }
+        });
+        ui.menu_button("Splice junctions", |ui| {
+            context_check(
+                ui,
+                "Show all junctions",
+                view.filters.show_all_junctions,
+                AlignmentContextAction::ToggleShowAllJunctions,
+                action,
+                menu.target,
+            );
+            if let Some(transcript) = view.selected_transcript.as_deref() {
+                context_button(
+                    ui,
+                    &format!("Show only junctions of {transcript}"),
+                    AlignmentContextAction::ShowTranscriptJunctions,
+                    action,
+                    menu.target,
+                );
+            }
+            if view.junction_filter_active {
+                context_button(
+                    ui,
+                    "Clear junction filter",
+                    AlignmentContextAction::ClearJunctionFilters,
                     action,
                     menu.target,
                 );

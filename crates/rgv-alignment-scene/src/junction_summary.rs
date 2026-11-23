@@ -242,20 +242,25 @@ impl ExactJunctionSummaryTile {
             if observations.is_empty() && entering_observations.is_empty() {
                 continue;
             }
-            let strand = junction_strand(selection.auxiliary_field(index, *b"XS")?);
+            let strand = match junction_strand(selection.auxiliary_field(index, *b"XS")?) {
+                JunctionStrandInput::Missing => {
+                    match junction_strand(selection.auxiliary_field(index, *b"TS")?) {
+                        JunctionStrandInput::Missing => read_relative(junction_strand(
+                            selection.auxiliary_field(index, *b"ts")?,
+                        )),
+                        strand => strand,
+                    }
+                }
+                strand => strand,
+            };
             if !observations.is_empty() {
-                builder.add_record_junctions(
-                    &observations,
-                    dropped,
-                    record.flags().is_reverse(),
-                    strand,
-                );
+                builder.add_record_junctions(&observations, dropped, record.flags(), strand);
             }
             if !entering_observations.is_empty() {
                 entering_builder.add_record_junctions(
                     &entering_observations,
                     0,
-                    record.flags().is_reverse(),
+                    record.flags(),
                     strand,
                 );
             }
@@ -412,6 +417,14 @@ fn junction_strand(field: Option<AuxField>) -> JunctionStrandInput {
         }
         Some(_) => JunctionStrandInput::Invalid,
         None => JunctionStrandInput::Missing,
+    }
+}
+
+/// A minimap2 `ts` tag names the transcript strand relative to the read, not the reference.
+const fn read_relative(input: JunctionStrandInput) -> JunctionStrandInput {
+    match input {
+        JunctionStrandInput::Tagged(strand) => JunctionStrandInput::ReadRelative(strand),
+        other => other,
     }
 }
 

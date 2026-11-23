@@ -571,43 +571,63 @@ and set **Aligned flank ≥** to requery and count only reads with the declared 
 `M`/`=`/`X` bases in both adjacent exon blocks. The inspector reports the observed left/right flank
 ranges and exactly how many observations the flank filter removed.
 
-The junction lane is a Sashimi view. **Collapsed** mode overlays arcs on one baseline; **Expanded**
-mode assigns overlapping arcs to deterministic rows. Arc height follows the chosen **Per-track
-auto**, **Fixed**, or **Shared visible tracks** scale. When several alignment labels are selected,
-shared mode compares those selected samples; otherwise it compares all visible participating
-alignment tracks. Counts can be raw reads or CPM. CPM uses the whole-file mapped-read total stored
-in the BAM index. If that metadata is absent, RGV explicitly labels the raw fallback instead of
-presenting a regional count as library-size normalization. Arc labels are optional and bounded.
+The junction lane is a Sashimi view: **one arc per junction**. **Collapsed** mode overlays arcs on
+one baseline; **Expanded** mode assigns overlapping arcs to deterministic rows. An arc's **height
+grows with its on-screen span** (it approaches the lane's half-height smoothly), so a short intron
+nests under a longer one; its **stroke thickness grows with read count** (square root, 1 to 6 pt)
+against the chosen **Per-track auto**, **Fixed**, or **Shared visible tracks** scale. When several
+alignment labels are selected, shared mode compares those selected samples; otherwise it compares
+all visible participating alignment tracks. Counts can be raw reads or CPM. CPM uses the whole-file
+mapped-read total stored in the BAM index. If that metadata is absent, RGV explicitly labels the
+raw fallback instead of presenting a regional count as library-size normalization.
 
-Red arcs have positive-strand support, blue negative, grey unknown, and purple mixed. A right-facing
-chevron marks pure positive-strand evidence and a left-facing chevron marks pure negative-strand
-evidence; mixed evidence has both offset chevrons, while unknown evidence has neither. A small green
-marker means the endpoints match adjacent exons from one transcript in a visible GTF/GFF track;
-orange means novel relative to a complete loaded annotation interval; grey means annotation status
-cannot safely be decided. Move the pointer onto the visible line of an arc to highlight that exact
-positive, negative, or unknown component. The cursor changes to a pointing hand and the stroke
-widens while retaining its strand colour. Acquisition follows the nearest drawn curve in screen
-space, including where shallow arcs overlap a prominent junction; support depth is not used to
-steal the pointer. Filtered, capped, hidden, clipped, and provisional navigation arcs are not
-interactive because no corresponding line is committed to the canvas.
+**Strand.** Each junction gets one strand, in this order: `XS` (or `TS`) tags, or minimap2's
+read-relative `ts` tag; then the canonical splice motif read from the open reference (GT-AG,
+GC-AG and AT-AC on `+`; CT-AC, CT-GC and GT-AT, their reverse complements, on `−`); then, when
+**Library strandedness** in track settings is *First read sense* or *First read antisense*, the
+first-of-pair orientation of the supporting reads; otherwise the strand is unknown. A read's own
+alignment orientation is never used: the two mates of one fragment align in opposite directions.
+`+` arcs are red above the baseline (right-facing chevron), `−` arcs blue below it (left-facing
+chevron), unknown arcs grey above it. When tags disagree the majority is drawn and the tooltip
+says so. Motifs are read on the reference thread, four bases per intron, once per FASTA; until
+they arrive (or without a reference) untagged junctions are grey.
 
-Hover is transient and does not replace a clicked selection. With hover-activated Properties it
-temporarily previews the junction under the pointer, then restores the clicked junction on exit;
-with click-activated Properties the visual hover cue still appears. Click a highlighted component
-to retain the whole biological junction and its focused strand component, then inspect or copy its
-skipped interval, intron length, raw/normalized count, flank range, per-junction strand-source
-counts, annotation evidence, filter provenance, completeness, and aggregation caps. Dragging from
-an arc continues to pan normally once it passes the click-motion threshold.
+**Weak junctions.** By default a junction is hidden when it has fewer than **2** reads (**Junction
+depth ≥**) or fewer than **1 %** of the reads of the strongest junction sharing either of its
+splice sites. Both thresholds are in track settings; **Show all junctions** (also in the lane's
+right-click **Splice junctions** menu) turns both off. The lane says how many weak junctions it
+hides (top right). Hidden junctions still count toward splice-site totals, and the BED export lists
+every junction with its drawn strand, strand source, motif, and whether the lane shows it.
 
-RGV uses `XS:+` or `XS:-` when present. If `XS` is absent, it explicitly falls back to the
-alignment strand and reports how many observations used that fallback. An invalid `XS` value is
-retained as unknown rather than silently reinterpreted. A query retains at most 100,000 distinct
-junctions and at most 4,096 splice operations from one record. A lane draws at most 4,096 visible
-junctions and 512 labels, choosing the deepest deterministically when capped. The selected junction
-inspector exports a bounded, provenance-bearing BED for its alignment track and deterministic
-multi-sample Sashimi PNG or SVG for the selected visible tracks. At most 16 tracks and 16 MiB of
-text/vector output are retained; actual layout, image encoding, and file writes run outside the UI
-thread.
+**Labels.** **Arc labels** shows read counts (default), PSI, or nothing. A label sits at the arc's
+apex on a small chip; where two would overlap, the junction with more reads keeps its label. PSI is
+shown as *donor/acceptor*: the share of the reads leaving the donor (entering the acceptor) that
+use this junction.
+
+A small green marker means the endpoints match adjacent exons from one transcript in a visible
+GTF/GFF track; orange means novel relative to a complete loaded annotation interval; grey means
+annotation status cannot safely be decided.
+
+**Hover and click.** Move the pointer onto an arc to highlight it; every other arc fades. The
+tooltip gives the coordinates, intron length, read count, strand and its source, the motif,
+annotated/novel when known, and the PSI at the donor and the acceptor. Acquisition follows the
+nearest drawn curve in screen space; hidden, filtered, clipped, and provisional arcs are not
+interactive. Click an arc's body to select the junction (as before) and inspect or copy its skipped
+interval, intron length, counts, flank range, strand evidence, Sashimi presentation, annotation
+evidence, and provenance. Click within a few points of an arc's **end**, or click the coverage at a
+splice site, to show only the junctions using that site; a chip ("Showing junctions at
+chr3:149,371,868 — clear") appears in the lane, and clicking it or pressing **Esc** clears the
+filter. With a transcript selected in a gene track, **Splice junctions → Show only junctions of
+…** in the lane's right-click menu limits the lane to that transcript's introns. Dragging from an
+arc continues to pan normally once it passes the click-motion threshold.
+
+A query retains at most 100,000 distinct junctions and at most 4,096 splice operations from one
+record. A lane draws at most 4,096 visible junctions and 512 labels, choosing the deepest
+deterministically when capped. The selected junction inspector exports a bounded,
+provenance-bearing BED for its alignment track and deterministic multi-sample Sashimi PNG or SVG
+for the selected visible tracks. At most 16 tracks and 16 MiB of text/vector output are retained;
+actual layout, image encoding, and file writes run outside the UI thread. In exported images, arc
+strokes follow arc height rather than read count.
 
 ### Stable read stacking
 

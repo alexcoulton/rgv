@@ -34,6 +34,9 @@ pub(crate) struct SemanticExportCapture {
     label_backdrops: Vec<RectPrimitive>,
     panels: Vec<rgv_alignment_scene::AlignmentPanelSceneFrame>,
     interactions: HashMap<(PanelId, TrackId), rgv_alignment_scene::AlignmentInteractionState>,
+    /// Each Sashimi lane's presentation, so the export draws the arcs the window shows.
+    sashimi_presentations:
+        HashMap<(PanelId, TrackId), std::sync::Arc<rgv_model::SashimiPresentationTable>>,
     bounds: egui::Rect,
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -163,11 +166,12 @@ impl SemanticExportCapture {
         scale: f32,
         gpu: Option<ExportGpu>,
     ) -> std::io::Result<()> {
-        let geometry = rgv_render::project_semantic_alignment_export(
+        let geometry = rgv_render::project_semantic_alignment_export_with_presentations(
             &self.panels,
             &self.ledger,
             &self.interactions,
             self.theme.palette(),
+            &self.sashimi_presentations,
         )?;
         let display = cropped_display_list(&self.generic, self.bounds);
         let alignment = cropped_display_list(&geometry.display, self.bounds);
@@ -356,6 +360,11 @@ impl Viewer {
         Ok(SemanticExportCapture {
             label_backdrops,
             interactions,
+            sashimi_presentations: self
+                .sashimi_presentations
+                .iter()
+                .map(|(key, presentation)| (*key, std::sync::Arc::clone(&presentation.table)))
+                .collect(),
             ledger: self.session.alignment_scene_ledger.clone(),
             theme: crate::theme::active(),
             generic,

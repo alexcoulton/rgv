@@ -232,6 +232,7 @@ pub(super) struct OwnedAlignmentSummaryGpuRequest {
     pub(super) scissor: AlignmentGpuScissor,
     pub(super) options: AlignmentSummaryGpuLaneOptions,
     pub(super) overlays: AlignmentSummaryFrameOverlays,
+    pub(super) junction_presentation: Option<Arc<rgv_model::SashimiPresentationTable>>,
 }
 
 impl OwnedAlignmentSummaryGpuRequest {
@@ -250,6 +251,7 @@ impl OwnedAlignmentSummaryGpuRequest {
             scissor: self.scissor,
             options: self.options.clone(),
             overlays: self.overlays,
+            junction_presentation: self.junction_presentation.clone(),
         }
     }
 }

@@ -419,6 +419,10 @@ struct JunctionArcHover {
     interaction_token: u32,
     distance_points: f32,
     content_revision: u64,
+    /// The splice site the pointer is at, when it is within a few points of an arc's end.
+    splice_site: Option<rgv_model::SpliceSite>,
+    evidence: rgv_model::JunctionEvidence,
+    presentation: rgv_model::JunctionPresentation,
 }
 
 const fn summary_junction_component(
@@ -1319,6 +1323,13 @@ struct Viewer {
     /// Lays out read-level text from the presented alignment bundle after the egui pass, into
     /// its own atlas texture in `egui_renderer`.
     presented_text_painter: ui::presented_text::PresentedTextPainter,
+    /// Annotation status line of the hovered junction's tooltip, keyed by that junction.
+    sashimi_hover_annotation: Option<((TrackId, u64, u64), Option<String>)>,
+    /// Resolved Sashimi presentation of each captured `(panel, track)` lane.
+    sashimi_presentations: std::collections::HashMap<
+        (PanelId, TrackId),
+        crate::workspace::alignment_management::sashimi_presentation::SashimiLanePresentation,
+    >,
     workspace_layout: WorkspaceLayoutSnapshot,
     genomic_canvas_layer_id: Option<egui::LayerId>,
     pane_divider_rect: Option<egui::Rect>,

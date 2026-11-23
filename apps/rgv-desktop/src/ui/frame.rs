@@ -30,6 +30,7 @@ mod canvas;
 mod commit;
 mod menus;
 mod prepare;
+mod sashimi_overlays;
 mod shell_dialogs;
 mod show;
 mod state;
@@ -353,6 +354,7 @@ impl Viewer {
             alignment_context_action: None,
             feature_context_menu: self.feature_context_menu.clone(),
             gene_transcripts_action: None,
+            sashimi_clear_filters: None,
         };
         self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellPreparation,

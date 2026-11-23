@@ -52,7 +52,7 @@ impl Viewer {
                 .is_some_and(|panel| panel != UiPanel::CommandPalette),
         });
         match action {
-            EscapeAction::Nothing => return false,
+            EscapeAction::Nothing => return self.clear_active_sashimi_filters(),
             EscapeAction::CloseContextMenu => {
                 self.close_alignment_context_menu("escape");
             }

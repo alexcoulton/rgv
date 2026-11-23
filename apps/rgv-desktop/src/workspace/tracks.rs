@@ -603,6 +603,9 @@ impl Viewer {
                 name: self.alignment_track_name_for_id(track.config.id),
                 junctions,
                 filters: self.alignment_filters_for_track(track.config.id),
+                presentation: self
+                    .sashimi_presentation(self.session.panels.active().id, track.config.id)
+                    .map(|presentation| std::sync::Arc::clone(&presentation.table)),
             });
         }
         SashimiExportBundle {

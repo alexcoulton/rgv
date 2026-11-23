@@ -557,6 +557,7 @@ impl Viewer {
             AutomationSetting::ShowReference { .. }
             | AutomationSetting::ShowCoverage { .. }
             | AutomationSetting::ShowJunctions { .. }
+            | AutomationSetting::SashimiJunctions { .. }
             | AutomationSetting::ViewAsPairs { .. }
             | AutomationSetting::AlignmentDensity { .. }
             | AutomationSetting::IncludeSecondary { .. }

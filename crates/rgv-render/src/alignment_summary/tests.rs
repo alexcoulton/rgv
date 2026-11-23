@@ -32,6 +32,7 @@ use rgv_model::{
 };
 
 use super::*;
+use rgv_layout::Rgba;
 
 const RECORD_CONTRACT: ContractFingerprint = ContractFingerprint::new(77);
 
@@ -578,6 +579,7 @@ fn request<'a>(
         },
         options: options.into(),
         overlays: AlignmentSummaryFrameOverlays::default(),
+        junction_presentation: None,
     }
 }
 
@@ -617,6 +619,7 @@ fn modification_request<'a>(
         },
         options: options.into(),
         overlays: AlignmentSummaryFrameOverlays::default(),
+        junction_presentation: None,
     }
 }
 
@@ -632,6 +635,7 @@ pub(crate) fn sashimi_options(
             scale_maximum: None,
             count_mode: SashimiCountMode::Raw,
             show_labels: true,
+            label_mode: rgv_core::SashimiLabelMode::Counts,
         },
         scale,
     }
@@ -660,6 +664,7 @@ fn sashimi_request<'a>(
         },
         options: options.into(),
         overlays: AlignmentSummaryFrameOverlays::default(),
+        junction_presentation: None,
     }
 }
 
@@ -1325,6 +1330,21 @@ fn packed_junctions_have_unique_tile_ownership_and_match_the_stable_cpu_oracle()
             unreachable!();
         };
         entry_count = entry_count.saturating_add(metadata.entries().len());
+        // One arc instance per drawn junction, whatever its strand evidence.
+        assert_eq!(
+            instances
+                .iter()
+                .filter(|instance| {
+                    instance.identity[1]
+                        != AlignmentSummaryJunctionComponentToken::Annotation as u32
+                })
+                .count(),
+            metadata
+                .entries()
+                .iter()
+                .filter(|entry| entry.drawn_component().is_some())
+                .count()
+        );
         for entry in metadata.entries() {
             assert_eq!(
                 entry.expanded_row(),
@@ -1335,7 +1355,7 @@ fn packed_junctions_have_unique_tile_ownership_and_match_the_stable_cpu_oracle()
             );
         }
         gpu.extend(instances.iter().filter_map(|instance| {
-            project_alignment_summary_junction_instance(
+            project_alignment_summary_junction_instance_with_labels(
                 *instance,
                 page.interval().start(),
                 camera,
@@ -1345,6 +1365,7 @@ fn packed_junctions_have_unique_tile_ownership_and_match_the_stable_cpu_oracle()
                 options.projection.minimum_depth,
                 options.projection.minimum_flank,
                 options.projection.display_mode,
+                options.projection.show_labels,
             )
             .filter(|projected| {
                 projected.component != AlignmentSummaryJunctionComponentToken::Annotation
@@ -1431,7 +1452,7 @@ fn junction_arcs_keep_their_unclamped_span_when_an_end_is_off_screen() {
     let gpu = instances
         .iter()
         .filter_map(|instance| {
-            project_alignment_summary_junction_instance(
+            project_alignment_summary_junction_instance_with_labels(
                 *instance,
                 page_start,
                 camera,
@@ -1441,6 +1462,7 @@ fn junction_arcs_keep_their_unclamped_span_when_an_end_is_off_screen() {
                 options.projection.minimum_depth,
                 options.projection.minimum_flank,
                 options.projection.display_mode,
+                options.projection.show_labels,
             )
         })
         .filter(|projected| {
@@ -1636,24 +1658,17 @@ fn junction_arc_stroke_uses_perpendicular_distance_on_steep_flanks() {
         assert_near(distance, vertical / (1.0 + slope * slope).sqrt());
         assert_near(junction_arc_stroke_coverage(distance, stroke), 1.0);
 
-        // The rendered stroke and the picking distance are the same function.
-        let rectangle = RectPrimitive {
+        // The rendered stroke and the picking distance are the same function, with the stroke
+        // carried explicitly (it follows read support, not the arc's height).
+        let bounds = AlignmentSummaryGpuProjectedBounds {
             x: 0.0,
             y: 0.0,
-            width: width as f32,
-            height: height as f32,
-            color: Rgba::new(0.0, 0.0, 0.0, 1.0),
-            object_id: 0,
-            shape: if downward {
-                RectShape::JunctionArcDown
-            } else {
-                RectShape::JunctionArcUp
-            },
+            width,
+            height,
         };
         let picked =
-            junction_arc_distance_to_point(rectangle, (fraction * width) as f32, local_y as f32)
-                .unwrap();
-        assert!((f64::from(picked) - distance).abs() < 1.0e-4);
+            junction_arc_distance(bounds, stroke, downward, fraction * width, local_y).unwrap();
+        assert!((picked - distance).abs() < 1.0e-9);
     }
 
     // At the apex the curve is flat and both measures agree.
@@ -1700,6 +1715,7 @@ fn junction_range_index_matches_exhaustive_scan_and_prunes_narrow_queries() {
                 },
                 expanded_row: (index % 23) as u32,
                 annotation: None,
+                presentation: rgv_model::JunctionPresentation::default(),
             }
         })
         .collect::<Vec<_>>();
@@ -1837,10 +1853,12 @@ fn native_sashimi_picking_and_hover_capture_reuse_persistent_geometry() {
     else {
         unreachable!();
     };
+    // The fixture read carries no strand tag, so its one arc is drawn on the unknown strand
+    // (its alignment orientation is not a transcript strand).
     let instance = *instances
         .iter()
         .find(|instance| {
-            instance.identity[1] == AlignmentSummaryJunctionComponentToken::Positive as u32
+            instance.identity[1] == AlignmentSummaryJunctionComponentToken::Unknown as u32
         })
         .unwrap();
     let projected = project_alignment_summary_junction_instance(
@@ -1870,7 +1888,21 @@ fn native_sashimi_picking_and_hover_capture_reuse_persistent_geometry() {
     assert_eq!(hit.evidence, metadata.entries()[0].evidence());
     assert_eq!(
         hit.component,
-        AlignmentSummaryJunctionComponentToken::Positive
+        AlignmentSummaryJunctionComponentToken::Unknown
+    );
+    assert_eq!(hit.presentation, metadata.entries()[0].presentation());
+    // The pointer a stroke's half-width beyond the apex still hits; far above it does not.
+    assert!(
+        renderer
+            .hit_test_junction_lane(
+                &first,
+                31,
+                41,
+                projected.bounds.x + projected.bounds.width * 0.5,
+                projected.bounds.y - 30.0,
+                4.0,
+            )
+            .is_none()
     );
 
     let authority = first.content_authority().clone();
@@ -1981,6 +2013,7 @@ fn canonical_gpu_pages_are_clipped_to_the_snapshot_prepared_interval() {
         0,
         0,
         JunctionDisplayMode::Collapsed,
+        false,
         AlignmentSummaryFrameOverlays::default(),
     );
     assert_eq!(uniform.covered_clip_x, clip);
@@ -3336,6 +3369,7 @@ fn cooperative_reclaim_batches_many_summary_pages_around_protected_and_pinned_me
         .map(|page| AlignmentSummaryGpuPageKey {
             semantic: page.key(),
             companion_depth: None,
+            junction_presentation: 0,
         })
         .collect::<Vec<_>>();
     let extra_semantic = keys[0].semantic;
@@ -3343,6 +3377,7 @@ fn cooperative_reclaim_batches_many_summary_pages_around_protected_and_pinned_me
     keys.push(AlignmentSummaryGpuPageKey {
         semantic: extra_semantic,
         companion_depth: Some(extra_companion),
+        junction_presentation: 0,
     });
     keys.sort_unstable();
     assert_eq!(keys.len(), revisions.len());
@@ -3933,4 +3968,143 @@ fn semantic_export_draws_the_same_coverage_insertion_marks() {
         assert_near(f64::from(exported.width), f64::from(overlay.size[0]));
         assert_near(f64::from(exported.height), f64::from(overlay.size[1]));
     }
+}
+
+#[test]
+fn a_lane_presentation_resolves_one_strand_hides_weak_junctions_and_keys_its_pages() {
+    fn request<'a>(
+        page: &'a Arc<SummarySemanticPage>,
+        presentation: Option<&'a Arc<rgv_model::SashimiPresentationTable>>,
+    ) -> AlignmentSummaryGpuPageRequest<'a> {
+        AlignmentSummaryGpuPageRequest {
+            page,
+            companion_depth: None,
+            junction_presentation: presentation,
+        }
+    }
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let scene = test_snapshot_with_summary_tile_bases(&ledger, NonZeroU64::new(10).unwrap());
+    let page = scene
+        .summary_pages()
+        .iter()
+        .find(|page| {
+            page.key().family() == SummaryPageFamily::Junctions && !page.primitives().is_empty()
+        })
+        .unwrap();
+    let evidence = page
+        .primitives()
+        .iter()
+        .find_map(|primitive| match primitive.component {
+            SummarySemanticComponent::Junction(junction) => Some(junction.evidence),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(evidence.depth, 1);
+    // The fixture's single untagged read: weak under the default thresholds.
+    let weak = Arc::new(rgv_model::SashimiPresentationTable::build(
+        [&evidence],
+        |_, _| rgv_model::SpliceMotif::Unavailable,
+        &rgv_model::SashimiPresentationOptions::default(),
+    ));
+    // Every junction shown, with a minus-strand motif from the reference.
+    let minus = Arc::new(rgv_model::SashimiPresentationTable::build(
+        [&evidence],
+        |_, _| rgv_model::SpliceMotif::CtAc,
+        &rgv_model::SashimiPresentationOptions {
+            show_all: true,
+            ..rgv_model::SashimiPresentationOptions::default()
+        },
+    ));
+    let keys = [
+        request(page, None).key().unwrap(),
+        request(page, Some(&weak)).key().unwrap(),
+        request(page, Some(&minus)).key().unwrap(),
+    ];
+    assert_eq!(keys[0].junction_presentation(), 0);
+    assert_ne!(keys[1], keys[0]);
+    assert_ne!(keys[2], keys[1]);
+
+    let arcs = |presentation| {
+        let PackedAlignmentSummaryPage::Junctions {
+            instances,
+            metadata,
+        } = PackedAlignmentSummaryPage::from_request(request(page, presentation)).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            metadata.entries().len(),
+            1,
+            "hidden junctions stay inspectable"
+        );
+        instances
+            .iter()
+            .filter(|instance| {
+                instance.identity[1] != AlignmentSummaryJunctionComponentToken::Annotation as u32
+            })
+            .map(|instance| instance.identity[1])
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        arcs(None),
+        vec![AlignmentSummaryJunctionComponentToken::Unknown as u32]
+    );
+    assert!(arcs(Some(&weak)).is_empty());
+    assert_eq!(
+        arcs(Some(&minus)),
+        vec![AlignmentSummaryJunctionComponentToken::Negative as u32]
+    );
+}
+
+#[test]
+fn junction_uniform_carries_label_room_and_hover_focus() {
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let scene = test_snapshot_with_summary_tile_bases(&ledger, NonZeroU64::new(10).unwrap());
+    let camera = camera(scene.prepared_interval());
+    let uniform = |labels: bool, hovered: Option<AlignmentSummaryJunctionInteraction>| {
+        summary_uniform(
+            camera,
+            [256.0, 96.0],
+            0,
+            [0.0, 256.0],
+            1,
+            0.0,
+            CoverageScaleTransform::Linear,
+            false,
+            CoverageAlleleInterpretation::GenericReferenceAware,
+            SummaryPageFamily::Junctions,
+            0,
+            ModifiedBaseColorMode::ByType,
+            10.0,
+            1.0,
+            1,
+            1,
+            0,
+            JunctionDisplayMode::Collapsed,
+            labels,
+            AlignmentSummaryFrameOverlays {
+                hovered_junction: hovered,
+                ..AlignmentSummaryFrameOverlays::default()
+            },
+        )
+    };
+    let idle = uniform(false, None);
+    assert_eq!(idle.junction_flags, 0);
+    // No hover: nothing fades.
+    assert_eq!(idle.junction_interaction[1], 0);
+    let hovered = uniform(
+        true,
+        Some(AlignmentSummaryJunctionInteraction {
+            start: 15,
+            end: 18,
+            component: AlignmentSummaryJunctionComponentToken::Unknown,
+        }),
+    );
+    assert_eq!(hovered.junction_flags, 1);
+    // A hovered arc is present: the shader draws it emphasised and fades every other arc.
+    assert_eq!(hovered.junction_interaction[1], 1);
+    assert_eq!(
+        hovered.junction_interaction[0],
+        AlignmentSummaryJunctionComponentToken::Unknown as u32
+    );
 }

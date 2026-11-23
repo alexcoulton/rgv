@@ -24,13 +24,13 @@ use rgv_alignment_scene::{
 };
 use rgv_core::{
     BisulfiteContext, CoverageScaleTransform, GenomicInterval, JunctionDisplayMode,
-    ModifiedBaseColorMode, SashimiCountMode,
+    ModifiedBaseColorMode, SashimiCountMode, SashimiLabelMode,
 };
-use rgv_layout::{
-    MAX_RENDERED_JUNCTION_LABELS, RectPrimitive, RectShape, Rgba, junction_arc_distance_to_point,
-    modification_code_color,
+use rgv_layout::{MAX_RENDERED_JUNCTION_LABELS, modification_code_color};
+use rgv_model::{
+    JunctionEvidence, ModificationBin, ModificationCode, ModificationSeriesKey,
+    SashimiPresentationTable,
 };
-use rgv_model::{JunctionEvidence, ModificationBin, ModificationCode, ModificationSeriesKey};
 use thiserror::Error;
 
 use crate::paged_cache::{self, CachedFrameSlot, CachedGpuPage, PageTableError, PagedGpuCache};
@@ -64,6 +64,10 @@ const ALIGNMENT_SUMMARY_CAMERA_FRAME_SLOT_COUNT: usize = 2;
 pub struct AlignmentSummaryGpuPageKey {
     semantic: SummaryPageKey,
     companion_depth: Option<SummaryPageKey>,
+    /// Fingerprint of the Sashimi presentation (resolved strands, hidden junctions, splice-site
+    /// totals) of this page's junctions; zero for every other page and for a junction page
+    /// packed from its evidence alone.
+    junction_presentation: u64,
 }
 
 impl AlignmentSummaryGpuPageKey {
@@ -76,6 +80,7 @@ impl AlignmentSummaryGpuPageKey {
         Ok(Self {
             semantic: page.key(),
             companion_depth: None,
+            junction_presentation: 0,
         })
     }
 
@@ -102,6 +107,7 @@ impl AlignmentSummaryGpuPageKey {
         Ok(Self {
             semantic,
             companion_depth: Some(depth),
+            junction_presentation: 0,
         })
     }
 
@@ -114,6 +120,7 @@ impl AlignmentSummaryGpuPageKey {
         Ok(Self {
             semantic: page.key(),
             companion_depth: None,
+            junction_presentation: 0,
         })
     }
 
@@ -126,12 +133,44 @@ impl AlignmentSummaryGpuPageKey {
         Ok(Self {
             semantic: page.key(),
             companion_depth: None,
+            junction_presentation: 0,
         })
+    }
+
+    /// A junction page drawn under a lane's Sashimi presentation. Its key changes only when the
+    /// presentation of one of its own junctions changes.
+    #[allow(clippy::result_large_err)]
+    pub fn junctions_with_presentation(
+        page: &SummarySemanticPage,
+        presentation: Option<&SashimiPresentationTable>,
+    ) -> Result<Self, AlignmentSummaryGpuPageError> {
+        let mut key = Self::junctions(page)?;
+        if let Some(presentation) = presentation {
+            let start = page.interval().start();
+            key.junction_presentation =
+                presentation.fingerprint_for(page.primitives().iter().map(|primitive| {
+                    match primitive.component {
+                        SummarySemanticComponent::Junction(junction) => {
+                            (junction.evidence.start, junction.evidence.end)
+                        }
+                        _ => (
+                            start.saturating_add(primitive.start_offset),
+                            start.saturating_add(primitive.end_offset),
+                        ),
+                    }
+                }));
+        }
+        Ok(key)
     }
 
     #[must_use]
     pub const fn semantic(self) -> SummaryPageKey {
         self.semantic
+    }
+
+    #[must_use]
+    pub const fn junction_presentation(self) -> u64 {
+        self.junction_presentation
     }
 
     #[must_use]
@@ -149,6 +188,8 @@ impl AlignmentSummaryGpuPageKey {
 pub struct AlignmentSummaryGpuPageRequest<'a> {
     pub page: &'a Arc<SummarySemanticPage>,
     pub companion_depth: Option<&'a Arc<SummarySemanticPage>>,
+    /// The lane's Sashimi presentation for a junction page.
+    pub junction_presentation: Option<&'a Arc<SashimiPresentationTable>>,
 }
 
 impl<'a> AlignmentSummaryGpuPageRequest<'a> {
@@ -157,6 +198,7 @@ impl<'a> AlignmentSummaryGpuPageRequest<'a> {
         Self {
             page,
             companion_depth: None,
+            junction_presentation: None,
         }
     }
 
@@ -168,6 +210,7 @@ impl<'a> AlignmentSummaryGpuPageRequest<'a> {
         Self {
             page,
             companion_depth: Some(companion_depth),
+            junction_presentation: None,
         }
     }
 
@@ -176,6 +219,7 @@ impl<'a> AlignmentSummaryGpuPageRequest<'a> {
         Self {
             page,
             companion_depth: None,
+            junction_presentation: None,
         }
     }
 
@@ -184,6 +228,7 @@ impl<'a> AlignmentSummaryGpuPageRequest<'a> {
         Self {
             page,
             companion_depth: None,
+            junction_presentation: None,
         }
     }
 
@@ -203,7 +248,10 @@ impl<'a> AlignmentSummaryGpuPageRequest<'a> {
                 AlignmentSummaryGpuPageKey::modifications(self.page)
             }
             SummaryPageFamily::Junctions if self.companion_depth.is_none() => {
-                AlignmentSummaryGpuPageKey::junctions(self.page)
+                AlignmentSummaryGpuPageKey::junctions_with_presentation(
+                    self.page,
+                    self.junction_presentation.map(Arc::as_ref),
+                )
             }
             family => Err(AlignmentSummaryGpuPageError::UnsupportedFamily(family)),
         }
@@ -343,7 +391,9 @@ impl PackedAlignmentSummaryPage {
                 )?,
             ),
             SummaryPageFamily::Modifications => pack_modification_page(request.page),
-            SummaryPageFamily::Junctions => pack_junction_page(request.page),
+            SummaryPageFamily::Junctions => {
+                pack_junction_page(request.page, request.junction_presentation.map(Arc::as_ref))
+            }
             family => Err(AlignmentSummaryGpuPageError::UnsupportedFamily(family)),
         }
     }
@@ -443,6 +493,9 @@ pub struct AlignmentSummaryGpuSceneRequest<'a> {
     pub scissor: AlignmentGpuScissor,
     pub options: AlignmentSummaryGpuLaneOptions,
     pub overlays: AlignmentSummaryFrameOverlays,
+    /// Resolved strands, hidden junctions and splice-site totals for a Sashimi lane. `None`
+    /// draws every junction from its own evidence (strand tags only, nothing hidden).
+    pub junction_presentation: Option<Arc<SashimiPresentationTable>>,
 }
 
 fn summary_content_selectors(
@@ -460,7 +513,12 @@ fn summary_content_selectors(
                 AlignmentSummaryGpuContentSelector::Modifications
             }
             AlignmentSummaryGpuLaneOptions::Sashimi(_) => {
-                AlignmentSummaryGpuContentSelector::Junctions
+                AlignmentSummaryGpuContentSelector::Junctions {
+                    presentation: request
+                        .junction_presentation
+                        .as_ref()
+                        .map_or(0, |table| table.fingerprint()),
+                }
             }
         })
         .collect()
@@ -492,7 +550,9 @@ struct AlignmentSummaryGpuUniform {
     junction_display_mode: u32,
     allele_interpretation: u32,
     bisulfite_context_mask: u32,
-    padding: [u32; 2],
+    /// Bit 0: junction labels reserve room above each apex.
+    junction_flags: u32,
+    padding: u32,
     hovered_junction_span: [f32; 4],
     selected_junction_span: [f32; 4],
     junction_interaction: [u32; 4],
@@ -557,6 +617,7 @@ pub struct AlignmentSummaryGpuPrefetchCursor {
     scenes: Vec<(
         Arc<AlignmentSceneSnapshot>,
         AlignmentSummaryGpuContentSelector,
+        Option<Arc<SashimiPresentationTable>>,
     )>,
     next_page: usize,
     pins: Vec<PinnedAllocationLease>,
@@ -690,6 +751,7 @@ struct PreparedSummaryDraw {
     minimum_junction_flank: u32,
     junction_display_mode: JunctionDisplayMode,
     junction_count_mode: SashimiCountMode,
+    junction_label_mode: SashimiLabelMode,
     show_junction_labels: bool,
     uniform_offset: u32,
     scissor: AlignmentGpuScissor,
@@ -721,6 +783,7 @@ struct PendingSummaryDraw {
     minimum_junction_flank: u32,
     junction_display_mode: JunctionDisplayMode,
     junction_count_mode: SashimiCountMode,
+    junction_label_mode: SashimiLabelMode,
     show_junction_labels: bool,
     overlays: AlignmentSummaryFrameOverlays,
     background_range: Range<u32>,
@@ -789,7 +852,7 @@ struct PreparedSummaryOverlayDraw {
 enum AlignmentSummaryGpuContentSelector {
     Coverage { alleles: bool },
     Modifications,
-    Junctions,
+    Junctions { presentation: u64 },
 }
 
 /// Camera-independent content authority for an exact-summary presentation. Replacement
@@ -2180,10 +2243,20 @@ impl AlignmentSummaryGpuRenderer {
                         AlignmentSummaryGpuLaneOptions::Coverage(_)
                         | AlignmentSummaryGpuLaneOptions::Modifications(_) => SashimiCountMode::Raw,
                     },
+                    junction_label_mode: match &request.options {
+                        AlignmentSummaryGpuLaneOptions::Sashimi(options) => {
+                            options.projection.label_mode
+                        }
+                        AlignmentSummaryGpuLaneOptions::Coverage(_)
+                        | AlignmentSummaryGpuLaneOptions::Modifications(_) => {
+                            SashimiLabelMode::None
+                        }
+                    },
                     show_junction_labels: matches!(
                         &request.options,
                         AlignmentSummaryGpuLaneOptions::Sashimi(options)
                             if options.projection.show_labels
+                                && options.projection.label_mode != SashimiLabelMode::None
                     ),
                     overlays: request.overlays,
                     background_range: style.background_range,
@@ -2239,6 +2312,7 @@ impl AlignmentSummaryGpuRenderer {
                 request.minimum_junction_depth,
                 request.minimum_junction_flank,
                 request.junction_display_mode,
+                request.show_junction_labels,
                 request.overlays,
             );
             let offset = uniform_index.saturating_mul(self.uniform_stride);
@@ -2257,6 +2331,7 @@ impl AlignmentSummaryGpuRenderer {
                 minimum_junction_flank: request.minimum_junction_flank,
                 junction_display_mode: request.junction_display_mode,
                 junction_count_mode: request.junction_count_mode,
+                junction_label_mode: request.junction_label_mode,
                 show_junction_labels: request.show_junction_labels,
                 uniform_offset: u32::try_from(offset)
                     .map_err(|_| AlignmentSummaryGpuPrepareError::DynamicUniformAddressSpace)?,
@@ -2289,6 +2364,7 @@ impl AlignmentSummaryGpuRenderer {
                 0,
                 0,
                 JunctionDisplayMode::Collapsed,
+                false,
                 AlignmentSummaryFrameOverlays::default(),
             );
             let offset = uniform_index.saturating_mul(self.uniform_stride);
@@ -3204,10 +3280,20 @@ impl AlignmentSummaryGpuRenderer {
                         AlignmentSummaryGpuLaneOptions::Coverage(_)
                         | AlignmentSummaryGpuLaneOptions::Modifications(_) => SashimiCountMode::Raw,
                     },
+                    junction_label_mode: match &request.options {
+                        AlignmentSummaryGpuLaneOptions::Sashimi(options) => {
+                            options.projection.label_mode
+                        }
+                        AlignmentSummaryGpuLaneOptions::Coverage(_)
+                        | AlignmentSummaryGpuLaneOptions::Modifications(_) => {
+                            SashimiLabelMode::None
+                        }
+                    },
                     show_junction_labels: matches!(
                         &request.options,
                         AlignmentSummaryGpuLaneOptions::Sashimi(options)
                             if options.projection.show_labels
+                                && options.projection.label_mode != SashimiLabelMode::None
                     ),
                     overlays: request.overlays,
                     background_range: style.background_range,
@@ -3261,6 +3347,7 @@ impl AlignmentSummaryGpuRenderer {
                 request.minimum_junction_depth,
                 request.minimum_junction_flank,
                 request.junction_display_mode,
+                request.show_junction_labels,
                 request.overlays,
             );
             let offset = uniform_index.saturating_mul(self.uniform_stride);
@@ -3295,6 +3382,7 @@ impl AlignmentSummaryGpuRenderer {
                 minimum_junction_flank: request.minimum_junction_flank,
                 junction_display_mode: request.junction_display_mode,
                 junction_count_mode: request.junction_count_mode,
+                junction_label_mode: request.junction_label_mode,
                 show_junction_labels: request.show_junction_labels,
                 uniform_offset,
                 scissor: request.scissor,
@@ -3326,6 +3414,7 @@ impl AlignmentSummaryGpuRenderer {
                 0,
                 0,
                 JunctionDisplayMode::Collapsed,
+                false,
                 AlignmentSummaryFrameOverlays::default(),
             );
             let offset = uniform_index.saturating_mul(self.uniform_stride);
@@ -3668,7 +3757,13 @@ impl AlignmentSummaryGpuRenderer {
         let scenes = requests
             .iter()
             .zip(selectors)
-            .map(|(request, selector)| (Arc::clone(request.scene), selector))
+            .map(|(request, selector)| {
+                (
+                    Arc::clone(request.scene),
+                    selector,
+                    request.junction_presentation.clone(),
+                )
+            })
             .collect();
         Ok(AlignmentSummaryGpuPrefetchCursor {
             device_generation: self.device_generation,
@@ -3937,7 +4032,8 @@ impl AlignmentSummaryGpuRenderer {
 
     /// Hit-tests the exact procedural junction geometry carried by a rendered frame. The same
     /// immutable metadata and projection oracle drive pixels and picking; no query-local junction
-    /// index or legacy display rectangle participates.
+    /// index or legacy display rectangle participates. Hidden (weak or filtered) junctions are
+    /// not drawn and so cannot be hit.
     #[must_use]
     pub fn hit_test_junction_lane(
         &self,
@@ -3975,84 +4071,35 @@ impl AlignmentSummaryGpuRenderer {
                 continue;
             };
             for entry in metadata.entries().iter().copied() {
-                let evidence = entry.evidence();
-                for (depth, component) in [
-                    (
-                        evidence.positive_depth,
-                        AlignmentSummaryJunctionComponentToken::Positive,
-                    ),
-                    (
-                        evidence.negative_depth,
-                        AlignmentSummaryJunctionComponentToken::Negative,
-                    ),
-                    (
-                        evidence.unknown_depth,
-                        AlignmentSummaryJunctionComponentToken::Unknown,
-                    ),
-                ] {
-                    if depth == 0 {
-                        continue;
-                    }
-                    let instance = AlignmentSummaryGpuJunctionInstance {
-                        start_offset: junction_page_offset(evidence.start, draw.page_start),
-                        end_offset: junction_page_offset(evidence.end, draw.page_start),
-                        evidence: [
-                            depth,
-                            evidence.depth,
-                            evidence.minimum_left_flank,
-                            evidence.minimum_right_flank,
-                        ],
-                        identity: [entry.expanded_row(), component as u32, 0, 0],
-                    };
-                    let Some(projected) = project_alignment_summary_junction_instance(
-                        instance,
-                        draw.page_start,
-                        draw.camera,
-                        f64::from(draw.junction_scale_maximum),
-                        f64::from(draw.junction_normalization),
-                        draw.junction_row_count,
-                        draw.minimum_junction_depth,
-                        draw.minimum_junction_flank,
-                        draw.junction_display_mode,
-                    ) else {
-                        continue;
-                    };
-                    // Arc bounds are unclamped and can start millions of points off-screen, so
-                    // express them relative to the pointer before narrowing to `f32`.
-                    let rectangle = RectPrimitive {
-                        x: (projected.bounds.x - x) as f32,
-                        y: (projected.bounds.y - y) as f32,
-                        width: projected.bounds.width as f32,
-                        height: projected.bounds.height as f32,
-                        color: Rgba::new(0.0, 0.0, 0.0, 1.0),
-                        object_id: 0,
-                        shape: if component == AlignmentSummaryJunctionComponentToken::Negative {
-                            RectShape::JunctionArcDown
-                        } else {
-                            RectShape::JunctionArcUp
-                        },
-                    };
-                    let Some(distance) =
-                        junction_arc_distance_to_point(rectangle, 0.0, 0.0).map(f64::from)
-                    else {
-                        continue;
-                    };
-                    let acquisition = maximum_distance.max(projected.stroke_width * 0.5 + 2.0);
-                    if distance > acquisition
-                        || best.is_some_and(|current| current.distance <= distance)
-                    {
-                        continue;
-                    }
-                    best = Some(AlignmentSummaryGpuJunctionHit {
-                        coherence_scope: draw.coherence_scope,
-                        lane_identity: draw.lane_identity,
-                        evidence,
-                        annotation: entry.annotation(),
-                        component,
-                        bounds: projected.bounds,
-                        distance,
-                    });
+                let Some((projected, component)) = project_drawn_junction(draw, entry) else {
+                    continue;
+                };
+                let Some(distance) = junction_arc_distance(
+                    projected.bounds,
+                    projected.stroke_width,
+                    component == AlignmentSummaryJunctionComponentToken::Negative,
+                    x,
+                    y,
+                ) else {
+                    continue;
+                };
+                let acquisition = maximum_distance.max(projected.stroke_width * 0.5 + 2.0);
+                if distance > acquisition
+                    || best.is_some_and(|current| current.distance <= distance)
+                {
+                    continue;
                 }
+                best = Some(AlignmentSummaryGpuJunctionHit {
+                    coherence_scope: draw.coherence_scope,
+                    lane_identity: draw.lane_identity,
+                    evidence: entry.evidence(),
+                    annotation: entry.annotation(),
+                    component,
+                    bounds: projected.bounds,
+                    distance,
+                    presentation: entry.presentation(),
+                    stroke_width: projected.stroke_width,
+                });
             }
         }
         best
@@ -4061,6 +4108,9 @@ impl AlignmentSummaryGpuRenderer {
     /// Projects a bounded set of labels from the same pinned junction pages used for pixels and
     /// picking. This is presentation-only work: it neither queries the alignment source nor
     /// rebuilds/uploads persistent geometry.
+    ///
+    /// Each drawn junction offers one label at its arc's apex (on the part of the arc that is on
+    /// screen). Where labels would overlap, the junction with more reads keeps its label.
     #[must_use]
     pub fn junction_labels(
         &self,
@@ -4069,16 +4119,13 @@ impl AlignmentSummaryGpuRenderer {
         if frame.device_generation != self.device_generation {
             return Vec::new();
         }
-        let mut labels = Vec::new();
-        let mut lane_counts = BTreeMap::<(u64, u64), usize>::new();
-        let mut occupied = BTreeMap::<(u64, u64), Vec<[f64; 4]>>::new();
+        let mut candidates =
+            BTreeMap::<(u64, u64), Vec<(AlignmentSummaryGpuJunctionLabel, u64)>>::new();
+        let mut seen = BTreeSet::<(u64, u64, u64, u64)>::new();
         for draw in frame.draws.iter().filter(|draw| {
             draw.page.family() == SummaryPageFamily::Junctions && draw.show_junction_labels
         }) {
             let lane = (draw.coherence_scope, draw.lane_identity);
-            if lane_counts.get(&lane).copied().unwrap_or_default() >= MAX_RENDERED_JUNCTION_LABELS {
-                continue;
-            }
             let Some(page) = self.page(draw.page) else {
                 continue;
             };
@@ -4086,55 +4133,14 @@ impl AlignmentSummaryGpuRenderer {
                 continue;
             };
             for entry in metadata.entries().iter().copied() {
-                if lane_counts.get(&lane).copied().unwrap_or_default()
-                    >= MAX_RENDERED_JUNCTION_LABELS
-                {
-                    break;
-                }
                 let evidence = entry.evidence();
-                let Some((component_depth, component)) = [
-                    (
-                        evidence.positive_depth,
-                        AlignmentSummaryJunctionComponentToken::Positive,
-                    ),
-                    (
-                        evidence.negative_depth,
-                        AlignmentSummaryJunctionComponentToken::Negative,
-                    ),
-                    (
-                        evidence.unknown_depth,
-                        AlignmentSummaryJunctionComponentToken::Unknown,
-                    ),
-                ]
-                .into_iter()
-                .filter(|(depth, _)| *depth > 0)
-                .max_by_key(|(depth, component)| (*depth, std::cmp::Reverse(*component as u32))) else {
+                let Some((projected, component)) = project_drawn_junction(draw, entry) else {
                     continue;
                 };
-                let instance = AlignmentSummaryGpuJunctionInstance {
-                    start_offset: junction_page_offset(evidence.start, draw.page_start),
-                    end_offset: junction_page_offset(evidence.end, draw.page_start),
-                    evidence: [
-                        component_depth,
-                        evidence.depth,
-                        evidence.minimum_left_flank,
-                        evidence.minimum_right_flank,
-                    ],
-                    identity: [entry.expanded_row(), component as u32, 0, 0],
-                };
-                let Some(projected) = project_alignment_summary_junction_instance(
-                    instance,
-                    draw.page_start,
-                    draw.camera,
-                    f64::from(draw.junction_scale_maximum),
-                    f64::from(draw.junction_normalization),
-                    draw.junction_row_count,
-                    draw.minimum_junction_depth,
-                    draw.minimum_junction_flank,
-                    draw.junction_display_mode,
-                ) else {
+                // A junction drawn by two pages of one lane (never expected) labels once.
+                if !seen.insert((lane.0, lane.1, evidence.start, evidence.end)) {
                     continue;
-                };
+                }
                 let row_count = match draw.junction_display_mode {
                     JunctionDisplayMode::Collapsed => 1,
                     JunctionDisplayMode::Expanded => draw.junction_row_count.max(1),
@@ -4148,7 +4154,7 @@ impl AlignmentSummaryGpuRenderer {
                 let visible_right =
                     (projected.bounds.x + projected.bounds.width).min(clip.x + clip.width);
                 let visible_width = visible_right - visible_left;
-                if visible_width < 30.0 || band_height < 28.0 {
+                if visible_width < 18.0 || band_height < 28.0 {
                     continue;
                 }
                 let band_top = clip.y + f64::from(projected.expanded_row) * band_height;
@@ -4159,50 +4165,81 @@ impl AlignmentSummaryGpuRenderer {
                     projected.bounds.height,
                     projected.stroke_width,
                 );
-                let apex = if component == AlignmentSummaryJunctionComponentToken::Negative {
+                let downward = component == AlignmentSummaryJunctionComponentToken::Negative;
+                let centre = if downward {
                     projected.bounds.y + projected.bounds.height - curve_offset
                 } else {
                     projected.bounds.y + curve_offset
                 };
-                let y = (if component == AlignmentSummaryJunctionComponentToken::Negative {
-                    apex + 7.0
+                // Just beyond the stroke, on the outside of the arc.
+                let offset = projected.stroke_width * 0.5 + JUNCTION_LABEL_HALF_HEIGHT + 0.5;
+                let y = (if downward {
+                    centre + offset
                 } else {
-                    apex - 7.0
+                    centre - offset
                 })
-                .clamp(band_top + 5.5, band_bottom - 5.5);
-                let text = junction_count_label(
-                    evidence,
-                    draw.junction_count_mode,
-                    f64::from(draw.junction_normalization),
+                .clamp(
+                    band_top + JUNCTION_LABEL_HALF_HEIGHT,
+                    band_bottom - JUNCTION_LABEL_HALF_HEIGHT,
                 );
-                let label_width =
-                    ((text.chars().count() as f64) * 6.2 + 2.0).clamp(10.0, visible_width);
-                let bounds = [
+                let text = match draw.junction_label_mode {
+                    SashimiLabelMode::Psi => {
+                        rgv_model::psi_label(&entry.presentation(), evidence.depth)
+                    }
+                    SashimiLabelMode::Counts | SashimiLabelMode::None => junction_count_label(
+                        evidence,
+                        draw.junction_count_mode,
+                        f64::from(draw.junction_normalization),
+                    ),
+                };
+                let label_width = junction_label_width(&text);
+                let label_box = [
                     x - label_width * 0.5,
-                    y - 5.5,
+                    y - JUNCTION_LABEL_HALF_HEIGHT,
                     x + label_width * 0.5,
-                    y + 5.5,
+                    y + JUNCTION_LABEL_HALF_HEIGHT,
                 ];
-                let lane_occupied = occupied.entry(lane).or_default();
-                if lane_occupied.iter().any(|other| {
-                    bounds[0] < other[2] + 2.0
-                        && bounds[2] > other[0] - 2.0
-                        && bounds[1] < other[3] + 2.0
-                        && bounds[3] > other[1] - 2.0
-                }) {
-                    continue;
-                }
-                lane_occupied.push(bounds);
-                labels.push(AlignmentSummaryGpuJunctionLabel {
-                    coherence_scope: draw.coherence_scope,
-                    lane_identity: draw.lane_identity,
-                    evidence,
-                    x,
-                    y,
-                    text,
-                });
-                *lane_counts.entry(lane).or_default() += 1;
+                candidates.entry(lane).or_default().push((
+                    AlignmentSummaryGpuJunctionLabel {
+                        coherence_scope: draw.coherence_scope,
+                        lane_identity: draw.lane_identity,
+                        evidence,
+                        x,
+                        y,
+                        text,
+                        chip: label_box,
+                    },
+                    u64::from(evidence.depth),
+                ));
             }
+        }
+        let mut labels = Vec::new();
+        for (_, lane_candidates) in candidates {
+            let boxes = lane_candidates
+                .iter()
+                .map(|(label, depth)| (label.chip, *depth))
+                .collect::<Vec<_>>();
+            let kept = rgv_model::place_labels_by_priority(&boxes, 1.0);
+            let mut lane_labels = lane_candidates;
+            let mut index = 0_usize;
+            lane_labels.retain(|_| {
+                let keep = kept.binary_search(&index).is_ok();
+                index += 1;
+                keep
+            });
+            // Bound the text per lane, keeping the strongest junctions' labels.
+            if lane_labels.len() > MAX_RENDERED_JUNCTION_LABELS {
+                lane_labels.sort_by_key(|(label, depth)| {
+                    (
+                        std::cmp::Reverse(*depth),
+                        label.evidence.start,
+                        label.evidence.end,
+                    )
+                });
+                lane_labels.truncate(MAX_RENDERED_JUNCTION_LABELS);
+                lane_labels.sort_by_key(|(label, _)| (label.evidence.start, label.evidence.end));
+            }
+            labels.extend(lane_labels.into_iter().map(|(label, _)| label));
         }
         labels
     }
@@ -4545,6 +4582,7 @@ struct OwnedSummaryPageRequest {
     key: AlignmentSummaryGpuPageKey,
     page: Arc<SummarySemanticPage>,
     companion_depth: Option<Arc<SummarySemanticPage>>,
+    junction_presentation: Option<Arc<SashimiPresentationTable>>,
 }
 
 impl OwnedSummaryPageRequest {
@@ -4552,6 +4590,7 @@ impl OwnedSummaryPageRequest {
         AlignmentSummaryGpuPageRequest {
             page: &self.page,
             companion_depth: self.companion_depth.as_ref(),
+            junction_presentation: self.junction_presentation.as_ref(),
         }
     }
 }
@@ -4576,9 +4615,13 @@ fn summary_requests_for_scene(
             .into_iter()
             .map(|page| {
                 Ok(OwnedSummaryPageRequest {
-                    key: AlignmentSummaryGpuPageKey::junctions(page)?,
+                    key: AlignmentSummaryGpuPageKey::junctions_with_presentation(
+                        page,
+                        request.junction_presentation.as_deref(),
+                    )?,
                     page: Arc::clone(page),
                     companion_depth: None,
+                    junction_presentation: request.junction_presentation.clone(),
                 })
             })
             .collect::<Result<Vec<_>, AlignmentSummaryGpuPageError>>()?;
@@ -4603,6 +4646,7 @@ fn summary_requests_for_scene(
                     key: AlignmentSummaryGpuPageKey::modifications(page)?,
                     page: Arc::clone(page),
                     companion_depth: None,
+                    junction_presentation: None,
                 })
             })
             .collect::<Result<Vec<_>, AlignmentSummaryGpuPageError>>()?;
@@ -4626,6 +4670,7 @@ fn summary_requests_for_scene(
             key: AlignmentSummaryGpuPageKey::depth(page)?,
             page: Arc::clone(page),
             companion_depth: None,
+            junction_presentation: None,
         });
     }
     if options.alleles.is_some() {
@@ -4652,6 +4697,7 @@ fn summary_requests_for_scene(
                 key: AlignmentSummaryGpuPageKey::alleles(page, companion)?,
                 page: Arc::clone(page),
                 companion_depth: Some(Arc::clone(companion)),
+                junction_presentation: None,
             });
         }
     }
@@ -4688,10 +4734,11 @@ fn summary_cursor_page(
     scenes: &[(
         Arc<AlignmentSceneSnapshot>,
         AlignmentSummaryGpuContentSelector,
+        Option<Arc<SashimiPresentationTable>>,
     )],
     key: AlignmentSummaryGpuPageKey,
 ) -> Result<OwnedSummaryPageRequest, AlignmentSummaryGpuPrefetchCursorError> {
-    for (scene, selector) in scenes {
+    for (scene, selector, presentation) in scenes {
         let Some(page) = scene.summary_page_for_key(key.semantic()) else {
             continue;
         };
@@ -4717,17 +4764,19 @@ fn summary_cursor_page(
                 AlignmentSummaryGpuContentSelector::Modifications,
                 SummaryPageFamily::Modifications,
             ) if key.companion_depth().is_none() => None,
-            (AlignmentSummaryGpuContentSelector::Junctions, SummaryPageFamily::Junctions)
-                if key.companion_depth().is_none() =>
-            {
-                None
-            }
+            (
+                AlignmentSummaryGpuContentSelector::Junctions { .. },
+                SummaryPageFamily::Junctions,
+            ) if key.companion_depth().is_none() => None,
             _ => continue,
         };
         let candidate = OwnedSummaryPageRequest {
             key,
             page: Arc::clone(page),
             companion_depth,
+            junction_presentation: (key.family() == SummaryPageFamily::Junctions)
+                .then(|| presentation.clone())
+                .flatten(),
         };
         if candidate.borrowed().key()? == key {
             return Ok(candidate);
@@ -5029,6 +5078,7 @@ fn summary_uniform(
     minimum_junction_depth: u32,
     minimum_junction_flank: u32,
     junction_display_mode: JunctionDisplayMode,
+    junction_labels: bool,
     overlays: AlignmentSummaryFrameOverlays,
 ) -> AlignmentSummaryGpuUniform {
     let (hovered_junction_span, hovered_component, hovered_present) =
@@ -5087,7 +5137,8 @@ fn summary_uniform(
                 u32::from(bisulfite_context_mask(context))
             }
         },
-        padding: [0; 2],
+        junction_flags: u32::from(junction_labels),
+        padding: 0,
         hovered_junction_span,
         selected_junction_span,
         junction_interaction: [
@@ -5116,6 +5167,51 @@ fn junction_interaction_uniform(
         interaction.start < interaction.end
             && interaction.component != AlignmentSummaryJunctionComponentToken::Annotation,
     )
+}
+
+/// Half the height of a junction label's chip, in points.
+const JUNCTION_LABEL_HALF_HEIGHT: f64 = 6.0;
+
+/// Width of a junction label's chip: the 10 pt text plus padding.
+fn junction_label_width(text: &str) -> f64 {
+    (text.chars().count() as f64) * 6.0 + 6.0
+}
+
+/// The arc a junction entry draws in `draw`, with its strand token; `None` when it is hidden,
+/// filtered by depth or flank, or off screen.
+fn project_drawn_junction(
+    draw: &PreparedSummaryDraw,
+    entry: AlignmentSummaryJunctionEntry,
+) -> Option<(
+    AlignmentSummaryGpuProjectedJunction,
+    AlignmentSummaryJunctionComponentToken,
+)> {
+    let component = entry.drawn_component()?;
+    let evidence = entry.evidence();
+    let instance = AlignmentSummaryGpuJunctionInstance {
+        start_offset: junction_page_offset(evidence.start, draw.page_start),
+        end_offset: junction_page_offset(evidence.end, draw.page_start),
+        evidence: [
+            evidence.depth,
+            evidence.depth,
+            evidence.minimum_left_flank,
+            evidence.minimum_right_flank,
+        ],
+        identity: [entry.expanded_row(), component as u32, 0, 0],
+    };
+    project_alignment_summary_junction_instance_with_labels(
+        instance,
+        draw.page_start,
+        draw.camera,
+        f64::from(draw.junction_scale_maximum),
+        f64::from(draw.junction_normalization),
+        draw.junction_row_count,
+        draw.minimum_junction_depth,
+        draw.minimum_junction_flank,
+        draw.junction_display_mode,
+        draw.show_junction_labels,
+    )
+    .map(|projected| (projected, component))
 }
 
 fn junction_count_label(

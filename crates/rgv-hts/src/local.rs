@@ -27,7 +27,7 @@ use crate::{
     alignment::alignment_header_metadata_from_sam,
     backend_record::{
         PileupAlignment, PositionedAdmission, PositionedBlockBuilder, RegionQueryAccumulator,
-        add_alignment_pileup, junction_strand_input,
+        add_alignment_pileup, junction_strand_from_tags,
     },
     index_overview::{load_local_alignment_index_overview, local_alignment_index_candidates},
     junction::JunctionSummaryBuilder,
@@ -551,7 +551,23 @@ fn add_record_view_pileup(
             flags: record.flags(),
             mapping_quality: record.mapping_quality(),
             observations,
-            junction_strand: junction_strand_input(strand.as_ref().map(|field| &field.value)),
+            junction_strand: junction_strand_from_tags(
+                strand.as_ref().map(|field| &field.value),
+                || {
+                    record
+                        .auxiliary_field(*b"TS")
+                        .ok()
+                        .flatten()
+                        .map(|field| field.value)
+                },
+                || {
+                    record
+                        .auxiliary_field(*b"ts")
+                        .ok()
+                        .flatten()
+                        .map(|field| field.value)
+                },
+            ),
         },
         pileup,
         junctions,
@@ -2694,7 +2710,9 @@ mod tests {
                 .iter()
                 .map(|junction| junction.positive_depth)
                 .sum::<u32>(),
-            5_000
+            // Half the tagged observations; the 2,500 untagged ones no longer take their
+            // alignment orientation as a strand.
+            2_500
         );
         assert_eq!(
             refused
@@ -2712,7 +2730,8 @@ mod tests {
                 .iter()
                 .map(|junction| junction.unknown_depth)
                 .sum::<u32>(),
-            2_500
+            // 2,500 invalid tags plus 2,500 untagged observations.
+            5_000
         );
         assert!(refused.junctions.provenance.all_eligible_records);
 

@@ -157,6 +157,8 @@ pub struct CpuJunctionProjectionOptions {
     pub scale_maximum: Option<f64>,
     pub count_mode: SashimiCountMode,
     pub show_labels: bool,
+    /// What a shown label says.
+    pub label_mode: rgv_core::SashimiLabelMode,
 }
 
 impl Default for CpuJunctionProjectionOptions {
@@ -168,6 +170,7 @@ impl Default for CpuJunctionProjectionOptions {
             scale_maximum: None,
             count_mode: SashimiCountMode::Raw,
             show_labels: true,
+            label_mode: rgv_core::SashimiLabelMode::Counts,
         }
     }
 }
@@ -394,6 +397,19 @@ impl CpuSummaryProjector {
         camera: CpuSummaryCamera,
         options: &CpuSummaryProjectionOptions,
     ) -> Result<CpuSummaryFrame, CpuSummaryProjectionError> {
+        Self::project_with_junction_presentation(scene, camera_sequence, camera, options, None)
+    }
+
+    /// [`Self::project`] drawing junctions under a Sashimi lane's presentation (resolved
+    /// strands, hidden junctions, splice-site totals), exactly as the GPU lane draws them.
+    /// Without one, each junction is drawn from its own evidence (strand tags only).
+    pub fn project_with_junction_presentation(
+        scene: &Arc<AlignmentSceneSnapshot>,
+        camera_sequence: u64,
+        camera: CpuSummaryCamera,
+        options: &CpuSummaryProjectionOptions,
+        junction_presentation: Option<&rgv_model::SashimiPresentationTable>,
+    ) -> Result<CpuSummaryFrame, CpuSummaryProjectionError> {
         let covered = intersect(camera.interval(), scene.prepared_interval());
         let family = options.family();
         let maximum_facts = covered.map_or(0, |interval| {
@@ -453,7 +469,14 @@ impl CpuSummaryProjector {
                     project_alleles(scene, camera, covered, *options, &mut frame);
                 }
                 CpuSummaryProjectionOptions::Junctions(options) => {
-                    project_junctions(scene, camera, covered, *options, &mut frame)?;
+                    project_junctions(
+                        scene,
+                        camera,
+                        covered,
+                        *options,
+                        junction_presentation,
+                        &mut frame,
+                    )?;
                 }
                 CpuSummaryProjectionOptions::Modifications(options) => {
                     project_modifications(scene, camera, covered, options, &mut frame);
@@ -893,6 +916,7 @@ fn project_junctions(
     camera: CpuSummaryCamera,
     covered: GenomicInterval,
     options: CpuJunctionProjectionOptions,
+    presentation: Option<&rgv_model::SashimiPresentationTable>,
     frame: &mut CpuSummaryFrame,
 ) -> Result<(), CpuSummaryProjectionError> {
     if options
@@ -901,7 +925,16 @@ fn project_junctions(
     {
         return Err(CpuSummaryProjectionError::InvalidScale);
     }
-    let junctions = filtered_junctions(scene, covered, options);
+    let resolve = |evidence: &JunctionEvidence| {
+        presentation.map_or_else(
+            || rgv_model::JunctionPresentation::from_evidence(evidence),
+            |table| table.resolve(evidence),
+        )
+    };
+    let junctions = filtered_junctions(scene, covered, options)
+        .into_iter()
+        .filter(|junction| !resolve(&junction.evidence).hidden())
+        .collect::<Vec<_>>();
     let measurement = measure_filtered_junction_scale(scene, &junctions, options.count_mode);
     let normalization = junction_normalization(scene);
     frame.normalization_available = measurement.normalization_available;
@@ -924,6 +957,7 @@ fn project_junctions(
         1
     };
     let band_height = camera.clip.height / row_count.max(1) as f64;
+    let labels = options.show_labels && options.label_mode != rgv_core::SashimiLabelMode::None;
     for row in 0..row_count {
         push(
             frame,
@@ -936,6 +970,7 @@ fn project_junctions(
             None,
         );
     }
+    let mut label_candidates = Vec::new();
     for (annotated, row) in junctions.into_iter().zip(rows) {
         let junction = annotated.evidence;
         let (x, width) = horizontal(camera, junction.start, junction.end);
@@ -949,52 +984,40 @@ fn project_junctions(
         // on the viewport edge. Markers and labels stay anchored to the visible span.
         let (arc_x, arc_width) = horizontal_unclamped(camera, junction.start, junction.end);
         let baseline = camera.clip.y + (f64::from(row) + 0.5) * band_height;
-        for (depth, strand, up) in [
-            (
-                junction.positive_depth,
-                CpuJunctionStrandToken::Positive,
-                true,
-            ),
-            (
-                junction.negative_depth,
-                CpuJunctionStrandToken::Negative,
-                false,
-            ),
-            (
-                junction.unknown_depth,
-                CpuJunctionStrandToken::Unknown,
-                true,
-            ),
-        ] {
-            if depth == 0 {
-                continue;
-            }
-            let component_value = junction_value(junction, options.count_mode, normalization)
-                * f64::from(depth)
-                / f64::from(junction.depth);
-            let fraction = (component_value / maximum).clamp(0.0, 1.0).sqrt();
-            let height = (band_height * 0.45 * (0.18 + 0.82 * fraction)).max(3.0);
-            push(
-                frame,
-                arc_x,
-                if up { baseline - height } else { baseline },
-                arc_width,
-                height,
-                if up {
-                    CpuSummaryPrimitiveShape::JunctionArcUp
-                } else {
-                    CpuSummaryPrimitiveShape::JunctionArcDown
-                },
-                CpuSummaryProjectedComponent::Junction {
-                    evidence: junction,
-                    annotation: annotated.annotation,
-                    strand,
-                    value_bits: component_value.to_bits(),
-                    row,
-                },
-                None,
-            );
-        }
+        let resolved = resolve(&junction);
+        // One arc per junction on its resolved strand: `+` above, `-` below, unknown above.
+        let (strand, up) = match resolved.strand {
+            rgv_model::JunctionStrand::Positive => (CpuJunctionStrandToken::Positive, true),
+            rgv_model::JunctionStrand::Negative => (CpuJunctionStrandToken::Negative, false),
+            rgv_model::JunctionStrand::Unknown => (CpuJunctionStrandToken::Unknown, true),
+        };
+        let value = junction_value(junction, options.count_mode, normalization);
+        let stroke = rgv_model::sashimi_stroke_width(value, maximum);
+        let height = rgv_model::sashimi_arc_height(
+            arc_width.max(1.0),
+            rgv_model::sashimi_available_height(band_height, labels),
+            stroke,
+        );
+        push(
+            frame,
+            arc_x,
+            if up { baseline - height } else { baseline },
+            arc_width,
+            height,
+            if up {
+                CpuSummaryPrimitiveShape::JunctionArcUp
+            } else {
+                CpuSummaryPrimitiveShape::JunctionArcDown
+            },
+            CpuSummaryProjectedComponent::Junction {
+                evidence: junction,
+                annotation: annotated.annotation,
+                strand,
+                value_bits: value.to_bits(),
+                row,
+            },
+            None,
+        );
         if let Some(status) = annotated.annotation {
             push(
                 frame,
@@ -1010,23 +1033,60 @@ fn project_junctions(
                 None,
             );
         }
-        if options.show_labels {
-            let text: Arc<str> =
-                Arc::from(junction_label(junction, options.count_mode, normalization));
-            push(
-                frame,
-                x + width * 0.5,
-                baseline - 6.0,
-                1.0,
-                12.0,
-                CpuSummaryPrimitiveShape::TextLabel,
-                CpuSummaryProjectedComponent::JunctionLabel {
-                    evidence: junction,
-                    annotation: annotated.annotation,
-                },
-                Some(text),
-            );
+        if labels {
+            let text = match options.label_mode {
+                rgv_core::SashimiLabelMode::Psi => rgv_model::psi_label(&resolved, junction.depth),
+                rgv_core::SashimiLabelMode::Counts | rgv_core::SashimiLabelMode::None => {
+                    junction_label(junction, options.count_mode, normalization)
+                }
+            };
+            // At the arc's apex (over the visible span), just outside the stroke.
+            let centre_x = x + width * 0.5;
+            let fraction = ((centre_x - arc_x) / arc_width.max(1.0)).clamp(0.0, 1.0);
+            let curve = stroke * 0.5 + (height - stroke).max(0.0) * 4.0 * (fraction - 0.5).powi(2);
+            let centre_y = if up {
+                baseline - height + curve - stroke * 0.5 - 6.5
+            } else {
+                baseline + height - curve + stroke * 0.5 + 6.5
+            };
+            let band_top = camera.clip.y + f64::from(row) * band_height;
+            let centre_y = centre_y.clamp(band_top + 6.0, band_top + band_height - 6.0);
+            let text_width = text.chars().count() as f64 * 6.0 + 6.0;
+            label_candidates.push((
+                centre_x,
+                centre_y,
+                text,
+                junction,
+                annotated.annotation,
+                [
+                    centre_x - text_width * 0.5,
+                    centre_y - 6.0,
+                    centre_x + text_width * 0.5,
+                    centre_y + 6.0,
+                ],
+            ));
         }
+    }
+    // Where labels would overlap, the junction with more reads keeps its label.
+    let boxes = label_candidates
+        .iter()
+        .map(|(_, _, _, junction, _, bounds)| (*bounds, u64::from(junction.depth)))
+        .collect::<Vec<_>>();
+    for index in rgv_model::place_labels_by_priority(&boxes, 2.0) {
+        let (centre_x, centre_y, text, junction, annotation, _) = &label_candidates[index];
+        push(
+            frame,
+            *centre_x,
+            centre_y - 6.0,
+            1.0,
+            12.0,
+            CpuSummaryPrimitiveShape::TextLabel,
+            CpuSummaryProjectedComponent::JunctionLabel {
+                evidence: *junction,
+                annotation: *annotation,
+            },
+            Some(Arc::from(text.as_str())),
+        );
     }
     Ok(())
 }

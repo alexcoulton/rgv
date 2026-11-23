@@ -726,6 +726,7 @@ mod tests {
                     scale_maximum: None,
                     count_mode: SashimiCountMode::CountsPerMillion,
                     show_labels: false,
+                    label_mode: rgv_core::SashimiLabelMode::Counts,
                 },
                 scale: AlignmentSashimiScalePolicy::Shared(group_id),
             }),

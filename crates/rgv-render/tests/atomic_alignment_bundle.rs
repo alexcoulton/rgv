@@ -359,6 +359,7 @@ fn summary_request<'a>(
         }
         .into(),
         overlays: AlignmentSummaryFrameOverlays::default(),
+        junction_presentation: None,
     }
 }
 
@@ -387,11 +388,13 @@ fn sashimi_request(
                 scale_maximum: None,
                 count_mode: SashimiCountMode::Raw,
                 show_labels: true,
+                label_mode: rgv_core::SashimiLabelMode::Counts,
             },
             scale: AlignmentSashimiScalePolicy::Automatic,
         }
         .into(),
         overlays: AlignmentSummaryFrameOverlays::default(),
+        junction_presentation: None,
     }
 }
 
@@ -419,6 +422,7 @@ fn modification_request(
         }
         .into(),
         overlays: AlignmentSummaryFrameOverlays::default(),
+        junction_presentation: None,
     }
 }
 

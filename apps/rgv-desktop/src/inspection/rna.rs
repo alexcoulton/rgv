@@ -19,7 +19,7 @@ use rgv_hts::{
 };
 use rgv_layout::{
     DisplayList, JunctionAnnotationLookup, JunctionAnnotationStatus, SashimiLayoutOptions,
-    junction_count_value, layout_sashimi,
+    junction_count_value, layout_sashimi_with_presentation,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -40,6 +40,8 @@ pub(crate) struct SashimiExportTrack {
     pub(crate) name: String,
     pub(crate) junctions: rgv_hts::JunctionSummary,
     pub(crate) filters: SessionFilters,
+    /// The live lane's presentation (strands with reference motifs, filters), when drawn.
+    pub(crate) presentation: Option<std::sync::Arc<rgv_model::SashimiPresentationTable>>,
 }
 
 pub(crate) struct SashimiExportBundle {
@@ -240,9 +242,14 @@ pub(crate) fn junction_bed_export(
         "# coordinates\tzero-based half-open skipped interval".to_owned(),
         format!("# track\t{}", tsv_cell(&track.name)),
         format!(
-            "# filters\tminimum_depth={}\tminimum_flank={}",
-            track.filters.minimum_junction_depth, provenance.minimum_flank
+            "# filters\tminimum_depth={}\tminimum_flank={}\trelative_threshold_percent={}\tshow_all={}\tlibrary={:?}",
+            track.filters.minimum_junction_depth,
+            provenance.minimum_flank,
+            track.filters.junction_relative_threshold_percent,
+            track.filters.show_all_junctions,
+            track.filters.junction_library_strandedness,
         ),
+        "# display\tevery junction is listed; `sashimi` says whether the lane draws it (shown), hides it as weak, or excludes it by a junction filter".to_owned(),
         format!(
             "# provenance\tauthority=committed_scene\texact_events=true\teligible_records={}\tall_eligible_records=true\tnormalization_mapped_records={}",
             provenance.eligible_records,
@@ -250,25 +257,46 @@ pub(crate) fn junction_bed_export(
                 .normalization_mapped_records
                 .map_or_else(|| ".".to_owned(), |value| value.to_string()),
         ),
-        "# columns\tchrom\tstart\tend\tname\tscore\tstrand\tdepth\tpositive\tnegative\tunknown\tminimum_left_flank\tminimum_right_flank\tannotation_status\tannotation_labels".to_owned(),
+        "# columns\tchrom\tstart\tend\tname\tscore\tstrand\tdepth\tpositive\tnegative\tunknown\tminimum_left_flank\tminimum_right_flank\tannotation_status\tannotation_labels\tstrand_source\tmotif\tsashimi".to_owned(),
     ] {
         if !push_rna_export_line(&mut output, &line) {
             return output;
         }
     }
-    for junction in track.junctions.junctions.iter().filter(|junction| {
-        junction.depth >= track.filters.minimum_junction_depth
-            && junction.start < viewport.end()
-            && junction.end > viewport.start()
-    }) {
-        let strand = match (
-            junction.positive_depth > 0,
-            junction.negative_depth > 0,
-            junction.unknown_depth > 0,
-        ) {
-            (true, false, false) => "+",
-            (false, true, false) => "-",
-            _ => ".",
+    // Weak junctions are hidden from the lane, not from the export.
+    let built;
+    let presentation = if let Some(presentation) = track.presentation.as_deref() {
+        presentation
+    } else {
+        built = rgv_model::SashimiPresentationTable::build(
+            &track.junctions.junctions,
+            |_, _| rgv_model::SpliceMotif::Unavailable,
+            &crate::workspace::alignment_management::sashimi_presentation::sashimi_presentation_options(
+                &track.filters,
+                None,
+                None,
+            ),
+        );
+        &built
+    };
+    for junction in track
+        .junctions
+        .junctions
+        .iter()
+        .filter(|junction| junction.start < viewport.end() && junction.end > viewport.start())
+    {
+        let resolved = presentation.resolve(junction);
+        let strand = match resolved.strand {
+            rgv_model::JunctionStrand::Positive => "+",
+            rgv_model::JunctionStrand::Negative => "-",
+            rgv_model::JunctionStrand::Unknown => ".",
+        };
+        let shown = if resolved.filtered {
+            "filtered"
+        } else if resolved.weak {
+            "weak"
+        } else {
+            "shown"
         };
         let annotation = match annotations.status(junction.start, junction.end) {
             JunctionAnnotationStatus::Annotated => "annotated",
@@ -276,7 +304,7 @@ pub(crate) fn junction_bed_export(
             JunctionAnnotationStatus::Unknown => "unknown",
         };
         let line = format!(
-            "{}\t{}\t{}\tjunction_{}_{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\tjunction_{}_{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             tsv_cell(contig),
             junction.start,
             junction.end,
@@ -292,6 +320,9 @@ pub(crate) fn junction_bed_export(
             junction.minimum_right_flank,
             annotation,
             tsv_cell(&annotations.labels(junction.start, junction.end).join(",")),
+            resolved.source.label(),
+            resolved.motif.transcript_label(),
+            shown,
         );
         if !push_rna_export_line(&mut output, &line) {
             break;
@@ -335,6 +366,10 @@ pub(crate) fn sashimi_export_display(bundle: &SashimiExportBundle) -> (DisplayLi
             top: top + 24.0,
             height: lane_height,
             minimum_depth: track.filters.minimum_junction_depth,
+            relative_threshold_percent: track.filters.junction_relative_threshold_percent,
+            show_all: track.filters.show_all_junctions,
+            library: track.filters.junction_library_strandedness,
+            label_mode: track.filters.sashimi_label_mode,
             display_mode: track.filters.junction_display_mode,
             scale_maximum: match track.filters.sashimi_scale_mode {
                 SashimiScaleMode::Automatic => None,
@@ -349,11 +384,12 @@ pub(crate) fn sashimi_export_display(bundle: &SashimiExportBundle) -> (DisplayLi
             count_mode: track.filters.sashimi_count_mode,
             show_labels: track.filters.show_junction_labels,
         };
-        let layout = layout_sashimi(
+        let layout = layout_sashimi_with_presentation(
             &track.junctions,
             bundle.viewport,
             options,
             Some(&bundle.annotations.lookup),
+            track.presentation.as_deref(),
         );
         display
             .rectangles

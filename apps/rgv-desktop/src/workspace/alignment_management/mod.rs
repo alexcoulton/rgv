@@ -8,6 +8,7 @@ pub(crate) mod gpu_publication;
 #[cfg(test)]
 mod gpu_publication_retry_tests;
 mod interactions;
+pub(crate) mod sashimi_presentation;
 mod scene_authority;
 mod scene_clip;
 mod scene_frame;

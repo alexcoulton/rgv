@@ -109,6 +109,7 @@ impl Viewer {
                 return;
             }
         };
+        self.refresh_sashimi_presentations(&candidate_epoch.panel_frames);
         let uncovered_vertical_lanes =
             self.uncovered_vertical_candidate_lane_count(&candidate_epoch);
         if uncovered_vertical_lanes > 0 {

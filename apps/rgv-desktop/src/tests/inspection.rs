@@ -270,6 +270,7 @@ fn rna_exports_preserve_filters_annotation_scaling_and_bounds() {
         name: "RNA sample".to_owned(),
         junctions,
         filters,
+        presentation: None,
     };
     let annotations = JunctionAnnotationContext {
         lookup: JunctionAnnotationLookup::new([(200, 300)], 1, true),
@@ -279,7 +280,9 @@ fn rna_exports_preserve_filters_annotation_scaling_and_bounds() {
     let bed = junction_bed_export(&track, "chr1", interval, &annotations);
     assert!(bed.contains("# filters\tminimum_depth=5\tminimum_flank=8"));
     assert!(bed.contains("chr1\t200\t300\tjunction_201_300"));
-    assert!(bed.contains("\tannotated\tGENE1\n"));
+    // Every junction is listed with its drawn strand, strand source, motif and lane state.
+    assert!(bed.contains("\tannotated\tGENE1\ttag\tunavailable\tshown\n"));
+    assert!(bed.contains("chr1\t200\t300\tjunction_201_300\t10\t+\t"));
     assert!(bed.len() <= MAX_RNA_EXPORT_BYTES);
 
     let bundle = SashimiExportBundle {

@@ -656,3 +656,24 @@ fn query_and_presentation_fields_are_told_apart() {
     assert!(applied.changes[0].style_changed() && !applied.changes[0].query_changed());
     assert!(applied.coalesce_key().is_none());
 }
+
+#[test]
+fn sashimi_presentation_fields_ask_for_a_new_presentation_not_a_query() {
+    let before = AlignmentSettings {
+        filters: rgv_core::SessionFilters::default(),
+        maximum_alignments: 1_000,
+    };
+    let mut after = before.clone();
+    after.filters.junction_relative_threshold_percent = 5.0;
+    after.filters.junction_library_strandedness =
+        rgv_core::LibraryStrandedness::FirstOfPairAntisense;
+    let change = super::alignment_settings::AlignmentSettingsChange {
+        track_id: rgv_core::TrackId::new(1),
+        primary: true,
+        fields: super::alignment_settings::changed_alignment_fields(&before, &after),
+        before,
+        after,
+    };
+    assert!(change.sashimi_presentation_changed());
+    assert!(!change.query_changed());
+}

@@ -40,6 +40,7 @@ pub use sashimi_layout::{
     JunctionAnnotationLookup, JunctionAnnotationStatus, JunctionArcComponent,
     MAX_ANNOTATED_JUNCTIONS, MAX_RENDERED_JUNCTION_LABELS, MAX_RENDERED_JUNCTIONS, SashimiLayout,
     SashimiLayoutOptions, SashimiLayoutStats, junction_count_value, layout_sashimi,
+    layout_sashimi_with_presentation,
 };
 pub use track_layout::{
     COPY_NUMBER_HEADER_HEIGHT, CopyNumberLayout, CopyNumberVisibleRow,
