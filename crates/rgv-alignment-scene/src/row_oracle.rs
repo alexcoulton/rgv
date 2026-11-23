@@ -17,6 +17,22 @@ use crate::{
     sampling::{SamplingCandidate, retained_by_sampling, sampling_priority},
 };
 
+/// Minimum number of empty reference bases between consecutive reads (or, viewed as pairs,
+/// templates) packed into one row, as IGV's minimum alignment spacing. Without it a read ending
+/// at base N and the next starting at N abut and read as one alignment. Packing compares the
+/// aligned reference span (`start..end`), the same span every row extent records; soft-clip
+/// ghosts are not part of it.
+///
+/// This is a fixed property of the packing algorithm, not a layout-contract knob: every atlas a
+/// process builds or extends uses it, so it needs no place in the layout fingerprint.
+pub(crate) const READ_ROW_SPACING_BASES: u64 = 3;
+
+/// Whether a row whose last read ends at `row_end` (exclusive) can take a read starting at
+/// `start`. Every packing path (clean build, ordered and layered extension) asks this.
+pub(crate) const fn row_accepts(row_end: u64, start: u64) -> bool {
+    row_end.saturating_add(READ_ROW_SPACING_BASES) <= start
+}
+
 /// Stable semantic identity for a contiguous row group. Dynamic tag values are retained as
 /// immutable strings and are part of the row-atlas allocation, never camera-local UI labels.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -369,7 +385,7 @@ pub(crate) fn extend_row_order(
             let unit = &units[index];
             while active
                 .peek()
-                .is_some_and(|Reverse((end, _, _))| *end <= unit.start)
+                .is_some_and(|Reverse((end, _, _))| row_accepts(*end, unit.start))
             {
                 let Reverse((_, packing, row)) = active.pop().expect("observed reusable row");
                 available.push(Reverse((packing, row)));
@@ -893,7 +909,7 @@ fn pack_groups(
             let unit = &units[unit_index];
             while active
                 .peek()
-                .is_some_and(|Reverse((end, _))| *end <= unit.start)
+                .is_some_and(|Reverse((end, _))| row_accepts(*end, unit.start))
             {
                 let Reverse((_, row)) = active.pop().expect("observed reusable row");
                 available.push(Reverse(row));

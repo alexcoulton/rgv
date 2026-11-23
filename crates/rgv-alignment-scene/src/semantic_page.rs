@@ -356,6 +356,53 @@ pub enum AlignmentGeometryToken {
     /// One soft-clipped base drawn faintly beyond the cut edge at base-level detail. Ghost cells
     /// paint beneath all other read geometry of their row, so a neighbouring read covers them.
     ClipGhost,
+    /// A rectangle drawn on a read (a base or specialist cell, or an aligned block piece) whose
+    /// tip-side edge lies within [`ArrowheadCellToken::MAXIMUM_BASES_FROM_TIP`] whole bases of
+    /// the read's directional tip, so the read's arrowhead may reach it. It is cut by the read's
+    /// one diagonal exactly as the [`Self::DirectionalTerminalLeft`] / `Right` primitives that
+    /// end on the tip are, with the tip that many bases beyond its own tip-side edge.
+    InsideArrowhead(ArrowheadCellToken),
+}
+
+/// Where a [`AlignmentGeometryToken::InsideArrowhead`] rectangle lies relative to its read's
+/// direction arrowhead: which way the read points and how many whole bases separate the
+/// rectangle's tip-side edge from the read's tip. The head is at most
+/// `ARROWHEAD_MAXIMUM_BASES` (ten) bases long at every zoom, so a rectangle ten or more bases
+/// from the tip is never cut and carries no token.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ArrowheadCellToken {
+    points_right: bool,
+    bases_from_tip: u8,
+}
+
+impl ArrowheadCellToken {
+    /// The largest distance a token records: the head never reaches a base this far plus one.
+    pub const MAXIMUM_BASES_FROM_TIP: u8 = 9;
+
+    /// `None` when `bases_from_tip` exceeds [`Self::MAXIMUM_BASES_FROM_TIP`].
+    #[must_use]
+    pub const fn new(points_right: bool, bases_from_tip: u8) -> Option<Self> {
+        if bases_from_tip > Self::MAXIMUM_BASES_FROM_TIP {
+            return None;
+        }
+        Some(Self {
+            points_right,
+            bases_from_tip,
+        })
+    }
+
+    /// The read's tip is its right end (a forward read); otherwise its left end.
+    #[must_use]
+    pub const fn points_right(self) -> bool {
+        self.points_right
+    }
+
+    /// Whole bases from the rectangle's tip-side edge (its end edge when the read points right,
+    /// its start edge otherwise) to the read's tip; zero when the rectangle ends on the tip.
+    #[must_use]
+    pub const fn bases_from_tip(self) -> u8 {
+        self.bases_from_tip
+    }
 }
 
 /// Which clipped boundary a [`AlignmentGeometryToken::ClipEdge`] marks and how it is drawn.
@@ -399,7 +446,8 @@ impl AlignmentGeometryToken {
             Self::Rectangle
             | Self::EventLine
             | Self::DirectionalTerminalLeft
-            | Self::DirectionalTerminalRight => 1,
+            | Self::DirectionalTerminalRight
+            | Self::InsideArrowhead(_) => 1,
         }
     }
 
@@ -1056,6 +1104,7 @@ impl AlignmentSemanticPage {
                 operation: None,
                 body: prepared.body,
             };
+            let first_record_overlay = primitives.len();
             for (draw_order, overlay) in prepared.overlays.into_iter().enumerate() {
                 let first_overlay_primitive = primitives.len();
                 push_span(
@@ -1076,6 +1125,43 @@ impl AlignmentSemanticPage {
                             primitive.geometry = AlignmentGeometryToken::PointMarkerAtEnd;
                         }
                     }
+                }
+            }
+            // Specialist cells near the read's tip are cut by its arrowhead like the base cells
+            // of the read geometry page: the same true terminal, hidden SBX tail included.
+            if primitives.len() > first_record_overlay
+                && presentation.style.show_direction_terminals
+            {
+                let hidden_tail = if matches!(
+                    presentation.style.color_mode,
+                    AlignmentColorMode::Sbx(options)
+                        if options.simplex_tail_mode == SbxSimplexTailMode::Hide
+                ) {
+                    hidden_sbx_tail_bounds(
+                        &selection,
+                        selection_index,
+                        record,
+                        presentation.style.color_mode,
+                    )
+                } else {
+                    None
+                };
+                if let Some((visible_start, visible_end)) =
+                    visible_reference_bounds(record, hidden_tail)
+                {
+                    let reverse = record.flags().is_reverse();
+                    mark_arrowhead_cells(
+                        &mut primitives[first_record_overlay..],
+                        hit.record.handle(),
+                        row_offset,
+                        if reverse {
+                            visible_start
+                        } else {
+                            visible_end.saturating_sub(1)
+                        },
+                        reverse,
+                        tile_start,
+                    );
                 }
             }
         }
@@ -2537,6 +2623,10 @@ fn emit_record_primitives(
 ///
 /// `output` must be the primitives of this one record. Scanning the whole page here made page
 /// construction quadratic in the number of reads.
+///
+/// Every other rectangle of the record whose tip-side edge is within the longest possible head
+/// (a mismatch cell a few bases in, a block piece ending at an insertion or a tile boundary near
+/// the tip) is marked by [`mark_arrowhead_cells`], so the arrow cuts it too.
 fn mark_directional_read_geometry(
     output: &mut [AlignmentSemanticPrimitive],
     handle: AlignmentHandle,
@@ -2546,28 +2636,71 @@ fn mark_directional_read_geometry(
     tile: GenomicInterval,
     tile_start: u64,
 ) {
-    if !tile.contains(terminal) {
-        return;
+    if tile.contains(terminal) {
+        let geometry = if reverse {
+            AlignmentGeometryToken::DirectionalTerminalLeft
+        } else {
+            AlignmentGeometryToken::DirectionalTerminalRight
+        };
+        let offset = terminal - tile_start;
+        for primitive in output.iter_mut().filter(|primitive| {
+            primitive.handle == handle
+                && primitive.row_offset == row_offset
+                && primitive.contains_offset(offset)
+                && matches!(
+                    primitive.component,
+                    AlignmentComponent::ReadSpan
+                        | AlignmentComponent::AlignedSegment { .. }
+                        | AlignmentComponent::Base { .. }
+                        | AlignmentComponent::DirectionTerminal
+                )
+        }) {
+            primitive.geometry = geometry;
+        }
     }
-    let geometry = if reverse {
-        AlignmentGeometryToken::DirectionalTerminalLeft
+    mark_arrowhead_cells(output, handle, row_offset, terminal, reverse, tile_start);
+}
+
+/// Marks every plain rectangle of one record (`output` holds only its primitives) whose
+/// tip-side edge is at most [`ArrowheadCellToken::MAXIMUM_BASES_FROM_TIP`] bases from the read's
+/// tip as [`AlignmentGeometryToken::InsideArrowhead`]: base, mismatch, modification, bisulfite,
+/// kinetics, SBX and other specialist cells, and aligned block pieces that end short of the tip.
+/// `terminal` is the read's true terminal base (see [`mark_directional_read_geometry`]); the
+/// tip is that base's end edge when the read points right, its start edge otherwise. Rectangles
+/// reaching past the tip (a cell of a hidden SBX tail) are beyond the arrow and stay as they
+/// are, as do boundary marks, event lines and labels.
+fn mark_arrowhead_cells(
+    output: &mut [AlignmentSemanticPrimitive],
+    handle: AlignmentHandle,
+    row_offset: u32,
+    terminal: u64,
+    reverse: bool,
+    tile_start: u64,
+) {
+    let tip = if reverse {
+        terminal
     } else {
-        AlignmentGeometryToken::DirectionalTerminalRight
+        terminal.saturating_add(1)
     };
-    let offset = terminal - tile_start;
     for primitive in output.iter_mut().filter(|primitive| {
         primitive.handle == handle
             && primitive.row_offset == row_offset
-            && primitive.contains_offset(offset)
-            && matches!(
-                primitive.component,
-                AlignmentComponent::ReadSpan
-                    | AlignmentComponent::AlignedSegment { .. }
-                    | AlignmentComponent::Base { .. }
-                    | AlignmentComponent::DirectionTerminal
-            )
+            && primitive.geometry == AlignmentGeometryToken::Rectangle
+            && !matches!(primitive.component, AlignmentComponent::Label { .. })
     }) {
-        primitive.geometry = geometry;
+        let bases_from_tip = if reverse {
+            tile_start
+                .saturating_add(primitive.start_offset)
+                .checked_sub(tip)
+        } else {
+            tip.checked_sub(tile_start.saturating_add(primitive.end_offset))
+        };
+        if let Some(token) = bases_from_tip
+            .and_then(|bases| u8::try_from(bases).ok())
+            .and_then(|bases| ArrowheadCellToken::new(!reverse, bases))
+        {
+            primitive.geometry = AlignmentGeometryToken::InsideArrowhead(token);
+        }
     }
 }
 
@@ -6106,8 +6239,8 @@ mod tests {
             ),
         ];
         // Mismatch cells only (the default), so the terminal base's cell is the only one at the
-        // tip. (A mismatch cell a few bases short of the tip, inside the head when zoomed out,
-        // is not cut by the arrow: its instance does not know where the tip is.)
+        // tip. (Cells a few bases short of it are covered by
+        // `cells_short_of_a_read_tip_are_cut_by_its_arrowhead_at_every_zoom`.)
         let scene = scene_for_records(
             &ledger,
             &records,
@@ -6257,6 +6390,274 @@ mod tests {
                         .unwrap()
                         .expect("the arrow tip picks its read");
                 assert_eq!(inside.handle, handle_of(ordinal), "{context}");
+            }
+        }
+    }
+
+    /// The reported defect: zoomed out (about 3.7 points per base), mismatch cells a few bases
+    /// short of a read's tip were drawn full height inside its arrowhead, poking out of the
+    /// cut-away corners, because only primitives ending on the tip knew where it was. Every
+    /// rectangle whose tip-side edge is within nine bases of the tip now records that distance
+    /// and is cut by the read's one diagonal: mismatch cells 1, 3 and 9 bases in, a block piece
+    /// after an insertion near the tip and a block piece ending on a tile boundary near it. At
+    /// every zoom nothing of the read lies outside its arrow outline, cells beyond the head are
+    /// whole, a cell 12 bases in is a plain rectangle, and picking in a cut corner misses.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cells_short_of_a_read_tip_are_cut_by_its_arrowhead_at_every_zoom() {
+        // (record, tip, points right, mismatch positions and their distance from the tip)
+        type TipCase = (usize, u64, bool, &'static [(u64, u64)]);
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let mut forward_bases = vec![b'A'; 60];
+        // Forward [100, 160), tip 160: mismatches 1, 3, 9 and 12 bases from the tip.
+        for index in [58, 56, 50, 47] {
+            forward_bases[index] = b'C';
+        }
+        // Reverse `3M 2I 55M` over [120, 180), tip 120: mismatches at 121, 123, 129 and 132
+        // (read indices skip the two inserted bases after the first three).
+        let mut reverse_bases = vec![b'A'; 60];
+        for index in [1, 5, 11, 14] {
+            reverse_bases[index] = b'G';
+        }
+        // Forward [190, 205), tip 205 on the next tile: mismatches 2 (on the tip's tile) and 7
+        // (on the previous tile, whose block piece ends 5 bases short of the tip).
+        let mut crossing_bases = vec![b'A'; 15];
+        crossing_bases[12] = b'T';
+        crossing_bases[7] = b'T';
+        let records = [
+            record(
+                b"forward",
+                100,
+                160,
+                &[(CigarOpKind::Match, 60)],
+                &forward_bases,
+            ),
+            with_flags(
+                record(
+                    b"reverse",
+                    120,
+                    180,
+                    &[
+                        (CigarOpKind::Match, 3),
+                        (CigarOpKind::Insertion, 2),
+                        (CigarOpKind::Match, 55),
+                    ],
+                    &reverse_bases,
+                ),
+                0x10,
+            ),
+            record(
+                b"crossing",
+                190,
+                205,
+                &[(CigarOpKind::Match, 15)],
+                &crossing_bases,
+            ),
+        ];
+        let scene = scene_for_records(
+            &ledger,
+            &records,
+            GeometryLod::Base,
+            crate::AlignmentStyleContract {
+                base_display: ReadBaseDisplayMode::Mismatches,
+                ..crate::AlignmentStyleContract::default()
+            },
+        );
+        let reads: [TipCase; 3] = [
+            (0, 160, true, &[(158, 1), (156, 3), (150, 9), (147, 12)]),
+            (1, 120, false, &[(121, 1), (123, 3), (129, 9), (132, 12)]),
+            (2, 205, true, &[(202, 2), (197, 7)]),
+        ];
+
+        // The semantic geometry: every mismatch within nine bases records its distance; the
+        // one twelve bases in is a plain rectangle; so are the block pieces short of the tip.
+        for (ordinal, tip, points_right, mismatches) in reads {
+            let mut seen = 0;
+            for page in scene.pages() {
+                for primitive in page
+                    .primitives()
+                    .iter()
+                    .filter(|primitive| primitive.handle == handle_of(ordinal))
+                {
+                    let start = page.interval().start() + primitive.start_offset;
+                    let end = page.interval().start() + primitive.end_offset;
+                    let expected = |bases: u64| {
+                        if bases <= 9 {
+                            AlignmentGeometryToken::InsideArrowhead(
+                                ArrowheadCellToken::new(points_right, bases as u8).unwrap(),
+                            )
+                        } else {
+                            AlignmentGeometryToken::Rectangle
+                        }
+                    };
+                    match primitive.component {
+                        AlignmentComponent::Base { .. } => {
+                            let bases = mismatches
+                                .iter()
+                                .find(|(position, _)| *position == start)
+                                .expect("only the fixture's mismatches are drawn")
+                                .1;
+                            assert_eq!(primitive.geometry, expected(bases), "{ordinal} at {start}");
+                            seen += 1;
+                        }
+                        AlignmentComponent::AlignedSegment { .. }
+                            if (points_right && end < tip) || (!points_right && start > tip) =>
+                        {
+                            let bases = if points_right { tip - end } else { start - tip };
+                            assert_eq!(primitive.geometry, expected(bases), "{ordinal} block");
+                            seen += 1;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // The mismatches, plus the block after the insertion or before the tile boundary.
+            let pieces = usize::from(ordinal != 0);
+            assert_eq!(seen, mismatches.len() + pieces, "record {ordinal}");
+        }
+
+        let track = rgv_core::TrackId::new(3);
+        for (ordinal, tip_position, points_right, mismatches) in reads {
+            for points_per_base in [0.6_f64, 2.0, 3.7, 4.0, 10.0] {
+                // At least forty points, and every mismatch, either side of the tip.
+                let span = ((40.0 / points_per_base).ceil() as u64).max(15);
+                let width = 2.0 * span as f64 * points_per_base;
+                let camera = clip_camera(tip_position - span, tip_position + span, width);
+                let frame = crate::CpuAlignmentProjector::project(&scene, 0, camera).unwrap();
+                let context = format!("record {ordinal} at {points_per_base} points per base");
+                let read = frame
+                    .primitives
+                    .iter()
+                    .filter(|primitive| {
+                        primitive.handle == handle_of(ordinal)
+                            && primitive.shape != crate::CpuPrimitiveShape::TextLabel
+                    })
+                    .collect::<Vec<_>>();
+                // One arrow for the whole read, whichever primitive carries it.
+                let arrow = read
+                    .iter()
+                    .find_map(|primitive| primitive.arrow)
+                    .expect("the read has an arrow");
+                assert!(
+                    read.iter()
+                        .all(|primitive| primitive.arrow.is_none_or(|found| found == arrow)),
+                    "{context}"
+                );
+                let tip_x = pane_x(camera, tip_position);
+                assert!((arrow.tip_x - tip_x).abs() < 1.0e-9, "{context}");
+                // Written out independently: min(0.55 x 11, 10 bases) long (0.5 points at
+                // least), covering |y - centre| <= 5.5 x min(d / head, 1).
+                let head = (11.0_f64 * 0.55).min(10.0 * points_per_base);
+                assert!(head >= 0.5);
+                let (centre, half) = (arrow.centre_y, 5.5);
+                let into_read = |x: f64| if points_right { tip_x - x } else { x - tip_x };
+                let inside_outline = |x: f64, y: f64| {
+                    let distance = into_read(x);
+                    distance > 0.0
+                        && (y - centre).abs() < half
+                        && (y - centre).abs() <= half * (distance / head).min(1.0)
+                };
+                // The whole read near its tip is exactly the arrow outline: no cell or block
+                // piece pokes out of a cut-away corner. (The insertion's marker is a boundary
+                // mark drawn over the read, not part of its outline.)
+                for column in 0..600 {
+                    let x = tip_x - 1.5 * head + f64::from(column) * 0.0503 + 0.0011;
+                    for row in 0..300 {
+                        let y = centre - half - 1.0 + f64::from(row) * 0.0437 + 0.0007;
+                        let covered = read.iter().any(|primitive| {
+                            !primitive.geometry.is_boundary_mark() && primitive.contains(x, y)
+                        });
+                        assert_eq!(
+                            covered,
+                            inside_outline(x, y),
+                            "{context}: ({x}, {y}) is {} from the tip",
+                            into_read(x)
+                        );
+                    }
+                }
+                let cells = read
+                    .iter()
+                    .filter(|primitive| {
+                        matches!(primitive.component, AlignmentComponent::Base { .. })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(cells.len(), mismatches.len(), "{context}");
+                for cell in cells {
+                    let bases = match cell.geometry {
+                        AlignmentGeometryToken::InsideArrowhead(token) => {
+                            assert_eq!(token.points_right(), points_right);
+                            assert_eq!(cell.arrow, Some(arrow), "{context}");
+                            u64::from(token.bases_from_tip())
+                        }
+                        geometry => {
+                            assert_eq!(geometry, AlignmentGeometryToken::Rectangle);
+                            assert_eq!(cell.arrow, None, "{context}");
+                            12
+                        }
+                    };
+                    assert!(mismatches.iter().any(|(_, distance)| *distance == bases));
+                    // An arrow-cut cell keeps its tip-side edge `bases` whole bases from the tip
+                    // (its one-point minimum grows away from the tip); a plain cell keeps its
+                    // start edge, as every rectangle does.
+                    let (edge, expected) = if cell.arrow.is_none() {
+                        let start = if points_right {
+                            tip_position - bases - 1
+                        } else {
+                            tip_position + bases
+                        };
+                        (cell.x, pane_x(camera, start))
+                    } else if points_right {
+                        (cell.x + cell.width, tip_x - bases as f64 * points_per_base)
+                    } else {
+                        (cell.x, tip_x + bases as f64 * points_per_base)
+                    };
+                    assert!((edge - expected).abs() < 1.0e-9, "{context}: {cell:?}");
+                    // Every covered point of the cell is inside the outline, and the cell is
+                    // whole beyond the head.
+                    for step_x in 0..40 {
+                        let x = cell.x + cell.width * (f64::from(step_x) + 0.5) / 40.0;
+                        for step_y in 0..60 {
+                            let y = cell.y + cell.height * (f64::from(step_y) + 0.5) / 60.0;
+                            let covered = cell.contains(x, y);
+                            if covered {
+                                assert!(inside_outline(x, y), "{context}: {cell:?} at ({x}, {y})");
+                            }
+                            if into_read(x) >= head {
+                                assert!(covered, "{context}: {cell:?} cut at ({x}, {y})");
+                            }
+                        }
+                    }
+                    // Within the head, a cut corner above the cell picks nothing of the read,
+                    // while the centre line picks the cell itself.
+                    let cell_centre = cell.x + cell.width * 0.5;
+                    let allowed = half * (into_read(cell_centre) / head).min(1.0);
+                    if allowed + 0.3 < half {
+                        let corner = crate::CpuAlignmentProjector::pick(
+                            &scene,
+                            track,
+                            &frame,
+                            cell_centre,
+                            centre - allowed - 0.3,
+                        )
+                        .unwrap();
+                        assert!(
+                            corner.is_none_or(|hit| hit.handle != handle_of(ordinal)),
+                            "{context}: picked {corner:?} in the cut-away corner"
+                        );
+                    }
+                    if cell.width >= 0.5 {
+                        let hit = crate::CpuAlignmentProjector::pick(
+                            &scene,
+                            track,
+                            &frame,
+                            cell_centre,
+                            centre,
+                        )
+                        .unwrap()
+                        .expect("the cell's centre picks it");
+                        assert_eq!(hit.component, cell.component, "{context}");
+                    }
+                }
             }
         }
     }
@@ -6683,8 +7084,9 @@ mod tests {
                 &[(CigarOpKind::Match, 10), (CigarOpKind::SoftClip, 5)],
                 b"AAAAAAAAAACGTCG",
             ),
-            // B: [112, 122), packed into A's row; it covers A's ghosts at 112..115.
-            record(b"b", 112, 122, &[(CigarOpKind::Match, 10)], b"AAAAAAAAAA"),
+            // B: [113, 123), packed into A's row (three bases after A, the minimum spacing of
+            // reads in a row); it covers A's ghosts at 113..115.
+            record(b"b", 113, 123, &[(CigarOpKind::Match, 10)], b"AAAAAAAAAA"),
             // C: [200, 210) with five trailing clipped bases (ghosts 210..215) and D: [217, 227)
             // with four leading ones (ghosts 213..217): the two reads' ghosts share 213 and 214.
             record(
@@ -6720,7 +7122,7 @@ mod tests {
             [
                 (110, false),
                 (111, false),
-                (112, true),
+                (112, false),
                 (113, true),
                 (114, true)
             ]
@@ -6734,7 +7136,7 @@ mod tests {
             .iter()
             .find(|page| {
                 page.key().family() == AlignmentPageFamily::ReadGeometry
-                    && page.interval().contains(112)
+                    && page.interval().contains(113)
             })
             .unwrap();
         let local_row = row - page.row_range().start;
@@ -6818,7 +7220,7 @@ mod tests {
             .map(|position| position.round() as u64)
             .collect::<Vec<_>>();
         lettered.sort_unstable();
-        assert_eq!(lettered, [110, 111, 210, 211, 212, 215, 216]);
+        assert_eq!(lettered, [110, 111, 112, 210, 211, 212, 215, 216]);
     }
 
     fn event_labels(

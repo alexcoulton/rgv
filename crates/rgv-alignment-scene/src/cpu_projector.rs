@@ -218,8 +218,10 @@ pub struct CpuProjectedPrimitive {
     /// Canonical atlas row. This remains stable while the row camera moves.
     pub row: u32,
     /// The read's direction arrowhead that cuts this primitive, for the direction-terminal
-    /// shapes: described in unclipped pane coordinates, so a primitive clipped by the pane keeps
-    /// the read's own tip and diagonal rather than growing a point at the pane edge.
+    /// shapes and the cells and block pieces within a head's reach of the tip
+    /// ([`AlignmentGeometryToken::InsideArrowhead`]): described in unclipped pane coordinates,
+    /// so a primitive clipped by the pane keeps the read's own tip and diagonal rather than
+    /// growing a point at the pane edge.
     pub arrow: Option<CpuArrowhead>,
 }
 
@@ -237,7 +239,9 @@ impl CpuProjectedPrimitive {
 /// in `rgv-render`'s `alignment_scene.wgsl`; keep in lockstep). Every primitive at the tip (the
 /// aligned block, the one-base direction terminal and, at base detail, the base cell) ends on
 /// the read's tip and is cut by this same diagonal, so the read's outline is one point at every
-/// zoom: a primitive narrower than the head is trimmed, never re-pointed at its own scale.
+/// zoom: a primitive narrower than the head is trimmed, never re-pointed at its own scale. Cells
+/// and block pieces a few bases short of the tip carry the same arrow, so nothing of the read
+/// pokes out of the cut-away corners.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CpuArrowhead {
     /// Pane x of the read's tip: its right end when `points_right`, else its left end.
@@ -1092,8 +1096,10 @@ fn project_primitive(
         }
         AlignmentGeometryToken::DirectionalTerminalLeft => {
             (x, width) = directional_extent(x, x + width, false);
+            // Every primitive cut by one read's arrow derives the tip from the same genomic
+            // position, so they all carry the identical arrow.
             arrow = Some(CpuArrowhead {
-                tip_x: x,
+                tip_x: camera.x_for_position(genomic_start),
                 centre_y: row_top + body_height * 0.5,
                 height: body_height,
                 points_per_base,
@@ -1108,7 +1114,7 @@ fn project_primitive(
         AlignmentGeometryToken::DirectionalTerminalRight => {
             (x, width) = directional_extent(x, x + width, true);
             arrow = Some(CpuArrowhead {
-                tip_x: x + width,
+                tip_x: camera.x_for_position(genomic_end),
                 centre_y: row_top + body_height * 0.5,
                 height: body_height,
                 points_per_base,
@@ -1120,18 +1126,28 @@ fn project_primitive(
                 body_height,
             )
         }
+        AlignmentGeometryToken::InsideArrowhead(token) => {
+            // A cell (or block piece) short of the tip: its own shape, cut by the read's arrow
+            // whose tip is `bases_from_tip` bases beyond its tip-side edge. Like the terminal
+            // shapes its one-point minimum grows away from the tip, so that edge stays put.
+            (x, width) = directional_extent(x, x + width, token.points_right());
+            let bases = u64::from(token.bases_from_tip());
+            arrow = Some(CpuArrowhead {
+                tip_x: camera.x_for_position(if token.points_right() {
+                    genomic_end.saturating_add(bases)
+                } else {
+                    genomic_start.saturating_sub(bases)
+                }),
+                centre_y: row_top + body_height * 0.5,
+                height: body_height,
+                points_per_base,
+                points_right: token.points_right(),
+            });
+            (rectangle_shape(primitive.component), row_top, body_height)
+        }
         AlignmentGeometryToken::Rectangle => {
             width = width.max(MINIMUM_PRIMITIVE_EXTENT);
-            let shape = match primitive.component {
-                AlignmentComponent::Label { .. } => CpuPrimitiveShape::TextLabel,
-                AlignmentComponent::Base { .. }
-                | AlignmentComponent::ModifiedBase { .. }
-                | AlignmentComponent::BisulfiteBase { .. }
-                | AlignmentComponent::SmrtKinetics { .. }
-                | AlignmentComponent::SbxTailBase { .. } => CpuPrimitiveShape::BaseCell,
-                _ => CpuPrimitiveShape::ReadBody,
-            };
-            (shape, row_top, body_height)
+            (rectangle_shape(primitive.component), row_top, body_height)
         }
     };
     let clip_right = camera.clip.x + camera.clip.width;
@@ -1158,6 +1174,20 @@ fn project_primitive(
         row: global_row,
         arrow,
     })
+}
+
+/// The shape of a plain rectangle (or one cut by its read's arrow, see
+/// [`AlignmentGeometryToken::InsideArrowhead`]) of `component`.
+const fn rectangle_shape(component: AlignmentComponent) -> CpuPrimitiveShape {
+    match component {
+        AlignmentComponent::Label { .. } => CpuPrimitiveShape::TextLabel,
+        AlignmentComponent::Base { .. }
+        | AlignmentComponent::ModifiedBase { .. }
+        | AlignmentComponent::BisulfiteBase { .. }
+        | AlignmentComponent::SmrtKinetics { .. }
+        | AlignmentComponent::SbxTailBase { .. } => CpuPrimitiveShape::BaseCell,
+        _ => CpuPrimitiveShape::ReadBody,
+    }
 }
 
 fn merge_label_fragments(existing: &mut CpuProjectedPrimitive, fragment: &CpuProjectedPrimitive) {
@@ -1394,7 +1424,7 @@ mod tests {
         AlignmentBodyColorToken, AlignmentSourceRevision, RevisionFingerprint, SourceFingerprint,
     };
 
-    const GEOMETRIES: [AlignmentGeometryToken; 9] = [
+    const GEOMETRIES: [AlignmentGeometryToken; 11] = [
         AlignmentGeometryToken::Rectangle,
         AlignmentGeometryToken::EventLine,
         AlignmentGeometryToken::PointMarker,
@@ -1412,6 +1442,8 @@ mod tests {
             behind_arrow: false,
         }),
         AlignmentGeometryToken::ClipGhost,
+        AlignmentGeometryToken::InsideArrowhead(crate::ArrowheadCellToken::new(true, 9).unwrap()),
+        AlignmentGeometryToken::InsideArrowhead(crate::ArrowheadCellToken::new(false, 1).unwrap()),
     ];
 
     fn primitive(

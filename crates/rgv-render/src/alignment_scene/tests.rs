@@ -664,6 +664,77 @@ fn instances_are_sixteen_bytes_and_out_of_range_fields_are_refused_at_pack_time(
     ));
 }
 
+/// A cell or block piece short of its read's tip packs as a direction-terminal shape whose
+/// distance from the tip (zero to nine bases) rides in the free top bits of the start and length
+/// words: every distance round-trips at the largest offsets and rows, beside a mapping-quality
+/// ramp and an inline colour whose parameter words are left untouched, and a distance the
+/// instance cannot carry is refused.
+#[test]
+fn arrow_cut_cells_carry_their_distance_from_the_tip_in_spare_span_bits() {
+    let mut semantic = primitive(AlignmentComponent::ReadSpan);
+    for body in [
+        AlignmentBodyColorToken::MappingQuality(Some(37)),
+        AlignmentBodyColorToken::Category(Some(ContractFingerprint::new(99))),
+    ] {
+        semantic.style.body = body;
+        let colour = color_for(semantic);
+        for points_right in [false, true] {
+            for bases in 0..=rgv_alignment_scene::ArrowheadCellToken::MAXIMUM_BASES_FROM_TIP {
+                for (start, end) in [
+                    (0, 1),
+                    (
+                        MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET - 1,
+                        MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET,
+                    ),
+                    (0, MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET),
+                ] {
+                    semantic.start_offset = start;
+                    semantic.end_offset = end;
+                    semantic.row_offset = MAXIMUM_ALIGNMENT_GPU_PAGE_ROWS - 1;
+                    semantic.geometry = AlignmentGeometryToken::InsideArrowhead(
+                        rgv_alignment_scene::ArrowheadCellToken::new(points_right, bases).unwrap(),
+                    );
+                    let instance = pack_primitive(semantic).unwrap().unwrap();
+                    assert_eq!(instance.start_offset(), start);
+                    assert_eq!(instance.end_offset(), end);
+                    assert_eq!(instance.row_offset(), MAXIMUM_ALIGNMENT_GPU_PAGE_ROWS - 1);
+                    assert_eq!(instance.bases_from_tip(), u32::from(bases));
+                    assert_eq!(
+                        instance.shape(),
+                        if points_right {
+                            AlignmentGpuShape::DirectionTerminalRight
+                        } else {
+                            AlignmentGpuShape::DirectionTerminalLeft
+                        } as u32
+                    );
+                    assert_eq!(instance.palette_color(), colour);
+                }
+            }
+        }
+    }
+    assert!(rgv_alignment_scene::ArrowheadCellToken::new(true, 10).is_none());
+    // Every other geometry is zero bases from the tip.
+    semantic.geometry = AlignmentGeometryToken::Rectangle;
+    assert_eq!(
+        pack_primitive(semantic).unwrap().unwrap().bases_from_tip(),
+        0
+    );
+    assert!(matches!(
+        AlignmentGpuInstance::new(
+            0,
+            1,
+            0,
+            AlignmentGpuShape::DirectionTerminalLeft,
+            color_for(semantic),
+            MAXIMUM_ALIGNMENT_GPU_TIP_BASES + 1,
+        ),
+        Err(AlignmentGpuPageAdmissionError::TipDistanceOutOfRange {
+            bases_from_tip: 16,
+            limit: 15,
+        })
+    ));
+}
+
 #[test]
 fn semantic_component_families_map_to_stable_gpu_shapes_without_labels() {
     assert_eq!(

@@ -22,6 +22,7 @@ use crate::{
     fingerprint::StableHasher,
     row_oracle::{
         AlignmentRowGroup, OracleRowExtent, RowOracleError, build_row_oracle, extend_row_order,
+        row_accepts,
     },
     sampling::{
         SamplingCandidate, retained_by_sampling, sampling_priority, sampling_window,
@@ -2024,7 +2025,7 @@ fn assign_extension_rows(
             validate_record(*record)?;
             while active_by_end
                 .peek()
-                .is_some_and(|Reverse((end, _))| *end <= record.start)
+                .is_some_and(|Reverse((end, _))| row_accepts(*end, record.start))
             {
                 let Reverse((_, row)) = active_by_end
                     .pop()
@@ -2034,7 +2035,9 @@ fn assign_extension_rows(
             let mut blocked = Vec::new();
             let mut compatible = None;
             while let Some(Reverse(row)) = available_rows.pop() {
-                if incumbent_minimum_starts[row as usize] >= record.end {
+                // The new read lies left of the row's first incumbent read: the same spacing
+                // applies with the roles of the two reads swapped.
+                if row_accepts(record.end, incumbent_minimum_starts[row as usize]) {
                     compatible = Some(row);
                     break;
                 }
@@ -2076,7 +2079,7 @@ fn assign_extension_rows(
             validate_record(*record)?;
             while active_by_end
                 .peek()
-                .is_some_and(|Reverse((end, _))| *end <= record.start)
+                .is_some_and(|Reverse((end, _))| row_accepts(*end, record.start))
             {
                 let Reverse((_, row)) = active_by_end
                     .pop()
@@ -3501,5 +3504,159 @@ mod tests {
         // Two places remain in the window; two of the four novel reads take them.
         assert_eq!(roomy_extended.record_count, 12);
         assert_eq!(roomy_extended.downsampled_read_counts(), Some((12, 14)));
+    }
+
+    /// Layouts covering every packing path: the layered default order under both stackings, an
+    /// ordered (sorted) layout, a grouped layout and view-as-pairs.
+    fn spacing_layouts() -> [LayoutContract; 5] {
+        [
+            contract(ReadStackingMode::Compact),
+            contract(ReadStackingMode::Stable),
+            LayoutContract {
+                sorting: AlignmentSortMode::MappingQuality,
+                ..contract(ReadStackingMode::Compact)
+            },
+            LayoutContract {
+                grouping: AlignmentGroupMode::Strand,
+                sort_order: AlignmentOrderDirection::Reverse,
+                ..contract(ReadStackingMode::Compact)
+            },
+            LayoutContract {
+                view_as_pairs: true,
+                ..contract(ReadStackingMode::Compact)
+            },
+        ]
+    }
+
+    /// Rows of `left` (10..20) and `right` (starting `gap` bases after `left` ends).
+    fn spaced_pair_rows(atlas: &AlignmentRowAtlas, evidence: &Arc<EvidenceRoot>) -> (u32, u32) {
+        let interval = atlas.interval();
+        let selection = evidence.select(interval).unwrap();
+        let mut rows = selection
+            .records()
+            .iter()
+            .map(|reference| {
+                let hit = atlas.record(reference.handle).unwrap().record;
+                (hit.start(), hit.row())
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        assert_eq!(rows.len(), 2);
+        (rows[0].1, rows[1].1)
+    }
+
+    #[test]
+    fn reads_closer_than_the_minimum_spacing_never_share_a_row() {
+        assert_eq!(crate::row_oracle::READ_ROW_SPACING_BASES, 3);
+        for layout in spacing_layouts() {
+            for gap in 0..6_u64 {
+                let ledger = AllocationLedger::new(8 << 20, 0);
+                let chunk = evidence_chunk(
+                    &ledger,
+                    &[(b"left", 10, 20, 1), (b"right", 20 + gap, 30 + gap, 2)],
+                );
+                let interval = GenomicInterval::new(ContigId::new(0), 0, 80).unwrap();
+                let evidence = evidence_root(&ledger, chunk, interval, 10);
+                let atlas = AlignmentRowAtlas::build(
+                    revision(20),
+                    &evidence,
+                    interval,
+                    layout,
+                    &ledger,
+                    ReservationKind::Normal,
+                    20,
+                )
+                .unwrap();
+                let (left, right) = spaced_pair_rows(&atlas, &evidence);
+                let shared = gap >= crate::row_oracle::READ_ROW_SPACING_BASES;
+                assert_eq!(left == right, shared, "gap {gap} {layout:?}");
+                assert_eq!(atlas.row_count(), if shared { 1 } else { 2 });
+            }
+        }
+    }
+
+    #[test]
+    fn extension_applies_the_minimum_spacing_across_the_seam_like_a_clean_build() {
+        for layout in spacing_layouts() {
+            for gap in 0..6_u64 {
+                let shared = gap >= crate::row_oracle::READ_ROW_SPACING_BASES;
+                let ledger = AllocationLedger::new(8 << 20, 0);
+                let chunk = evidence_chunk(
+                    &ledger,
+                    &[(b"left", 10, 20, 1), (b"right", 20 + gap, 30 + gap, 2)],
+                );
+                let wide_interval = GenomicInterval::new(ContigId::new(0), 0, 80).unwrap();
+                let wide = evidence_root(&ledger, Arc::clone(&chunk), wide_interval, 11);
+                let clean = AlignmentRowAtlas::build(
+                    revision(30),
+                    &wide,
+                    wide_interval,
+                    layout,
+                    &ledger,
+                    ReservationKind::Normal,
+                    30,
+                )
+                .unwrap();
+                let clean_rows = spaced_pair_rows(&clean, &wide);
+
+                // Rightwards: the incumbent holds `left`; `right` arrives in the new strip.
+                let narrow_interval = GenomicInterval::new(ContigId::new(0), 0, 20).unwrap();
+                let narrow = evidence_root(&ledger, Arc::clone(&chunk), narrow_interval, 10);
+                let incumbent = AlignmentRowAtlas::build(
+                    revision(20),
+                    &narrow,
+                    narrow_interval,
+                    layout,
+                    &ledger,
+                    ReservationKind::Normal,
+                    20,
+                )
+                .unwrap();
+                let extended = incumbent
+                    .extend(
+                        revision(21),
+                        &wide,
+                        wide_interval,
+                        &ledger,
+                        ReservationKind::Normal,
+                        21,
+                    )
+                    .unwrap();
+                let (left, right) = spaced_pair_rows(&extended, &wide);
+                assert_eq!((left, right), clean_rows, "right gap {gap} {layout:?}");
+                assert_eq!(left == right, shared, "right gap {gap} {layout:?}");
+
+                // Leftwards under stable stacking: the incumbent holds `right` and `left`
+                // arrives against the incumbent row's first read.
+                if layout.stacking == ReadStackingMode::Stable {
+                    let middle_interval =
+                        GenomicInterval::new(ContigId::new(0), 20, 80).unwrap();
+                    let middle = evidence_root(&ledger, Arc::clone(&chunk), middle_interval, 12);
+                    let incumbent = AlignmentRowAtlas::build(
+                        revision(22),
+                        &middle,
+                        middle_interval,
+                        layout,
+                        &ledger,
+                        ReservationKind::Normal,
+                        22,
+                    )
+                    .unwrap();
+                    let extended = incumbent
+                        .extend(
+                            revision(23),
+                            &wide,
+                            wide_interval,
+                            &ledger,
+                            ReservationKind::Normal,
+                            23,
+                        )
+                        .unwrap();
+                    assert_eq!(extended.layer_count(), 2, "left gap {gap}");
+                    let (left, right) = spaced_pair_rows(&extended, &wide);
+                    assert_eq!(left == right, shared, "left gap {gap} {layout:?}");
+                }
+            }
+        }
     }
 }

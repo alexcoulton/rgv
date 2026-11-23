@@ -39,8 +39,10 @@ const BOUNDARY_MARK_HAIRLINE_WIDTH: f32 = 1.0;
 const CLIP_GHOST_MINIMUM_POINTS_PER_BASE: f32 = 7.0;
 
 // One sixteen-byte instance (`AlignmentGpuInstance`):
-//   span.x     whole bases from the page start to the primitive's start
-//   span.y     whole bases covered
+//   span.x     whole bases from the page start to the primitive's start (bits 0..30)
+//   span.y     whole bases covered (bits 0..30)
+//              bits 30..32 of span.x (low) and span.y (high): for shapes 3 and 4, whole bases
+//              from the shape's tip-side edge to its read's tip; see `tip_bases`
 //   packed.x   row offset in the page (bits 0..20) | shape (20..24) | palette index (24..32)
 //   packed.y   colour parameter word; see `palette_color`
 struct VertexInput {
@@ -64,7 +66,17 @@ struct VertexOutput {
     @location(3) @interpolate(flat) shape: u32,
     // The read's arrowhead length, for direction terminals; see `arrowhead_length`.
     @location(4) @interpolate(flat) head: f32,
+    // For direction terminals, the points between the shape's tip-side edge and the read's tip.
+    @location(5) @interpolate(flat) tip_offset: f32,
 };
+
+const SPAN_MASK: u32 = 0x3FFFFFFFu;
+
+// Whole bases from a direction terminal's tip-side edge to its read's tip, carried in the top
+// two bits of `span.x` (low) and `span.y` (high). Mirrored by `AlignmentGpuInstance::bases_from_tip`.
+fn tip_bases(span: vec2<u32>) -> u32 {
+    return (span.x >> 30u) | ((span.y >> 30u) << 2u);
+}
 
 fn camera_points_per_base() -> f32 {
     return camera.points_per_base.x + camera.points_per_base.y;
@@ -120,8 +132,9 @@ fn project_instance(
     let corner = quad_corner(vertex_index);
     let row_offset = packed.x & 0xFFFFFu;
     let shape = (packed.x >> 20u) & 0xFu;
-    var left = project_x(span.x);
-    var right = project_x(span.x + span.y);
+    let start = span.x & SPAN_MASK;
+    var left = project_x(start);
+    var right = project_x(start + (span.y & SPAN_MASK));
     let row = f32(camera.page_row_start + row_offset);
     let row_top = camera.clip_origin.y
         + (row - camera.row_scroll) * camera.row_height
@@ -188,8 +201,9 @@ fn project_instance(
             right = left;
         }
     } else if shape == 3u {
-        // A right-pointing direction terminal keeps its tip on the read's end: its one-point
-        // minimum grows leftwards. Mirrored by `directional_extent` in `rgv-alignment-scene`.
+        // A right-pointing direction terminal keeps its tip-side edge (on the read's end, or
+        // `tip_bases` short of it): its one-point minimum grows leftwards. Mirrored by
+        // `directional_extent` in `rgv-alignment-scene`.
         left = min(left, right - 1.0);
     } else if shape == 14u && points_per_base < CLIP_GHOST_MINIMUM_POINTS_PER_BASE {
         // Ghost cells appear only together with their letters. Mirrored by `clip_ghost_visible`.
@@ -215,6 +229,7 @@ fn project_instance(
     output.size = vec2<f32>(right - left, height);
     output.shape = output_shape;
     output.head = arrowhead_length(height);
+    output.tip_offset = f32(tip_bases(span)) * points_per_base;
     return output;
 }
 
@@ -244,13 +259,16 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
         // The read's one arrowhead. Every primitive at the tip (aligned block, one-base terminal,
         // base cell) ends on the read's tip and is cut by this same diagonal: the head's length
         // depends on the read height only, never on the primitive's own width, so a primitive
-        // narrower than the head is trimmed rather than re-pointed at its own scale. A zero head
-        // (far zoomed out) leaves the read's end square. Mirrored by `arrowhead_covers` in
+        // narrower than the head is trimmed rather than re-pointed at its own scale. A cell or
+        // block piece `tip_bases` short of the tip is cut by the same diagonal, measured from
+        // the read's tip `tip_offset` points beyond its own tip-side edge. A zero head (far
+        // zoomed out) leaves the read's end square. Mirrored by `arrowhead_covers` in
         // `rgv-alignment-scene`.
         var distance_from_tip = input.size.x - input.local_point.x;
         if input.shape == 4u {
             distance_from_tip = input.local_point.x;
         }
+        distance_from_tip = distance_from_tip + input.tip_offset;
         let head_width = input.head;
         if distance_from_tip < head_width {
             let half_height = input.size.y * 0.5;

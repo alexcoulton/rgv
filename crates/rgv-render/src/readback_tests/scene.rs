@@ -176,8 +176,15 @@ fn unclipped_quad(
 }
 
 /// Mirror of `alignment_scene.wgsl`'s fragment stage: direction terminals are cut to an
-/// arrowhead and a soft clip's edge to a zigzag stroke; everything else is solid.
-fn fragment_is_kept(shape: u32, local: [f64; 2], size: [f64; 2], points_per_base: f64) -> bool {
+/// arrowhead and a soft clip's edge to a zigzag stroke; everything else is solid. A direction
+/// terminal's tip-side edge is `bases_from_tip` whole bases short of its read's tip.
+fn fragment_is_kept(
+    shape: u32,
+    local: [f64; 2],
+    size: [f64; 2],
+    points_per_base: f64,
+    bases_from_tip: u32,
+) -> bool {
     if (6..=13).contains(&shape) && (shape - 6) & 2 == 0 {
         // Written out independently of `clip_edge_covers`: a 1.5-point stroke zigzagging
         // between the boundary side and the inner side, round(height / 4) teeth (at least one).
@@ -202,7 +209,7 @@ fn fragment_is_kept(shape: u32, local: [f64; 2], size: [f64; 2], points_per_base
         local[0]
     } else {
         size[0] - local[0]
-    };
+    } + f64::from(bases_from_tip) * points_per_base;
     // The head length depends on the read height and the zoom only, whatever the shape's own
     // width: 0.55 x height, at most ten bases, and no head at all under half a point.
     let head_width = (size[1] * 0.55).min(points_per_base * 10.0);
@@ -287,6 +294,7 @@ fn oracle_with_palette(
             }
             .map(f64::from);
             let shape = instance.shape();
+            let bases_from_tip = instance.bases_from_tip();
             let points_per_base = 1.0 / camera.bases_per_pixel();
             oracle.paint(quad, scissor, |x, y| match quad.classify(x, y) {
                 Some(false) => Shade::Outside,
@@ -297,6 +305,7 @@ fn oracle_with_palette(
                         [x - quad.x, y - quad.y],
                         [quad.width, quad.height],
                         points_per_base,
+                        bases_from_tip,
                     )
                     .then_some(colour)
                 }),
@@ -1072,7 +1081,11 @@ fn ghost_bases_are_not_drawn_until_their_letters_fit_on_the_gpu() {
         .iter()
         .filter(|instance| instance.shape == AlignmentGpuShape::ClipGhostCell as u32)
         .collect::<Vec<_>>();
-    assert_eq!(ghosts.len(), 3, "the page still carries the three ghost cells");
+    assert_eq!(
+        ghosts.len(),
+        3,
+        "the page still carries the three ghost cells"
+    );
     assert!(
         ghosts.iter().all(|ghost| ghost.quad.width <= 0.0),
         "no ghost quad has area below the letter threshold"
@@ -1083,12 +1096,14 @@ fn ghost_bases_are_not_drawn_until_their_letters_fit_on_the_gpu() {
         frame
             .primitives
             .iter()
-            .all(|primitive| primitive.shape != rgv_alignment_scene::CpuPrimitiveShape::ClipGhostCell),
+            .all(|primitive| primitive.shape
+                != rgv_alignment_scene::CpuPrimitiveShape::ClipGhostCell),
         "the CPU projector (picking and export) hides ghost cells too"
     );
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
     use crate::alignment_scene::tests::test_scene_detailed;
     use rgv_alignment_scene::{AlignmentComponent, GeometryLod};
@@ -1096,15 +1111,16 @@ fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
         return;
     };
     let ledger = AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20);
-    // A: `M7 S3` over [10, 17), SEQ ACGTACG|TAC, ghosts at 17, 18, 19. B: [19, 29) in the
-    // same row, on top of A's third ghost.
+    // A: `M5 S5` over [12, 17), SEQ ACGTA|CGTAC, ghosts at 17..22. B: [20, 30) in the same
+    // row (three bases after A, the minimum spacing of reads in a row), on top of A's fourth
+    // and fifth ghosts.
     let reads = [
         TestRead {
-            start: 10,
+            start: 12,
             reverse: false,
-            cigar: cigar(&[(CigarOpKind::Match, 7), (CigarOpKind::SoftClip, 3)]),
+            cigar: cigar(&[(CigarOpKind::Match, 5), (CigarOpKind::SoftClip, 5)]),
         },
-        TestRead::forward(19),
+        TestRead::forward(20),
     ];
     let scene = test_scene_detailed(
         &ledger,
@@ -1138,7 +1154,16 @@ fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
         }
     }
     ghost_rows.sort_unstable();
-    assert_eq!(ghost_rows, [(17, 0, false), (18, 0, false), (19, 0, true)]);
+    assert_eq!(
+        ghost_rows,
+        [
+            (17, 0, false),
+            (18, 0, false),
+            (19, 0, false),
+            (20, 0, true),
+            (21, 0, true)
+        ]
+    );
 
     let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
     let image = render_scene(&gpu, &mut renderer, &scene, camera, &ledger, 1);
@@ -1148,7 +1173,7 @@ fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
             .iter()
             .filter(|instance| instance.shape == AlignmentGpuShape::ClipGhostCell as u32)
             .count(),
-        3
+        5
     );
     oracle.assert_matches(&image, "soft clip ghost bases");
 
@@ -1169,7 +1194,7 @@ fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
             .handle
     };
     let a = body_rgb(&scene, camera, handle_at(15));
-    let b = body_rgb(&scene, camera, handle_at(20));
+    let b = body_rgb(&scene, camera, handle_at(21));
     // The ghost colour over the white target: the read colour moved half way to the ghost
     // slot, at the ghost slot's alpha.
     let tint = AlignmentPalette::light().color(crate::palette::PaletteToken::CLIP_GHOST);
@@ -1180,7 +1205,7 @@ fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
         ((mixed * alpha + (1.0 - alpha)) * 255.0).round() as u8
     });
     let cell_centre = |position: u64| (CLIP.x + 32.0 * (position as f64 - 14.0) + 16.0) as u32;
-    for position in [17, 18] {
+    for position in [17, 18, 19] {
         let pixel = rgb_at(&image, cell_centre(position), 15);
         assert!(
             close(pixel, ghost),
@@ -1189,9 +1214,16 @@ fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
         assert_ne!(pixel, a);
         assert_ne!(pixel, [255, 255, 255]);
     }
-    // Position 19 holds A's third ghost, but B (whose first base matches the reference) is
-    // drawn over it in B's own colour.
-    assert_eq!(rgb_at(&image, cell_centre(19), 15), b);
+    // Positions 20 and 21 hold A's fourth and fifth ghosts, but B is drawn over them: its
+    // first base matches the reference, so 20 is B's own colour, and its second (`C` against
+    // the all-`A` reference) is B's mismatch cell, not the ghost.
+    assert_eq!(rgb_at(&image, cell_centre(20), 15), b);
+    let covered = rgb_at(&image, cell_centre(21), 15);
+    assert!(
+        !close(covered, ghost),
+        "ghost 21 shows through B: {covered:?}"
+    );
+    assert_ne!(covered, [255, 255, 255]);
     eprintln!(
         "ghost bases on {}: ghost {ghost:?}, covered cell {b:?}",
         gpu.description
@@ -1231,8 +1263,7 @@ fn read_tips_are_one_clean_arrowhead_on_the_gpu_when_zoomed_out() {
             &ledger,
             interval,
             200,
-            // Two tiles; no page boundary falls inside a head (a block piece that ends short of
-            // the tip, like a mismatch cell short of it, is not cut by the arrow).
+            // Two tiles; no page boundary falls inside a head.
             NonZeroU64::new(100).unwrap(),
             &reads,
             NonZeroU32::new(2).unwrap(),
@@ -1412,6 +1443,146 @@ fn read_tips_are_one_clean_arrowhead_on_the_gpu_when_zoomed_out() {
                     .collect::<Vec<_>>()
             );
         }
+    }
+}
+
+/// The reported screenshot on the real GPU: a reverse read at about 3.7 points per base with
+/// mismatches in its first few bases. The cells short of the tip were drawn full height inside
+/// the arrowhead, poking out of its cut-away corners; each now carries its distance from the tip
+/// and is cut by the read's one diagonal. No mismatch-coloured pixel (indeed no painted pixel)
+/// lies outside the arrow outline, cut cells still show inside it, and the frame matches the
+/// CPU oracle pixel for pixel.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mismatch_cells_near_a_read_tip_stay_inside_its_arrowhead_on_the_gpu() {
+    use crate::alignment_scene::tests::test_scene_detailed;
+    use crate::palette::PaletteToken;
+    use rgv_alignment_scene::{AlignmentComponent, AlignmentGeometryToken, GeometryLod};
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20);
+    // Reverse [60, 70), tip 60. Against the all-`A` reference the fixture sequence `ACGTACGTAC`
+    // puts mismatch cells 1, 2, 3, 5, 6, 7 and 9 bases from the tip.
+    let reads = [TestRead {
+        start: 60,
+        reverse: true,
+        cigar: cigar(&[(CigarOpKind::Match, 10)]),
+    }];
+    let scene = test_scene_detailed(
+        &ledger,
+        GenomicInterval::new(ContigId::new(0), 0, 200).unwrap(),
+        200,
+        NonZeroU64::new(100).unwrap(),
+        &reads,
+        NonZeroU32::new(2).unwrap(),
+        None,
+        GeometryLod::Base,
+    );
+    let mismatch_colours = [b'C', b'G', b'T'].map(|base| light_rgb(PaletteToken::base(base)));
+    let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    // 256 points over 69 bases: 3.71 points per base. The usual 11-point read has a 6.05-point
+    // head (1.6 bases); a 24-point one a 13.2-point head (3.6 bases).
+    for (index, (row_height, read_height)) in [(14.0, 11.0), (30.0, 24.0)].into_iter().enumerate() {
+        let label = format!("{read_height}-point read at 3.71 points per base");
+        let camera = AlignmentCamera::new(
+            GenomicInterval::new(ContigId::new(0), 30, 99).unwrap(),
+            0.0,
+            row_height,
+            read_height,
+            CLIP,
+        )
+        .unwrap();
+        let image = render_scene(
+            &gpu,
+            &mut renderer,
+            &scene,
+            camera,
+            &ledger,
+            index as u64 + 1,
+        );
+        let (oracle, expected) = oracle_for(&scene, camera);
+        oracle.assert_matches(&image, &label);
+        // The cells 1, 2 and 3 bases in are instances cut by the arrow, with their distance.
+        assert!(
+            expected
+                .iter()
+                .filter(|instance| instance.shape == AlignmentGpuShape::DirectionTerminalLeft as u32)
+                .count()
+                >= 3,
+            "{label}"
+        );
+
+        let frame = rgv_alignment_scene::CpuAlignmentProjector::project(&scene, 1, camera).unwrap();
+        let arrow = frame
+            .primitives
+            .iter()
+            .find_map(|primitive| primitive.arrow)
+            .unwrap();
+        let near_cells = frame
+            .primitives
+            .iter()
+            .filter(|primitive| {
+                matches!(primitive.component, AlignmentComponent::Base { .. })
+                    && matches!(
+                        primitive.geometry,
+                        AlignmentGeometryToken::InsideArrowhead(_)
+                    )
+            })
+            .count();
+        assert_eq!(near_cells, 7, "{label}");
+        assert!(!arrow.points_right);
+        let body = body_rgb(&scene, camera, frame.primitives[0].handle);
+        assert!(
+            mismatch_colours
+                .iter()
+                .all(|colour| !close(*colour, body) && !close(*colour, [255, 255, 255]))
+        );
+        // Written out independently: min(0.55 x height, 10 bases) from the tip, covering
+        // |y - centre| <= height / 2 x min(d / head, 1).
+        let head = (read_height * 0.55).min(10.0 * 256.0 / 69.0);
+        assert!((arrow.length() - head).abs() < 1.0e-9);
+        let half = read_height * 0.5;
+        let top = arrow.centre_y - half;
+        let (mut outside, mut cut_cell_pixels) = (0, 0);
+        for column in (arrow.tip_x - 3.0).floor() as u32..(arrow.tip_x + head + 4.0) as u32 {
+            for row in (top - 2.0).floor() as u32..(top + read_height + 2.0).ceil() as u32 {
+                let (x, y) = (f64::from(column) + 0.5, f64::from(row) + 0.5);
+                let distance = x - arrow.tip_x;
+                let offset = (y - arrow.centre_y).abs();
+                let outline = half * (distance / head).min(1.0);
+                // Pixel centres within a hair of the outline are not decided by either side.
+                if (offset - outline).abs() < 1.0e-3 || (offset - half).abs() < 1.0e-3 {
+                    continue;
+                }
+                let inside = distance > 0.0 && offset < half && offset <= outline;
+                let pixel = rgb_at(&image, column, row);
+                let mismatch = mismatch_colours.iter().any(|colour| close(*colour, pixel));
+                if !inside {
+                    assert!(
+                        !mismatch,
+                        "{label}: mismatch colour {pixel:?} outside the arrow at ({x}, {y}), \
+                         {distance:.2} from the tip"
+                    );
+                    if pixel != [255, 255, 255] {
+                        outside += 1;
+                    }
+                } else if mismatch && distance < head {
+                    cut_cell_pixels += 1;
+                }
+            }
+        }
+        assert_eq!(
+            outside, 0,
+            "{label}: painted pixels outside the arrow outline"
+        );
+        // The cut cells are still drawn within the head.
+        assert!(cut_cell_pixels > 0, "{label}");
+        eprintln!(
+            "{label} on {}: head {head:.2} points, {cut_cell_pixels} mismatch pixels within it, \
+             none outside",
+            gpu.description
+        );
     }
 }
 

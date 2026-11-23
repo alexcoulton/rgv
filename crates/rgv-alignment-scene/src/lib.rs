@@ -164,10 +164,10 @@ pub use scene_snapshot::{
 pub use semantic_page::{
     AlignmentBodyColorToken, AlignmentComponent, AlignmentGeometryToken, AlignmentLabelKind,
     AlignmentOperation, AlignmentPageKey, AlignmentSemanticLabel, AlignmentSemanticPage,
-    AlignmentSemanticPrimitive, AlignmentStyleToken, BisulfiteObservationToken, CanonicalRowBlock,
-    ClipEdgeToken, ModificationState, SbxInsertionToken, SemanticPageError, SemanticPageHit,
-    SpecialistMode, SpecialistUnavailableReason, UltimaIndelToken, UltimaQualitySourceToken,
-    UltimaUnavailableToken,
+    AlignmentSemanticPrimitive, AlignmentStyleToken, ArrowheadCellToken, BisulfiteObservationToken,
+    CanonicalRowBlock, ClipEdgeToken, ModificationState, SbxInsertionToken, SemanticPageError,
+    SemanticPageHit, SpecialistMode, SpecialistUnavailableReason, UltimaIndelToken,
+    UltimaQualitySourceToken, UltimaUnavailableToken,
 };
 pub use store::{
     BoundedCacheTrim, EvidenceCandidate, EvidenceStore, EvidenceStoreError, ExactSummaryCandidate,

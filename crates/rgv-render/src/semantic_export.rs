@@ -803,8 +803,8 @@ mod tests {
     /// CPU projector picks: the read's one diagonal (min(0.55 x height, 10 bases) from the
     /// read's tip, none under half a point), whatever the primitive's own width, so a one-base
     /// terminal or base cell narrower than the head is a trimmed triangle, not a smaller arrow
-    /// of its own. Unclipped it is at most a rectangle and a chevron; clipped by the pane it is
-    /// traced with slices.
+    /// of its own. Unclipped it is at most a rectangle and a chevron; clipped by the pane, or a
+    /// cell short of the tip, it is traced with slices.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn primitives_at_a_read_tip_export_the_shared_arrowhead_outline() {
@@ -902,6 +902,19 @@ mod tests {
                 true,
                 1,
             ),
+            // A mismatch cell short of the tip (`InsideArrowhead`), its edge one base (2 points)
+            // from the tip: cut by the same diagonal, traced with slices ...
+            (primitive(96.0, 10.0, 2.0, 11.0, right), false, 22),
+            (primitive(22.0, 10.0, 2.0, 11.0, left), false, 22),
+            // ... three bases in at 0.4 points per base (a one-point cell within the 4-point
+            // head) ...
+            (
+                primitive(97.8, 10.0, 1.0, 11.0, zoomed_out(right, 0.4)),
+                false,
+                22,
+            ),
+            // ... and four bases in, beyond the head: a whole rectangle.
+            (primitive(90.0, 10.0, 2.0, 11.0, right), true, 1),
         ];
         assert!((zoomed_out(right, 0.4).length() - 4.0).abs() < 1.0e-9);
         assert!(zoomed_out(right, 0.04).length().abs() < f64::EPSILON);

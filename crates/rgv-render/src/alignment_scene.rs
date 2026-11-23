@@ -43,6 +43,15 @@ const ROW_MASK: u32 = (1 << ROW_BITS) - 1;
 const SHAPE_SHIFT: u32 = ROW_BITS;
 const SHAPE_MASK: u32 = 0xF;
 const PALETTE_SHIFT: u32 = 24;
+/// `start` and `length` are each at most [`MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET`], under 2^30, so
+/// their top two bits are free. Together they carry the four-bit distance, in whole bases, from
+/// an arrow-cut shape's tip-side edge to its read's tip (see [`AlignmentGpuInstance::new`]).
+const SPAN_BITS: u32 = 30;
+const SPAN_MASK: u32 = (1 << SPAN_BITS) - 1;
+const TIP_BASES_LOW_MASK: u32 = 0b11;
+const _: () = assert!(MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET < 1 << SPAN_BITS);
+/// Largest distance from the tip an instance can carry (the semantic token stops at nine).
+pub const MAXIMUM_ALIGNMENT_GPU_TIP_BASES: u8 = 15;
 
 /// Persistent GPU representation of one non-text semantic primitive: sixteen bytes.
 ///
@@ -52,9 +61,11 @@ const PALETTE_SHIFT: u32 = 24;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Pod, Zeroable)]
 pub struct AlignmentGpuInstance {
-    /// Whole bases from the page start to the primitive's start.
+    /// Whole bases from the page start to the primitive's start (bits 0..30); bits 30..32 are
+    /// the low two bits of the distance from the tip (direction-terminal shapes only).
     start: u32,
-    /// Whole bases covered; never zero.
+    /// Whole bases covered, never zero (bits 0..30); bits 30..32 are the high two bits of the
+    /// distance from the tip.
     length: u32,
     /// Row offset inside the page (bits 0..20), shape (bits 20..24) and the eight-bit palette
     /// index of [`PaletteColor::encode`] (bits 24..32).
@@ -65,6 +76,11 @@ pub struct AlignmentGpuInstance {
 
 impl AlignmentGpuInstance {
     /// Packs one instance, refusing any value its fields cannot hold exactly.
+    ///
+    /// `bases_from_tip` is meaningful for the direction-terminal shapes only: how many whole
+    /// bases lie between the shape's tip-side edge and its read's tip (zero when it ends on the
+    /// tip; at most [`MAXIMUM_ALIGNMENT_GPU_TIP_BASES`]). The shader then cuts it by the read's
+    /// one arrowhead diagonal, measured from that tip.
     // The page-admission error type every packing path already returns.
     #[allow(clippy::result_large_err)]
     pub fn new(
@@ -73,6 +89,7 @@ impl AlignmentGpuInstance {
         row_offset: u32,
         shape: AlignmentGpuShape,
         color: PaletteColor,
+        bases_from_tip: u8,
     ) -> Result<Self, AlignmentGpuPageAdmissionError> {
         if start_offset >= end_offset {
             return Err(AlignmentGpuPageAdmissionError::InvalidSemanticSpan {
@@ -93,11 +110,18 @@ impl AlignmentGpuInstance {
                 limit: MAXIMUM_ALIGNMENT_GPU_PAGE_ROWS,
             });
         }
+        if bases_from_tip > MAXIMUM_ALIGNMENT_GPU_TIP_BASES {
+            return Err(AlignmentGpuPageAdmissionError::TipDistanceOutOfRange {
+                bases_from_tip,
+                limit: MAXIMUM_ALIGNMENT_GPU_TIP_BASES,
+            });
+        }
         let (palette_index, color_parameter) = color.encode();
+        let tip = u32::from(bases_from_tip);
         Ok(Self {
-            // Both fit: `end_offset` is at most 7e8.
-            start: start_offset as u32,
-            length: (end_offset - start_offset) as u32,
+            // Both fit in thirty bits: `end_offset` is at most 7e8.
+            start: start_offset as u32 | ((tip & TIP_BASES_LOW_MASK) << SPAN_BITS),
+            length: (end_offset - start_offset) as u32 | ((tip >> 2) << SPAN_BITS),
             row_shape_palette: row_offset
                 | ((shape as u32) << SHAPE_SHIFT)
                 | (u32::from(palette_index) << PALETTE_SHIFT),
@@ -108,13 +132,19 @@ impl AlignmentGpuInstance {
     /// Whole bases from the page start to the primitive's start.
     #[must_use]
     pub const fn start_offset(&self) -> u64 {
-        self.start as u64
+        (self.start & SPAN_MASK) as u64
     }
 
     /// Whole bases from the page start to the primitive's end (exclusive).
     #[must_use]
     pub const fn end_offset(&self) -> u64 {
-        self.start as u64 + self.length as u64
+        (self.start & SPAN_MASK) as u64 + (self.length & SPAN_MASK) as u64
+    }
+
+    /// Whole bases from a direction-terminal shape's tip-side edge to its read's tip.
+    #[must_use]
+    pub const fn bases_from_tip(&self) -> u32 {
+        (self.start >> SPAN_BITS) | ((self.length >> SPAN_BITS) << 2)
     }
 
     #[must_use]
@@ -178,6 +208,9 @@ pub enum AlignmentGpuShape {
     EventLine = 1,
     /// Narrow bar centred on the start edge of its one-base span.
     PointMarker = 2,
+    /// A shape cut by its read's direction arrowhead (pointing right, or left): the one-base
+    /// terminal, a block or base cell ending on the tip, or a cell or block piece
+    /// [`AlignmentGpuInstance::bases_from_tip`] bases short of it.
     DirectionTerminalRight = 3,
     DirectionTerminalLeft = 4,
     /// Narrow bar centred on the end edge of its one-base span (a read's right boundary).
@@ -297,7 +330,8 @@ pub fn project_alignment_gpu_instance(
     } else if shape == AlignmentGpuShape::DirectionTerminalRight as u32
         || shape == AlignmentGpuShape::DirectionTerminalLeft as u32
     {
-        // The tip stays on the read's end; the one-point minimum grows away from it.
+        // The tip-side edge stays put (on the read's end, or `bases_from_tip` bases short of
+        // it); the one-point minimum grows away from the tip.
         let (left, width) = rgv_alignment_scene::directional_extent(
             x,
             right,
@@ -3971,12 +4005,17 @@ fn pack_primitive(
     if matches!(primitive.component, AlignmentComponent::Label { .. }) {
         return Ok(None);
     }
+    let bases_from_tip = match primitive.geometry {
+        AlignmentGeometryToken::InsideArrowhead(token) => token.bases_from_tip(),
+        _ => 0,
+    };
     AlignmentGpuInstance::new(
         primitive.start_offset,
         primitive.end_offset,
         primitive.row_offset,
         shape_for(primitive.geometry),
         color_for(primitive),
+        bases_from_tip,
     )
     .map(Some)
 }
@@ -3993,6 +4032,14 @@ const fn shape_for(geometry: AlignmentGeometryToken) -> AlignmentGpuShape {
         }
         AlignmentGeometryToken::ClipEdge(edge) => AlignmentGpuShape::clip_edge(edge),
         AlignmentGeometryToken::ClipGhost => AlignmentGpuShape::ClipGhostCell,
+        // Drawn as the terminal shapes are, with its distance from the tip.
+        AlignmentGeometryToken::InsideArrowhead(token) => {
+            if token.points_right() {
+                AlignmentGpuShape::DirectionTerminalRight
+            } else {
+                AlignmentGpuShape::DirectionTerminalLeft
+            }
+        }
     }
 }
 
@@ -4443,6 +4490,11 @@ pub enum AlignmentGpuPageAdmissionError {
          page can address"
     )]
     RowOffsetOutOfRange { row_offset: u32, limit: u32 },
+    #[error(
+        "alignment semantic primitive is {bases_from_tip} bases from its read's tip, beyond the \
+         {limit} a GPU instance can carry"
+    )]
+    TipDistanceOutOfRange { bases_from_tip: u8, limit: u8 },
     #[error(
         "alignment GPU page table capacity is invalid: required {required}, allocated {actual}"
     )]

@@ -521,7 +521,7 @@ fn summary_contract(policy: OverlappingMatePolicy) -> SummaryContract {
 }
 
 /// `handle -> (row, start, end)` for every record holding a row, checking on the way that no
-/// two records in one row overlap.
+/// two records in one row overlap or sit closer than the packing's minimum spacing.
 fn atlas_rows(
     atlas: &AlignmentRowAtlas,
     target: GenomicInterval,
@@ -546,12 +546,19 @@ fn atlas_rows(
             "{context}: a record holds two rows"
         );
     }
+    // Unpaired reads sharing a row keep the packing's minimum spacing. Viewed as pairs, a
+    // template's own mates share its row and are only required not to overlap other spans.
+    let spacing = if atlas.layout_contract().view_as_pairs {
+        0
+    } else {
+        crate::row_oracle::READ_ROW_SPACING_BASES
+    };
     for (row, mut spans) in by_row {
         spans.sort_unstable();
         for pair in spans.windows(2) {
             assert!(
-                pair[0].1 <= pair[1].0,
-                "{context}: row {row} overlaps {pair:?}"
+                pair[0].1 + spacing <= pair[1].0,
+                "{context}: row {row} packs {pair:?} closer than {spacing} bases"
             );
         }
     }
