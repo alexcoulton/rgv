@@ -395,9 +395,15 @@ impl CpuAlignmentProjector {
             }
         }
         reconcile_labels(&mut primitives, labels.into_values(), camera.clip);
+        // Paint order: point markers overhang the neighbouring cells of their row, so (as on
+        // the GPU) they follow the rest of the row.
         primitives.sort_by(|left, right| {
             left.row
                 .cmp(&right.row)
+                .then_with(|| {
+                    (left.shape == CpuPrimitiveShape::PointMarker)
+                        .cmp(&(right.shape == CpuPrimitiveShape::PointMarker))
+                })
                 .then_with(|| left.y.total_cmp(&right.y))
                 .then_with(|| left.x.total_cmp(&right.x))
                 .then_with(|| left.draw_order.cmp(&right.draw_order))
@@ -647,17 +653,27 @@ fn pick_captured_scene(
     {
         return None;
     }
-    let point_interval = GenomicInterval::new(
+    // A point marker is centred on a base boundary and overhangs by at most half its maximum
+    // width, so markers whose one-base span lies a cell (plus that overhang) away from the
+    // pointer's base can still be under it.
+    let covered_interval = covered_interval?;
+    let pointer = camera.viewport.genomic_at_pixel(x - camera.clip.x);
+    let reach = POINT_MARKER_MAXIMUM_WIDTH * 0.5 * camera.bases_per_pixel();
+    let marker_start = ((pointer - reach).floor() - 1.0).max(0.0) as u64;
+    let marker_end = ((pointer + reach).floor() as u64).saturating_add(2);
+    let search_interval = GenomicInterval::new(
         camera.interval().contig(),
-        position,
-        position.saturating_add(1),
+        marker_start.max(covered_interval.start()).min(position),
+        marker_end
+            .min(covered_interval.end())
+            .max(position.saturating_add(1)),
     )
     .ok()?;
     scene
-        .visible_pages(point_interval, row..row.saturating_add(1))
+        .visible_pages(search_interval, row..row.saturating_add(1))
         .into_iter()
         .flat_map(|page| {
-            page.primitive_candidates(row, position)
+            page.pick_candidates(row, position, marker_start..marker_end)
                 .filter(|primitive| {
                     !matches!(primitive.component, AlignmentComponent::Label { .. })
                 })
@@ -676,7 +692,15 @@ fn pick_captured_scene(
                 })
         })
         .filter(|primitive| primitive.contains(x, y))
-        .max_by_key(|primitive| (primitive.draw_order, primitive.component, primitive.handle))
+        // Point markers paint over their row (see the semantic page order), so they win here too.
+        .max_by_key(|primitive| {
+            (
+                primitive.shape == CpuPrimitiveShape::PointMarker,
+                primitive.draw_order,
+                primitive.component,
+                primitive.handle,
+            )
+        })
         .map(|primitive| AlignmentHit {
             track,
             scene_revision: scene.revision(),
@@ -689,6 +713,26 @@ fn pick_captured_scene(
 /// point is at least one physical pixel at every window scale factor. Keep in lockstep with
 /// `project_instance` in `rgv-render`'s `alignment_scene.wgsl`.
 const MINIMUM_PRIMITIVE_EXTENT: f64 = 1.0;
+
+/// Point markers (insertions, clips, padding, specialist insertions) are narrow bars centred on
+/// a base boundary: a quarter of a base wide, but never narrower than two points (so they stay
+/// visible zoomed out) nor wider than six (so they never read as a base cell). Keep in lockstep
+/// with shapes 2 and 5 of `project_instance` in `rgv-render`'s `alignment_scene.wgsl` and with
+/// `project_alignment_gpu_instance`.
+const POINT_MARKER_BASE_FRACTION: f64 = 0.25;
+const POINT_MARKER_MINIMUM_WIDTH: f64 = 2.0;
+const POINT_MARKER_MAXIMUM_WIDTH: f64 = 6.0;
+
+/// Horizontal extent `(left, width)` of a point marker whose one-base span projects to
+/// `cell_left..cell_right`: centred on the cell's start edge, or on its end edge when `at_end`
+/// (`AlignmentGeometryToken::PointMarkerAtEnd`).
+#[must_use]
+pub fn point_marker_extent(cell_left: f64, cell_right: f64, at_end: bool) -> (f64, f64) {
+    let width = ((cell_right - cell_left) * POINT_MARKER_BASE_FRACTION)
+        .clamp(POINT_MARKER_MINIMUM_WIDTH, POINT_MARKER_MAXIMUM_WIDTH);
+    let boundary = if at_end { cell_right } else { cell_left };
+    (boundary - width * 0.5, width)
+}
 
 fn project_primitive(
     primitive: AlignmentSemanticPrimitive,
@@ -722,11 +766,19 @@ fn project_primitive(
                 (camera.read_height * 0.1).max(MINIMUM_PRIMITIVE_EXTENT),
             )
         }
-        AlignmentGeometryToken::PointMarker => {
-            let marker_width = width.max(1.5);
-            x -= (marker_width - width) * 0.5;
-            width = marker_width;
-            (CpuPrimitiveShape::PointMarker, row_top, body_height)
+        AlignmentGeometryToken::PointMarker | AlignmentGeometryToken::PointMarkerAtEnd => {
+            let at_end = primitive.geometry == AlignmentGeometryToken::PointMarkerAtEnd;
+            if matches!(primitive.component, AlignmentComponent::Label { .. }) {
+                // A boundary-anchored label keeps its one-base box (so its visibility rules are
+                // unchanged) but centres it on the boundary its event's marker is drawn on.
+                let boundary = if at_end { x + width } else { x };
+                width = width.max(MINIMUM_PRIMITIVE_EXTENT);
+                x = boundary - width * 0.5;
+                (CpuPrimitiveShape::TextLabel, row_top, body_height)
+            } else {
+                (x, width) = point_marker_extent(x, x + width, at_end);
+                (CpuPrimitiveShape::PointMarker, row_top, body_height)
+            }
         }
         AlignmentGeometryToken::DirectionalTerminalLeft => {
             width = width.max(MINIMUM_PRIMITIVE_EXTENT);
@@ -967,10 +1019,11 @@ mod tests {
         AlignmentBodyColorToken, AlignmentSourceRevision, RevisionFingerprint, SourceFingerprint,
     };
 
-    const GEOMETRIES: [AlignmentGeometryToken; 5] = [
+    const GEOMETRIES: [AlignmentGeometryToken; 6] = [
         AlignmentGeometryToken::Rectangle,
         AlignmentGeometryToken::EventLine,
         AlignmentGeometryToken::PointMarker,
+        AlignmentGeometryToken::PointMarkerAtEnd,
         AlignmentGeometryToken::DirectionalTerminalLeft,
         AlignmentGeometryToken::DirectionalTerminalRight,
     ];
@@ -1053,13 +1106,66 @@ mod tests {
                 projected.height
             );
         }
-        let marker = project(
-            primitive(50_000, 50_001, AlignmentGeometryToken::PointMarker),
-            8,
-            camera,
+        // Point markers keep a two-point minimum (it was 1.5 when a marker filled its base cell)
+        // so a boundary bar stays visible when zoomed out, centred on its boundary.
+        for (geometry, boundary) in [
+            (AlignmentGeometryToken::PointMarker, 50_000.0),
+            (AlignmentGeometryToken::PointMarkerAtEnd, 50_001.0),
+        ] {
+            let marker = project(primitive(50_000, 50_001, geometry), 8, camera).unwrap();
+            assert!((marker.width - 2.0).abs() < 1.0e-9);
+            assert!((marker.x + 1.0 - (10.0 + boundary / 1_000.0)).abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn point_markers_are_narrow_bars_on_a_base_boundary_and_labels_follow_them() {
+        // 112 points per base.
+        let camera = AlignmentCamera::new(
+            GenomicInterval::new(ContigId::new(0), 1_000, 1_010).unwrap(),
+            0.0,
+            14.0,
+            11.0,
+            CpuClipRect {
+                x: 10.0,
+                y: 20.0,
+                width: 1_120.0,
+                height: 50.0,
+            },
         )
         .unwrap();
-        assert!((marker.width - 1.5).abs() < 1.0e-9);
+        let start_edge = 10.0 + 5.0 * 112.0;
+        let end_edge = start_edge + 112.0;
+        for (geometry, boundary) in [
+            (AlignmentGeometryToken::PointMarker, start_edge),
+            (AlignmentGeometryToken::PointMarkerAtEnd, end_edge),
+        ] {
+            let marker = project(primitive(5, 6, geometry), 0, camera).unwrap();
+            assert_eq!(marker.shape, CpuPrimitiveShape::PointMarker);
+            assert!((marker.width - 6.0).abs() < 1.0e-9, "{marker:?}");
+            assert!((marker.x + 3.0 - boundary).abs() < 1.0e-9, "{marker:?}");
+            assert!((marker.height - 11.0).abs() < 1.0e-9);
+
+            // A label carrying the same token keeps its one-base box, centred on the boundary.
+            let mut label = primitive(5, 6, geometry);
+            label.component = AlignmentComponent::Label {
+                kind: AlignmentLabelKind::InsertionLength,
+                id: crate::ContractFingerprint::new(1),
+            };
+            let label = project(label, 0, camera).unwrap();
+            assert_eq!(label.shape, CpuPrimitiveShape::TextLabel);
+            assert!((label.width - 112.0).abs() < 1.0e-9);
+            assert!((label.x + label.width * 0.5 - boundary).abs() < 1.0e-9);
+        }
+        // A span-anchored label is unchanged: centred on its base cell.
+        let mut label = primitive(5, 6, AlignmentGeometryToken::Rectangle);
+        label.component = AlignmentComponent::Label {
+            kind: AlignmentLabelKind::ClipLength,
+            id: crate::ContractFingerprint::new(1),
+        };
+        let label = project(label, 0, camera).unwrap();
+        assert!((label.x - start_edge).abs() < 1.0e-9);
+        assert!((label.width - 112.0).abs() < 1.0e-9);
     }
 
     #[test]

@@ -555,6 +555,7 @@ fn instances_are_sixteen_bytes_and_out_of_range_fields_are_refused_at_pack_time(
             65_536,
             AlignmentGeometryToken::PointMarker,
         ),
+        (9, 10, 3, AlignmentGeometryToken::PointMarkerAtEnd),
     ] {
         semantic.start_offset = start;
         semantic.end_offset = end;
@@ -580,6 +581,7 @@ fn instances_are_sixteen_bytes_and_out_of_range_fields_are_refused_at_pack_time(
         AlignmentGpuShape::PointMarker,
         AlignmentGpuShape::DirectionTerminalRight,
         AlignmentGpuShape::DirectionTerminalLeft,
+        AlignmentGpuShape::PointMarkerAtEnd,
     ] {
         assert!(shape as u32 <= SHAPE_MASK);
     }
@@ -4084,4 +4086,403 @@ fn draw_what_fits_keeps_resident_visible_pages_when_nothing_more_fits() {
     );
     assert!(renderer.page(order[0]).is_some());
     render_test_frame(&device, &queue, &renderer, &frame).unwrap();
+}
+
+/// Genomic origin of the boundary-marker fixture, far enough into the contig that a two-point
+/// marker at 0.01 points per base is not clipped by the pane's left edge.
+pub(crate) const BOUNDARY_FIXTURE_ORIGIN: u64 = 50_000;
+
+/// Reads whose point events sit on base boundaries (forward strand, ten query bases each):
+/// - `S2 M2 I2 M4` at origin + 20: a leading clip on its left boundary (origin + 20) and an
+///   insertion between origin + 21 and origin + 22;
+/// - `M6 S4` at origin + 400: a trailing clip on its right boundary (origin + 406);
+/// - `M8 I2` at origin + 800: an insertion at the very end of the CIGAR, on its right boundary
+///   (origin + 808).
+pub(crate) fn boundary_marker_reads() -> Vec<TestRead> {
+    let cigar = |operations: &[(CigarOpKind, u32)]| {
+        operations
+            .iter()
+            .map(|(kind, len)| CigarOp {
+                kind: *kind,
+                len: *len,
+            })
+            .collect::<Vec<_>>()
+    };
+    let origin = BOUNDARY_FIXTURE_ORIGIN;
+    vec![
+        TestRead {
+            start: origin + 20,
+            reverse: false,
+            cigar: cigar(&[
+                (CigarOpKind::SoftClip, 2),
+                (CigarOpKind::Match, 2),
+                (CigarOpKind::Insertion, 2),
+                (CigarOpKind::Match, 4),
+            ]),
+        },
+        TestRead {
+            start: origin + 400,
+            reverse: false,
+            cigar: cigar(&[(CigarOpKind::Match, 6), (CigarOpKind::SoftClip, 4)]),
+        },
+        TestRead {
+            start: origin + 800,
+            reverse: false,
+            cigar: cigar(&[(CigarOpKind::Match, 8), (CigarOpKind::Insertion, 2)]),
+        },
+    ]
+}
+
+pub(crate) fn boundary_marker_scene(ledger: &AllocationLedger) -> Arc<AlignmentPresentationScene> {
+    test_scene_over(
+        ledger,
+        GenomicInterval::new(ContigId::new(0), 0, 100_000).unwrap(),
+        100_000,
+        NonZeroU64::new(1_000).unwrap(),
+        &boundary_marker_reads(),
+        NonZeroU32::new(16).unwrap(),
+    )
+}
+
+fn boundary_ledger() -> AllocationLedger {
+    AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20)
+}
+
+/// Pane 10 points from the left; `width` points over `start..end` (origin-relative).
+fn boundary_camera(start: u64, end: u64, width: f64) -> AlignmentCamera {
+    AlignmentCamera::new(
+        GenomicInterval::new(
+            ContigId::new(0),
+            BOUNDARY_FIXTURE_ORIGIN + start,
+            BOUNDARY_FIXTURE_ORIGIN + end,
+        )
+        .unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        rgv_alignment_scene::CpuClipRect {
+            x: 10.0,
+            y: 20.0,
+            width,
+            height: 50.0,
+        },
+    )
+    .unwrap()
+}
+
+/// Pane x of the boundary at the start edge of origin-relative base `position`.
+fn boundary_x(camera: AlignmentCamera, position: u64) -> f64 {
+    camera.clip().x
+        + ((BOUNDARY_FIXTURE_ORIGIN + position) as f64 - camera.exact_start())
+            / camera.bases_per_pixel()
+}
+
+/// GPU-oracle bounds (`project_alignment_gpu_instance`) of every packed instance whose semantic
+/// primitive satisfies `select`.
+fn oracle_bounds(
+    scene: &Arc<AlignmentPresentationScene>,
+    camera: AlignmentCamera,
+    select: impl Fn(&AlignmentSemanticPrimitive) -> bool,
+) -> Vec<(AlignmentSemanticPrimitive, AlignmentGpuProjectedBounds)> {
+    let mut found = Vec::new();
+    for page in scene.visible_pages(camera.interval(), camera.visible_rows()) {
+        let packed = PackedAlignmentPage::from_semantic(page).unwrap();
+        for (instance, index) in packed.instances.into_iter().zip(packed.semantic_indices) {
+            let primitive = page.primitives()[index as usize];
+            if !select(&primitive) {
+                continue;
+            }
+            if let Some(bounds) = project_alignment_gpu_instance(
+                instance,
+                page.interval().start(),
+                page.row_range().start,
+                camera,
+            ) {
+                found.push((primitive, bounds));
+            }
+        }
+    }
+    found
+}
+
+fn cpu_primitives(
+    scene: &Arc<AlignmentPresentationScene>,
+    camera: AlignmentCamera,
+    select: impl Fn(&rgv_alignment_scene::CpuProjectedPrimitive) -> bool,
+) -> Vec<rgv_alignment_scene::CpuProjectedPrimitive> {
+    CpuAlignmentProjector::project(scene, 1, camera)
+        .unwrap()
+        .primitives
+        .iter()
+        .filter(|primitive| select(primitive))
+        .cloned()
+        .collect()
+}
+
+/// One point marker as projected by both the GPU oracle and the CPU projector.
+#[derive(Clone, Copy, Debug)]
+struct AgreedMarker {
+    left: f64,
+    width: f64,
+    y: f64,
+    height: f64,
+    geometry: AlignmentGeometryToken,
+    handle: AlignmentHandle,
+}
+
+impl AgreedMarker {
+    fn centre(self) -> f64 {
+        self.left + self.width * 0.5
+    }
+}
+
+/// The single point marker of `component_matches`, projected by both the GPU oracle
+/// (`project_alignment_gpu_instance`) and the CPU projector, which must agree exactly.
+fn agreed_marker(
+    scene: &Arc<AlignmentPresentationScene>,
+    camera: AlignmentCamera,
+    component_matches: impl Fn(AlignmentComponent) -> bool,
+) -> AgreedMarker {
+    let gpu = oracle_bounds(scene, camera, |primitive| {
+        component_matches(primitive.component)
+    });
+    let cpu = cpu_primitives(scene, camera, |primitive| {
+        component_matches(primitive.component)
+    });
+    assert_eq!(gpu.len(), 1, "{gpu:?}");
+    assert_eq!(cpu.len(), 1, "{cpu:?}");
+    let (primitive, bounds) = gpu[0];
+    let projected = &cpu[0];
+    assert_eq!(
+        projected.shape,
+        rgv_alignment_scene::CpuPrimitiveShape::PointMarker
+    );
+    assert!(
+        (bounds.x - projected.x).abs() < 1.0e-9,
+        "{bounds:?} {projected:?}"
+    );
+    assert!((bounds.width - projected.width).abs() < 1.0e-9);
+    assert!((bounds.y - projected.y).abs() < 1.0e-9);
+    assert!((bounds.height - projected.height).abs() < 1.0e-9);
+    AgreedMarker {
+        left: bounds.x,
+        width: bounds.width,
+        y: bounds.y,
+        height: bounds.height,
+        geometry: primitive.geometry,
+        handle: primitive.handle,
+    }
+}
+
+fn is_insertion_of_read_at(start: u64) -> impl Fn(AlignmentComponent) -> bool {
+    move |component| {
+        matches!(component, AlignmentComponent::Insertion { cigar_index, .. }
+            if cigar_index == if start == 20 { 2 } else { 1 })
+    }
+}
+
+/// The user-visible defect: at ~13 bases across the screen an insertion filled its whole base
+/// cell, exactly like a substitution. It is now a narrow bar centred on the boundary between
+/// the two reference bases it lies between, and stays visible when zoomed far out.
+#[test]
+fn insertion_markers_are_narrow_bars_centred_on_the_start_edge_of_their_base() {
+    let ledger = boundary_ledger();
+    let scene = boundary_marker_scene(&ledger);
+    // 4 bases over 448 points: 112 points per base. The insertion lies between origin + 21 and
+    // origin + 22.
+    let zoomed_in = boundary_camera(21, 25, 448.0);
+    assert!((1.0 / zoomed_in.bases_per_pixel() - 112.0).abs() < 1.0e-9);
+    let marker = agreed_marker(&scene, zoomed_in, is_insertion_of_read_at(20));
+    assert_eq!(marker.geometry, AlignmentGeometryToken::PointMarker);
+    let boundary = boundary_x(zoomed_in, 22);
+    assert!(
+        marker.width <= 6.0 + 1.0e-9,
+        "{marker:?} is not a narrow bar"
+    );
+    assert!((marker.width - 6.0).abs() < 1.0e-9);
+    assert!((marker.centre() - boundary).abs() < 1.0e-9);
+    // Full read height, unchanged.
+    assert!((marker.height - 11.0).abs() < 1.0e-9);
+    assert!((marker.y - (20.0 + 1.5)).abs() < 1.0e-9);
+    // Neither neighbouring base cell is covered beyond the bar's half width.
+    assert!(marker.left > boundary_x(zoomed_in, 21) + 50.0);
+    assert!(marker.left + marker.width < boundary_x(zoomed_in, 23) - 50.0);
+
+    // 100,000 bases over 1,000 points: 0.01 points per base. The bar keeps its two-point
+    // minimum, still centred on the boundary.
+    let zoomed_out = AlignmentCamera::new(
+        GenomicInterval::new(ContigId::new(0), 0, 100_000).unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        rgv_alignment_scene::CpuClipRect {
+            x: 10.0,
+            y: 20.0,
+            width: 1_000.0,
+            height: 50.0,
+        },
+    )
+    .unwrap();
+    assert!((1.0 / zoomed_out.bases_per_pixel() - 0.01).abs() < 1.0e-12);
+    let marker = agreed_marker(&scene, zoomed_out, is_insertion_of_read_at(20));
+    assert!((marker.width - 2.0).abs() < 1.0e-9, "{marker:?}");
+    assert!((marker.centre() - boundary_x(zoomed_out, 22)).abs() < 1.0e-9);
+}
+
+/// Clips and an insertion at the end of the CIGAR sit on the read's own boundaries: a leading
+/// clip on the start edge of the first aligned base, a trailing event on the end edge of the
+/// last aligned base (its position, one past that base, was clamped onto it).
+#[test]
+fn clip_and_terminal_insertion_markers_sit_on_the_read_boundaries() {
+    let ledger = boundary_ledger();
+    let scene = boundary_marker_scene(&ledger);
+    // Horizontal extent of the read's own body (everything but its markers and labels).
+    let body_edges = |camera: AlignmentCamera, handle: AlignmentHandle| {
+        let body = cpu_primitives(&scene, camera, |primitive| {
+            primitive.handle == handle
+                && primitive.shape != rgv_alignment_scene::CpuPrimitiveShape::PointMarker
+                && primitive.shape != rgv_alignment_scene::CpuPrimitiveShape::TextLabel
+        });
+        assert!(!body.is_empty());
+        (
+            body.iter().map(|p| p.x).fold(f64::INFINITY, f64::min),
+            body.iter()
+                .map(|p| p.x + p.width)
+                .fold(f64::NEG_INFINITY, f64::max),
+        )
+    };
+
+    // 10 points per base.
+    let leading = boundary_camera(15, 35, 200.0);
+    let marker = agreed_marker(&scene, leading, |component| {
+        matches!(
+            component,
+            AlignmentComponent::SoftClip { cigar_index: 0, .. }
+        )
+    });
+    assert_eq!(marker.geometry, AlignmentGeometryToken::PointMarker);
+    assert!((marker.width - 2.5).abs() < 1.0e-9);
+    assert!((marker.centre() - boundary_x(leading, 20)).abs() < 1.0e-9);
+    assert!((marker.centre() - body_edges(leading, marker.handle).0).abs() < 1.0e-9);
+
+    let trailing = boundary_camera(390, 410, 200.0);
+    let marker = agreed_marker(&scene, trailing, |component| {
+        matches!(
+            component,
+            AlignmentComponent::SoftClip { cigar_index: 1, .. }
+        )
+    });
+    assert_eq!(marker.geometry, AlignmentGeometryToken::PointMarkerAtEnd);
+    assert!((marker.centre() - boundary_x(trailing, 406)).abs() < 1.0e-9);
+    assert!((marker.centre() - body_edges(trailing, marker.handle).1).abs() < 1.0e-9);
+
+    let terminal_insertion = boundary_camera(790, 810, 200.0);
+    let marker = agreed_marker(&scene, terminal_insertion, is_insertion_of_read_at(800));
+    assert_eq!(marker.geometry, AlignmentGeometryToken::PointMarkerAtEnd);
+    assert!((marker.centre() - boundary_x(terminal_insertion, 808)).abs() < 1.0e-9);
+    assert!((marker.centre() - body_edges(terminal_insertion, marker.handle).1).abs() < 1.0e-9);
+}
+
+/// The insertion length is centred on the same boundary as the insertion's bar.
+#[test]
+fn insertion_length_labels_are_anchored_on_the_marker_boundary() {
+    let ledger = boundary_ledger();
+    let scene = boundary_marker_scene(&ledger);
+    let insertion_label_centre = |camera: AlignmentCamera| {
+        let frame = CpuAlignmentProjector::project_labels(&scene, 1, camera).unwrap();
+        let labels = frame
+            .labels
+            .iter()
+            .filter(|label| {
+                matches!(
+                    label.component,
+                    AlignmentComponent::Label {
+                        kind: rgv_alignment_scene::AlignmentLabelKind::InsertionLength,
+                        ..
+                    }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(labels.len(), 1, "{:?}", frame.labels);
+        assert_eq!(labels[0].text.as_deref(), Some("2"));
+        labels[0].x + labels[0].width * 0.5
+    };
+    let camera = boundary_camera(21, 25, 448.0);
+    let marker = agreed_marker(&scene, camera, is_insertion_of_read_at(20));
+    let centre = insertion_label_centre(camera);
+    assert!((centre - boundary_x(camera, 22)).abs() < 1.0e-9, "{centre}");
+    assert!((centre - marker.centre()).abs() < 1.0e-9);
+
+    // The terminal insertion's label follows its marker onto the read's right boundary.
+    let camera = boundary_camera(790, 810, 200.0);
+    let centre = insertion_label_centre(camera);
+    assert!(
+        (centre - boundary_x(camera, 808)).abs() < 1.0e-9,
+        "{centre}"
+    );
+}
+
+/// A click on the bar, including the half that overhangs the previous base's cell, selects the
+/// insertion; a click in the middle of either neighbouring base selects the read, not the marker.
+#[test]
+fn picking_follows_the_boundary_bar() {
+    let ledger = boundary_ledger();
+    let scene = boundary_marker_scene(&ledger);
+    let track = rgv_core::TrackId::new(7);
+    let camera = boundary_camera(21, 25, 448.0);
+    let marker = agreed_marker(&scene, camera, is_insertion_of_read_at(20));
+    let (y, height) = (marker.y, marker.height);
+    let frame = CpuAlignmentProjector::project(&scene, 1, camera).unwrap();
+    let pick = |x: f64| {
+        CpuAlignmentProjector::pick(&scene, track, &frame, x, y + height * 0.5)
+            .unwrap()
+            .map(|hit| hit.component)
+    };
+    let boundary = boundary_x(camera, 22);
+    assert!(marker.left < boundary - 2.5 && marker.left + marker.width > boundary + 2.5);
+    for x in [boundary - 2.5, boundary, boundary + 2.5] {
+        assert!(
+            pick(x).is_some_and(is_insertion_of_read_at(20)),
+            "{x}: {:?}",
+            pick(x)
+        );
+    }
+    for x in [
+        boundary - 3.5,
+        boundary + 3.5,
+        boundary_x(camera, 21) + 56.0,
+        boundary_x(camera, 22) + 56.0,
+    ] {
+        let hit = pick(x);
+        assert!(hit.is_some(), "{x}: the read itself is under the pointer");
+        assert!(
+            !hit.is_some_and(|component| matches!(
+                component,
+                AlignmentComponent::Insertion { .. } | AlignmentComponent::SoftClip { .. }
+            )),
+            "{x}: {hit:?}"
+        );
+    }
+
+    // Zoomed far out the two-point bar spans ~200 bases; a click on it away from the
+    // insertion's own base still selects it (its leading clip, two bases left, draws first).
+    let zoomed_out = AlignmentCamera::new(
+        GenomicInterval::new(ContigId::new(0), 0, 100_000).unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        rgv_alignment_scene::CpuClipRect {
+            x: 10.0,
+            y: 20.0,
+            width: 1_000.0,
+            height: 50.0,
+        },
+    )
+    .unwrap();
+    let frame = CpuAlignmentProjector::project(&scene, 1, zoomed_out).unwrap();
+    let x = boundary_x(zoomed_out, 22) + 0.9;
+    let hit = CpuAlignmentProjector::pick(&scene, track, &frame, x, y + height * 0.5)
+        .unwrap()
+        .map(|hit| hit.component);
+    assert!(hit.is_some_and(is_insertion_of_read_at(20)), "{hit:?}");
 }

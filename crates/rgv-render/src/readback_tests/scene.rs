@@ -18,7 +18,8 @@ use crate::{
     AlignmentGpuInstance, AlignmentGpuRenderer, AlignmentGpuSceneRequest, AlignmentGpuScissor,
     AlignmentGpuShape, PackedAlignmentPage,
     alignment_scene::tests::{
-        TestRead, legacy_semantic_alignment_color, test_scene_colored, test_scene_over,
+        BOUNDARY_FIXTURE_ORIGIN, TestRead, boundary_marker_scene, legacy_semantic_alignment_color,
+        test_scene_colored, test_scene_over,
     },
     palette::{AlignmentPalette, ThemeId},
     project_alignment_gpu_instance,
@@ -105,9 +106,13 @@ fn unclipped_quad(
         top = row_top + camera.read_height() * 0.45;
         height = (camera.read_height() * 0.10).max(1.0);
     }
-    if instance.shape() == AlignmentGpuShape::PointMarker as u32 {
-        let width = (right - left).max(1.5);
-        left -= (width - (right - left)) * 0.5;
+    let at_end = instance.shape() == AlignmentGpuShape::PointMarkerAtEnd as u32;
+    if at_end || instance.shape() == AlignmentGpuShape::PointMarker as u32 {
+        // Written out independently of `point_marker_extent`: a bar a quarter of a base wide,
+        // within [2, 6] points, centred on the start (or end) edge of the base.
+        let width = ((right - left) * 0.25).clamp(2.0, 6.0);
+        let boundary = if at_end { right } else { left };
+        left = boundary - width * 0.5;
         right = left + width;
     } else {
         right = right.max(left + 1.0);
@@ -643,4 +648,102 @@ fn double_single_projection_agrees_with_the_f64_oracle_one_megabase_from_the_pag
 #[test]
 fn projection_uses_both_offset_words_beyond_single_f32_integer_precision() {
     sweep_far_from_the_page_start(20_000_001, 1 << 25, "twenty-megabase");
+}
+
+/// The reported defect on the real GPU: at ~128 points per base an insertion is a six-point bar
+/// on the boundary between the two reference bases it lies between, and both neighbouring base
+/// cells stay read-coloured, exactly where the CPU projector and the f64 oracle put them.
+#[test]
+fn insertion_bar_is_painted_on_the_base_boundary_and_not_over_its_base_cell() {
+    use crate::palette::{PaletteColor, PaletteToken};
+    use rgv_alignment_scene::{AlignmentComponent, CpuAlignmentProjector};
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20);
+    let scene = boundary_marker_scene(&ledger);
+    let origin = BOUNDARY_FIXTURE_ORIGIN;
+    // Two bases over the 256-point lane: the insertion lies between origin + 21 and origin + 22,
+    // whose shared edge is in the middle of the lane.
+    let camera = AlignmentCamera::new(
+        GenomicInterval::new(ContigId::new(0), origin + 21, origin + 23).unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        CLIP,
+    )
+    .unwrap();
+    let boundary = CLIP.x + 128.0;
+    let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    let image = render_scene(&gpu, &mut renderer, &scene, camera, &ledger, 1);
+    let (oracle, expected) = oracle_for(&scene, camera);
+    assert!(
+        expected
+            .iter()
+            .any(|instance| instance.shape == AlignmentGpuShape::PointMarker as u32)
+    );
+    oracle.assert_matches(&image, "insertion boundary bar");
+
+    let frame = CpuAlignmentProjector::project(&scene, 1, camera).unwrap();
+    let marker = frame
+        .primitives
+        .iter()
+        .find(|primitive| matches!(primitive.component, AlignmentComponent::Insertion { .. }))
+        .expect("the insertion is projected");
+    assert!((marker.x + marker.width * 0.5 - boundary).abs() < 1.0e-9);
+    assert!((marker.width - 6.0).abs() < 1.0e-9);
+
+    let palette = AlignmentPalette::light();
+    let insertion = palette
+        .resolve(PaletteColor::Token(PaletteToken::INSERTION))
+        .map(|channel| (f64::from(channel) * 255.0).round() as u8);
+    let scanline = (marker.y + marker.height * 0.5) as u32;
+    let pixel = |column: u32| {
+        let [r, g, b, _] = image.get_pixel(column, scanline).0;
+        [r, g, b]
+    };
+    // Every column whose centre lies inside the CPU-projected bar is insertion-coloured, and the
+    // bar's edges are where the CPU projector puts them.
+    let (left, right) = (marker.x, marker.x + marker.width);
+    assert!(edge_is_decidable(left) && edge_is_decidable(right));
+    let first = first_column_at_or_after(left) as u32;
+    let end = first_column_at_or_after(right) as u32;
+    assert!(end - first >= 5, "{first}..{end}");
+    for column in first..end {
+        assert_eq!(pixel(column), insertion[..3], "bar column {column}");
+    }
+    // The neighbouring base cells, both mid-cell and immediately beside the bar, are the read's
+    // own body colour (this fixture's colour mode tints it by strand rather than plain grey):
+    // neither base looks substituted.
+    let body = frame
+        .primitives
+        .iter()
+        .find(|primitive| {
+            primitive.handle == marker.handle
+                && matches!(
+                    primitive.component,
+                    AlignmentComponent::AlignedSegment { .. }
+                )
+        })
+        .expect("the read body is projected");
+    let read = palette
+        .resolve(crate::alignment_scene::semantic_alignment_color(
+            body.component,
+            body.style,
+        ))
+        .map(|channel| (f64::from(channel) * 255.0).round() as u8);
+    let read = [read[0], read[1], read[2]];
+    assert_ne!(read, insertion[..3]);
+    for column in [
+        (CLIP.x + 64.0) as u32,
+        first - 2,
+        end + 1,
+        (CLIP.x + 192.0) as u32,
+    ] {
+        assert_eq!(pixel(column), read, "base-cell column {column}");
+    }
+    eprintln!(
+        "insertion bar on {}: columns {first}..{end} around boundary {boundary}",
+        gpu.description
+    );
 }

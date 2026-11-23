@@ -101,10 +101,13 @@ fn project_instance(
         top = row_top + camera.read_height * 0.45;
         height = max(camera.read_height * 0.10, 1.0);
     }
-    if shape == 2u {
-        let original_width = right - left;
-        let marker_width = max(original_width, 1.5);
-        left -= (marker_width - original_width) * 0.5;
+    // Point markers (2: start edge, 5: end edge of the one-base span) are narrow bars centred on
+    // that base boundary, a quarter of a base wide but within [2, 6] points; mirrored by
+    // `point_marker_extent` in `rgv-alignment-scene`.
+    if shape == 2u || shape == 5u {
+        let marker_width = clamp((right - left) * 0.25, 2.0, 6.0);
+        let boundary = select(left, right, shape == 5u);
+        left = boundary - marker_width * 0.5;
         right = left + marker_width;
     } else {
         right = max(right, left + 1.0);

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     mem::size_of,
     num::NonZeroU32,
+    ops::Range,
     sync::Arc,
 };
 
@@ -327,9 +328,36 @@ impl AlignmentComponent {
 pub enum AlignmentGeometryToken {
     Rectangle,
     EventLine,
+    /// A narrow bar centred on the base boundary at the START edge of its one-base span (between
+    /// the span's base and the base before it): insertions, leading clips, padding. It never
+    /// fills the base cell, so it cannot be mistaken for a substitution.
     PointMarker,
+    /// As [`Self::PointMarker`], centred on the END edge of its one-base span. Used when the
+    /// event lies at the read's right boundary (a trailing clip or insertion), whose position is
+    /// one past the last aligned base and was therefore clamped onto that base.
+    PointMarkerAtEnd,
     DirectionalTerminalLeft,
     DirectionalTerminalRight,
+}
+
+impl AlignmentGeometryToken {
+    /// Point markers sit on a base boundary rather than covering their span.
+    #[must_use]
+    pub const fn is_point_marker(self) -> bool {
+        matches!(self, Self::PointMarker | Self::PointMarkerAtEnd)
+    }
+
+    /// Boundary geometry for a point event at `position`, whose valid aligned bases are
+    /// `record_start..record_end`. An event at or past `record_end` is drawn on the read's right
+    /// boundary: the end edge of the last aligned base.
+    #[must_use]
+    pub const fn point_marker_for(position: u64, record_end: u64) -> Self {
+        if position >= record_end {
+            Self::PointMarkerAtEnd
+        } else {
+            Self::PointMarker
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -508,6 +536,9 @@ struct PreparedOverlay {
     start: u64,
     end: u64,
     component: AlignmentComponent,
+    /// A point event at the read's right boundary, clamped onto the last aligned base; its
+    /// marker is drawn on that base's end edge.
+    end_anchored: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -900,6 +931,7 @@ impl AlignmentSemanticPage {
                 body: prepared.body,
             };
             for (draw_order, overlay) in prepared.overlays.into_iter().enumerate() {
+                let first_overlay_primitive = primitives.len();
                 push_span(
                     &mut primitives,
                     hit.record.handle(),
@@ -912,6 +944,13 @@ impl AlignmentSemanticPage {
                     overlay_style,
                     20_000_u32.saturating_add(u32::try_from(draw_order).unwrap_or(u32::MAX)),
                 );
+                if overlay.end_anchored {
+                    for primitive in &mut primitives[first_overlay_primitive..] {
+                        if primitive.geometry.is_point_marker() {
+                            primitive.geometry = AlignmentGeometryToken::PointMarkerAtEnd;
+                        }
+                    }
+                }
             }
         }
         for connector in pair_connectors {
@@ -955,9 +994,13 @@ impl AlignmentSemanticPage {
             "semantic page emitted {} labels but reserved {maximum_labels}",
             labels.len(),
         );
+        // Within a row, point markers come last: they sit on a base boundary and overhang the
+        // neighbouring cells, so they must paint over the read body and bases on both sides
+        // (the GPU draws a page's instances in this order).
         primitives.sort_unstable_by_key(|primitive| {
             (
                 primitive.row_offset,
+                primitive.geometry.is_point_marker(),
                 primitive.start_offset,
                 primitive.end_offset,
                 primitive.draw_order,
@@ -1125,26 +1168,55 @@ impl AlignmentSemanticPage {
         row: u32,
         genomic_position: u64,
     ) -> impl Iterator<Item = AlignmentSemanticPrimitive> + '_ {
-        let candidates = if row < self.row_start
-            || row >= self.row_end
-            || !self.interval.contains(genomic_position)
-        {
-            &[][..]
+        let candidates = if self.interval.contains(genomic_position) {
+            self.row_primitives(row)
         } else {
-            usize::try_from(row - self.row_start)
-                .ok()
-                .and_then(|local_row| {
-                    let start = self.row_offsets.get(local_row).copied()?;
-                    let end = self.row_offsets.get(local_row.saturating_add(1)).copied()?;
-                    self.primitives.get(start as usize..end as usize)
-                })
-                .unwrap_or_default()
+            &[][..]
         };
         let offset = genomic_position.saturating_sub(self.interval.start());
         candidates
             .iter()
             .filter(move |primitive| primitive.contains_offset(offset))
             .copied()
+    }
+
+    /// [`Self::primitive_candidates`] plus every point marker of `row` whose one-base span
+    /// intersects `marker_search`. A point marker is drawn centred on a base boundary, so it
+    /// overhangs into the neighbouring base cell (and, when zoomed out, possibly further) and can
+    /// be under the pointer while its own span is not. Like `primitive_candidates`, this borrows
+    /// the page and allocates nothing.
+    pub fn pick_candidates(
+        &self,
+        row: u32,
+        genomic_position: u64,
+        marker_search: Range<u64>,
+    ) -> impl Iterator<Item = AlignmentSemanticPrimitive> + '_ {
+        let page_start = self.interval.start();
+        self.row_primitives(row)
+            .iter()
+            .filter(move |primitive| {
+                let start = page_start.saturating_add(primitive.start_offset);
+                let end = page_start.saturating_add(primitive.end_offset);
+                (start <= genomic_position && genomic_position < end)
+                    || (primitive.geometry.is_point_marker()
+                        && start < marker_search.end
+                        && marker_search.start < end)
+            })
+            .copied()
+    }
+
+    fn row_primitives(&self, row: u32) -> &[AlignmentSemanticPrimitive] {
+        if row < self.row_start || row >= self.row_end {
+            return &[];
+        }
+        usize::try_from(row - self.row_start)
+            .ok()
+            .and_then(|local_row| {
+                let start = self.row_offsets.get(local_row).copied()?;
+                let end = self.row_offsets.get(local_row.saturating_add(1)).copied()?;
+                self.primitives.get(start as usize..end as usize)
+            })
+            .unwrap_or_default()
     }
 
     /// Compatibility collector for non-interactive callers and tests that need an owned list.
@@ -1436,6 +1508,7 @@ fn prepare_modified_base_overlays(
         };
         if tile.contains(position) {
             output.push(PreparedOverlay {
+                end_anchored: false,
                 start: position,
                 end: position.saturating_add(1),
                 component: AlignmentComponent::ModifiedBase {
@@ -1494,6 +1567,7 @@ fn prepare_modified_base_overlays(
                 };
                 if tile.contains(position) {
                     output.push(PreparedOverlay {
+                        end_anchored: false,
                         start: position,
                         end: position.saturating_add(1),
                         component: AlignmentComponent::ModifiedBase {
@@ -1555,6 +1629,7 @@ fn prepare_bisulfite_overlays(
             && let Ok(read_index) = u32::try_from(read_index)
         {
             output.push(PreparedOverlay {
+                end_anchored: false,
                 start: position,
                 end: position.saturating_add(1),
                 component: AlignmentComponent::BisulfiteBase {
@@ -1603,6 +1678,7 @@ fn prepare_smrt_overlays(
             u32::try_from(read_index),
         ) {
             output.push(PreparedOverlay {
+                end_anchored: false,
                 start: position,
                 end: position.saturating_add(1),
                 component: AlignmentComponent::SmrtKinetics {
@@ -1655,6 +1731,7 @@ fn prepare_ultima_overlays(
             continue;
         }
         output.push(PreparedOverlay {
+            end_anchored: false,
             start: event.reference_start,
             end,
             component: AlignmentComponent::UltimaIndel {
@@ -1713,6 +1790,7 @@ fn prepare_sbx_overlays(
                 && let Ok(read_index) = u32::try_from(read_index)
             {
                 output.push(PreparedOverlay {
+                    end_anchored: false,
                     start: position,
                     end: position.saturating_add(1),
                     component: AlignmentComponent::SbxTailBase { read_index },
@@ -1748,6 +1826,7 @@ fn prepare_sbx_overlays(
                     );
                     if let Ok(cigar_index) = u32::try_from(cigar_index) {
                         output.push(PreparedOverlay {
+                            end_anchored: reference_position >= record.end(),
                             start: reference_position.min(record.end().saturating_sub(1)),
                             end: reference_position
                                 .min(record.end().saturating_sub(1))
@@ -1809,6 +1888,7 @@ fn push_unavailable(
     let end = record.end().min(tile.end());
     if start < end {
         output.push(PreparedOverlay {
+            end_anchored: false,
             start,
             end,
             component: AlignmentComponent::SpecialistUnavailable { mode, reason },
@@ -2552,6 +2632,41 @@ fn push_label_span(
     style: AlignmentStyleToken,
     draw_order: u32,
 ) -> Result<(), SemanticPageError> {
+    push_label_with_geometry(
+        output,
+        labels,
+        handle,
+        row_offset,
+        start,
+        end,
+        tile,
+        tile_start,
+        kind,
+        text,
+        style,
+        draw_order,
+        AlignmentGeometryToken::Rectangle,
+    )
+}
+
+/// `geometry` is the label's anchor: `Rectangle` centres the text on its span, while a point
+/// marker token centres it on the same base boundary as the event's marker.
+#[allow(clippy::too_many_arguments)]
+fn push_label_with_geometry(
+    output: &mut Vec<AlignmentSemanticPrimitive>,
+    labels: &mut Vec<PendingLabel>,
+    handle: AlignmentHandle,
+    row_offset: u32,
+    start: u64,
+    end: u64,
+    tile: GenomicInterval,
+    tile_start: u64,
+    kind: AlignmentLabelKind,
+    text: &str,
+    style: AlignmentStyleToken,
+    draw_order: u32,
+    geometry: AlignmentGeometryToken,
+) -> Result<(), SemanticPageError> {
     let semantic_start = start;
     let semantic_end = end;
     let start = start.max(tile.start());
@@ -2570,7 +2685,7 @@ fn push_label_span(
         row_offset,
         handle,
         component: AlignmentComponent::Label { kind, id },
-        geometry: AlignmentGeometryToken::Rectangle,
+        geometry,
         style,
         draw_order,
     });
@@ -2593,8 +2708,15 @@ fn push_label_point(
     style: AlignmentStyleToken,
     draw_order: u32,
 ) -> Result<(), SemanticPageError> {
+    // An insertion's length is centred on the boundary its marker is drawn on. Other point
+    // labels keep their base-cell anchor.
+    let geometry = if kind == AlignmentLabelKind::InsertionLength {
+        AlignmentGeometryToken::point_marker_for(position, record_end)
+    } else {
+        AlignmentGeometryToken::Rectangle
+    };
     let position = position.clamp(record_start, record_end.saturating_sub(1));
-    push_label_span(
+    push_label_with_geometry(
         output,
         labels,
         handle,
@@ -2607,6 +2729,7 @@ fn push_label_point(
         text,
         style,
         draw_order,
+        geometry,
     )
 }
 
@@ -2706,6 +2829,10 @@ fn push_point(
     style: AlignmentStyleToken,
     draw_order: u32,
 ) {
+    let mut geometry = geometry_for(component, style);
+    if geometry.is_point_marker() {
+        geometry = AlignmentGeometryToken::point_marker_for(position, record_end);
+    }
     let position = position.clamp(record_start, record_end.saturating_sub(1));
     if !tile.contains(position) {
         return;
@@ -2716,7 +2843,7 @@ fn push_point(
         row_offset,
         handle,
         component,
-        geometry: geometry_for(component, style),
+        geometry,
         style,
         draw_order,
     });
@@ -2730,6 +2857,12 @@ fn geometry_for(
         AlignmentComponent::Deletion { .. }
         | AlignmentComponent::ReferenceSkip { .. }
         | AlignmentComponent::PairConnector { .. } => AlignmentGeometryToken::EventLine,
+        // An Ultima deletion covers the deleted reference bases, so it keeps a span shape; only
+        // events between two reference bases are boundary markers.
+        AlignmentComponent::UltimaIndel {
+            kind: UltimaIndelToken::Deletion,
+            ..
+        } => AlignmentGeometryToken::Rectangle,
         AlignmentComponent::Insertion { .. }
         | AlignmentComponent::SoftClip { .. }
         | AlignmentComponent::HardClip { .. }

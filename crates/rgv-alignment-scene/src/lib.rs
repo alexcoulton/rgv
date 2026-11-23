@@ -60,7 +60,7 @@ pub use coverage::{
 pub use cpu_projector::{
     AlignmentCamera, AlignmentHit, CpuAlignmentFrame, CpuAlignmentLabelFrame,
     CpuAlignmentProjector, CpuClipRect, CpuFrameCoverage, CpuInteractionError, CpuPrimitiveShape,
-    CpuProjectedPrimitive, CpuProjectionError,
+    CpuProjectedPrimitive, CpuProjectionError, point_marker_extent,
 };
 pub use cpu_summary_projector::{
     CoverageAlleleInterpretation, CpuAlleleProjectionOptions, CpuAlleleToken,

@@ -175,9 +175,12 @@ impl AlignmentGpuInstance {
 pub enum AlignmentGpuShape {
     Rectangle = 0,
     EventLine = 1,
+    /// Narrow bar centred on the start edge of its one-base span.
     PointMarker = 2,
     DirectionTerminalRight = 3,
     DirectionTerminalLeft = 4,
+    /// Narrow bar centred on the end edge of its one-base span (a read's right boundary).
+    PointMarkerAtEnd = 5,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -221,11 +224,17 @@ pub fn project_alignment_gpu_instance(
         y = row_top + camera.read_height() * 0.45;
         height = (camera.read_height() * 0.10).max(1.0);
     }
-    if instance.shape() == AlignmentGpuShape::PointMarker as u32 {
-        let original_width = right - x;
-        let marker_width = original_width.max(1.5);
-        x -= (marker_width - original_width) * 0.5;
-        right = x + marker_width;
+    let shape = instance.shape();
+    if shape == AlignmentGpuShape::PointMarker as u32
+        || shape == AlignmentGpuShape::PointMarkerAtEnd as u32
+    {
+        let (left, width) = rgv_alignment_scene::point_marker_extent(
+            x,
+            right,
+            shape == AlignmentGpuShape::PointMarkerAtEnd as u32,
+        );
+        x = left;
+        right = left + width;
     } else {
         right = right.max(x + 1.0);
     }
@@ -3902,6 +3911,7 @@ const fn shape_for(geometry: AlignmentGeometryToken) -> AlignmentGpuShape {
         AlignmentGeometryToken::Rectangle => AlignmentGpuShape::Rectangle,
         AlignmentGeometryToken::EventLine => AlignmentGpuShape::EventLine,
         AlignmentGeometryToken::PointMarker => AlignmentGpuShape::PointMarker,
+        AlignmentGeometryToken::PointMarkerAtEnd => AlignmentGpuShape::PointMarkerAtEnd,
         AlignmentGeometryToken::DirectionalTerminalLeft => AlignmentGpuShape::DirectionTerminalLeft,
         AlignmentGeometryToken::DirectionalTerminalRight => {
             AlignmentGpuShape::DirectionTerminalRight
