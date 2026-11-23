@@ -7287,6 +7287,49 @@ mod tests {
         }
     }
 
+    /// A clip length never lands on another read. With ghost bases hidden at this zoom it sits
+    /// right at the read's clipped end (not past invisible ghosts); with ghosts drawn it sits past
+    /// them, unless that place is on the next read packed into the same row, where it is dropped.
+    #[test]
+    fn clip_length_labels_follow_the_drawn_ghosts_and_never_sit_on_another_read() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let clipped = record(
+            b"clipped",
+            120,
+            140,
+            &[(CigarOpKind::Match, 20), (CigarOpKind::SoftClip, 11)],
+            &[b'A'; 31],
+        );
+        // 24 bases starting six bases after the clipped read ends: the same row (spacing 3),
+        // and on top of where its eleven ghost bases would be.
+        let neighbour = record(b"neighbour", 146, 170, &[(CigarOpKind::Match, 24)], &[b'A'; 24]);
+        let style = crate::AlignmentStyleContract::default();
+        let alone = scene_for_records(&ledger, &[clipped.clone()], GeometryLod::Base, style);
+        let packed = scene_for_records(&ledger, &[clipped, neighbour], GeometryLod::Base, style);
+
+        // 6.5 points per base: base LOD builds the ghosts but they are not drawn (< 7).
+        let hidden_ghosts = clip_camera(100, 180, 520.0);
+        assert!(!crate::clip_ghost_visible(6.5));
+        for scene in [&alone, &packed] {
+            let labels = event_labels(scene, hidden_ghosts, AlignmentLabelKind::ClipLength);
+            assert_eq!(labels.len(), 1, "{labels:?}");
+            assert!(
+                (labels[0].x - pane_x(hidden_ghosts, 140)).abs() < 1.0e-9,
+                "the count starts at the clipped end, not past hidden ghosts: {:?}",
+                labels[0]
+            );
+        }
+
+        // 12 points per base: ghosts drawn, so the count goes past them (base 151)...
+        let drawn_ghosts = clip_camera(100, 160, 720.0);
+        let labels = event_labels(&alone, drawn_ghosts, AlignmentLabelKind::ClipLength);
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert!((labels[0].x - pane_x(drawn_ghosts, 151)).abs() < 1.0e-9, "{:?}", labels[0]);
+        // ...which is on the neighbouring read, so there the count is dropped.
+        let labels = event_labels(&packed, drawn_ghosts, AlignmentLabelKind::ClipLength);
+        assert!(labels.is_empty(), "a clip count was drawn on another read: {labels:?}");
+    }
+
     /// Event lengths only appear where they have room. Span events (deletions, skips) need the
     /// text to fit inside their on-screen extent; point events (insertions, clips) need at
     /// least two points per base and the text to fit in the width their bases would take.

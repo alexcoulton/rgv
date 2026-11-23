@@ -551,7 +551,11 @@ impl CpuAlignmentProjector {
                 }
             }
         }
-        reconcile_labels(&mut primitives, labels.into_values(), camera);
+        let mut read_bodies = ReadBodiesByRow::new();
+        for primitive in &primitives {
+            add_read_body(&mut read_bodies, primitive);
+        }
+        reconcile_labels(&mut primitives, labels.into_values(), camera, &read_bodies);
         // Paint order, as on the GPU: clip ghosts lie beneath the rest of their row, and boundary
         // marks (point markers, clip edges) overhang the neighbouring cells, so they follow it.
         primitives.sort_by(|left, right| {
@@ -662,7 +666,31 @@ impl CpuAlignmentProjector {
             HashMap::<(AlignmentHandle, AlignmentComponent), CpuProjectedPrimitive>::with_capacity(
                 maximum_labels,
             );
+        let mut read_bodies = ReadBodiesByRow::new();
         if covered_interval.is_some() {
+            for page in &visible_text_pages {
+                for primitive in page
+                    .primitives()
+                    .iter()
+                    .copied()
+                    .filter(|primitive| is_read_body(primitive.component))
+                {
+                    let global_row = page.row_range().start.saturating_add(primitive.row_offset);
+                    if global_row < covered_rows.start || global_row >= covered_rows.end {
+                        continue;
+                    }
+                    if let Some(projected) = project_primitive(
+                        primitive,
+                        page.interval().start(),
+                        global_row,
+                        camera,
+                        None,
+                        AlignmentInteractionToken::default(),
+                    ) {
+                        add_read_body(&mut read_bodies, &projected);
+                    }
+                }
+            }
             for page in visible_text_pages {
                 for primitive in page.primitives().iter().copied().filter(|primitive| {
                     matches!(
@@ -710,7 +738,7 @@ impl CpuAlignmentProjector {
             }
         }
         let mut labels = Vec::with_capacity(maximum_labels);
-        reconcile_labels(&mut labels, fragments.into_values(), camera);
+        reconcile_labels(&mut labels, fragments.into_values(), camera, &read_bodies);
         let base_labels_projected = labels
             .iter()
             .filter(|label| matches!(label.component, AlignmentComponent::Base { .. }))
@@ -1220,10 +1248,36 @@ fn point_event_label_length(text: &str) -> f64 {
     digits.parse::<u32>().map_or(1.0, f64::from).max(1.0)
 }
 
+/// Horizontal extents of read bodies per row, so a clip length placed outside its read can be
+/// refused when it would sit on a different read packed into the same row.
+type ReadBodiesByRow = HashMap<u32, Vec<(f64, f64, AlignmentHandle)>>;
+
+fn is_read_body(component: AlignmentComponent) -> bool {
+    matches!(
+        component,
+        AlignmentComponent::ReadSpan
+            | AlignmentComponent::AlignedSegment { .. }
+            | AlignmentComponent::DirectionTerminal
+            | AlignmentComponent::Deletion { .. }
+            | AlignmentComponent::ReferenceSkip { .. }
+    )
+}
+
+fn add_read_body(bodies: &mut ReadBodiesByRow, primitive: &CpuProjectedPrimitive) {
+    if is_read_body(primitive.component) {
+        bodies.entry(primitive.row).or_default().push((
+            primitive.x,
+            primitive.x + primitive.width,
+            primitive.handle,
+        ));
+    }
+}
+
 fn reconcile_labels(
     primitives: &mut Vec<CpuProjectedPrimitive>,
     labels: impl Iterator<Item = CpuProjectedPrimitive>,
     camera: AlignmentCamera,
+    read_bodies: &ReadBodiesByRow,
 ) {
     const MIN_TEXT_HEIGHT: f64 = 5.0;
     const MINIMUM_BASE_GLYPH_WIDTH: f64 = CLIP_GHOST_MINIMUM_POINTS_PER_BASE;
@@ -1283,15 +1337,29 @@ fn reconcile_labels(
                 return None;
             }
             if let AlignmentGeometryToken::ClipEdge(edge) = label.geometry {
-                // A clip length sits outside the read, just beyond its anchor (the clipped
-                // boundary and any ghost bases drawn past it), never over the read body: when
-                // that place is off the pane the label is dropped rather than moved inwards.
-                let left = if edge.at_end {
-                    label.x + label.width
-                } else {
-                    label.x - text_width
+                // A clip length sits outside its read, never over a read body. Its anchor span
+                // is the clipped boundary base plus the ghost bases built beyond it. When those
+                // ghosts are drawn (see `clip_ghost_visible`) the text goes past them; when they
+                // are hidden at this zoom it goes right at the read's clipped end, rather than
+                // past invisible ghosts and onto the next read in the row. Off the pane, or on
+                // any other read of the same row, the label is dropped rather than moved.
+                let ghosts_drawn = clip_ghost_visible(points_per_base);
+                let left = match (edge.at_end, ghosts_drawn) {
+                    (true, true) => label.x + label.width,
+                    (true, false) => label.x + points_per_base,
+                    (false, true) => label.x - text_width,
+                    (false, false) => label.x + label.width - points_per_base - text_width,
                 };
                 if left < clip.x || left + text_width > clip_right {
+                    return None;
+                }
+                let right = left + text_width;
+                let on_another_read = read_bodies.get(&label.row).is_some_and(|bodies| {
+                    bodies.iter().any(|&(start, end, handle)| {
+                        handle != label.handle && start < right && end > left
+                    })
+                });
+                if on_another_read {
                     return None;
                 }
                 label.x = left;
