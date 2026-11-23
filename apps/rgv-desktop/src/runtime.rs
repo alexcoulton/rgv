@@ -294,7 +294,9 @@ impl ApplicationHandler for Application {
                 button: MouseButton::Right,
                 ..
             } => {
-                if viewer.open_alignment_context_menu_at_cursor("secondary_click") {
+                if viewer.open_alignment_context_menu_at_cursor("secondary_click")
+                    || viewer.open_feature_context_menu_at_cursor()
+                {
                     Viewer::mark_native_input_handled(&mut recording_observation);
                 }
             }

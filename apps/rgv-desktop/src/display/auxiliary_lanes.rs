@@ -1,8 +1,8 @@
 use crate::display::auxiliary::{
-    measured_feature_label_widths, quantitative_display_records, quantitative_object_id_span,
-    quantitative_overlay_members, quantitative_overlay_subtracks, shared_copy_number_range,
-    shared_quantitative_range, snapshot_data_record_count, strip_object_ids,
-    track_options_with_object_ids,
+    feature_presentation, measured_feature_label_widths, quantitative_display_records,
+    quantitative_object_id_span, quantitative_overlay_members, quantitative_overlay_subtracks,
+    shared_copy_number_range, shared_quantitative_range, snapshot_data_record_count,
+    strip_object_ids, track_options_with_object_ids,
 };
 use crate::display::{GenomicDisplayPass, primary_pinned_gene_id};
 use crate::ui::gestures::retained_data_overlaps;
@@ -18,9 +18,9 @@ use rgv_core::{
 };
 use rgv_engine::TrackSnapshotData;
 use rgv_layout::{
-    DisplayList, ObjectIdAllocator, TrackLayoutOptions, layout_copy_number,
-    layout_features_with_label_widths, layout_gwas, layout_interactions, layout_mutations,
-    layout_quantitative, layout_variants,
+    DisplayList, ObjectIdAllocator, TrackLayoutOptions, layout_copy_number, layout_gwas,
+    layout_interactions, layout_mutations, layout_presented_features, layout_quantitative,
+    layout_variants,
 };
 use std::collections::BTreeSet;
 
@@ -352,12 +352,18 @@ impl Viewer {
             track_options_with_object_ids(object_ids, object_id_span, options);
         let mut display = match data {
             TrackSnapshotData::Features(records) => {
-                let label_widths = measured_feature_label_widths(&self.egui_context, records);
-                layout_features_with_label_widths(
+                let presentation = feature_presentation(member, records);
+                let label_widths = measured_feature_label_widths(
+                    &self.egui_context,
+                    records,
+                    presentation.as_ref(),
+                );
+                layout_presented_features(
                     records,
                     source_viewport,
                     options,
                     Some(&label_widths),
+                    presentation.as_ref(),
                 )
                 .0
             }

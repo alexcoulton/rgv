@@ -517,6 +517,10 @@ impl Viewer {
                                 inspector_actions.sashimi_svg_export_requested;
                             st.lists.add_selected_feature_to_review |=
                                 inspector_actions.add_selected_feature_to_review;
+                            if inspector_actions.gene_transcripts_toggled.is_some() {
+                                st.gene_transcripts_action =
+                                    inspector_actions.gene_transcripts_toggled;
+                            }
                             if inspector_actions.show_all_transcripts_requested.is_some() {
                                 st.inspect.show_all_transcripts_requested =
                                     inspector_actions.show_all_transcripts_requested;

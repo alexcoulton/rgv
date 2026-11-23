@@ -1,3 +1,6 @@
+mod transcript_choice;
+pub use transcript_choice::*;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FeatureFormat {
     Bed,

@@ -225,6 +225,23 @@ impl Viewer {
                     hit.track_name,
                     hit.record.feature_type.as_deref().unwrap_or("feature")
                 );
+                // A hit the track does not draw as itself still navigates; say why it is not
+                // drawn.
+                if let Some(note) = self
+                    .session
+                    .tracks
+                    .tracks()
+                    .iter()
+                    .find(|track| track.id == hit.track_id)
+                    .and_then(|track| {
+                        crate::inspection::gene_transcripts::search_hit_presentation_note(
+                            track,
+                            &hit.record,
+                        )
+                    })
+                {
+                    self.session.data_status = format!("{} · {note}", self.session.data_status);
+                }
             }
             Err(error) => self.report_error(error.to_string()),
         }

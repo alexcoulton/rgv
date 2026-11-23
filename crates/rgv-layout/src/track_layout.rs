@@ -13,7 +13,7 @@ use rgv_model::{
     MutationQuery, QuantitativeRecord, Strand, VariantRecord,
 };
 
-use crate::{DisplayList, RectPrimitive, RectShape, Rgba, TextPrimitive};
+use crate::{DisplayList, FeaturePresentation, RectPrimitive, RectShape, Rgba, TextPrimitive};
 
 pub const MAX_QUANTITATIVE_WINDOWS: usize = 4_096;
 pub const MAX_RAW_QUANTITATIVE_RECORDS: usize = 16_384;
@@ -192,6 +192,20 @@ pub fn layout_features_with_label_widths(
     options: TrackLayoutOptions,
     measured_label_widths: Option<&[f32]>,
 ) -> (DisplayList, TrackLayoutStats) {
+    layout_presented_features(features, viewport, options, measured_label_widths, None)
+}
+
+/// [`layout_features_with_label_widths`] for a gene-model track: records the `presentation`
+/// hides take no row and are not drawn, and its labels replace the records' own. Measured label
+/// widths, when given, are of the presented labels.
+#[allow(clippy::too_many_lines)]
+pub fn layout_presented_features(
+    features: &[FeatureRecord],
+    viewport: Viewport,
+    options: TrackLayoutOptions,
+    measured_label_widths: Option<&[f32]>,
+    presentation: Option<&FeaturePresentation>,
+) -> (DisplayList, TrackLayoutStats) {
     let mut display = DisplayList::default();
     let row_count = match options.feature_display_mode {
         FeatureDisplayMode::Collapsed => 1,
@@ -204,6 +218,7 @@ pub fn layout_features_with_label_widths(
         viewport,
         row_count,
         options.feature_display_mode == FeatureDisplayMode::Collapsed,
+        |index| presentation.is_some_and(|presentation| presentation.is_hidden(index)),
     );
     let hidden = overflow.len();
 
@@ -223,10 +238,10 @@ pub fn layout_features_with_label_widths(
         if !labelable || (row_height < 16.0 && !selected) {
             continue;
         }
-        let Some(label) = feature.display_label().filter(|label| !label.is_empty()) else {
+        let text = FeaturePresentation::label_text(presentation, features, placement.record_index);
+        if text.is_empty() {
             continue;
-        };
-        let text = label.chars().take(32).collect::<String>();
+        }
         let text_width = measured_label_widths
             .and_then(|widths| widths.get(placement.record_index))
             .copied()
@@ -348,6 +363,7 @@ fn pack_feature_rows(
     viewport: Viewport,
     row_count: usize,
     collapsed: bool,
+    hidden: impl Fn(usize) -> bool,
 ) -> (Vec<PlacedFeature>, Vec<usize>) {
     let interval = viewport.interval();
     let visible =
@@ -356,7 +372,7 @@ fn pack_feature_rows(
         let placed = features
             .iter()
             .enumerate()
-            .filter(|(_, feature)| visible(feature))
+            .filter(|(index, feature)| !hidden(*index) && visible(feature))
             .map(|(record_index, _)| PlacedFeature {
                 record_index,
                 row: 0,
@@ -365,7 +381,9 @@ fn pack_feature_rows(
         return (placed, Vec::new());
     }
     let padding = (viewport.bases_per_pixel() * FEATURE_ROW_PADDING_PIXELS).ceil() as u64;
-    let mut order = (0..features.len()).collect::<Vec<_>>();
+    let mut order = (0..features.len())
+        .filter(|index| !hidden(*index))
+        .collect::<Vec<_>>();
     order.sort_by_key(|index| (features[*index].start, features[*index].end, *index));
     // Exclusive end of the last feature on each row, including its padding.
     let mut row_ends = vec![0_u64; row_count];

@@ -435,6 +435,36 @@ impl Viewer {
         Ok(())
     }
 
+    /// Edits the transcript settings of a gene-model track as one track-settings action, as
+    /// the track settings window does.
+    fn apply_automation_gene_model_setting(
+        &mut self,
+        track_id: TrackId,
+        edit: impl FnOnce(&mut rgv_core::FeatureTrackSettings),
+    ) -> Result<()> {
+        let track = self
+            .session
+            .tracks
+            .tracks()
+            .iter()
+            .find(|track| track.id == track_id)
+            .ok_or_else(|| anyhow::anyhow!("track {} was not found", track_id.get()))?;
+        anyhow::ensure!(
+            track.kind == rgv_core::TrackKind::GeneModel,
+            "track {} is not a gene-model track",
+            track_id.get()
+        );
+        let mut config = track.clone();
+        edit(&mut config.feature);
+        if config != *track {
+            self.apply_action(crate::action::Action::SetTrackConfigs {
+                tracks: vec![config],
+            })?;
+        }
+        self.rebuild_all_panel_displays();
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn apply_automation_setting(
         &mut self,
@@ -611,6 +641,16 @@ impl Viewer {
                 "visible",
                 &serde_json::json!(value),
             )?,
+            AutomationSetting::TrackTranscripts { track_id, value } => {
+                self.apply_automation_gene_model_setting(*track_id, |settings| {
+                    settings.transcripts = *value;
+                })?;
+            }
+            AutomationSetting::TrackProteinCodingOnly { track_id, value } => {
+                self.apply_automation_gene_model_setting(*track_id, |settings| {
+                    settings.protein_coding_only = *value;
+                })?;
+            }
             AutomationSetting::VerticalScrollPoints {
                 panel_id,
                 value,

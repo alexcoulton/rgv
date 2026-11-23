@@ -209,7 +209,8 @@ first (primary) alignment track's settings. `show_reads`, `alignment_density` an
 `vertical_scroll_points` take an optional `track_id` naming the alignment track to change; when it
 is omitted they act on the primary alignment track, as before. `track_height`,
 `track_collapsed` and `track_visible` address a track's annotation-channel row, and
-`track_collapsed: true` is the same operation as `track_visible: false`. `alignment_density`
+`track_collapsed: true` is the same operation as `track_visible: false`. `track_transcripts`
+(`one_per_gene` or `all`) and `track_protein_coding_only` apply to gene-model tracks only. `alignment_density`
 passes batch validation from 0.25 but the viewer rejects values below 0.35;
 `read_panel_density` raises such values to 0.35 and reports `clamped`.
 `presentation_node_visible` and `presentation_node_height` take the reference lane or a track,

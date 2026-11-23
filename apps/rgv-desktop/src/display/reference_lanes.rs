@@ -1,6 +1,6 @@
 use crate::display::auxiliary::{
-    measured_feature_label_widths, pinned_gene_layout_maximum_rows, strip_object_ids,
-    track_options_with_object_ids,
+    feature_presentation, measured_feature_label_widths, pinned_gene_layout_maximum_rows,
+    strip_object_ids, track_options_with_object_ids,
 };
 use crate::display::{
     GenomicDisplayPass, pinned_gene_track_height, primary_pinned_gene_id, reference_bases_label,
@@ -19,9 +19,8 @@ use rgv_core::{
 use rgv_engine::{MAX_REFERENCE_QUERY_BASES, TrackSnapshot, TrackSnapshotData};
 use rgv_hts::ReferenceSlice;
 use rgv_layout::{
-    DisplayList, MINIMUM_BASE_GLYPH_PIXEL_WIDTH, TrackLayoutOptions,
-    layout_features_with_label_widths, layout_reference_slice_oriented,
-    layout_reference_translation_in_contig,
+    DisplayList, MINIMUM_BASE_GLYPH_PIXEL_WIDTH, TrackLayoutOptions, layout_presented_features,
+    layout_reference_slice_oriented, layout_reference_translation_in_contig,
 };
 
 /// Appends one 20-point lane per translation frame. Reverse frames are
@@ -346,12 +345,18 @@ impl Viewer {
                 };
                 let (options, object_id_range) =
                     track_options_with_object_ids(object_ids, records.len(), options);
-                let label_widths = measured_feature_label_widths(&self.egui_context, records);
-                let mut gene_display = layout_features_with_label_widths(
+                let presentation = feature_presentation(&config, records);
+                let label_widths = measured_feature_label_widths(
+                    &self.egui_context,
+                    records,
+                    presentation.as_ref(),
+                );
+                let mut gene_display = layout_presented_features(
                     records,
                     source_viewport,
                     options,
                     Some(&label_widths),
+                    presentation.as_ref(),
                 )
                 .0;
                 if object_id_range.is_none() {

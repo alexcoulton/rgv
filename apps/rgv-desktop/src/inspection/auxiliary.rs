@@ -39,6 +39,65 @@ fn feature_attribute_values(record: &rgv_hts::FeatureRecord, key: &str) -> Vec<S
         .collect()
 }
 
+/// A record's attributes as its source wrote them: without the representative-transcript
+/// choice the viewer adds, which the panel shows as its own section.
+fn source_attributes(record: &rgv_hts::FeatureRecord) -> impl Iterator<Item = &(String, String)> {
+    record
+        .attributes
+        .iter()
+        .filter(|(key, _)| key != rgv_model::TRANSCRIPT_CHOICE_ATTRIBUTE)
+}
+
+/// "Representative: ENST… (reason: MANE Select)" for a transcript of a multi-transcript gene.
+pub(crate) fn representative_transcript_text(record: &rgv_hts::FeatureRecord) -> Option<String> {
+    let choice = record.transcript_choice()?;
+    let this = if choice.is_representative() {
+        " · this transcript"
+    } else {
+        ""
+    };
+    Some(format!(
+        "{} (reason: {}){this}",
+        choice.representative,
+        choice.reason.description()
+    ))
+}
+
+/// The section listing the gene's transcripts, with the representative and why it was chosen.
+fn gene_transcripts_section(inspector: &FeatureInspectorSnapshot) -> Option<InspectorSection> {
+    let record = &inspector.record;
+    let choice = record.transcript_choice()?;
+    let mut fields = vec![
+        InspectorField::new(
+            "representative-transcript",
+            "Representative",
+            InspectorValue::Text(representative_transcript_text(record)?),
+        )
+        .with_copy_value(choice.representative)
+        .with_provenance(InspectorProvenance::Parsed),
+    ];
+    let listed = &inspector.gene_transcripts.transcripts;
+    if !listed.is_empty() {
+        fields.push(
+            InspectorField::new(
+                "gene-transcripts",
+                format!("Transcripts ({})", choice.count),
+                InspectorValue::List(listed.clone()),
+            )
+            .with_provenance(if listed.len() < choice.count {
+                InspectorProvenance::Truncated {
+                    displayed: listed.len(),
+                    total: Some(choice.count),
+                    reason: "transcripts in the loaded region".to_owned(),
+                }
+            } else {
+                InspectorProvenance::Source
+            }),
+        );
+    }
+    Some(InspectorSection::new("gene-transcripts", "Gene transcripts", 15).with_fields(fields))
+}
+
 fn semantic_identifier_field(id: &str, label: &str, value: Option<&str>) -> Option<InspectorField> {
     value.map(|value| {
         InspectorField::new(id, label, InspectorValue::Identifier(value.to_owned()))
@@ -91,7 +150,7 @@ fn complete_feature_details_text(
             let _ = write!(details, "\nBlock {}: {}-{}", index + 1, start + 1, end);
         }
     }
-    for (index, (key, value)) in record.attributes.iter().enumerate() {
+    for (index, (key, value)) in source_attributes(record).enumerate() {
         let _ = write!(details, "\nAttribute {} · {key}: {value}", index + 1);
     }
     details
@@ -310,6 +369,10 @@ pub(crate) fn feature_inspector_document(
             .push(InspectorSection::new("gene", "Gene", 10).with_fields(gene_fields));
     }
 
+    if let Some(section) = gene_transcripts_section(inspector) {
+        document.sections.push(section);
+    }
+
     let transcript_fields = [
         semantic_identifier_field("transcript-name", "Transcript name", transcript_name),
         semantic_identifier_field("transcript-id", "Transcript ID", identity.transcript_id),
@@ -499,9 +562,7 @@ pub(crate) fn feature_inspector_document(
         );
     }
 
-    document.raw_fields = record
-        .attributes
-        .iter()
+    document.raw_fields = source_attributes(record)
         .take(MAX_FEATURE_INSPECTOR_ATTRIBUTES)
         .enumerate()
         .map(|(index, (key, complete_value))| {
@@ -545,6 +606,15 @@ pub(crate) fn feature_inspector_document(
         ),
         InspectorAction::new(InspectorActionId::ClearSelection, "Clear selection").low_emphasis(),
     ];
+    if let Some(target) = &inspector.gene_transcripts.toggle {
+        document.actions.insert(
+            1,
+            InspectorAction::new(
+                InspectorActionId::ToggleGeneTranscripts,
+                crate::inspection::gene_transcripts::gene_transcripts_toggle_label(target),
+            ),
+        );
+    }
     if feature_attribute(record, &["landmark_asset_role"]) == Some("representative_genes")
         && let Some(bundle_id) = feature_attribute(record, &["landmark_bundle_id"])
     {
@@ -641,6 +711,18 @@ fn feature_inspector_legacy_fields(inspector: &FeatureInspectorSnapshot) -> Vec<
         };
         fields.push((format!("{block_label} ({})", record.blocks.len()), exons));
     }
+    if let Some(representative) = representative_transcript_text(record) {
+        fields.push(("Representative".to_owned(), representative));
+        if !inspector.gene_transcripts.transcripts.is_empty() {
+            fields.push((
+                format!(
+                    "Gene transcripts ({})",
+                    record.transcript_choice().map_or(0, |choice| choice.count)
+                ),
+                inspector.gene_transcripts.transcripts.join(", "),
+            ));
+        }
+    }
     if let Some(peak) = record.peak {
         fields.extend([
             ("Signal value".to_owned(), peak.signal_value.to_string()),
@@ -670,11 +752,7 @@ fn feature_inspector_legacy_fields(inspector: &FeatureInspectorSnapshot) -> Vec<
             ),
         ]);
     }
-    for (key, value) in record
-        .attributes
-        .iter()
-        .take(MAX_FEATURE_INSPECTOR_ATTRIBUTES)
-    {
+    for (key, value) in source_attributes(record).take(MAX_FEATURE_INSPECTOR_ATTRIBUTES) {
         let (value, _) = bounded_feature_attribute_display(value);
         fields.push((format!("Attribute · {key}"), value));
     }

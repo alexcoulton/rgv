@@ -1,5 +1,5 @@
 use crate::display::auxiliary::{
-    feature_record_index_at_display_point, genomic_distance_to_interval,
+    feature_presentation, feature_record_index_at_display_point, genomic_distance_to_interval,
     gwas_record_index_at_point, interaction_record_index_at_position,
     measured_feature_label_widths, mutation_record_index_at_position,
     pinned_gene_layout_maximum_rows, quantitative_record_index_at_position,
@@ -10,12 +10,14 @@ use crate::display::hit_test::{
     alignment_lane_in_pane_layout,
 };
 use crate::display::primary_pinned_gene_id;
+use crate::inspection::gene_transcripts::gene_transcript_identifiers;
 use crate::inspection::model::{
     CopyNumberInspectorSnapshot, CopyNumberSelection, EvidenceSelection, FeatureInspectorSnapshot,
-    FeatureSelection, GwasInspectorSnapshot, GwasSelection, InteractionInspectorSnapshot,
-    InteractionSelection, MutationInspectorSnapshot, MutationSelection,
-    QuantitativeInspectorSnapshot, QuantitativeOperandSnapshot, QuantitativeSelection,
-    VariantAlignmentEvidence, VariantInspectorSnapshot, VariantSelection, next_evidence_index,
+    FeatureSelection, GeneTranscriptsSummary, GwasInspectorSnapshot, GwasSelection,
+    InteractionInspectorSnapshot, InteractionSelection, MutationInspectorSnapshot,
+    MutationSelection, QuantitativeInspectorSnapshot, QuantitativeOperandSnapshot,
+    QuantitativeSelection, VariantAlignmentEvidence, VariantInspectorSnapshot, VariantSelection,
+    next_evidence_index,
 };
 use crate::inspection::rna::selected_supplementary_chain;
 use crate::inspection::variant::variant_allele_evidence_summary;
@@ -38,7 +40,7 @@ use rgv_engine::{AlignmentIndividualReadCapability, TrackSnapshotData};
 use rgv_layout::{
     COPY_NUMBER_HEADER_HEIGHT, JunctionArcComponent, MUTATION_HEADER_HEIGHT, ObjectIdAllocator,
     TrackLayoutOptions, alignment_read_name_hash, copy_number_sample_order,
-    layout_features_with_label_widths,
+    layout_presented_features,
 };
 use std::sync::Arc;
 
@@ -130,6 +132,7 @@ impl Viewer {
             self.session.panels.active_mut().selected_chain = None;
         } else if let Some(selection) = self.feature_at_cursor() {
             self.session.panels.active_mut().selected_feature = Some(selection);
+            self.toggle_gene_transcripts_on_click(selection);
             self.session.panels.active_mut().selected_alignment_track = None;
             self.session.panels.active_mut().selected_pileup_position = None;
             self.session
@@ -338,8 +341,11 @@ impl Viewer {
             TrackLayoutOptions::default().maximum_rows
         };
         let object_ids = ObjectIdAllocator::new().allocate(records.len())?;
-        let label_widths = measured_feature_label_widths(&self.egui_context, records);
-        let display = layout_features_with_label_widths(
+        // The same presentation the lane was drawn with, so a click lands on what is drawn.
+        let presentation = feature_presentation(track, records);
+        let label_widths =
+            measured_feature_label_widths(&self.egui_context, records, presentation.as_ref());
+        let display = layout_presented_features(
             records,
             self.session.panels.active().viewport,
             TrackLayoutOptions {
@@ -351,6 +357,7 @@ impl Viewer {
                 ..TrackLayoutOptions::default()
             },
             Some(&label_widths),
+            presentation.as_ref(),
         )
         .0;
         feature_record_index_at_display_point(
@@ -767,6 +774,10 @@ impl Viewer {
                     self.enrich_builtin_feature_record(selection.track_id, &mut record);
                     Some(FeatureInspectorSnapshot {
                         track_name: snapshot.name.clone(),
+                        gene_transcripts: GeneTranscriptsSummary {
+                            transcripts: gene_transcript_identifiers(records, &record),
+                            toggle: self.gene_transcripts_target_of(selection),
+                        },
                         record,
                     })
                 }

@@ -2294,6 +2294,7 @@ fn desktop_reference_translation_phases_reverse_frames_from_the_contig_end() {
 #[test]
 fn feature_inspector_reports_gene_models_and_peak_statistics() {
     let inspector = FeatureInspectorSnapshot {
+        gene_transcripts: crate::inspection::model::GeneTranscriptsSummary::default(),
         track_name: "peaks".to_owned(),
         record: rgv_hts::FeatureRecord {
             contig: "chr1".to_owned(),
@@ -2330,6 +2331,7 @@ fn feature_inspector_reports_gene_models_and_peak_statistics() {
 #[test]
 fn builtin_gene_properties_include_model_and_bundle_provenance() {
     let inspector = FeatureInspectorSnapshot {
+        gene_transcripts: crate::inspection::model::GeneTranscriptsSummary::default(),
         track_name: "Genes".to_owned(),
         record: rgv_hts::FeatureRecord {
             contig: "chr1".to_owned(),
@@ -2413,6 +2415,7 @@ fn builtin_gene_properties_include_model_and_bundle_provenance() {
 #[test]
 fn feature_inspector_labels_psl_blocks_and_preserves_alignment_counts() {
     let inspector = FeatureInspectorSnapshot {
+        gene_transcripts: crate::inspection::model::GeneTranscriptsSummary::default(),
         track_name: "PSL".to_owned(),
         record: rgv_hts::FeatureRecord {
             contig: "chr1".to_owned(),
@@ -2440,6 +2443,7 @@ fn feature_inspector_labels_psl_blocks_and_preserves_alignment_counts() {
 #[test]
 fn feature_document_promotes_gencode_semantics_and_preserves_duplicate_tags() {
     let inspector = FeatureInspectorSnapshot {
+        gene_transcripts: crate::inspection::model::GeneTranscriptsSummary::default(),
         track_name: "GENCODE v29".to_owned(),
         record: rgv_hts::FeatureRecord {
             contig: "chr1".to_owned(),
@@ -2510,6 +2514,7 @@ fn feature_document_promotes_gencode_semantics_and_preserves_duplicate_tags() {
 fn feature_document_fallback_keeps_blocks_unknown_attributes_and_complete_copy_values() {
     let long_value = "ACGT".repeat(1_200);
     let inspector = FeatureInspectorSnapshot {
+        gene_transcripts: crate::inspection::model::GeneTranscriptsSummary::default(),
         track_name: "custom BED12".to_owned(),
         record: rgv_hts::FeatureRecord {
             contig: "chr7".to_owned(),
@@ -2557,6 +2562,7 @@ fn feature_document_fallback_keeps_blocks_unknown_attributes_and_complete_copy_v
 fn feature_documents_cover_gene_transcript_exon_cds_and_utr_contexts() {
     for feature_type in ["gene", "transcript", "exon", "CDS", "UTR"] {
         let inspector = FeatureInspectorSnapshot {
+            gene_transcripts: crate::inspection::model::GeneTranscriptsSummary::default(),
             track_name: "GENCODE".to_owned(),
             record: rgv_hts::FeatureRecord {
                 contig: "chr3".to_owned(),
@@ -2605,6 +2611,7 @@ fn feature_documents_cover_gene_transcript_exon_cds_and_utr_contexts() {
 fn feature_documents_keep_genepred_and_refflat_model_geometry() {
     for track_name in ["genes.genePred", "genes.refFlat"] {
         let inspector = FeatureInspectorSnapshot {
+            gene_transcripts: crate::inspection::model::GeneTranscriptsSummary::default(),
             track_name: track_name.to_owned(),
             record: rgv_hts::FeatureRecord {
                 contig: "chr12".to_owned(),

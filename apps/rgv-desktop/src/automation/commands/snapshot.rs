@@ -693,6 +693,7 @@ impl Viewer {
                         include_secondary: track.config.filters.include_secondary,
                         include_supplementary: track.config.filters.include_supplementary,
                     }),
+                    gene_model: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -728,6 +729,13 @@ impl Viewer {
                 lifecycle,
                 failure,
                 alignment: None,
+                gene_model: (track.kind == TrackKind::GeneModel).then(|| {
+                    rgv_automation::AutomationGeneModelTrackSnapshot {
+                        transcripts: track.feature.transcripts,
+                        protein_coding_only: track.feature.protein_coding_only,
+                        expanded_genes: track.feature.expanded_genes.iter().cloned().collect(),
+                    }
+                }),
             }
         }));
         let source_available = |track_id: TrackId| {

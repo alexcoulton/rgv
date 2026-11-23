@@ -155,7 +155,22 @@ pub(crate) fn next_evidence_index(
 pub(crate) struct FeatureInspectorSnapshot {
     pub(crate) track_name: String,
     pub(crate) record: rgv_hts::FeatureRecord,
+    /// The other transcripts of the record's gene, for a transcript of a multi-transcript gene.
+    pub(crate) gene_transcripts: GeneTranscriptsSummary,
 }
+
+/// The transcripts of a selected transcript's gene, as the track holds them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GeneTranscriptsSummary {
+    /// Identifiers of the gene's transcripts in the loaded region, representative first; at
+    /// most [`MAX_INSPECTOR_GENE_TRANSCRIPTS`].
+    pub(crate) transcripts: Vec<String>,
+    /// The toggle between one and every transcript, when the track folds the gene.
+    pub(crate) toggle: Option<crate::inspection::gene_transcripts::GeneTranscriptsTarget>,
+}
+
+/// Most transcripts of one gene the properties panel lists.
+pub(crate) const MAX_INSPECTOR_GENE_TRANSCRIPTS: usize = 64;
 
 #[derive(Clone)]
 pub(crate) struct InteractionInspectorSnapshot {

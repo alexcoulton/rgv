@@ -172,6 +172,8 @@ pub(super) struct TrackControlsDraft {
     pub(super) alignment_subtrack_controls: Vec<(TrackId, SessionFilters)>,
     pub(super) track_controls: Vec<TrackControl>,
     pub(super) feature_settings_controls: Vec<(TrackId, rgv_core::FeatureTrackSettings)>,
+    /// Feature tracks of gene models, which offer the transcript settings.
+    pub(super) gene_model_tracks: BTreeSet<TrackId>,
     pub(super) natural_row_height_tracks: BTreeSet<TrackId>,
     pub(super) variant_settings_controls: Vec<(TrackId, VariantTrackSettings)>,
     pub(super) gwas_settings_controls: Vec<(TrackId, GwasTrackSettings)>,
@@ -376,4 +378,9 @@ pub(super) struct ShellFrame {
     pub(super) alignment_context_menu: Option<AlignmentContextMenuState>,
     pub(super) alignment_context_menu_view: Option<AlignmentContextMenuView>,
     pub(super) alignment_context_action: Option<(AlignmentContextTarget, AlignmentContextAction)>,
+    pub(super) feature_context_menu:
+        Option<crate::inspection::gene_transcripts::FeatureContextMenuState>,
+    /// The gene whose transcripts the feature menu or the properties panel toggled.
+    pub(super) gene_transcripts_action:
+        Option<crate::inspection::gene_transcripts::GeneTranscriptsTarget>,
 }

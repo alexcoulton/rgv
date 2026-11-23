@@ -22,7 +22,7 @@ use std::sync::Arc;
 use rgv_alignment_scene::AllocationLedger;
 use rgv_core::{
     FeatureTrackSettings, GenomicSourceFormat, PanelId, TrackConfig, TrackId, TrackKind,
-    TrackPipeline, Viewport, classify_genomic_source,
+    TrackPipeline, TranscriptDisplay, Viewport, classify_genomic_source,
 };
 use rgv_engine::{
     EngineQueueError, LaidOutTrackTile, TrackTileEngine, TrackTileEngineConfig,
@@ -42,7 +42,9 @@ use rgv_render::{
     TrackTilePageKey, TrackTileRenderer,
 };
 
-use crate::inspection::model::{FeatureInspectorSnapshot, FeatureSelection};
+use crate::inspection::model::{
+    FeatureInspectorSnapshot, FeatureSelection, GeneTranscriptsSummary,
+};
 use crate::sources::remote_range_config;
 use crate::{Viewer, ui};
 
@@ -62,8 +64,9 @@ const LABEL_FONT_SIZE: f32 = 9.0;
 ///
 /// `true` only under [`TrackPipeline::Tiles`] and only for plain feature tracks: BED, bigBed,
 /// GFF3 and GTF annotations that are not a built-in landmark track, carry no explicit schema
-/// (bigGenePred, bigNarrowPeak) and use the default feature display settings. Every other
-/// kind, format or setting keeps the legacy pipeline.
+/// (bigGenePred, bigNarrowPeak) and use the default feature display settings (for GFF3 and GTF,
+/// with every transcript shown). Every other kind, format or setting keeps the legacy
+/// pipeline.
 ///
 /// The first visible gene-model track is drawn by the pinned-gene path, not as an auxiliary
 /// lane; [`tile_pipeline_track_ids`] excludes it on top of this decision.
@@ -79,19 +82,25 @@ pub(crate) fn track_uses_tile_pipeline(
     // is stays on the legacy path, which has its own fallback.
     let format =
         classify_genomic_source(&track.source.redacted_label()).map(|source| source.format);
-    let plain = track.built_in.is_none()
-        && track.format.is_none()
-        && track.feature == FeatureTrackSettings::default();
+    let plain = track.built_in.is_none() && track.format.is_none();
     match track_kind {
         TrackKind::Feature => {
             plain
+                && track.feature == FeatureTrackSettings::default()
                 && matches!(
                     format,
                     Some(GenomicSourceFormat::Bed | GenomicSourceFormat::BigBed)
                 )
         }
+        // The tile pipeline draws every transcript: a gene-model track is routed only when it
+        // shows all transcripts, unfiltered. One per gene stays on the legacy path.
         TrackKind::GeneModel => {
             plain
+                && track.feature
+                    == FeatureTrackSettings {
+                        transcripts: TranscriptDisplay::All,
+                        ..FeatureTrackSettings::default()
+                    }
                 && matches!(
                     format,
                     Some(GenomicSourceFormat::Gff3 | GenomicSourceFormat::Gtf)
@@ -1405,6 +1414,7 @@ impl Viewer {
         Some(FeatureInspectorSnapshot {
             track_name,
             record: selection.record.clone(),
+            gene_transcripts: GeneTranscriptsSummary::default(),
         })
     }
 }
@@ -1425,14 +1435,19 @@ mod tests {
     use super::*;
 
     fn track(id: u64, kind: TrackKind, path: &str) -> TrackConfig {
-        TrackConfig::new(
+        let mut config = TrackConfig::new(
             TrackId::new(id),
             format!("track {id}"),
             kind,
             TrackSource::Local {
                 path: path.to_owned(),
             },
-        )
+        );
+        // Gene-model tracks are routed only while they show every transcript.
+        if kind == TrackKind::GeneModel {
+            config.feature.transcripts = TranscriptDisplay::All;
+        }
+        config
     }
 
     fn routed(kind: TrackKind, path: &str) -> bool {
@@ -1537,6 +1552,27 @@ mod tests {
                 TrackPipeline::Tiles,
                 explicit.kind,
                 &explicit
+            ));
+        }
+        // A gene-model track showing one transcript per gene (the default), filtered to
+        // protein-coding genes or with an expanded gene is drawn by the legacy path.
+        let genes = track(1, TrackKind::GeneModel, "genes.gtf");
+        assert!(track_uses_tile_pipeline(
+            TrackPipeline::Tiles,
+            genes.kind,
+            &genes
+        ));
+        let mut one_per_gene = genes.clone();
+        one_per_gene.feature.transcripts = TranscriptDisplay::OnePerGene;
+        let mut coding = genes.clone();
+        coding.feature.protein_coding_only = true;
+        let mut expanded = genes;
+        expanded.feature.expanded_genes.insert("G1".to_owned());
+        for changed in [one_per_gene, coding, expanded] {
+            assert!(!track_uses_tile_pipeline(
+                TrackPipeline::Tiles,
+                changed.kind,
+                &changed
             ));
         }
         let mut built_in = track(1, TrackKind::GeneModel, "genes.gff3");

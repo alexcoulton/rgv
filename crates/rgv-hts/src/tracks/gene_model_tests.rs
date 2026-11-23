@@ -83,7 +83,8 @@ fn gtf_lines_become_one_record_per_transcript() {
             // The CDS, extended by the stop codon below it.
             coding_interval: Some((1_497, 8_500)),
             peak: None,
-            // The transcript line's attributes, unchanged.
+            // The transcript line's attributes, unchanged, then its place in its gene: the
+            // representative of two, ahead of T2.1 by its CCDS tag.
             attributes: pairs(&[
                 ("gene_id", "G1.5"),
                 ("transcript_id", "T1.2"),
@@ -93,6 +94,7 @@ fn gtf_lines_become_one_record_per_transcript() {
                 ("transcript_name", "GENE1-201"),
                 ("tag", "basic"),
                 ("tag", "CCDS"),
+                (TRANSCRIPT_CHOICE_ATTRIBUTE, "0\t2\tccds\tT1.2\tG1.5"),
             ]),
         }
     );
@@ -182,7 +184,8 @@ fn gff3_hierarchies_become_one_record_per_transcript() {
             blocks: vec![(1_000, 1_500), (3_000, 3_600), (8_000, 9_000)],
             coding_interval: Some((1_200, 8_400)),
             peak: None,
-            // The mRNA line's attributes, with its gene's name and identifier first.
+            // The mRNA line's attributes, with its gene's name and identifier first, then its
+            // place in its gene: the representative of two, ahead of T2 by its basic tag.
             attributes: pairs(&[
                 ("gene_name", "ALPHA"),
                 ("gene_id", "G1"),
@@ -191,6 +194,7 @@ fn gff3_hierarchies_become_one_record_per_transcript() {
                 ("Name", "ALPHA-201"),
                 ("transcript_id", "T1"),
                 ("tag", "basic"),
+                (TRANSCRIPT_CHOICE_ATTRIBUTE, "0\t2\tbasic\tT1\tG1"),
             ]),
         }
     );

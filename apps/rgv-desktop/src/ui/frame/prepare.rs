@@ -537,6 +537,14 @@ impl Viewer {
             .filter(|track| matches!(track.kind, TrackKind::Feature | TrackKind::GeneModel))
             .map(|track| (track.id, track.feature.clone()))
             .collect::<Vec<_>>();
+        let gene_model_tracks = self
+            .session
+            .tracks
+            .tracks()
+            .iter()
+            .filter(|track| track.kind == TrackKind::GeneModel)
+            .map(|track| track.id)
+            .collect();
         let natural_row_height_tracks = self
             .session
             .tracks
@@ -653,6 +661,7 @@ impl Viewer {
             alignment_subtrack_controls,
             track_controls,
             feature_settings_controls,
+            gene_model_tracks,
             natural_row_height_tracks,
             variant_settings_controls,
             gwas_settings_controls,

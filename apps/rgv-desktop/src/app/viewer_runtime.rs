@@ -1090,6 +1090,7 @@ impl Viewer {
             captured_motion_distance: 0.0,
             suppress_horizontal_overview_click: false,
             alignment_context_menu: None,
+            feature_context_menu: None,
         };
         if start_diagnostic_trace
             && (viewer.session.synthetic || viewer.session.alignment_tracks.is_empty())

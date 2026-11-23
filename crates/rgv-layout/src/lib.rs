@@ -2,6 +2,7 @@
 
 mod alignment_style;
 mod display;
+mod feature_presentation;
 mod genome_context;
 mod object_id;
 mod reference_layout;
@@ -17,6 +18,9 @@ pub use display::{
     Direction, DisplayList, JunctionArcGeometrySample, RectPrimitive, RectShape, Rgba,
     TextPrimitive, breakend_bracket_dimensions, junction_arc_distance_to_point,
     junction_arc_geometry_at_point, junction_arc_stroke_width, read_arrow_head_width,
+};
+pub use feature_presentation::{
+    FeaturePresentation, MAX_FEATURE_LABEL_CHARACTERS, representative_label,
 };
 pub use genome_context::{
     ContigAxis, CoordinateRulerLayout, CoordinateRulerOptions, IdeogramCentromere, IdeogramLayout,
@@ -47,7 +51,8 @@ pub use track_layout::{
     compose_quantitative_records, copy_number_sample_order, copy_number_track_height,
     gwas_point_color, gwas_point_y, layout_copy_number, layout_features,
     layout_features_with_label_widths, layout_gwas, layout_interactions, layout_mutations,
-    layout_quantitative, layout_variants, mutation_track_height, quantitative_data_range,
+    layout_presented_features, layout_quantitative, layout_variants, mutation_track_height,
+    quantitative_data_range,
 };
 pub use track_world_layout::{
     MAXIMUM_WORLD_LABEL_CHARACTERS, PlacedTrackLabel, TrackLabelView, TrackSceneHit,

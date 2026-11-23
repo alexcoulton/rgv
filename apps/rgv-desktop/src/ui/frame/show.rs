@@ -38,6 +38,11 @@ impl Viewer {
             st.alignment_context_menu_view.as_ref(),
             &mut st.alignment_context_action,
         );
+        crate::inspection::gene_transcripts::show_feature_context_menu(
+            ui,
+            &mut st.feature_context_menu,
+            &mut st.gene_transcripts_action,
+        );
     }
 
     /// Round-trips the workspace list state through the metadata, regions and review dialogs.

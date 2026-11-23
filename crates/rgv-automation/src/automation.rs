@@ -1329,6 +1329,24 @@ pub enum AutomationSetting {
         /// True shows the row's content, false hides it.
         value: bool,
     },
+    /// Draw one representative transcript per gene (`one_per_gene`, the default) or every
+    /// transcript (`all`) on a gene-model track (GTF, GFF3, genePred, refFlat, bigGenePred).
+    TrackTranscripts {
+        /// Positive stable ID of the gene-model track, as reported in the workspace snapshot
+        /// (`tracks[].id`).
+        track_id: TrackId,
+        /// `one_per_gene` draws each gene's representative transcript labelled with the number
+        /// of other transcripts; `all` draws every transcript in a row of its own.
+        value: rgv_core::TranscriptDisplay,
+    },
+    /// Draw only protein-coding genes on a gene-model track. Search still finds the others.
+    TrackProteinCodingOnly {
+        /// Positive stable ID of the gene-model track, as reported in the workspace snapshot
+        /// (`tracks[].id`).
+        track_id: TrackId,
+        /// True draws protein-coding genes only; false draws every gene.
+        value: bool,
+    },
     /// Scroll one alignment track's read panel in one genomic panel: the track named by
     /// `track_id`, or the first (primary) alignment track when `track_id` is omitted.
     VerticalScrollPoints {
@@ -1490,9 +1508,10 @@ impl AutomationSetting {
                     Err("track height must be finite and between 40 and 1200".to_owned())
                 }
             }
-            Self::TrackCollapsed { track_id, .. } | Self::TrackVisible { track_id, .. } => {
-                validate_track_id(*track_id)
-            }
+            Self::TrackCollapsed { track_id, .. }
+            | Self::TrackVisible { track_id, .. }
+            | Self::TrackTranscripts { track_id, .. }
+            | Self::TrackProteinCodingOnly { track_id, .. } => validate_track_id(*track_id),
             Self::PresentationNodeVisible { target, .. } => match target {
                 rgv_core::PresentationNodeId::Reference
                 | rgv_core::PresentationNodeId::Track { .. } => Ok(()),
@@ -2320,6 +2339,20 @@ pub struct AutomationTrackSnapshot {
     pub failure: Option<String>,
     #[serde(default)]
     pub alignment: Option<AutomationAlignmentTrackSnapshot>,
+    /// A gene-model track's transcript presentation; absent for other tracks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gene_model: Option<AutomationGeneModelTrackSnapshot>,
+}
+
+/// How a gene-model track presents its transcripts.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AutomationGeneModelTrackSnapshot {
+    pub transcripts: rgv_core::TranscriptDisplay,
+    pub protein_coding_only: bool,
+    /// Genes drawn with every transcript while `transcripts` is `one_per_gene`, by gene key
+    /// (the `gene_id`, else `name@contig` and strand).
+    #[serde(default)]
+    pub expanded_genes: Vec<String>,
 }
 
 const fn automation_default_true() -> bool {
@@ -4130,6 +4163,47 @@ mod tests {
             invalid.to_json(),
             Err(AutomationError::InvalidCommand { index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn gene_model_transcript_settings_are_typed_track_settings() {
+        let json = format!(
+            r#"{{"schema_version":{AUTOMATION_SCHEMA_VERSION},"commands":[
+                {{"command":"configure","setting":{{"setting":"track_transcripts","track_id":3,"value":"all"}}}},
+                {{"command":"configure","setting":{{"setting":"track_transcripts","track_id":3,"value":"one_per_gene"}}}},
+                {{"command":"configure","setting":{{"setting":"track_protein_coding_only","track_id":3,"value":true}}}}
+            ]}}"#
+        );
+        let batch = AutomationBatch::from_json(&json).unwrap();
+        assert_eq!(
+            batch.commands,
+            [
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::TrackTranscripts {
+                        track_id: TrackId::new(3),
+                        value: rgv_core::TranscriptDisplay::All,
+                    },
+                },
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::TrackTranscripts {
+                        track_id: TrackId::new(3),
+                        value: rgv_core::TranscriptDisplay::OnePerGene,
+                    },
+                },
+                AutomationCommand::Configure {
+                    setting: AutomationSetting::TrackProteinCodingOnly {
+                        track_id: TrackId::new(3),
+                        value: true,
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            AutomationBatch::from_json(&batch.to_json().unwrap()).unwrap(),
+            batch
+        );
+        let invalid = json.replace("\"track_id\":3", "\"track_id\":0");
+        assert!(AutomationBatch::from_json(&invalid).is_err());
     }
 
     #[test]

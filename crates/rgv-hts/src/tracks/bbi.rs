@@ -138,6 +138,10 @@ pub struct QuantitativeSummaryQuery {
     pub provenance: QuantitativeQueryProvenance,
 }
 
+/// Furthest a bigGenePred read is widened beyond the window to reach every transcript of the
+/// genes it meets. The longest human genes span about 2.5 Mb.
+const MAX_GENE_READ_REACH: u64 = 4_000_000;
+
 pub struct BigBedSource {
     reader: BigBedBackend,
     format: BigBedFeatureFormat,
@@ -220,7 +224,39 @@ impl BigBedSource {
         self.remote.as_ref().map(RemoteReaderControl::stats)
     }
 
+    /// Records overlapping `[start, end)`. Transcripts of a bigGenePred carry their gene's
+    /// representative-transcript choice, made over every transcript of the gene: the read is
+    /// widened to the extent of each gene it meets (by at most [`MAX_GENE_READ_REACH`]).
     pub fn query(
+        &mut self,
+        contig: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<FeatureRecord>, TrackError> {
+        let mut records = self.read(contig, start, end)?;
+        if self.format != BigBedFeatureFormat::BigGenePred {
+            return Ok(records);
+        }
+        let (mut low, mut high) = (start, end);
+        for _ in 0..2 {
+            let (wider_low, wider_high) =
+                transcript_group_read_extent(&records, start, end, MAX_GENE_READ_REACH);
+            if wider_low >= low && wider_high <= high {
+                break;
+            }
+            let (wider_low, wider_high) = (wider_low.min(low), wider_high.max(high));
+            match self.read(contig, wider_low, wider_high) {
+                Ok(wider) => (records, low, high) = (wider, wider_low, wider_high),
+                Err(TrackError::ResourceLimit(_)) => break,
+                Err(error) => return Err(error),
+            }
+        }
+        annotate_transcript_choices(&mut records);
+        records.retain(|record| record.start < end && record.end > start);
+        Ok(records)
+    }
+
+    fn read(
         &mut self,
         contig: &str,
         start: u64,

@@ -1442,6 +1442,8 @@ struct Viewer {
     captured_motion_distance: f64,
     suppress_horizontal_overview_click: bool,
     alignment_context_menu: Option<AlignmentContextMenuState>,
+    /// The right-click menu of a gene-model feature, while open.
+    feature_context_menu: Option<inspection::gene_transcripts::FeatureContextMenuState>,
 }
 
 impl Viewer {}

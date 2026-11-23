@@ -351,6 +351,8 @@ impl Viewer {
             alignment_context_menu,
             alignment_context_menu_view,
             alignment_context_action: None,
+            feature_context_menu: self.feature_context_menu.clone(),
+            gene_transcripts_action: None,
         };
         self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ShellPreparation,

@@ -913,6 +913,32 @@ display. Collapsed overlays every visible item in one row, squished doubles the 
 and expanded uses normal-height packed rows. The mode is persisted, and mouse picking uses the same
 row assignment as rendering.
 
+Gene-model tracks (GTF, GFF3, genePred, refFlat, bigGenePred and the built-in Genes track) add
+**Transcripts: One per gene** (the default) or **All** in the track settings (☰, or right-click the
+track name › Track settings…). One per gene draws each gene's representative transcript, labelled
+with the number of other transcripts (`CLASP2 +11`), so a gene takes one row. The representative is
+chosen by the first rule that separates the gene's transcripts: a `MANE_Select` tag; an
+`Ensembl_canonical` or `RefSeq Select` tag; the APPRIS principal level (`appris_principal_1` first);
+CCDS (tag, `ccdsid` or a `CCDS:` cross-reference); the `basic` tag; the longest coding sequence; the
+longest spliced length; the smallest transcript ID. Transcripts are grouped by `gene_id`, else by
+gene name on the same contig and strand within 100 kb of each other. The choice is made over the
+whole file when it is loaded into memory, and over every transcript of the genes in view for an
+indexed file or bigGenePred (reads are widened to the genes' extent, by at most 4 Mb), so it does not
+change as you pan. Click a representative, or right-click it › **Show all transcripts of CLASP2**, to
+draw that gene with one row per transcript (labelled by transcript name); do it again, or choose
+**Show one transcript**, to fold it back. Expanded genes are saved with the track. The properties
+panel of a transcript of a multi-transcript gene shows the representative and why it was chosen
+(`Representative: ENST… (reason: MANE Select)`) and lists the gene's transcripts in the loaded
+region. The setting does not apply to the Collapsed display mode, which overlays every transcript.
+
+**Protein-coding only** (off by default) draws only protein-coding genes, judged by
+`gene_type`/`gene_biotype`, else `transcript_type`/`transcript_biotype`/`biotype`, else by having a
+coding sequence. Hidden genes are still found by search: a hit navigates as usual and the status
+line notes that the filter hides it (or, in one-per-gene mode, which representative stands for a
+transcript that is not drawn). Automation sets both with `{"setting": "track_transcripts",
+"track_id": N, "value": "one_per_gene" | "all"}` and `{"setting": "track_protein_coding_only",
+"track_id": N, "value": true}`; the workspace snapshot reports them under `tracks[].gene_model`.
+
 ### GWAS Manhattan tracks
 
 RGV accepts the same flexible association-summary headers as IGV. A header is required, columns
@@ -1004,7 +1030,8 @@ with a dedicated GPU renderer. It is provided for evaluation. With the setting o
 changes.
 
 **Covered track kinds.** Only plain feature tracks: BED, bigBed, GFF3 and GTF files (recognised
-by file name) that use the default *Expanded* feature display mode. Every other track stays on
+by file name) that use the default *Expanded* feature display mode (GFF3 and GTF with
+**Transcripts: All** and no protein-coding filter). Every other track stays on
 the established pipeline even when the setting is on: bigWig, bedGraph, WIG and TDF signal,
 VCF/BCF, BEDPE and interact, SEG, MAF, GWAS, narrowPeak, broadPeak, PSL, genePred, refFlat,
 bigGenePred, bigNarrowPeak, the built-in Genes track, the pinned gene track (the first visible

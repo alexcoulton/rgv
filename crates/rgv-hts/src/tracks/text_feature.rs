@@ -242,18 +242,44 @@ impl IndexedTextFeatures {
         reach: u64,
     ) -> Result<Vec<FeatureRecord>, TrackError> {
         let mut records = self.read(contig, start, end)?;
+        let (mut low, mut high) = (start, end);
         if let Some(gtf) = gene_model_dialect(self.format) {
-            let (low, high) =
+            let (wider_low, wider_high) =
                 super::gene_model::assembly_read_extent(&records, start, end, reach, gtf);
-            if low < start || high > end {
-                match self.read(contig, low, high) {
-                    Ok(wider) => records = wider,
+            if wider_low < start || wider_high > end {
+                match self.read(contig, wider_low, wider_high) {
+                    Ok(wider) => (records, low, high) = (wider, wider_low, wider_high),
                     // The window alone stays within the limit: its models may be partial.
                     Err(TrackError::ResourceLimit(_)) => {}
                     Err(error) => return Err(error),
                 }
             }
             records = super::gene_model::assemble(records, gtf).records;
+        }
+        if is_gene_model_format(self.format) {
+            // Every transcript of a gene in the window is read before its representative is
+            // chosen, so the choice is the same in every window. A transcript beyond all the
+            // others of its gene is met by reading again, twice at most.
+            for _ in 0..2 {
+                let (wider_low, wider_high) =
+                    transcript_group_read_extent(&records, start, end, reach);
+                if wider_low >= low && wider_high <= high {
+                    break;
+                }
+                let (wider_low, wider_high) = (wider_low.min(low), wider_high.max(high));
+                match self.read(contig, wider_low, wider_high) {
+                    Ok(wider) => {
+                        records = match gene_model_dialect(self.format) {
+                            Some(gtf) => super::gene_model::assemble(wider, gtf).records,
+                            None => wider,
+                        };
+                        (low, high) = (wider_low, wider_high);
+                    }
+                    Err(TrackError::ResourceLimit(_)) => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            annotate_transcript_choices(&mut records);
             records.retain(|record| record.start < end && record.end > start);
         }
         records.sort_by_key(|record| (record.start, record.end));
@@ -477,6 +503,15 @@ pub(super) const fn gene_model_dialect(format: FeatureFormat) -> Option<bool> {
         FeatureFormat::Gff3 => Some(false),
         _ => None,
     }
+}
+
+/// Whether a format's records are transcript models, of which one per gene can be drawn: they
+/// carry a representative-transcript choice (see [`annotate_transcript_choices`]).
+pub(super) const fn is_gene_model_format(format: FeatureFormat) -> bool {
+    matches!(
+        format,
+        FeatureFormat::Gtf | FeatureFormat::Gff3 | FeatureFormat::GenePred | FeatureFormat::RefFlat
+    )
 }
 
 /// Replaces the lines of a fully loaded GTF or GFF3 source by its transcript models, and builds
@@ -724,6 +759,13 @@ impl TextFeatureSource {
             }
             FeatureSearchIndex::build(&features, search_cap)
         };
+        if is_gene_model_format(format) {
+            // A whole contig is at hand: every gene's representative is chosen from all its
+            // transcripts. Records keep their positions, so the name index stays valid.
+            for index in features.values_mut() {
+                annotate_transcript_choices(&mut index.records);
+            }
+        }
         Ok(Self {
             features,
             search,

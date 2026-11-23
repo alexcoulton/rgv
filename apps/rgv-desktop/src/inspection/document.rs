@@ -632,6 +632,8 @@ pub(crate) enum InspectorActionId {
     ExportVariantGenotypes,
     ExportVariantEvidence,
     ShowAllTranscriptsForGene(String),
+    /// Shows every transcript of the selected transcript's gene, or its representative only.
+    ToggleGeneTranscripts,
     ClearSelection,
 }
 

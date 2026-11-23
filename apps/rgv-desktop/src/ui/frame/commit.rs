@@ -164,6 +164,7 @@ impl Viewer {
             });
         }
         self.alignment_context_menu = st.alignment_context_menu.take();
+        self.feature_context_menu = st.feature_context_menu.take();
         let repaint_delay = full_output
             .viewport_output
             .get(&egui::ViewportId::ROOT)

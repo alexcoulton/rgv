@@ -428,6 +428,9 @@ impl Viewer {
         {
             self.report_error(error.to_string());
         }
+        if let Some(target) = st.gene_transcripts_action.take() {
+            self.set_gene_transcripts_expanded(target.track_id, &target.gene_key, !target.expanded);
+        }
         if let Some((target, action)) = st.alignment_context_action.take() {
             self.apply_alignment_context_action(target, action);
         }

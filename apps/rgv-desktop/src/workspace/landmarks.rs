@@ -665,6 +665,8 @@ impl Viewer {
         });
         config.format = format;
         config.feature.display_mode = FeatureDisplayMode::Squished;
+        // The user asked for every transcript; one per gene would contradict the track's name.
+        config.feature.transcripts = rgv_core::TranscriptDisplay::All;
         self.add_preconfigured_track_source_with_query_contig_aliases(
             &path,
             spec_kind,
@@ -1503,18 +1505,29 @@ mod tests {
         );
     }
 
+    fn gzipped(text: &str) -> Vec<u8> {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write as _;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(text.as_bytes()).unwrap();
+        encoder.finish().unwrap()
+    }
+
     /// A one-chromosome bundle whose assets are written to `root` with their
     /// real sizes and SHA-256 digests.
     fn written_bundle(root: &Path) -> GenomeLandmarkCatalogue {
-        use flate2::{Compression, write::GzEncoder};
+        written_bundle_with(
+            root,
+            b"genes".to_vec(),
+            "rgv_gene_names_v1\nactb\tACTB\tENSG1\tNM_1\tchr1\t10\t20\t+\t\n",
+        )
+    }
+
+    fn written_bundle_with(root: &Path, genes: Vec<u8>, names: &str) -> GenomeLandmarkCatalogue {
         use sha2::{Digest, Sha256};
         use std::fmt::Write as _;
-        use std::io::Write as _;
 
-        let mut names = GzEncoder::new(Vec::new(), Compression::default());
-        names
-            .write_all(b"rgv_gene_names_v1\nactb\tACTB\tENSG1\tNM_1\tchr1\t10\t20\t+\t\n")
-            .unwrap();
         let files: [(
             LandmarkAssetRole,
             rgv_core::LandmarkAssetFormat,
@@ -1525,7 +1538,7 @@ mod tests {
                 LandmarkAssetRole::RepresentativeGenes,
                 rgv_core::LandmarkAssetFormat::GenePredExtGzip,
                 "fixture/genes.genePred.gz",
-                b"genes".to_vec(),
+                genes,
             ),
             (
                 LandmarkAssetRole::ContigAliases,
@@ -1543,7 +1556,7 @@ mod tests {
                 LandmarkAssetRole::GeneSearch,
                 rgv_core::LandmarkAssetFormat::RgvGeneNamesV1Gzip,
                 "fixture/names.tsv.gz",
-                names.finish().unwrap(),
+                gzipped(names),
             ),
         ];
         std::fs::create_dir_all(root.join("fixture")).unwrap();
@@ -1637,5 +1650,72 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("SHA-256"), "{error}");
+    }
+
+    /// The curated bundles list every gene of IGV's default `RefSeq` track, not
+    /// only MANE: a gene outside MANE (PBRM1 here) is searchable, and every
+    /// hit names a model the Genes track draws.
+    #[test]
+    fn genes_outside_mane_are_searchable_and_drawn() {
+        let genes = [
+            "NM_001101.5\tchr1\t-\t5\t30\t6\t29\t1\t5,\t30,\t0\tACTB\tcmpl\tcmpl\t0,",
+            "NM_001297719.2\tchr1\t+\t32\t40\t32\t40\t1\t32,\t40,\t0\tBMAL1\tcmpl\tcmpl\t0,",
+            "NM_001405600.1\tchr1\t-\t45\t90\t50\t80\t2\t45,70,\t60,90,\t0\tPBRM1\tcmpl\tcmpl\t0,0,",
+        ];
+        let names = "rgv_gene_names_v1\n\
+            actb\tACTB\tENSG00000075624.17\tNM_001101.5\tchr1\t5\t30\t-\tENST00000646664.1\n\
+            bmal1\tBMAL1\tENSG00000133794.20\tNM_001297719.2\tchr1\t32\t40\t+\tARNTL,ENST00000403290.6\n\
+            pbrm1\tPBRM1\tPBRM1\tNM_001405600.1\tchr1\t45\t90\t-\t\n";
+        let root = tempfile::tempdir().unwrap();
+        let catalogue =
+            written_bundle_with(root.path(), gzipped(&(genes.join("\n") + "\n")), names);
+        let dictionary = ReferenceDictionary::from_contigs([("chr1".to_owned(), 100)]);
+
+        let prepared =
+            prepare_landmark_context(root.path(), &catalogue, "fixture", &dictionary).unwrap();
+        assert_eq!(prepared.search_error, None);
+        let index = prepared
+            .search_index
+            .expect("verified names are searchable");
+
+        let drawn = {
+            let mut text = String::new();
+            MultiGzDecoder::new(std::fs::File::open(&prepared.genes_path).unwrap())
+                .read_to_string(&mut text)
+                .unwrap();
+            text
+        };
+        let lands_on_drawn_model = |entry: &rgv_core::LandmarkSearchEntry| {
+            drawn.lines().any(|line| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                fields[0] == entry.transcript_id
+                    && fields[1] == entry.contig
+                    && fields[3] == entry.start.to_string()
+                    && fields[4] == entry.end.to_string()
+                    && fields[11] == entry.display_symbol
+            })
+        };
+
+        let pbrm1 = index.search("pbrm1", 5);
+        assert_eq!(pbrm1.len(), 1);
+        assert_eq!(
+            (
+                pbrm1[0].display_symbol.as_str(),
+                pbrm1[0].gene_id.as_str(),
+                pbrm1[0].contig.as_str(),
+                pbrm1[0].start,
+                pbrm1[0].end
+            ),
+            ("PBRM1", "PBRM1", "chr1", 45, 90)
+        );
+        // A former MANE symbol and the MANE Ensembl transcript still find
+        // their gene, and every hit is a model the Genes track draws.
+        assert_eq!(index.search("ARNTL", 5)[0].display_symbol, "BMAL1");
+        assert_eq!(index.search("ENST00000646664", 5)[0].display_symbol, "ACTB");
+        for query in ["ACTB", "BMAL1", "PBRM1", "ARNTL", "ENSG00000075624"] {
+            let hits = index.search(query, 5);
+            assert!(!hits.is_empty(), "{query}");
+            assert!(hits.iter().all(|hit| lands_on_drawn_model(hit)), "{query}");
+        }
     }
 }

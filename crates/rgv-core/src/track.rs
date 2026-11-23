@@ -65,10 +65,45 @@ pub enum FeatureDisplayMode {
     Expanded,
 }
 
+/// Which transcripts of a gene a gene-model track draws.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum TranscriptDisplay {
+    /// One representative transcript per gene (MANE Select, canonical, APPRIS principal, …),
+    /// labelled with the number of other transcripts.
+    #[default]
+    OnePerGene,
+    /// Every transcript in a row of its own.
+    All,
+}
+
+/// Most genes one track keeps expanded to every transcript while it shows one per gene.
+pub const MAX_EXPANDED_GENES: usize = 4_096;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FeatureTrackSettings {
     #[serde(default)]
     pub display_mode: FeatureDisplayMode,
+    /// Gene-model tracks only: one transcript per gene or all of them. Not applied to the
+    /// collapsed display mode, which overlays every transcript in one row.
+    #[serde(default)]
+    pub transcripts: TranscriptDisplay,
+    /// Gene-model tracks only: draw protein-coding genes only. Search still finds the others.
+    #[serde(default)]
+    pub protein_coding_only: bool,
+    /// Gene-model tracks only: genes (by transcript-choice gene key) drawn with every transcript
+    /// while `transcripts` is one per gene.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub expanded_genes: std::collections::BTreeSet<String>,
+}
+
+impl FeatureTrackSettings {
+    /// Whether one gene, by its transcript-choice gene key, is drawn with every transcript.
+    #[must_use]
+    pub fn shows_all_transcripts_of(&self, gene_key: &str) -> bool {
+        self.transcripts == TranscriptDisplay::All || self.expanded_genes.contains(gene_key)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -981,6 +1016,56 @@ mod tests {
         let track: TrackConfig = serde_json::from_str(json).unwrap();
         assert!(!track.collapsed);
         assert_eq!(track.variant, VariantTrackSettings::default());
+    }
+
+    #[test]
+    fn gene_model_transcript_settings_round_trip_and_default_to_one_per_gene() {
+        let mut track = TrackConfig::new(
+            TrackId::new(4),
+            "GENCODE".to_owned(),
+            TrackKind::GeneModel,
+            TrackSource::Local {
+                path: "gencode.gtf.gz".to_owned(),
+            },
+        );
+        assert_eq!(track.feature.transcripts, TranscriptDisplay::OnePerGene);
+        assert!(!track.feature.protein_coding_only);
+        track.feature.transcripts = TranscriptDisplay::All;
+        track.feature.protein_coding_only = true;
+        track
+            .feature
+            .expanded_genes
+            .insert("ENSG00000168615".to_owned());
+        let json = serde_json::to_value(&track).unwrap();
+        assert_eq!(json["feature"]["transcripts"], "all");
+        assert_eq!(json["feature"]["protein_coding_only"], true);
+        assert_eq!(
+            json["feature"]["expanded_genes"],
+            serde_json::json!(["ENSG00000168615"])
+        );
+        // Legacy presentation fields (height) are not written; the feature settings are.
+        assert_eq!(
+            serde_json::from_value::<TrackConfig>(json).unwrap().feature,
+            track.feature
+        );
+        assert!(track.feature.shows_all_transcripts_of("anything"));
+
+        // Sessions written before the setting existed show one transcript per gene.
+        let legacy: TrackConfig = serde_json::from_str(
+            r#"{
+                "id": 4,
+                "name": "GENCODE",
+                "kind": "GeneModel",
+                "source": {"Local": {"path": "gencode.gtf.gz"}},
+                "feature": {"display_mode": "expanded"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.feature, FeatureTrackSettings::default());
+        assert!(!legacy.feature.shows_all_transcripts_of("ENSG1"));
+        // An empty expansion set is not written.
+        let written = serde_json::to_value(&legacy).unwrap();
+        assert!(written["feature"].get("expanded_genes").is_none());
     }
 
     #[test]

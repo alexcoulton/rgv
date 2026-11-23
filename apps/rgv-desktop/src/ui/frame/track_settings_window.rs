@@ -20,7 +20,7 @@ use rgv_core::{
     AlignmentReadSampling, CoverageScaleTransform, FeatureDisplayMode, GeneticCode,
     InspectorActivation, JunctionDisplayMode, LandmarkAssetRole, ModifiedBaseColorMode,
     OverlappingMatePolicy, ReadBaseDisplayMode, ReadStackingMode, ReferenceTranslationFrame,
-    SashimiCountMode, SashimiScaleMode, TrackId,
+    SashimiCountMode, SashimiScaleMode, TrackId, TranscriptDisplay,
 };
 use rgv_layout::{AlignmentSortMode, MAX_HIDDEN_MODIFICATION_CODES, modification_code_color};
 
@@ -1010,6 +1010,9 @@ impl Viewer {
                     })
                     .response
                     .labelled_by(label.id);
+                if st.tracks.gene_model_tracks.contains(&id) {
+                    gene_model_transcript_settings_ui(ui, settings, id);
+                }
             }
             if let Some((_, settings)) = st
                 .tracks
@@ -1115,4 +1118,55 @@ impl Viewer {
             });
         }
     }
+}
+
+/// The transcript controls of a gene-model track: one transcript per gene or all of them, and
+/// the protein-coding filter.
+fn gene_model_transcript_settings_ui(
+    ui: &mut egui::Ui,
+    settings: &mut rgv_core::FeatureTrackSettings,
+    id: TrackId,
+) {
+    let label = ui.label("Transcripts");
+    egui::ComboBox::from_id_salt(("gene-model-transcripts", id.get()))
+        .selected_text(match settings.transcripts {
+            TranscriptDisplay::OnePerGene => "One per gene",
+            TranscriptDisplay::All => "All",
+        })
+        .show_ui(ui, |ui| {
+            ui.selectable_value(
+                &mut settings.transcripts,
+                TranscriptDisplay::OnePerGene,
+                "One per gene",
+            )
+            .on_hover_text(
+                "Draw each gene's representative transcript (MANE Select, canonical, APPRIS \
+                 principal, …) labelled with the number of other transcripts. Click it to show \
+                 all of that gene's transcripts.",
+            );
+            ui.selectable_value(&mut settings.transcripts, TranscriptDisplay::All, "All");
+        })
+        .response
+        .labelled_by(label.id);
+    if settings.transcripts == TranscriptDisplay::OnePerGene
+        && settings.display_mode == FeatureDisplayMode::Collapsed
+    {
+        ui.small("Collapsed overlays every transcript in one row.");
+    }
+    if settings.transcripts == TranscriptDisplay::OnePerGene
+        && !settings.expanded_genes.is_empty()
+        && ui
+            .button(format!(
+                "Show one transcript of all genes ({} expanded)",
+                settings.expanded_genes.len()
+            ))
+            .clicked()
+    {
+        settings.expanded_genes.clear();
+    }
+    ui.checkbox(&mut settings.protein_coding_only, "Protein-coding only")
+        .on_hover_text(
+            "Draw protein-coding genes only (gene or transcript biotype, else a coding \
+             sequence). Search still finds the others.",
+        );
 }

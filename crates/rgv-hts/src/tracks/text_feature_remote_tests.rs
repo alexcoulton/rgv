@@ -834,3 +834,68 @@ fn a_window_beyond_the_widening_limit_keeps_the_transcript_span_and_identity() {
         );
     }
 }
+
+/// A windowed read of an indexed GTF without gene lines chooses each gene's representative
+/// from all its transcripts, however little of the gene the window holds, exactly as the
+/// whole-file load does.
+#[test]
+fn indexed_windows_choose_the_representative_from_every_transcript_of_the_gene() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("genes.gtf.gz");
+    let line = |id: &str, kind: &str, start: u64, end: u64, extra: &str| {
+        format!(
+            "chr1\tsrc\t{kind}\t{start}\t{end}\t.\t+\t.\tgene_id \"G1\"; transcript_id \"{id}\"; gene_name \"GENE1\";{extra}"
+        )
+    };
+    // T_MANE lies far left of the window used below; T_LONG bridges to it; T_RIGHT lies inside.
+    let mut lines = vec![
+        line(
+            "T_MANE",
+            "transcript",
+            1_001,
+            2_000,
+            " tag \"MANE_Select\";",
+        ),
+        line("T_MANE", "exon", 1_001, 2_000, ""),
+        line("T_LONG", "transcript", 1_501, 60_000, ""),
+        line("T_LONG", "exon", 1_501, 1_800, ""),
+        line("T_LONG", "exon", 59_001, 60_000, ""),
+        line("T_RIGHT", "transcript", 59_501, 60_000, ""),
+        line("T_RIGHT", "exon", 59_501, 60_000, ""),
+    ];
+    lines.sort_by_key(|line| line.split('\t').nth(3).unwrap().parse::<u64>().unwrap());
+    write_indexed(&path, &lines, Layout::Gff, 2);
+    let indexed = TextFeatureSource::open(&path, FeatureFormat::Gtf).unwrap();
+    assert!(indexed.is_indexed());
+    let loaded =
+        TextFeatureSource::from_reader(lines.join("\n").as_bytes(), FeatureFormat::Gtf).unwrap();
+    let choices = |records: Vec<FeatureRecord>| {
+        records
+            .iter()
+            .map(|record| {
+                let choice = record.transcript_choice().unwrap();
+                (
+                    record.transcript_identifier().unwrap().to_owned(),
+                    choice.rank,
+                    choice.count,
+                    choice.representative.to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let window = choices(indexed.query("chr1", 59_600, 59_700).unwrap());
+    assert_eq!(
+        window,
+        [
+            ("T_LONG".to_owned(), 1, 3, "T_MANE".to_owned()),
+            ("T_RIGHT".to_owned(), 2, 3, "T_MANE".to_owned()),
+        ]
+    );
+    assert_eq!(
+        window,
+        choices(loaded.query("chr1", 59_600, 59_700).unwrap())
+    );
+    let left = choices(indexed.query("chr1", 1_100, 1_200).unwrap());
+    assert_eq!(left, [("T_MANE".to_owned(), 0, 3, "T_MANE".to_owned())]);
+    assert_eq!(left, choices(loaded.query("chr1", 1_100, 1_200).unwrap()));
+}

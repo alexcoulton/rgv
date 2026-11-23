@@ -10,8 +10,8 @@ use rgv_core::{
 };
 use rgv_engine::{TrackSnapshot, TrackSnapshotData};
 use rgv_layout::{
-    DisplayList, ObjectIdAllocator, ObjectIdRange, QuantitativeRange, TrackLayoutOptions,
-    compose_quantitative_records, gwas_point_y, quantitative_data_range,
+    DisplayList, FeaturePresentation, ObjectIdAllocator, ObjectIdRange, QuantitativeRange,
+    TrackLayoutOptions, compose_quantitative_records, gwas_point_y, quantitative_data_range,
 };
 use std::borrow::Cow;
 
@@ -65,22 +65,38 @@ pub(crate) fn pinned_gene_layout_maximum_rows(height: f32) -> usize {
     ((height / 20.0).floor() as usize).clamp(1, TrackLayoutOptions::default().maximum_rows)
 }
 
+/// How a feature track's records are presented: for a gene-model track, one transcript per
+/// gene (or all), the protein-coding filter and the genes expanded to every transcript; `None`
+/// for any other track, whose records are drawn as they are.
+pub(crate) fn feature_presentation(
+    config: &TrackConfig,
+    records: &[rgv_hts::FeatureRecord],
+) -> Option<FeaturePresentation> {
+    (config.kind == TrackKind::GeneModel)
+        .then(|| FeaturePresentation::gene_model(records, &config.feature))
+}
+
+/// Size of feature labels as `rgv_layout` emits them (`TextPrimitive::font_size`).
+const FEATURE_LABEL_FONT_SIZE: f32 = 9.0;
+
+/// The drawn width of each record's label, as `presentation` labels it.
 pub(crate) fn measured_feature_label_widths(
     context: &egui::Context,
     records: &[rgv_hts::FeatureRecord],
+    presentation: Option<&FeaturePresentation>,
 ) -> Vec<f32> {
     context.fonts_mut(|fonts| {
-        records
-            .iter()
-            .map(|record| {
-                let label = record
-                    .display_label()
-                    .unwrap_or_default()
-                    .chars()
-                    .take(32)
-                    .collect::<String>();
+        (0..records.len())
+            .map(|index| {
+                let label = FeaturePresentation::label_text(presentation, records, index);
+                // Measured in the font `paint_genomic_text` draws labels with, so the layout's
+                // collision gap holds on screen.
                 fonts
-                    .layout_no_wrap(label, egui::FontId::proportional(9.0), egui::Color32::WHITE)
+                    .layout_no_wrap(
+                        label,
+                        egui::FontId::monospace(FEATURE_LABEL_FONT_SIZE),
+                        egui::Color32::WHITE,
+                    )
                     .size()
                     .x
             })
@@ -578,4 +594,43 @@ pub(crate) fn gwas_record_index_at_point(
                 .then_with(|| left.1.cmp(&right.1))
         })
         .map(|(_, record_index)| record_index)
+}
+
+#[cfg(test)]
+mod label_width_tests {
+    use super::*;
+
+    /// Labels are painted in monospace (`paint_genomic_text`); measuring them in the narrower
+    /// proportional font let neighbouring labels touch ("FBXL2 +1LINC01811 +1").
+    #[test]
+    fn label_widths_are_measured_in_the_font_labels_are_painted_with() {
+        let context = egui::Context::default();
+        context.begin_pass(egui::RawInput::default());
+        let record = rgv_hts::FeatureRecord {
+            contig: "chr1".to_owned(),
+            start: 0,
+            end: 100,
+            name: Some("LINC01811".to_owned()),
+            feature_type: None,
+            score: None,
+            strand: rgv_hts::Strand::Unstranded,
+            blocks: Vec::new(),
+            coding_interval: None,
+            peak: None,
+            attributes: Vec::new(),
+        };
+        let widths = measured_feature_label_widths(&context, std::slice::from_ref(&record), None);
+        let painted = context.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    "LINC01811".to_owned(),
+                    egui::FontId::monospace(FEATURE_LABEL_FONT_SIZE),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x
+        });
+        assert!((widths[0] - painted).abs() < 0.01, "{} vs {painted}", widths[0]);
+        let _ = context.end_pass();
+    }
 }
