@@ -771,15 +771,16 @@ fn a_one_base_locus_is_widened_to_the_zoom_limit_and_reported() {
             },
         )
         .unwrap();
-    // The two requested bases (52693..52695) sit centred in a 40-base view.
-    assert_eq!(span_of(&panels, A), (52_674, 52_714, 40));
+    // The two requested bases (52693..52695) sit centred in a 10-base view.
+    assert_eq!(span_of(&panels, A), (52_689, 52_699, 10));
     let reported = reduced.outcome.interval.unwrap();
-    assert_eq!((reported.start(), reported.end()), (52_674, 52_714));
+    assert_eq!((reported.start(), reported.end()), (52_689, 52_699));
     // History records the effective view, so Back/Forward land on it again.
     let entry = panels.get(A).unwrap().navigation_history.current();
-    assert_eq!((entry.start, entry.end), (52_674, 52_714));
+    assert_eq!((entry.start, entry.end), (52_689, 52_699));
 
-    // Contig edges shift the window instead of shrinking it.
+    // A single position opens its own window, clamped at the contig end; that is already wider
+    // than the zoom limit.
     harness
         .reduce(
             &mut panels,
@@ -789,7 +790,7 @@ fn a_one_base_locus_is_widened_to_the_zoom_limit_and_reported() {
             },
         )
         .unwrap();
-    assert_eq!(span_of(&panels, A), (499_960, 500_000, 40));
+    assert_eq!(span_of(&panels, A), (499_979, 500_000, 21));
     harness
         .reduce(
             &mut panels,
@@ -799,7 +800,7 @@ fn a_one_base_locus_is_widened_to_the_zoom_limit_and_reported() {
             },
         )
         .unwrap();
-    assert_eq!(span_of(&panels, A), (0, 40, 40));
+    assert_eq!(span_of(&panels, A), (0, 10, 10));
 }
 
 #[test]
@@ -822,7 +823,7 @@ fn automation_zoom_fit_and_window_cameras_stop_at_the_zoom_limit() {
             .unwrap();
     }
     let viewport = panels.get(A).unwrap().viewport;
-    assert!((viewport.span() - 40.0).abs() < 1.0e-9);
+    assert!((viewport.span() - 10.0).abs() < 1.0e-9);
     // The anchor stays on screen at the same relative place it started (the centre).
     assert!((viewport.genomic_at_pixel(300.0) - 15_000.0).abs() < 1.0e-6);
 
@@ -839,7 +840,7 @@ fn automation_zoom_fit_and_window_cameras_stop_at_the_zoom_limit() {
             },
         )
         .unwrap();
-    assert_eq!(span_of(&panels, A).2, 40);
+    assert_eq!(span_of(&panels, A).2, 10);
 
     // A narrow camera computed by the window is widened about its centre.
     let narrow = Viewport::new(
@@ -857,7 +858,7 @@ fn automation_zoom_fit_and_window_cameras_stop_at_the_zoom_limit() {
             },
         )
         .unwrap();
-    assert_eq!(span_of(&panels, B), (6_981, 7_021, 40));
+    assert_eq!(span_of(&panels, B), (6_996, 7_006, 10));
 }
 
 #[test]
@@ -875,7 +876,7 @@ fn added_panels_and_history_entries_respect_the_zoom_limit() {
         .outcome
         .panel_id
         .unwrap();
-    assert_eq!(span_of(&panels, added).2, 40);
+    assert_eq!(span_of(&panels, added).2, 10);
     // A legacy one-base history entry is revisited at the limit.
     let entry = rgv_core::NavigationEntry {
         contig_name: "chr1".to_owned(),
@@ -892,7 +893,7 @@ fn added_panels_and_history_entries_respect_the_zoom_limit() {
             },
         )
         .unwrap();
-    assert_eq!(span_of(&panels, A), (881, 921, 40));
+    assert_eq!(span_of(&panels, A), (896, 906, 10));
 }
 
 #[test]
@@ -907,7 +908,7 @@ fn a_saved_view_narrower_than_the_limit_loads_widened() {
     let viewport = workspace.active().viewport;
     assert_eq!(
         (viewport.interval().start(), viewport.interval().end()),
-        (52_694_286, 52_694_326)
+        (52_694_301, 52_694_311)
     );
     // The requested locus is kept as typed; the dictionary resolution widens it again.
     assert_eq!(

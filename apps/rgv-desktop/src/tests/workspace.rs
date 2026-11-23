@@ -3223,16 +3223,15 @@ fn locus_parser_accepts_single_positions_bare_contigs_and_chr_prefix_variants() 
         resolve_initial_locus(&dictionary, &aliases, Some("chr1:12,345")).unwrap();
     assert_eq!(name, "chr1");
     assert_eq!((interval.start(), interval.end()), (12_324, 12_365));
-    // Near the contig start the window is clamped, not rejected, and still spans the zoom
-    // limit's 40 bases.
+    // Near the contig start the window is clamped, not rejected.
     let (interval, _, _) = resolve_initial_locus(&dictionary, &aliases, Some("chr1:5")).unwrap();
-    assert_eq!((interval.start(), interval.end()), (0, 40));
+    assert_eq!((interval.start(), interval.end()), (0, 25));
     // A 2-base request widens symmetrically to the zoom limit.
     let (interval, _, _) =
         resolve_initial_locus(&dictionary, &aliases, Some("chr1:52,306-52,307")).unwrap();
-    assert_eq!((interval.start(), interval.end()), (52_286, 52_326));
+    assert_eq!((interval.start(), interval.end()), (52_301, 52_311));
     let (interval, _, _) = standalone_locus("chr3:52694306-52694307").unwrap();
-    assert_eq!((interval.start(), interval.end()), (52_694_286, 52_694_326));
+    assert_eq!((interval.start(), interval.end()), (52_694_301, 52_694_311));
 
     // A bare contig shows the whole contig.
     let (interval, _, _) = resolve_initial_locus(&dictionary, &aliases, Some("chr1")).unwrap();
@@ -3418,8 +3417,8 @@ fn contig_aliases_may_name_colon_bearing_contigs() {
     let (interval, name, _) =
         resolve_initial_locus(&dictionary, &aliases, Some("hla-a:5-10")).unwrap();
     assert_eq!(name, "HLA-A*01:01:01:01");
-    // Six bases widen to the 40-base zoom limit, clamped at the contig start.
-    assert_eq!((interval.start(), interval.end()), (0, 40));
+    // Six bases widen symmetrically to the 10-base zoom limit.
+    assert_eq!((interval.start(), interval.end()), (2, 12));
     assert!(parse_contig_aliases(&["a b=chr1".to_owned()]).is_err());
 }
 
@@ -3536,8 +3535,8 @@ fn locus_parser_uses_only_explicit_unambiguous_contig_aliases() {
     let (interval, canonical, _) =
         resolve_initial_locus(&dictionary, &aliases, Some("one:11-20")).unwrap();
     assert_eq!(canonical, "chr1");
-    // Ten bases widen to the 40-base zoom limit, clamped at the contig start.
-    assert_eq!((interval.start(), interval.end()), (0, 40));
+    // Ten bases already meet the zoom limit.
+    assert_eq!((interval.start(), interval.end()), (10, 20));
 
     let conflicting = parse_contig_aliases(&["1=chr1".to_owned()]).unwrap();
     assert!(resolve_initial_locus(&dictionary, &conflicting, Some("1:1-10")).is_err());

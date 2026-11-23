@@ -284,12 +284,12 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   transaction, and commits never fade. Resize, pane, density, vertical-scroll, track-presentation,
   or display-scale changes invalidate an incompatible preview safely.
 - Drag horizontally to pan and use the wheel or trackpad to zoom around the pointer.
-- Like IGV, zooming stops at 40 bases across the panel (about 35 points per base in a 1,400-point
+- Zooming stops at 10 bases across the panel (about 140 points per base in a 1,400-point
   panel). The wheel, pinch, `+`, the zoom slider and automation zoom stop exactly on that limit,
   keeping the base under the pointer in place, and the zoom-in button is disabled there. A locus
-  narrower than 40 bases (`chr3:52694306-52694307`, a one-base history entry, a saved session or
-  an automation `goto`) opens centred in a 40-base window, shifted inward at a contig end;
-  contigs shorter than 40 bases are shown whole. Automation `goto` reports the widened view in
+  narrower than 10 bases (`chr3:52694306-52694307`, a one-base history entry, a saved session or
+  an automation `goto`) opens centred in a 10-base window, shifted inward at a contig end;
+  contigs shorter than 10 bases are shown whole. Automation `goto` reports the widened view in
   `effective_loci`.
 - Annotation tracks occupy the upper pane and reads occupy the lower pane. They are independent
   presentation channels even when both rows refer to the same alignment source. Every row has an

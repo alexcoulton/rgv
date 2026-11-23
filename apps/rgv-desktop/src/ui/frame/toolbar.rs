@@ -598,9 +598,10 @@ mod zoom_slider_tests {
 
     #[test]
     fn small_contigs_cannot_zoom_past_their_length() {
-        assert_eq!(zoom_slider_span(25, zoom_slider_maximum(25)), 25);
-        assert_eq!(zoom_slider_span(25, 1.0), 25);
-        assert!(zoom_slider_maximum(25) > 0.0);
+        let small = MIN_VISIBLE_BASES - 2;
+        assert_eq!(zoom_slider_span(small, zoom_slider_maximum(small)), small);
+        assert_eq!(zoom_slider_span(small, 1.0), small);
+        assert!(zoom_slider_maximum(small) > 0.0);
         assert_eq!(
             zoom_slider_span(400, zoom_slider_maximum(400)),
             MIN_VISIBLE_BASES
