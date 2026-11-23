@@ -16,6 +16,11 @@
 //!   Their own row identifiers (`ID=exon:…`, `exon_id`) are not indexed. A sub-feature row
 //!   with no identity attribute and no `Parent` is indexed by its own names, once per name.
 //!
+//! A fully loaded GTF or GFF3 source draws assembled transcript models, not lines (see
+//! `gene_model`). Its index is still built over the lines, by the rules above, and then
+//! re-pointed: a transcript line's terms at its model, a gene line's at a copy of the gene kept
+//! by the index (the gene line itself is not drawn).
+//!
 //! An identifier with a version suffix (`ENSG00000163939.18`, `NM_000546.6`: letters, digits,
 //! a dot and digits) is also indexed without it, so an unversioned query matches exactly.
 
@@ -68,10 +73,15 @@ pub(super) fn search_level(record: &FeatureRecord) -> SearchLevel {
     let Some(feature_type) = record.feature_type.as_deref() else {
         return SearchLevel::Other;
     };
-    let feature_type = feature_type.to_ascii_lowercase();
-    if SUB_FEATURE_TYPES.contains(&feature_type.as_str()) {
+    // Called for every line of a large file: compared without allocating.
+    if SUB_FEATURE_TYPES
+        .iter()
+        .any(|candidate| feature_type.eq_ignore_ascii_case(candidate))
+    {
         SearchLevel::SubFeature
-    } else if feature_type.ends_with("gene") {
+    } else if feature_type.len() >= 4
+        && feature_type.as_bytes()[feature_type.len() - 4..].eq_ignore_ascii_case(b"gene")
+    {
         SearchLevel::Gene
     } else {
         SearchLevel::Other
@@ -247,6 +257,44 @@ fn widen_span(span: &mut FeatureRecord, record: &FeatureRecord) {
     span.end = span.end.max(record.end);
 }
 
+/// What a search for a gene whose line is not drawn (its transcripts are) finds: the gene's
+/// span, type and identity attributes.
+pub(super) fn container_search_record(record: FeatureRecord) -> FeatureRecord {
+    let FeatureRecord {
+        contig,
+        start,
+        end,
+        name,
+        feature_type,
+        strand,
+        attributes,
+        ..
+    } = record;
+    FeatureRecord {
+        contig,
+        start,
+        end,
+        name,
+        feature_type,
+        score: None,
+        strand,
+        blocks: Vec::new(),
+        coding_interval: None,
+        peak: None,
+        attributes: attributes
+            .into_iter()
+            .filter(|(key, _)| {
+                let key = key.to_ascii_lowercase();
+                GENE_IDENTITY_KEYS.contains(&key.as_str())
+                    || matches!(
+                        key.as_str(),
+                        "id" | "name" | "alias" | "gene_type" | "gene_biotype" | "biotype"
+                    )
+            })
+            .collect(),
+    }
+}
+
 /// A search hit needs identity and location, not exon structure or the full attribute list.
 pub(super) fn slim_search_record(record: &FeatureRecord) -> FeatureRecord {
     FeatureRecord {
@@ -331,6 +379,14 @@ pub(super) enum SearchTarget {
     Span(usize),
 }
 
+/// Where [`FeatureSearchIndex::retarget_records`] moves a record target.
+pub(super) enum Retarget {
+    /// Record `index` of the same contig.
+    Record(usize),
+    /// One of the index's own records.
+    Span(usize),
+}
+
 /// The name index of a fully loaded source.
 #[derive(Debug, Default)]
 pub(super) struct FeatureSearchIndex {
@@ -359,6 +415,30 @@ impl FeatureSearchIndex {
 
     pub(super) const fn coverage(&self) -> &FeatureSearchIndexCoverage {
         &self.coverage
+    }
+
+    /// Re-points the record targets of an index built over a file's lines at what those lines
+    /// became once assembled into transcript models (see `gene_model`). `resolve` is given a
+    /// line's contig and index and the index's own records, to which it may add one; it
+    /// returns the new target, or `None` to drop the association.
+    pub(super) fn retarget_records(
+        &mut self,
+        mut resolve: impl FnMut(&str, usize, &mut Vec<FeatureRecord>) -> Option<Retarget>,
+    ) {
+        let Self { terms, spans, .. } = self;
+        for targets in terms.values_mut() {
+            targets.retain_mut(|target| {
+                let SearchTarget::Record { contig, index } = target else {
+                    return true;
+                };
+                match resolve(contig, *index, spans) {
+                    Some(Retarget::Record(record)) => *index = record,
+                    Some(Retarget::Span(span)) => *target = SearchTarget::Span(span),
+                    None => return false,
+                }
+                true
+            });
+        }
     }
 
     fn push(&mut self, term: String, target: SearchTarget, cap: usize) -> bool {

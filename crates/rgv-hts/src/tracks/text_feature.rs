@@ -1,4 +1,7 @@
-use super::feature_search::{FeatureSearchIndex, StreamingFeatureSearch};
+use super::feature_search::{
+    FeatureSearchIndex, Retarget, StreamingFeatureSearch, container_search_record,
+};
+use super::gene_model::{Assembly, Placement};
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
@@ -47,6 +50,10 @@ fn poisoned() -> TrackError {
 
 /// Initial distance searched backwards for the previous feature; quadrupled until one is found.
 const INDEXED_PREVIOUS_FEATURE_WINDOW: u64 = 16_384;
+
+/// Furthest a windowed read of a GTF or GFF3 file is widened beyond the window to reach the
+/// ends of the genes and transcripts it overlaps. The longest human genes span about 2.5 Mb.
+const MAX_GENE_MODEL_READ_REACH: u64 = 4_000_000;
 
 fn parse_feature_line(format: FeatureFormat, line: &str) -> Result<Option<FeatureRecord>, String> {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -201,7 +208,8 @@ impl IndexedTextFeatures {
         Ok(())
     }
 
-    fn query(&self, contig: &str, start: u64, end: u64) -> Result<Vec<FeatureRecord>, TrackError> {
+    /// Every line overlapping `[start, end)`.
+    fn read(&self, contig: &str, start: u64, end: u64) -> Result<Vec<FeatureRecord>, TrackError> {
         let mut records = Vec::new();
         self.visit(contig, start, end, |feature| {
             if records.len() == MAX_FEATURE_RECORDS_PER_QUERY {
@@ -212,6 +220,42 @@ impl IndexedTextFeatures {
             records.push(feature);
             Ok(true)
         })?;
+        Ok(records)
+    }
+
+    /// Records overlapping `[start, end)`. GTF and GFF3 lines are assembled into transcript
+    /// models: the read is first widened to the full extent of every gene and transcript line
+    /// it meets (up to [`MAX_GENE_MODEL_READ_REACH`] beyond the window), so a model has all its
+    /// exons, the same span and the same identity in every window.
+    fn query(&self, contig: &str, start: u64, end: u64) -> Result<Vec<FeatureRecord>, TrackError> {
+        self.query_within_reach(contig, start, end, MAX_GENE_MODEL_READ_REACH)
+    }
+
+    /// [`Self::query`], widening a GTF or GFF3 read by at most `reach` bases on either side.
+    /// A model reaching further keeps its transcript line's span and identity, but holds only
+    /// the exons the read met.
+    fn query_within_reach(
+        &self,
+        contig: &str,
+        start: u64,
+        end: u64,
+        reach: u64,
+    ) -> Result<Vec<FeatureRecord>, TrackError> {
+        let mut records = self.read(contig, start, end)?;
+        if let Some(gtf) = gene_model_dialect(self.format) {
+            let (low, high) =
+                super::gene_model::assembly_read_extent(&records, start, end, reach, gtf);
+            if low < start || high > end {
+                match self.read(contig, low, high) {
+                    Ok(wider) => records = wider,
+                    // The window alone stays within the limit: its models may be partial.
+                    Err(TrackError::ResourceLimit(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            records = super::gene_model::assemble(records, gtf).records;
+            records.retain(|record| record.start < end && record.end > start);
+        }
         records.sort_by_key(|record| (record.start, record.end));
         Ok(records)
     }
@@ -222,6 +266,9 @@ impl IndexedTextFeatures {
         position: u64,
         forward: bool,
     ) -> Option<FeatureRecord> {
+        if gene_model_dialect(self.format).is_some() {
+            return self.adjacent_gene_model(contig, position, forward);
+        }
         if forward {
             let mut next: Option<FeatureRecord> = None;
             // Records are start-sorted, so reading stops at the first later start.
@@ -258,6 +305,43 @@ impl IndexedTextFeatures {
             .ok()?;
             if previous.is_some() || start == 0 {
                 return previous;
+            }
+            window = window.saturating_mul(4);
+        }
+    }
+
+    /// [`Self::adjacent_feature`] over transcript models: windows of growing size are
+    /// assembled until one holds a model starting at or after `position` (forward) or ending
+    /// at or before it (backward). The nearest such model in a window is the nearest overall.
+    fn adjacent_gene_model(
+        &self,
+        contig: &str,
+        position: u64,
+        forward: bool,
+    ) -> Option<FeatureRecord> {
+        let limit = u64::from(u32::MAX);
+        let mut window = INDEXED_PREVIOUS_FEATURE_WINDOW;
+        loop {
+            let (start, end) = if forward {
+                (position, position.saturating_add(window).min(limit))
+            } else {
+                (position.saturating_sub(window), position)
+            };
+            if start >= end {
+                return None;
+            }
+            let records = self.query(contig, start, end).ok()?;
+            let found = if forward {
+                // Start-sorted, shortest first among equal starts.
+                records.into_iter().find(|record| record.start >= position)
+            } else {
+                records
+                    .into_iter()
+                    .filter(|record| record.end <= position)
+                    .max_by_key(|record| record.start)
+            };
+            if found.is_some() || (forward && end == limit) || (!forward && start == 0) {
+                return found;
             }
             window = window.saturating_mul(4);
         }
@@ -383,6 +467,88 @@ impl FeatureIndex {
         }
         Ok(records)
     }
+}
+
+/// `Some(true)` for GTF and `Some(false)` for GFF3, whose lines are assembled into transcript
+/// models (see [`super::gene_model`]); `None` for formats whose lines are whole features.
+pub(super) const fn gene_model_dialect(format: FeatureFormat) -> Option<bool> {
+    match format {
+        FeatureFormat::Gtf => Some(true),
+        FeatureFormat::Gff3 => Some(false),
+        _ => None,
+    }
+}
+
+/// Replaces the lines of a fully loaded GTF or GFF3 source by its transcript models, and builds
+/// the name index.
+///
+/// The index is built over the lines, exactly as for any other source, so gene names still
+/// find gene spans and the association count does not change; its targets are then re-pointed
+/// at what each line became: a transcript line at its model, a gene line whose transcripts are
+/// drawn at a copy of its span kept by the index.
+fn assemble_loaded_gene_models(
+    features: &mut HashMap<String, FeatureIndex>,
+    gtf: bool,
+    search_cap: usize,
+) -> FeatureSearchIndex {
+    struct Assembled {
+        placements: Vec<Placement>,
+        /// Sorted position of each assembled record.
+        positions: Vec<usize>,
+        hidden: Vec<Option<FeatureRecord>>,
+        hidden_spans: Vec<Option<usize>>,
+    }
+    let mut search = FeatureSearchIndex::build(features, search_cap);
+    let mut assembled = HashMap::with_capacity(features.len());
+    for (contig, index) in features.iter_mut() {
+        let lines = std::mem::take(&mut index.records);
+        let Assembly {
+            records,
+            hidden,
+            placements,
+        } = super::gene_model::assemble(lines, gtf);
+        let mut order = (0..records.len()).collect::<Vec<_>>();
+        order.sort_by_key(|&record| (records[record].start, records[record].end));
+        let mut positions = vec![0; records.len()];
+        for (position, &record) in order.iter().enumerate() {
+            positions[record] = position;
+        }
+        let mut slots = records.into_iter().map(Some).collect::<Vec<_>>();
+        index.records = order
+            .into_iter()
+            .filter_map(|record| slots[record].take())
+            .collect();
+        index.finish();
+        let hidden_spans = vec![None; hidden.len()];
+        assembled.insert(
+            contig.clone(),
+            Assembled {
+                placements,
+                positions,
+                hidden: hidden.into_iter().map(Some).collect(),
+                hidden_spans,
+            },
+        );
+    }
+    search.retarget_records(|contig, line, spans| {
+        let assembled = assembled.get_mut(contig)?;
+        match *assembled.placements.get(line)? {
+            Placement::Drawn(record) => Some(Retarget::Record(assembled.positions[record])),
+            Placement::Hidden(container) => {
+                // Several terms of one gene share one copy.
+                if let Some(span) = assembled.hidden_spans[container] {
+                    return Some(Retarget::Span(span));
+                }
+                let record = assembled.hidden[container].take()?;
+                spans.push(container_search_record(record));
+                assembled.hidden_spans[container] = Some(spans.len() - 1);
+                Some(Retarget::Span(spans.len() - 1))
+            }
+            // Parts are found through spans of their own, never as records.
+            Placement::Absorbed => None,
+        }
+    });
+    search
 }
 
 /// Largest remote text annotation which is downloaded whole.
@@ -550,10 +716,14 @@ impl TextFeatureSource {
         {
             return Err(TrackError::MalformedLine { line, message });
         }
-        for index in features.values_mut() {
-            index.finish();
-        }
-        let search = FeatureSearchIndex::build(&features, search_cap);
+        let search = if let Some(gtf) = gene_model_dialect(format) {
+            assemble_loaded_gene_models(&mut features, gtf, search_cap)
+        } else {
+            for index in features.values_mut() {
+                index.finish();
+            }
+            FeatureSearchIndex::build(&features, search_cap)
+        };
         Ok(Self {
             features,
             search,

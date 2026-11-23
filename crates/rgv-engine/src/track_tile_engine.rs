@@ -3494,9 +3494,37 @@ chr1\tsrc\texon\t20001\t21000\t.\t-\t.\tgene_id \"G2\"; transcript_id \"T2\";\n"
                 0,
                 1_000_000,
             );
-            assert!(legacy.len() >= 3, "{name}: {legacy:?}");
-            // The fixtures exercise what a tile does not carry: BED12's complete block list
-            // and coding interval, and the type and attribute list of GFF3 and GTF lines.
+            // BED12 has three records; GFF3 and GTF one assembled transcript model for ALPHA
+            // (its gene line not drawn) and one more feature for BETA.
+            assert_eq!(
+                legacy.len(),
+                if kind == TrackSpecKind::Bed { 3 } else { 2 },
+                "{name}: {legacy:?}"
+            );
+            // The fixtures exercise what a tile does not carry: the complete block list and
+            // coding interval (of BED12 and of the assembled GFF3 and GTF transcripts), and
+            // the type and attribute list of GFF3 and GTF records.
+            if kind != TrackSpecKind::Bed {
+                let model = legacy
+                    .iter()
+                    .find(|record| record.display_label() == Some("ALPHA"))
+                    .unwrap_or_else(|| panic!("{name}: {legacy:#?}"));
+                assert_eq!(model.feature_type.as_deref(), Some("transcript"), "{name}");
+                assert_eq!((model.start, model.end), (1_000, 9_000), "{name}");
+                assert_eq!(
+                    model.blocks,
+                    [(1_000, 1_500), (3_000, 3_600), (8_000, 9_000)],
+                    "{name}"
+                );
+                assert_eq!(model.coding_interval, Some((1_200, 8_400)), "{name}");
+                assert!(
+                    !legacy
+                        .iter()
+                        .any(|record| record.feature_type.as_deref() == Some("gene")
+                            && record.display_label() == Some("ALPHA")),
+                    "{name}: the gene line of a drawn transcript is not drawn"
+                );
+            }
             if kind == TrackSpecKind::Bed {
                 assert!(
                     legacy.iter().any(|record| record.blocks.len() >= 3),

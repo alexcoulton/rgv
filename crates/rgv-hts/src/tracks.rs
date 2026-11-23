@@ -33,6 +33,7 @@ const MAX_GWAS_SEARCH_SCANNED_ASSOCIATIONS: usize = 100_000;
 
 mod feature_search;
 use feature_search::{feature_search_terms, normalized_feature_search_term};
+mod gene_model;
 mod remote_tabix;
 mod text_feature;
 #[cfg(test)]

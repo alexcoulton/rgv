@@ -146,12 +146,9 @@ fn sub_feature_rows_no_longer_consume_the_association_cap() {
         .join("\n");
     let cap = 300;
     // Before, every row added each of its names: far beyond the cap.
-    let all = load(&text, FeatureFormat::Gtf, usize::MAX);
-    let per_row_terms = all
-        .features
-        .values()
-        .flat_map(|index| &index.records)
-        .map(|record| feature_search_terms(record).len())
+    let per_row_terms = text
+        .lines()
+        .map(|line| feature_search_terms(&parse_gff(line, true).unwrap()).len())
         .sum::<usize>();
     assert!(per_row_terms > 10 * cap, "{per_row_terms}");
     // Now 40 genes cost six associations each, well inside it.

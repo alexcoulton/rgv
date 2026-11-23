@@ -175,6 +175,63 @@ fn junction_annotation_requires_adjacent_exons_from_the_same_transcript() {
 }
 
 #[test]
+fn junction_annotation_keeps_the_transcripts_of_one_gene_apart() {
+    // GTF and GFF3 transcripts are drawn as one record each, with their exons as blocks and
+    // the gene's name: junctions join exons of one transcript, never of two.
+    let mut configs = TrackCollection::default();
+    configs.push(TrackConfig::new(
+        TrackId::new(7),
+        "Genes".to_owned(),
+        TrackKind::GeneModel,
+        TrackSource::Local {
+            path: "genes.gtf".to_owned(),
+        },
+    ));
+    let transcript = |blocks: Vec<(u64, u64)>, transcript: &str| rgv_hts::FeatureRecord {
+        contig: "chr1".to_owned(),
+        start: blocks[0].0,
+        end: blocks[blocks.len() - 1].1,
+        name: Some("GENE1".to_owned()),
+        feature_type: Some("transcript".to_owned()),
+        score: None,
+        strand: rgv_hts::Strand::Forward,
+        blocks,
+        coding_interval: None,
+        peak: None,
+        attributes: vec![
+            ("gene_name".to_owned(), "GENE1".to_owned()),
+            ("transcript_id".to_owned(), transcript.to_owned()),
+        ],
+    };
+    let snapshots = vec![TrackSnapshot {
+        id: TrackId::new(7),
+        name: "Genes".to_owned(),
+        data: TrackSnapshotData::Features(vec![
+            transcript(vec![(100, 200), (300, 400)], "tx1"),
+            transcript(vec![(150, 250), (500, 600)], "tx2"),
+        ]),
+    }];
+    let loaded = GenomicInterval::new(ContigId::new(0), 0, 1_000).unwrap();
+    let viewport = GenomicInterval::new(ContigId::new(0), 50, 900).unwrap();
+    let context = junction_annotation_context(
+        &configs,
+        &snapshots,
+        &BTreeMap::from([(TrackId::new(7), loaded)]),
+        viewport,
+    );
+    assert_eq!(
+        context.status(200, 300),
+        JunctionAnnotationStatus::Annotated
+    );
+    assert_eq!(
+        context.status(250, 500),
+        JunctionAnnotationStatus::Annotated
+    );
+    assert_eq!(context.status(250, 300), JunctionAnnotationStatus::Novel);
+    assert_eq!(context.status(400, 500), JunctionAnnotationStatus::Novel);
+}
+
+#[test]
 fn rna_exports_preserve_filters_annotation_scaling_and_bounds() {
     let interval = GenomicInterval::new(ContigId::new(0), 100, 400).unwrap();
     let junctions = rgv_hts::JunctionSummary {

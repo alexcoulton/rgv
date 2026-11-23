@@ -1950,4 +1950,107 @@ mod tests {
         assert_eq!(again.lod, TrackTileLod::Summary);
         assert_eq!(again.provenance.source_reduction_bases, Some(10_240));
     }
+
+    #[test]
+    fn a_gtf_transcript_is_drawn_like_the_same_transcript_from_a_gene_pred_file() {
+        // One minus-strand coding transcript, as GENCODE writes it (the stop codon outside the
+        // CDS) and as a refFlat row.
+        let attributes = "gene_id \"G1.5\"; transcript_id \"T1.2\"; gene_name \"GENE1\";";
+        let gtf = [
+            ("gene", 1_001, 9_000),
+            ("transcript", 1_001, 9_000),
+            ("exon", 8_001, 9_000),
+            ("UTR", 8_501, 9_000),
+            ("CDS", 8_001, 8_500),
+            ("start_codon", 8_498, 8_500),
+            ("exon", 4_001, 5_000),
+            ("CDS", 4_001, 5_000),
+            ("exon", 1_001, 2_000),
+            ("CDS", 1_501, 2_000),
+            ("stop_codon", 1_498, 1_500),
+            ("UTR", 1_001, 1_497),
+        ]
+        .iter()
+        .map(|(kind, start, end)| {
+            format!("chr1\tHAVANA\t{kind}\t{start}\t{end}\t.\t-\t.\t{attributes}\n")
+        })
+        .collect::<Vec<_>>()
+        .concat();
+        let ref_flat =
+            "GENE1\tT1.2\tchr1\t-\t1000\t9000\t1497\t8500\t3\t1000,4000,8000,\t2000,5000,9000,\n";
+        let directory = tempfile::tempdir().unwrap();
+        let gtf_path = write(&directory, "genes.gtf", &gtf);
+        let ref_flat_path = write(&directory, "genes.refFlat", ref_flat);
+
+        let record = |path: &Path, format| {
+            let records = rgv_hts::TextFeatureSource::open(path, format)
+                .unwrap()
+                .query("chr1", 0, 20_000)
+                .unwrap();
+            assert_eq!(records.len(), 1, "{records:#?}");
+            records.into_iter().next().unwrap()
+        };
+        let assembled = record(&gtf_path, rgv_hts::FeatureFormat::Gtf);
+        let gene_pred = record(&ref_flat_path, rgv_hts::FeatureFormat::RefFlat);
+        // Same model; only the attribute lists differ (each keeps its own source's).
+        assert_eq!(
+            FeatureRecord {
+                attributes: Vec::new(),
+                ..assembled.clone()
+            },
+            FeatureRecord {
+                attributes: Vec::new(),
+                ..gene_pred.clone()
+            }
+        );
+        assert_eq!(assembled.display_label(), gene_pred.display_label());
+
+        // The pixel layout draws the same primitives: thin UTRs, thick CDS, intron connector,
+        // strand chevrons and the gene-name label.
+        let viewport = rgv_core::Viewport::new(
+            rgv_core::GenomicInterval::new(rgv_core::ContigId::new(0), 0, 10_000).unwrap(),
+            1_000.0,
+        )
+        .unwrap();
+        let options = rgv_layout::TrackLayoutOptions {
+            height: 48.0,
+            maximum_rows: 2,
+            ..rgv_layout::TrackLayoutOptions::default()
+        };
+        let (gtf_display, _) =
+            rgv_layout::layout_features(std::slice::from_ref(&assembled), viewport, options);
+        let (gene_pred_display, _) =
+            rgv_layout::layout_features(std::slice::from_ref(&gene_pred), viewport, options);
+        assert!(gtf_display.rectangles.len() > 5);
+        assert!(gtf_display.texts.iter().any(|text| text.text == "GENE1"));
+        assert_eq!(gtf_display, gene_pred_display);
+
+        // So does a tile: the same feature, blocks, coding split and identity.
+        let tile = |path: &Path, kind| {
+            let tile = open(path, kind)
+                .query_tile(&request(4, 0), &TrackCancellation::never())
+                .unwrap();
+            let TrackTilePayload::Features(features) = tile.payload else {
+                panic!("expected features");
+            };
+            features
+        };
+        let gtf_tile = tile(&gtf_path, TrackSpecKind::Gtf);
+        assert_eq!(gtf_tile.features.len(), 1);
+        assert_eq!(
+            gtf_tile.features[0]
+                .blocks
+                .iter()
+                .map(|block| (block.start, block.end, block.thick))
+                .collect::<Vec<_>>(),
+            [
+                (1_000, 1_497, false),
+                (1_497, 2_000, true),
+                (4_000, 5_000, true),
+                (8_000, 8_500, true),
+                (8_500, 9_000, false)
+            ]
+        );
+        assert_eq!(gtf_tile, tile(&ref_flat_path, TrackSpecKind::RefFlat));
+    }
 }

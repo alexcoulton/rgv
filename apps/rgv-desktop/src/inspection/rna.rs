@@ -121,10 +121,16 @@ pub(crate) fn junction_annotation_context(
             processed_records = processed_records.saturating_add(1);
             let label = feature_annotation_label(record, &config.name);
             if record.blocks.len() >= 2 {
-                let key = (
-                    config.id.get(),
-                    format!("blocks:{}", record.name.as_deref().unwrap_or("unnamed")),
-                );
+                // One transcript per record (BED12, genePred, an assembled GTF/GFF3 model):
+                // keyed by its own identifier, since several transcripts share a gene name.
+                let identity = record
+                    .attributes
+                    .iter()
+                    .find(|(key, _)| key == "transcript_id" || key == "ID")
+                    .map(|(_, value)| value.as_str())
+                    .or(record.name.as_deref())
+                    .unwrap_or("unnamed");
+                let key = (config.id.get(), format!("blocks:{identity}"));
                 let group = transcripts.entry(key).or_default();
                 group.0.extend(record.blocks.iter().copied());
                 group.1.insert(label);

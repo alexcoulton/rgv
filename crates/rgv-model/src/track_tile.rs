@@ -318,11 +318,18 @@ impl TrackRecordId {
         }]);
         digest.write_text(record.name.as_deref());
         digest.write_text(record.feature_type.as_deref());
-        digest.write_u64(record.blocks.len() as u64);
+        let mut named = false;
         for (key, value) in &record.attributes {
             if key.eq_ignore_ascii_case("ID") || key.eq_ignore_ascii_case("transcript_id") {
                 digest.write_text(Some(value));
+                named = true;
             }
+        }
+        // A record named by `ID` or `transcript_id` is that name over that extent, however
+        // many of its blocks were read: a transcript assembled from a window of an indexed
+        // GTF or GFF3 file that holds only some of its exons is still the same transcript.
+        if !named {
+            digest.write_u64(record.blocks.len() as u64);
         }
         Self(digest.finish())
     }

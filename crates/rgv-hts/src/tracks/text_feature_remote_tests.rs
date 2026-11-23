@@ -652,3 +652,185 @@ fn remote_indexed_gff_treats_interior_comment_lines_as_the_local_path_does() {
     assert!(remote.query("chr1", 149_000, 153_000).is_err());
     assert_eq!(remote.query("chr1", 10_000, 20_500).unwrap().len(), 11);
 }
+
+/// A 300 kb minus-strand transcript with an unrelated gene inside one of its introns, as GTF
+/// lines sorted for tabix: the lines of `tests/fixtures/long_transcript.gtf.gz`.
+fn long_transcript_gtf() -> Vec<String> {
+    let line = |kind: &str, start: u64, end: u64, attributes: &str| {
+        format!("chr1\tsrc\t{kind}\t{start}\t{end}\t.\t-\t.\t{attributes}")
+    };
+    let long = "gene_id \"G1\"; transcript_id \"T1\"; gene_name \"LONG\";";
+    let nested = "gene_id \"G2\"; transcript_id \"T2\"; gene_name \"NESTED\";";
+    let mut lines = vec![
+        line(
+            "gene",
+            100_001,
+            400_000,
+            "gene_id \"G1\"; gene_name \"LONG\";",
+        ),
+        line("transcript", 100_001, 400_000, long),
+        line("exon", 100_001, 101_000, long),
+        line("UTR", 100_001, 100_500, long),
+        line("stop_codon", 100_501, 100_503, long),
+        line("CDS", 100_504, 101_000, long),
+        line("exon", 200_001, 201_000, long),
+        line("CDS", 200_001, 201_000, long),
+        line(
+            "gene",
+            250_001,
+            251_000,
+            "gene_id \"G2\"; gene_name \"NESTED\";",
+        ),
+        line("transcript", 250_001, 251_000, nested),
+        line("exon", 250_001, 251_000, nested),
+        line("exon", 300_001, 301_000, long),
+        line("CDS", 300_001, 300_700, long),
+        line("start_codon", 300_698, 300_700, long),
+        line("UTR", 300_701, 301_000, long),
+        line("exon", 399_001, 400_000, long),
+        line("UTR", 399_001, 400_000, long),
+    ];
+    lines.sort_by_key(|line| line.split('\t').nth(3).unwrap().parse::<u64>().unwrap());
+    lines
+}
+
+/// The fixture opened through its index and loaded whole, and the long transcript's model.
+fn long_transcript_sources() -> (PathBuf, TextFeatureSource, TextFeatureSource, FeatureRecord) {
+    // Indexed by `tabix -p gff` (an index built here would not carry HTSlib's linear offsets).
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/long_transcript.gtf.gz");
+    let lines = long_transcript_gtf();
+    let mut text = String::new();
+    MultiGzDecoder::new(std::fs::File::open(&path).unwrap())
+        .read_to_string(&mut text)
+        .unwrap();
+    assert_eq!(
+        text,
+        lines.join("\n") + "\n",
+        "the fixture holds these lines"
+    );
+    let indexed = TextFeatureSource::open(&path, FeatureFormat::Gtf).unwrap();
+    assert!(indexed.is_indexed());
+    let loaded = TextFeatureSource::from_reader(text.as_bytes(), FeatureFormat::Gtf).unwrap();
+    let whole = loaded.query("chr1", 0, 1_000_000).unwrap();
+    assert_eq!(whole.len(), 2, "{whole:#?}");
+    let expected = whole
+        .into_iter()
+        .find(|record| record.name.as_deref() == Some("LONG"))
+        .unwrap();
+    assert_eq!((expected.start, expected.end), (100_000, 400_000));
+    assert_eq!(
+        expected.blocks,
+        [
+            (100_000, 101_000),
+            (200_000, 201_000),
+            (300_000, 301_000),
+            (399_000, 400_000)
+        ]
+    );
+    assert_eq!(expected.coding_interval, Some((100_500, 300_700)));
+    (path, indexed, loaded, expected)
+}
+
+#[test]
+fn a_window_of_an_indexed_gtf_returns_the_whole_transcript_with_a_stable_identity() {
+    let (path, indexed, loaded, expected) = long_transcript_sources();
+    let identity = rgv_model::track_tile::TrackRecordId::for_feature(&expected);
+
+    // Windows that hold one exon, only intron, or only the nested gene return the same
+    // complete model: the read is widened to the extent of the transcript lines it meets.
+    for (start, end) in [
+        (100_200, 100_300),
+        (200_500, 200_600),
+        (150_000, 150_010),
+        (250_100, 250_200),
+        (399_990, 400_000),
+        (0, 1_000_000),
+    ] {
+        let records = indexed.query("chr1", start, end).unwrap();
+        let long = records
+            .iter()
+            .filter(|record| record.name.as_deref() == Some("LONG"))
+            .collect::<Vec<_>>();
+        assert_eq!(long, [&expected], "{start}-{end}");
+        assert_eq!(
+            rgv_model::track_tile::TrackRecordId::for_feature(long[0]),
+            identity
+        );
+        // Only what overlaps the window: the nested gene's model appears only where it is.
+        let nested = records
+            .iter()
+            .any(|record| record.name.as_deref() == Some("NESTED"));
+        assert_eq!(nested, start < 251_000 && end > 250_000, "{start}-{end}");
+        assert_eq!(records, loaded.query("chr1", start, end).unwrap());
+    }
+    // Next and previous feature step over the models, not over their exons.
+    let next = indexed.adjacent_feature("chr1", 100_001, true).unwrap();
+    assert_eq!(next.name.as_deref(), Some("NESTED"));
+    assert_eq!(
+        next,
+        loaded.adjacent_feature("chr1", 100_001, true).unwrap()
+    );
+    let previous = indexed.adjacent_feature("chr1", 260_000, false).unwrap();
+    assert_eq!(previous.name.as_deref(), Some("NESTED"));
+    assert!(indexed.adjacent_feature("chr1", 250_001, false).is_none());
+
+    // A remote copy of the same file answers the same.
+    let server = RangeServer::start(
+        HashMap::from([
+            ("/genes.gtf.gz".to_owned(), std::fs::read(&path).unwrap()),
+            (
+                "/genes.gtf.gz.tbi".to_owned(),
+                std::fs::read(format!("{}.tbi", path.display())).unwrap(),
+            ),
+        ]),
+        false,
+    );
+    let remote = TextFeatureSource::open_with_remote_config(
+        server.url("genes.gtf.gz"),
+        FeatureFormat::Gtf,
+        &config(),
+    )
+    .unwrap();
+    assert!(remote.is_indexed());
+    assert_sources_agree(
+        &indexed,
+        &remote,
+        &[
+            ("chr1", 150_000, 150_010),
+            ("chr1", 250_100, 250_200),
+            ("chr1", 0, 1_000_000),
+        ],
+    );
+}
+
+#[test]
+fn a_window_beyond_the_widening_limit_keeps_the_transcript_span_and_identity() {
+    let (_, indexed, _, expected) = long_transcript_sources();
+    let identity = rgv_model::track_tile::TrackRecordId::for_feature(&expected);
+    // Without widening (a transcript reaching further than the widening limit), a window holds
+    // only some of the exons; the model still has its transcript line's span and the same
+    // identity.
+    let backend = indexed.indexed.as_ref().unwrap();
+    for (start, end, blocks) in [
+        (100_200, 100_300, vec![(100_000, 101_000)]),
+        (
+            199_000,
+            300_100,
+            vec![(200_000, 201_000), (300_000, 301_000)],
+        ),
+    ] {
+        let records = backend.query_within_reach("chr1", start, end, 0).unwrap();
+        let long = records
+            .iter()
+            .find(|record| record.name.as_deref() == Some("LONG"))
+            .unwrap_or_else(|| panic!("{start}-{end}: {records:#?}"));
+        assert_eq!((long.start, long.end), (100_000, 400_000), "{start}-{end}");
+        assert_eq!(long.feature_type.as_deref(), Some("transcript"));
+        assert_eq!(long.blocks, blocks, "{start}-{end}");
+        assert_eq!(
+            rgv_model::track_tile::TrackRecordId::for_feature(long),
+            identity,
+            "{start}-{end}"
+        );
+    }
+}

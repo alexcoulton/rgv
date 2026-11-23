@@ -1193,22 +1193,30 @@ fn tabix_indexed_annotations_are_read_on_demand() {
     contigs.sort_unstable();
     assert_eq!(contigs, ["chr1", "chr2"]);
 
-    // One-based inclusive GTF rows become zero-based half-open records.
+    // One-based inclusive GTF rows become zero-based half-open records, and the gene, transcript
+    // and exon rows one transcript model.
     let first = source.query("chr1", 0, 6_000).unwrap();
     assert_eq!(
         first
             .iter()
-            .map(|record| (record.start, record.end, record.feature_type.as_deref()))
+            .map(|record| (
+                record.start,
+                record.end,
+                record.feature_type.as_deref(),
+                record.blocks.clone()
+            ))
             .collect::<Vec<_>>(),
-        vec![
-            (1_000, 1_200, Some("exon")),
-            (1_000, 5_000, Some("gene")),
-            (1_000, 5_000, Some("transcript")),
-            (4_800, 5_000, Some("exon")),
-        ]
+        vec![(
+            1_000,
+            5_000,
+            Some("transcript"),
+            vec![(1_000, 1_200), (4_800, 5_000)]
+        )]
     );
-    // Overlap is exact: a query touching only the gap between the exons returns the spans.
-    assert_eq!(source.query("chr1", 2_000, 2_001).unwrap().len(), 2);
+    // Overlap is exact: a query touching only the gap between the exons returns the model,
+    // with both exons.
+    let intron = source.query("chr1", 2_000, 2_001).unwrap();
+    assert_eq!(intron, first);
     assert!(source.query("chr1", 5_000, 6_000).unwrap().is_empty());
     assert!(source.query("chr3", 0, 1_000).unwrap().is_empty());
     assert_eq!(
@@ -1219,7 +1227,7 @@ fn tabix_indexed_annotations_are_read_on_demand() {
     let next = source.adjacent_feature("chr1", 5_000, true).unwrap();
     assert_eq!((next.start, next.end), (200_000, 200_500));
     let previous = source.adjacent_feature("chr1", 200_000, false).unwrap();
-    assert_eq!((previous.start, previous.end), (4_800, 5_000));
+    assert_eq!((previous.start, previous.end), (1_000, 5_000));
     assert!(source.adjacent_feature("chr1", 1_000, false).is_none());
 
     // Name search keeps the widest feature carrying each term: the gene, not an exon.
