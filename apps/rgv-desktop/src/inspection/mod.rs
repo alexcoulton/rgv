@@ -1,4 +1,5 @@
 pub(crate) mod auxiliary;
+pub(crate) mod coverage_insertions;
 pub(crate) mod document;
 pub(crate) mod gene_transcripts;
 pub(crate) mod inspector_controller;

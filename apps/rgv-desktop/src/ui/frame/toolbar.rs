@@ -328,33 +328,39 @@ impl Viewer {
         if zoom_out.clicked() {
             st.nav.zoom_out_requested = true;
         }
-        let maximum_zoom = (self.session.panels.active().contig_length.max(1) as f64)
+        let contig_length = self.session.panels.active().contig_length;
+        let maximum_zoom = zoom_slider_maximum(contig_length);
+        let mut zoom_level = (contig_length as f64 / st.snapshot.interval.len() as f64)
             .log10()
-            .max(1.0);
-        let mut zoom_level = (self.session.panels.active().contig_length as f64
-            / st.snapshot.interval.len() as f64)
-            .log10();
+            .min(maximum_zoom);
         let zoom_response = ui
             .add(egui::Slider::new(&mut zoom_level, 0.0..=maximum_zoom).show_value(false))
             .on_hover_text("Genome zoom");
         zoom_response
             .widget_info(|| egui::WidgetInfo::slider(true, zoom_level, "Genome zoom level"));
         if zoom_response.changed() {
-            st.nav.requested_span = Some(
-                (self.session.panels.active().contig_length as f64 / 10_f64.powf(zoom_level))
-                    .round()
-                    .clamp(1.0, self.session.panels.active().contig_length as f64)
-                    as u64,
-            );
+            st.nav.requested_span = Some(zoom_slider_span(contig_length, zoom_level));
         }
+        // At the zoom limit the button is disabled rather than silently doing nothing.
+        let can_zoom_in = !self
+            .session
+            .panels
+            .active()
+            .viewport
+            .is_at_minimum_span(contig_length);
         let zoom_in = ui
-            .add(ui::icons::IconButton::new(
-                ui::icons::AppIcon::ZoomIn,
-                "Zoom in",
-            ))
-            .on_hover_text("Zoom in");
-        zoom_in
-            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Zoom in"));
+            .add_enabled(
+                can_zoom_in,
+                ui::icons::IconButton::new(ui::icons::AppIcon::ZoomIn, "Zoom in"),
+            )
+            .on_hover_text("Zoom in")
+            .on_disabled_hover_text(format!(
+                "Zoom in (at the {}-base zoom limit)",
+                rgv_core::MIN_VISIBLE_BASES
+            ));
+        zoom_in.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, can_zoom_in, "Zoom in")
+        });
         if zoom_in.clicked() {
             st.nav.zoom_in_requested = true;
         }
@@ -553,5 +559,51 @@ impl Viewer {
                 .response
                 .rect
         }
+    }
+}
+
+/// The genome zoom slider's top end: `log10(contig / narrowest span)`, so its maximum lands
+/// exactly on [`rgv_core::MIN_VISIBLE_BASES`] across the panel. A contig no longer than the
+/// minimum gets a token range, since it cannot zoom at all.
+pub(crate) fn zoom_slider_maximum(contig_length: u64) -> f64 {
+    let contig = contig_length.max(1) as f64;
+    (contig / rgv_core::minimum_visible_span(contig_length) as f64)
+        .log10()
+        .max(1.0e-3)
+}
+
+/// The span, in bases, a slider position asks for, never narrower than the zoom limit.
+pub(crate) fn zoom_slider_span(contig_length: u64, zoom_level: f64) -> u64 {
+    let contig = contig_length.max(1) as f64;
+    (contig / 10_f64.powf(zoom_level))
+        .round()
+        .clamp(rgv_core::minimum_visible_span(contig_length) as f64, contig) as u64
+}
+
+#[cfg(test)]
+mod zoom_slider_tests {
+    use super::{zoom_slider_maximum, zoom_slider_span};
+    use rgv_core::MIN_VISIBLE_BASES;
+
+    #[test]
+    fn slider_maximum_is_the_zoom_limit() {
+        let contig = 198_295_559_u64;
+        let maximum = zoom_slider_maximum(contig);
+        assert_eq!(zoom_slider_span(contig, maximum), MIN_VISIBLE_BASES);
+        // Past the end (a stale level) still clamps to the limit.
+        assert_eq!(zoom_slider_span(contig, maximum + 2.0), MIN_VISIBLE_BASES);
+        assert_eq!(zoom_slider_span(contig, 0.0), contig);
+        assert_eq!(zoom_slider_span(contig, 3.0), 198_296);
+    }
+
+    #[test]
+    fn small_contigs_cannot_zoom_past_their_length() {
+        assert_eq!(zoom_slider_span(25, zoom_slider_maximum(25)), 25);
+        assert_eq!(zoom_slider_span(25, 1.0), 25);
+        assert!(zoom_slider_maximum(25) > 0.0);
+        assert_eq!(
+            zoom_slider_span(400, zoom_slider_maximum(400)),
+            MIN_VISIBLE_BASES
+        );
     }
 }

@@ -764,6 +764,8 @@ impl PresentationContract {
             }
             AlignmentPageFamily::Labels => {
                 hash.write(&self.style.minimum_event_label_size.to_le_bytes());
+                // An insertion hidden by the minimum indel size carries no label either.
+                hash.write(&self.style.minimum_indel_size.to_le_bytes());
                 match self.style.read_labels {
                     AlignmentReadLabelMode::Hidden => hash.write(&[0]),
                     AlignmentReadLabelMode::ReadName => hash.write(&[1]),
@@ -946,6 +948,18 @@ mod tests {
         assert_ne!(
             base.page_fingerprint(AlignmentPageFamily::Labels),
             labels.page_fingerprint(AlignmentPageFamily::Labels)
+        );
+        // Insertion labels follow their I-beams, which the minimum indel size can hide.
+        let indels = PresentationContract {
+            style: AlignmentStyleContract {
+                minimum_indel_size: 5,
+                ..base.style
+            },
+            ..base
+        };
+        assert_ne!(
+            base.page_fingerprint(AlignmentPageFamily::Labels),
+            indels.page_fingerprint(AlignmentPageFamily::Labels)
         );
 
         let modifications = PresentationContract {

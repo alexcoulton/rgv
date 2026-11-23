@@ -166,6 +166,16 @@ fn retarget<P: Panel>(
     viewport: Viewport,
     record: bool,
 ) -> Reduced {
+    // Every locus a panel is sent to spans at least `MIN_VISIBLE_BASES`.
+    let clamped = viewport
+        .clamped_to_minimum_span(contig_length)
+        .unwrap_or(viewport);
+    let interval = if clamped == viewport {
+        interval
+    } else {
+        clamped.interval()
+    };
+    let viewport = clamped;
     let panel = panels.panel_mut(panel_id).state_mut();
     panel.viewport = viewport;
     panel.contig_name = contig_name;
@@ -302,7 +312,8 @@ pub fn reduce_panel_action<P: Panel>(
                 panel.viewport,
                 panel.contig_length,
                 *operation,
-            )?;
+            )?
+            .clamped_to_minimum_span(panel.contig_length)?;
             let panel = panels.panel_mut(*panel_id).state_mut();
             panel.viewport = next;
             if *commit == ViewportCommit::Discrete {
@@ -328,12 +339,16 @@ pub fn reduce_panel_action<P: Panel>(
             commit,
         } => {
             ensure_panel(panels, *panel_id)?;
+            // Window-computed cameras (slider, overview drag, pointer gestures) obey the same
+            // minimum span as typed loci.
+            let viewport =
+                viewport.clamped_to_minimum_span(panels.panel(*panel_id).state().contig_length)?;
             let interval = viewport.interval();
             if *commit == ViewportCommit::Discrete {
                 before_commit(panels);
             }
             let panel = panels.panel_mut(*panel_id).state_mut();
-            panel.viewport = *viewport;
+            panel.viewport = viewport;
             if *commit == ViewportCommit::Discrete {
                 panel.visit_history(interval);
             }

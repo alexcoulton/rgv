@@ -42,12 +42,14 @@ use crate::{
 mod alleles;
 mod depth;
 mod depth_pyramid;
+mod insertion_marks;
 mod junctions;
 mod modifications;
 
 pub use alleles::*;
 pub use depth::*;
 pub use depth_pyramid::*;
+pub use insertion_marks::*;
 pub use junctions::*;
 pub use modifications::*;
 
@@ -1445,10 +1447,22 @@ impl AlignmentSummaryGpuRenderer {
                 .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)
         })?;
         let overlay_draw_envelope = requests.len();
-        let overlay_instance_envelope = requests
-            .len()
-            .checked_mul(2)
-            .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?;
+        // Centre line and selected position, plus the insertion marks a camera-only zoom could
+        // reveal anywhere in the prepared horizon of a coverage lane with allele detail.
+        let overlay_instance_envelope = requests.iter().try_fold(0_usize, |total, request| {
+            let insertion_marks = match &request.options {
+                AlignmentSummaryGpuLaneOptions::Coverage(options) if options.alleles.is_some() => {
+                    usize::try_from(request.scene.prepared_interval().len())
+                        .unwrap_or(usize::MAX)
+                        .min(MAXIMUM_INSERTION_MARKS_PER_LANE)
+                        .saturating_mul(INSERTION_MARK_RECTS)
+                }
+                _ => 0,
+            };
+            total
+                .checked_add(2_usize.saturating_add(insertion_marks))
+                .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)
+        })?;
         u32::try_from(overlay_instance_envelope)
             .map_err(|_| AlignmentSummaryGpuPrepareError::TooManyOverlayPrimitives)?;
         let uniform_envelope = semantic_draw_envelope
@@ -5533,7 +5547,25 @@ fn summary_overlay_count(request: &AlignmentSummaryGpuSceneRequest<'_>) -> usize
     let selected = usize::from(
         selected_position.is_some_and(|position| request.camera.interval().contains(position)),
     );
-    center.saturating_add(selected)
+    center
+        .saturating_add(selected)
+        .saturating_add(summary_insertion_mark_rects(request).len())
+}
+
+/// IGV-style insertion marks for a coverage lane with per-base allele detail. Counted and
+/// appended through this one function so the overlay count always matches what is emitted.
+fn summary_insertion_mark_rects(
+    request: &AlignmentSummaryGpuSceneRequest<'_>,
+) -> Vec<InsertionMarkRect> {
+    let AlignmentSummaryGpuLaneOptions::Coverage(options) = &request.options else {
+        return Vec::new();
+    };
+    let (Some(alleles), Some(covered)) = (options.alleles, summary_covered_interval(request))
+    else {
+        return Vec::new();
+    };
+    let marks = coverage_insertion_marks(request.scene, covered, alleles.minimum_fraction);
+    insertion_mark_rects(request.camera, &marks)
 }
 
 fn append_summary_overlays(
@@ -5564,6 +5596,13 @@ fn append_summary_overlays(
                 PaletteToken::JUNCTION_BASELINE,
             ));
         }
+    }
+    for rect in summary_insertion_mark_rects(request) {
+        overlays.push(AlignmentSummaryGpuOverlayInstance::new(
+            rect.origin,
+            rect.size,
+            PaletteToken::INSERTION,
+        ));
     }
     if matches!(
         &request.options,

@@ -401,8 +401,10 @@ impl<P: Panel> PanelWorkspace<P> {
                     .end
                     .saturating_mul(2)
                     .max(saved.locus.end.saturating_add(1_000_000));
+                // A saved view narrower than the zoom limit loads widened, not rejected.
                 let interval =
-                    GenomicInterval::new(ContigId::new(0), saved.locus.start, saved.locus.end)?;
+                    GenomicInterval::new(ContigId::new(0), saved.locus.start, saved.locus.end)?
+                        .widened_to_minimum_view(contig_length);
                 let viewport = Viewport::new(interval, panel_width)?;
                 let locus = format!(
                     "{}:{}-{}",

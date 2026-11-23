@@ -4447,10 +4447,10 @@ fn is_insertion_of_read_at(start: u64) -> impl Fn(AlignmentComponent) -> bool {
 }
 
 /// The user-visible defect: at ~13 bases across the screen an insertion filled its whole base
-/// cell, exactly like a substitution. It is now a narrow bar centred on the boundary between
-/// the two reference bases it lies between, and stays visible when zoomed far out.
+/// cell, exactly like a substitution. It is now an I-beam centred on the boundary between the
+/// two reference bases it lies between, and stays visible when zoomed far out.
 #[test]
-fn insertion_markers_are_narrow_bars_centred_on_the_start_edge_of_their_base() {
+fn insertion_markers_are_i_beams_centred_on_the_start_edge_of_their_base() {
     let ledger = boundary_ledger();
     let scene = boundary_marker_scene(&ledger);
     // 4 bases over 448 points: 112 points per base. The insertion lies between origin + 21 and
@@ -4460,11 +4460,12 @@ fn insertion_markers_are_narrow_bars_centred_on_the_start_edge_of_their_base() {
     let marker = agreed_marker(&scene, zoomed_in, is_insertion_of_read_at(20));
     assert_eq!(marker.geometry, AlignmentGeometryToken::PointMarker);
     let boundary = boundary_x(zoomed_in, 22);
+    // A three-point bar plus two 2.5-point serifs (was a six-point bar).
     assert!(
-        marker.width <= 6.0 + 1.0e-9,
-        "{marker:?} is not a narrow bar"
+        marker.width <= 8.0 + 1.0e-9,
+        "{marker:?} is not a narrow I-beam"
     );
-    assert!((marker.width - 6.0).abs() < 1.0e-9);
+    assert!((marker.width - 8.0).abs() < 1.0e-9);
     assert!((marker.centre() - boundary).abs() < 1.0e-9);
     // Full read height, unchanged.
     assert!((marker.height - 11.0).abs() < 1.0e-9);
@@ -4511,6 +4512,113 @@ fn insertion_markers_are_narrow_bars_centred_on_the_start_edge_of_their_base() {
         ))
         .is_empty()
     );
+}
+
+/// The I-beam's zoom bands, agreed by the GPU oracle and the CPU projector: nothing below 0.1
+/// points per base, a one-point plain hairline below one, and from one point per base a bar a
+/// quarter of a base wide within [2, 3] points with 2.5-point serifs, so the whole mark is at
+/// most eight points wide however far the camera zooms in. The serifs are 0.15 x the read
+/// height thick (1.65 points on these 11-point reads) and picking hits them, but not the empty
+/// corners of the mark's box.
+#[test]
+fn insertion_i_beam_follows_the_zoom_bands_in_the_gpu_oracle_and_cpu_projector() {
+    let ledger = boundary_ledger();
+    let scene = boundary_marker_scene(&ledger);
+    let is_insertion = is_insertion_of_read_at(20);
+    // (points per base, first base, last base, expected width, full I-beam).
+    let bands = [
+        (0.05, 0, 20_000, None, false),
+        (0.5, 0, 2_000, Some(1.0), false),
+        (1.0, 0, 1_000, Some(7.0), true),
+        (7.0, 0, 100, Some(7.0), true),
+        (50.0, 2, 42, Some(8.0), true),
+        (1_400.0, 21, 23, Some(8.0), true),
+    ];
+    for (points_per_base, start, end, width, full) in bands {
+        let context = format!("{points_per_base} points per base");
+        let camera = boundary_camera(start, end, (end - start) as f64 * points_per_base);
+        assert!(
+            (1.0 / camera.bases_per_pixel() - points_per_base).abs() < 1.0e-9,
+            "{context}"
+        );
+        let Some(width) = width else {
+            assert!(
+                oracle_bounds(&scene, camera, |primitive| is_insertion(
+                    primitive.component
+                ))
+                .is_empty(),
+                "{context}"
+            );
+            assert!(
+                cpu_primitives(&scene, camera, |primitive| is_insertion(
+                    primitive.component
+                ))
+                .is_empty(),
+                "{context}"
+            );
+            continue;
+        };
+        let marker = agreed_marker(&scene, camera, &is_insertion);
+        assert!(
+            (marker.width - width).abs() < 1.0e-9,
+            "{context}: {marker:?}"
+        );
+        assert!(
+            (marker.centre() - boundary_x(camera, 22)).abs() < 1.0e-9,
+            "{context}"
+        );
+        assert!((marker.height - 11.0).abs() < 1.0e-9, "{context}");
+        let cpu = cpu_primitives(&scene, camera, |primitive| {
+            is_insertion(primitive.component)
+        })
+        .remove(0);
+        if !full {
+            assert_eq!(
+                cpu.shape,
+                rgv_alignment_scene::CpuPrimitiveShape::BoundaryHairline,
+                "{context}"
+            );
+            assert!(cpu.insertion_mark.is_none(), "{context}");
+            continue;
+        }
+        assert_eq!(
+            cpu.shape,
+            rgv_alignment_scene::CpuPrimitiveShape::PointMarker,
+            "{context}"
+        );
+        let mark = cpu.insertion_mark.expect("a full I-beam");
+        let serif = rgv_alignment_scene::insertion_serif_thickness(11.0);
+        assert!((serif - 1.65).abs() < 1.0e-12);
+        let [bar, top, bottom] = mark.parts();
+        let bar_width = width - 5.0;
+        assert!((bar.2 - bar_width).abs() < 1.0e-9, "{context}: {bar:?}");
+        assert!((bar.0 + bar.2 * 0.5 - boundary_x(camera, 22)).abs() < 1.0e-9);
+        assert!((bar.3 - 11.0).abs() < 1.0e-9);
+        for (part, y) in [(top, marker.y), (bottom, marker.y + 11.0 - serif)] {
+            assert!((part.0 - marker.left).abs() < 1.0e-9, "{context}");
+            assert!((part.2 - width).abs() < 1.0e-9, "{context}");
+            assert!((part.1 - y).abs() < 1.0e-9 && (part.3 - serif).abs() < 1.0e-9);
+        }
+        // Picking: a serif's outer end, top and bottom, hits the insertion; the empty corner
+        // beside the bar at mid-height does not (it picks the read beneath).
+        let outer = marker.left + 0.3;
+        for y in [marker.y + 0.3, marker.y + 11.0 - 0.3] {
+            assert!(cpu.contains(outer, y), "{context}: serif at ({outer}, {y})");
+        }
+        assert!(!cpu.contains(outer, marker.y + 5.5), "{context}");
+        assert!(cpu.contains(marker.centre(), marker.y + 5.5), "{context}");
+        let frame = CpuAlignmentProjector::project(&scene, 1, camera).unwrap();
+        let hit = CpuAlignmentProjector::pick(
+            &scene,
+            rgv_core::TrackId::new(1),
+            &frame,
+            outer,
+            marker.y + 0.3,
+        )
+        .unwrap()
+        .expect("the serif is picked");
+        assert!(is_insertion(hit.component), "{context}: {hit:?}");
+    }
 }
 
 /// One clip cut edge as projected by both the GPU oracle and the CPU projector, which must
@@ -4763,47 +4871,47 @@ fn clip_edges_use_their_own_colour_and_ghosts_their_reads() {
     }
 }
 
-/// The insertion length is centred on the same boundary as the insertion's bar.
+/// An insertion's label is a chip just after its I-beam (one point clear of the serifs), the
+/// read's height tall, stating the two inserted bases (`+AC`, from the fixture's `SEQ`). It was
+/// a bare length centred on the bar, which hid under it.
 #[test]
-fn insertion_length_labels_are_anchored_on_the_marker_boundary() {
+fn insertion_labels_sit_just_after_the_i_beam() {
     let ledger = boundary_ledger();
     let scene = boundary_marker_scene(&ledger);
-    let insertion_label_centre = |camera: AlignmentCamera| {
+    let insertion_label = |camera: AlignmentCamera| {
         let frame = CpuAlignmentProjector::project_labels(&scene, 1, camera).unwrap();
         let labels = frame
             .labels
             .iter()
-            .filter(|label| {
-                matches!(
-                    label.component,
-                    AlignmentComponent::Label {
-                        kind: rgv_alignment_scene::AlignmentLabelKind::InsertionLength,
-                        ..
-                    }
-                )
-            })
+            .filter(|label| rgv_alignment_scene::is_insertion_label(label.component))
+            .cloned()
             .collect::<Vec<_>>();
         assert_eq!(labels.len(), 1, "{:?}", frame.labels);
-        assert_eq!(labels[0].text.as_deref(), Some("2"));
-        labels[0].x + labels[0].width * 0.5
+        assert_eq!(labels[0].text.as_deref(), Some("+AC"));
+        labels[0].clone()
     };
     let camera = boundary_camera(21, 25, 448.0);
     let marker = agreed_marker(&scene, camera, is_insertion_of_read_at(20));
-    let centre = insertion_label_centre(camera);
-    assert!((centre - boundary_x(camera, 22)).abs() < 1.0e-9, "{centre}");
-    assert!((centre - marker.centre()).abs() < 1.0e-9);
-
-    // The terminal insertion's label follows its marker onto the read's right boundary.
-    let camera = boundary_camera(790, 810, 200.0);
-    let centre = insertion_label_centre(camera);
+    let label = insertion_label(camera);
     assert!(
-        (centre - boundary_x(camera, 808)).abs() < 1.0e-9,
-        "{centre}"
+        (label.x - (marker.left + marker.width + 1.0)).abs() < 1.0e-9,
+        "{label:?}"
+    );
+    assert!((label.y - marker.y).abs() < 1.0e-9 && (label.height - 11.0).abs() < 1.0e-9);
+
+    // The terminal insertion's label follows its I-beam onto the read's right boundary: at 10
+    // points per base the bar is 2.5 points, so the I-beam reaches 3.75 points either side.
+    let camera = boundary_camera(790, 815, 250.0);
+    let label = insertion_label(camera);
+    assert!(
+        (label.x - (boundary_x(camera, 808) + 3.75 + 1.0)).abs() < 1.0e-9,
+        "{label:?}"
     );
 }
 
-/// A click on the bar, including the half that overhangs the previous base's cell, selects the
-/// insertion; a click in the middle of either neighbouring base selects the read, not the marker.
+/// A click on the I-beam's bar, including the half that overhangs the previous base's cell,
+/// selects the insertion; a click beside the bar between the serifs, or in the middle of either
+/// neighbouring base, selects the read, not the marker.
 #[test]
 fn picking_follows_the_boundary_bar() {
     let ledger = boundary_ledger();
@@ -4819,8 +4927,9 @@ fn picking_follows_the_boundary_bar() {
             .map(|hit| hit.component)
     };
     let boundary = boundary_x(camera, 22);
-    assert!(marker.left < boundary - 2.5 && marker.left + marker.width > boundary + 2.5);
-    for x in [boundary - 2.5, boundary, boundary + 2.5] {
+    // A three-point bar inside an eight-point I-beam (was a six-point bar).
+    assert!(marker.left < boundary - 3.5 && marker.left + marker.width > boundary + 3.5);
+    for x in [boundary - 1.4, boundary, boundary + 1.4] {
         assert!(
             pick(x).is_some_and(is_insertion_of_read_at(20)),
             "{x}: {:?}",
@@ -4828,8 +4937,10 @@ fn picking_follows_the_boundary_bar() {
         );
     }
     for x in [
-        boundary - 3.5,
-        boundary + 3.5,
+        boundary - 2.5,
+        boundary + 2.5,
+        boundary - 4.5,
+        boundary + 4.5,
         boundary_x(camera, 21) + 56.0,
         boundary_x(camera, 22) + 56.0,
     ] {
@@ -4928,6 +5039,34 @@ fn shader_mark_scaling_constants_match_the_cpu_projector() {
         (
             "BOUNDARY_MARK_HAIRLINE_WIDTH",
             rgv_alignment_scene::BOUNDARY_MARK_HAIRLINE_WIDTH,
+        ),
+        (
+            "INSERTION_BAR_BASE_FRACTION",
+            rgv_alignment_scene::INSERTION_BAR_BASE_FRACTION,
+        ),
+        (
+            "INSERTION_BAR_MINIMUM_WIDTH",
+            rgv_alignment_scene::INSERTION_BAR_MINIMUM_WIDTH,
+        ),
+        (
+            "INSERTION_BAR_MAXIMUM_WIDTH",
+            rgv_alignment_scene::INSERTION_BAR_MAXIMUM_WIDTH,
+        ),
+        (
+            "INSERTION_SERIF_WIDTH",
+            rgv_alignment_scene::INSERTION_SERIF_WIDTH,
+        ),
+        (
+            "INSERTION_SERIF_THICKNESS_FRACTION",
+            rgv_alignment_scene::INSERTION_SERIF_THICKNESS_FRACTION,
+        ),
+        (
+            "INSERTION_SERIF_MINIMUM_THICKNESS",
+            rgv_alignment_scene::INSERTION_SERIF_MINIMUM_THICKNESS,
+        ),
+        (
+            "INSERTION_SERIF_MAXIMUM_THICKNESS",
+            rgv_alignment_scene::INSERTION_SERIF_MAXIMUM_THICKNESS,
         ),
     ] {
         assert!((constant(name) - value).abs() < 1.0e-12, "{name}");

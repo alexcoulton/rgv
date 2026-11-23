@@ -17,7 +17,7 @@ use egui::epaint::{
     TessellationOptions, Tessellator,
 };
 use egui::{Align2, Color32, Rect, TextureId, pos2};
-use rgv_layout::{Rgba, TextPrimitive};
+use rgv_layout::{RectPrimitive, Rgba, TextPrimitive};
 use std::sync::Arc;
 
 /// The egui texture holding [`PresentedTextPainter`]'s font atlas.
@@ -83,9 +83,11 @@ impl PresentedTextPainter {
     }
 
     /// Lays out `texts` centred on their anchors, in monospace, clipped to `clip`, exactly as
-    /// [`crate::ui::paint_genomic_text`] would inside the pass.
+    /// [`crate::ui::paint_genomic_text`] would inside the pass, over `backdrops` (label chips,
+    /// already in their final colour).
     pub(crate) fn paint(
         &mut self,
+        backdrops: &[RectPrimitive],
         texts: &[TextPrimitive],
         clip: Rect,
         pixels_per_point: f32,
@@ -105,27 +107,44 @@ impl PresentedTextPainter {
         atlas_fonts.begin_pass(options);
         let shapes = {
             let mut view = atlas_fonts.with_pixels_per_point(pixels_per_point);
-            texts
-                .iter()
-                .filter_map(|text| {
-                    let color = color(text.color);
-                    let galley = view.layout(
-                        text.text.clone(),
-                        FontId::monospace(text.font_size),
-                        color,
-                        f32::INFINITY,
-                    );
-                    if galley.is_empty() {
-                        return None;
-                    }
-                    let rect =
-                        Align2::CENTER_CENTER.anchor_size(pos2(text.x, text.y), galley.size());
-                    Some(ClippedShape {
-                        clip_rect: clip,
-                        shape: Shape::galley(rect.min, galley, color),
-                    })
+            let chips = backdrops.iter().map(|backdrop| {
+                let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+                ClippedShape {
+                    clip_rect: clip,
+                    shape: Shape::rect_filled(
+                        Rect::from_min_size(
+                            pos2(backdrop.x, backdrop.y),
+                            egui::vec2(backdrop.width, backdrop.height),
+                        ),
+                        1.5,
+                        Color32::from_rgba_unmultiplied(
+                            channel(backdrop.color.red),
+                            channel(backdrop.color.green),
+                            channel(backdrop.color.blue),
+                            channel(backdrop.color.alpha),
+                        ),
+                    ),
+                }
+            });
+            let mut shapes = chips.collect::<Vec<_>>();
+            shapes.extend(texts.iter().filter_map(|text| {
+                let color = color(text.color);
+                let galley = view.layout(
+                    text.text.clone(),
+                    FontId::monospace(text.font_size),
+                    color,
+                    f32::INFINITY,
+                );
+                if galley.is_empty() {
+                    return None;
+                }
+                let rect = Align2::CENTER_CENTER.anchor_size(pos2(text.x, text.y), galley.size());
+                Some(ClippedShape {
+                    clip_rect: clip,
+                    shape: Shape::galley(rect.min, galley, color),
                 })
-                .collect::<Vec<_>>()
+            }));
+            shapes
         };
         let texture_delta = atlas_fonts.font_image_delta();
         let atlas = atlas_fonts.texture_atlas();
@@ -233,7 +252,7 @@ mod tests {
     fn text_is_drawn_from_its_own_atlas_uploaded_in_the_same_frame() {
         let mut painter = PresentedTextPainter::default();
         let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(400.0, 300.0));
-        let first = painter.paint(&[text("A", 20.0, 30.0)], clip, 2.0, fonts(), |_| {
+        let first = painter.paint(&[], &[text("A", 20.0, 30.0)], clip, 2.0, fonts(), |_| {
             Color32::BLACK
         });
         let delta = first
@@ -259,22 +278,83 @@ mod tests {
             font_size: 9.37,
             ..text("7", 50.0, 60.0)
         };
-        let second = painter.paint(&[resized], clip, 2.0, fonts(), |_| Color32::BLACK);
+        let second = painter.paint(&[], &[resized], clip, 2.0, fonts(), |_| Color32::BLACK);
         assert!(second.texture_delta.is_some());
         // Nothing new: nothing to upload.
-        let third = painter.paint(&[text("A", 80.0, 30.0)], clip, 2.0, fonts(), |_| {
+        let third = painter.paint(&[], &[text("A", 80.0, 30.0)], clip, 2.0, fonts(), |_| {
             Color32::BLACK
         });
         assert!(third.texture_delta.is_none());
 
         painter.reset();
-        let after_reset = painter.paint(&[text("A", 20.0, 30.0)], clip, 2.0, fonts(), |_| {
+        let after_reset = painter.paint(&[], &[text("A", 20.0, 30.0)], clip, 2.0, fonts(), |_| {
             Color32::BLACK
         });
         assert!(
             after_reset
                 .texture_delta
                 .is_some_and(|delta| delta.pos.is_none())
+        );
+    }
+
+    /// A label chip is painted in its own colour, beneath the text laid out over it, in the
+    /// same atlas texture.
+    #[test]
+    fn label_chips_are_painted_beneath_their_text() {
+        let mut painter = PresentedTextPainter::default();
+        let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(400.0, 300.0));
+        let backdrop = RectPrimitive {
+            x: 100.0,
+            y: 20.0,
+            width: 16.0,
+            height: 11.0,
+            color: Rgba::new(0.55, 0.2, 0.7, 1.0),
+            object_id: 0,
+            shape: rgv_layout::RectShape::Rectangle,
+        };
+        let frame = painter.paint(
+            &[backdrop],
+            &[text("+T", 108.0, 25.5)],
+            clip,
+            2.0,
+            fonts(),
+            |_| Color32::WHITE,
+        );
+        let purple = Color32::from_rgba_unmultiplied(140, 51, 179, 255);
+        let vertices = frame
+            .primitives
+            .iter()
+            .flat_map(|primitive| match &primitive.primitive {
+                Primitive::Mesh(mesh) => {
+                    assert_eq!(mesh.texture_id, PRESENTED_TEXT_TEXTURE);
+                    mesh.vertices.clone()
+                }
+                Primitive::Callback(_) => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let first_text = vertices
+            .iter()
+            .position(|vertex| vertex.color == Color32::WHITE)
+            .expect("the text is painted");
+        // The chip's fill (its anti-aliased rim fades to transparent) precedes all text.
+        let chip_vertices = vertices[..first_text]
+            .iter()
+            .filter(|vertex| vertex.color == purple)
+            .collect::<Vec<_>>();
+        assert!(!chip_vertices.is_empty());
+        assert!(
+            vertices[..first_text]
+                .iter()
+                .all(|vertex| vertex.color == purple || vertex.color.a() == 0)
+        );
+        let (left, right) = chip_vertices
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, r), v| {
+                (l.min(v.pos.x), r.max(v.pos.x))
+            });
+        assert!(
+            (left - 100.0).abs() < 1.0 && (right - 116.0).abs() < 1.0,
+            "{left}..{right}"
         );
     }
 }

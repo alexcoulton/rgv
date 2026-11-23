@@ -263,8 +263,13 @@ by one frame (bc5de51), mismatch fill hidden under the following aligned block (
       never scrolls the read stack to the record's row, so in a deep stack the selected read can
       be off-screen. Setting `reveal_when_resolved` on the pending selection and preparing the
       frame again did not make it scroll; cause not found. Needed for MCP agents to show a read.
-- [ ] Short insertions (below `minimum_event_label_size`, default 10) never show their length,
+- [x] Short insertions (below `minimum_event_label_size`, default 10) never show their length,
       even when zoomed in far enough for the text to fit.
+      — fixed (not yet committed): every insertion is labelled once base letters are drawn
+        (`+T`/`+AG` up to 4 bases, `+12` beyond) on a purple chip beside the I-beam;
+        `minimum_event_label_size` now only gates the zoomed-out (2–7 points per base) length.
+        Insertions are drawn as I-beams (capped bar plus serifs), so at extreme zoom the mark can
+        no longer be mistaken for a base. Verified by unit, oracle and Metal readback tests.
 
 ## Wave 4 — product reach
 

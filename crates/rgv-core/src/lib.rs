@@ -100,4 +100,4 @@ pub use track::{
     VariantFieldComparison, VariantFieldPredicate, VariantFieldScope, VariantGenotypeFilter,
     VariantGenotypeGrouping, VariantMissingValueRule, VariantTrackSettings, VariantTypeGroup,
 };
-pub use viewport::{Viewport, ViewportError};
+pub use viewport::{MIN_VISIBLE_BASES, Viewport, ViewportError, minimum_visible_span};

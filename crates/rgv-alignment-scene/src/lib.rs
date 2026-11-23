@@ -64,8 +64,13 @@ pub use cpu_projector::{
     CpuAlignmentFrame, CpuAlignmentLabelFrame, clip_ghost_visible,
     CpuAlignmentProjector, CpuArrowhead, CpuClipRect, CpuFrameCoverage, CpuInteractionError,
     CpuPrimitiveShape, CpuProjectedPrimitive, CpuProjectionError,
-    EVENT_LABEL_MINIMUM_POINTS_PER_BASE, arrowhead_covers, arrowhead_length, boundary_mark_detail,
-    clip_edge_covers, clip_edge_extent, directional_extent, point_marker_extent,
+    CpuInsertionMark, EVENT_LABEL_MINIMUM_POINTS_PER_BASE, INSERTION_BAR_BASE_FRACTION,
+    INSERTION_BAR_MAXIMUM_WIDTH, INSERTION_BAR_MINIMUM_WIDTH, INSERTION_LABEL_MAXIMUM_BASES,
+    INSERTION_LABEL_MINIMUM_HEIGHT, INSERTION_SERIF_MAXIMUM_THICKNESS,
+    INSERTION_SERIF_MINIMUM_THICKNESS, INSERTION_SERIF_THICKNESS_FRACTION, INSERTION_SERIF_WIDTH,
+    arrowhead_covers, arrowhead_length, boundary_mark_detail, clip_edge_covers, clip_edge_extent,
+    directional_extent, insertion_bar_width, insertion_label_text, insertion_mark_covers,
+    insertion_serif_thickness, is_insertion_label, point_marker_extent,
 };
 pub use cpu_summary_projector::{
     CoverageAlleleInterpretation, CpuAlleleProjectionOptions, CpuAlleleToken,

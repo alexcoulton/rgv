@@ -114,11 +114,14 @@ fn unclipped_quad(
     }
     let at_end = instance.shape() == AlignmentGpuShape::PointMarkerAtEnd as u32;
     if at_end || instance.shape() == AlignmentGpuShape::PointMarker as u32 {
-        // Written out independently of `point_marker_extent`: a bar a quarter of a base wide,
-        // within [2, 6] points, centred on the start (or end) edge of the base.
+        // Written out independently of `point_marker_extent`: an I-beam whose bar is a quarter
+        // of a base wide within [2, 3] points, with serifs reaching 2.5 points beyond it on
+        // each side, centred on the start (or end) edge of the base. Zoomed out it is a plain
+        // one-point hairline.
         let width = if full_marks {
-            ((right - left) * 0.25).clamp(2.0, 6.0)
+            ((right - left) * 0.25).clamp(2.0, 3.0) + 5.0
         } else {
+            fragment_shape = AlignmentGpuShape::Rectangle as u32;
             1.0
         };
         let boundary = if at_end { right } else { left };
@@ -176,8 +179,9 @@ fn unclipped_quad(
 }
 
 /// Mirror of `alignment_scene.wgsl`'s fragment stage: direction terminals are cut to an
-/// arrowhead and a soft clip's edge to a zigzag stroke; everything else is solid. A direction
-/// terminal's tip-side edge is `bases_from_tip` whole bases short of its read's tip.
+/// arrowhead, a soft clip's edge to a zigzag stroke and an insertion to an I-beam; everything
+/// else is solid. A direction terminal's tip-side edge is `bases_from_tip` whole bases short of
+/// its read's tip.
 fn fragment_is_kept(
     shape: u32,
     local: [f64; 2],
@@ -185,6 +189,18 @@ fn fragment_is_kept(
     points_per_base: f64,
     bases_from_tip: u32,
 ) -> bool {
+    if shape == AlignmentGpuShape::PointMarker as u32
+        || shape == AlignmentGpuShape::PointMarkerAtEnd as u32
+    {
+        // Written out independently of `insertion_mark_covers`: the bar is what is left of the
+        // width after two 2.5-point serifs, centred; the serifs are 0.15 of the height thick,
+        // within [1, 2] points, at the top and bottom.
+        let bar = (size[0] - 5.0).max(0.0);
+        let serif = (size[1] * 0.15).clamp(1.0, 2.0);
+        return (local[0] - size[0] * 0.5).abs() < bar * 0.5
+            || local[1] < serif
+            || local[1] > size[1] - serif;
+    }
     if (6..=13).contains(&shape) && (shape - 6) & 2 == 0 {
         // Written out independently of `clip_edge_covers`: a 1.5-point stroke zigzagging
         // between the boundary side and the inner side, round(height / 4) teeth (at least one).
@@ -749,11 +765,14 @@ fn projection_uses_both_offset_words_beyond_single_f32_integer_precision() {
     sweep_far_from_the_page_start(20_000_001, 1 << 25, "twenty-megabase");
 }
 
-/// The reported defect on the real GPU: at ~128 points per base an insertion is a six-point bar
-/// on the boundary between the two reference bases it lies between, and both neighbouring base
-/// cells stay read-coloured, exactly where the CPU projector and the f64 oracle put them.
+/// The reported defects on the real GPU: at ~128 points per base an insertion is an I-beam (a
+/// three-point bar with serifs across the top and bottom of the read, eight points wide in all)
+/// on the boundary between the two reference bases it lies between, never a block the size of a
+/// base, and both neighbouring base cells stay read-coloured, exactly where the CPU projector
+/// and the f64 oracle put them.
 #[test]
-fn insertion_bar_is_painted_on_the_base_boundary_and_not_over_its_base_cell() {
+#[allow(clippy::too_many_lines)]
+fn insertion_i_beam_is_painted_on_the_base_boundary_and_not_over_its_base_cell() {
     use crate::palette::{PaletteColor, PaletteToken};
     use rgv_alignment_scene::{AlignmentComponent, CpuAlignmentProjector};
     let Some(gpu) = test_gpu() else {
@@ -790,7 +809,9 @@ fn insertion_bar_is_painted_on_the_base_boundary_and_not_over_its_base_cell() {
         .find(|primitive| matches!(primitive.component, AlignmentComponent::Insertion { .. }))
         .expect("the insertion is projected");
     assert!((marker.x + marker.width * 0.5 - boundary).abs() < 1.0e-9);
-    assert!((marker.width - 6.0).abs() < 1.0e-9);
+    // 128 points per base: the I-beam stays capped at a three-point bar plus two 2.5-point
+    // serifs, a sixteenth of the base cell.
+    assert!((marker.width - 8.0).abs() < 1.0e-9);
 
     let palette = AlignmentPalette::light();
     let insertion = palette
@@ -801,16 +822,45 @@ fn insertion_bar_is_painted_on_the_base_boundary_and_not_over_its_base_cell() {
         let [r, g, b, _] = image.get_pixel(column, scanline).0;
         [r, g, b]
     };
-    // Every column whose centre lies inside the CPU-projected bar is insertion-coloured, and the
-    // bar's edges are where the CPU projector puts them.
+    // Mid-height, only the three-point bar is insertion-coloured: every column whose centre lies
+    // inside it, and none of the box's columns beside it.
+    let (bar_left, bar_right) = (boundary - 1.5, boundary + 1.5);
+    assert!(edge_is_decidable(bar_left) && edge_is_decidable(bar_right));
+    let bar_first = first_column_at_or_after(bar_left) as u32;
+    let bar_end = first_column_at_or_after(bar_right) as u32;
+    assert_eq!(bar_end - bar_first, 3, "{bar_first}..{bar_end}");
+    for column in bar_first..bar_end {
+        assert_eq!(pixel(column), insertion[..3], "bar column {column}");
+    }
+    // The serifs: a scanline inside the top serif (0.15 x 11 = 1.65 points thick) and one inside
+    // the bottom serif are insertion-coloured across the whole eight-point box.
     let (left, right) = (marker.x, marker.x + marker.width);
     assert!(edge_is_decidable(left) && edge_is_decidable(right));
     let first = first_column_at_or_after(left) as u32;
     let end = first_column_at_or_after(right) as u32;
-    assert!(end - first >= 5, "{first}..{end}");
-    for column in first..end {
-        assert_eq!(pixel(column), insertion[..3], "bar column {column}");
+    assert!(end - first >= 7, "{first}..{end}");
+    let serif = 11.0 * 0.15;
+    for (name, centre) in [
+        ("top", marker.y + serif * 0.5),
+        ("bottom", marker.y + marker.height - serif * 0.5),
+    ] {
+        let row = centre.floor() as u32;
+        let row_centre = f64::from(row) + 0.5;
+        assert!(
+            (row_centre - centre).abs() < serif * 0.5 - 0.05,
+            "{name} serif scanline {row} is not inside the serif"
+        );
+        for column in first..end {
+            assert_eq!(
+                rgb_at(&image, column, row),
+                insertion[..3],
+                "{name} serif column {column}"
+            );
+        }
+        assert_ne!(rgb_at(&image, first - 1, row), insertion[..3]);
+        assert_ne!(rgb_at(&image, end, row), insertion[..3]);
     }
+    let (first, end) = (bar_first, bar_end);
     // The neighbouring base cells, both mid-cell and immediately beside the bar, are the read's
     // own body colour (this fixture's colour mode tints it by strand rather than plain grey):
     // neither base looks substituted.
@@ -1796,6 +1846,32 @@ fn zoomed_out_reads_keep_a_short_arrowhead_and_a_hairline_insertion_on_the_gpu()
                     .collect::<Vec<_>>(),
                 comparison.compared
             );
+        }
+    }
+}
+
+/// The harness's independent I-beam fragment rule agrees with the CPU projector's
+/// `insertion_mark_covers` over the whole box, for every bar width and several read heights.
+#[test]
+fn insertion_fragment_mirror_agrees_with_the_cpu_cover_rule() {
+    for width in [7.0, 7.5, 8.0] {
+        for height in [1.0, 5.0, 11.0, 20.0] {
+            for step_x in 0..80 {
+                let x = width * (f64::from(step_x) + 0.5) / 80.0;
+                for step_y in 0..80 {
+                    let y = height * (f64::from(step_y) + 0.5) / 80.0;
+                    for shape in [
+                        AlignmentGpuShape::PointMarker,
+                        AlignmentGpuShape::PointMarkerAtEnd,
+                    ] {
+                        assert_eq!(
+                            fragment_is_kept(shape as u32, [x, y], [width, height], 50.0, 0),
+                            rgv_alignment_scene::insertion_mark_covers(x, y, width, height),
+                            "{width} x {height} at ({x}, {y})"
+                        );
+                    }
+                }
+            }
         }
     }
 }

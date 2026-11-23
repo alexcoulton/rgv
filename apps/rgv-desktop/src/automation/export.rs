@@ -30,6 +30,8 @@ use std::path::{Path, PathBuf};
 
 pub(crate) struct SemanticExportCapture {
     generic: DisplayList,
+    /// Insertion label chips, painted over the alignment geometry and beneath all text.
+    label_backdrops: Vec<RectPrimitive>,
     panels: Vec<rgv_alignment_scene::AlignmentPanelSceneFrame>,
     interactions: HashMap<(PanelId, TrackId), rgv_alignment_scene::AlignmentInteractionState>,
     bounds: egui::Rect,
@@ -169,12 +171,23 @@ impl SemanticExportCapture {
         )?;
         let display = cropped_display_list(&self.generic, self.bounds);
         let alignment = cropped_display_list(&geometry.display, self.bounds);
-        let display = themed_export_display_list(
+        let mut display = themed_export_display_list(
             display,
             &alignment.rectangles,
             self.width,
             self.height,
             &self.theme,
+        );
+        // Label chips belong to the read text: above the read geometry, beneath every text.
+        display.rectangles.extend(
+            cropped_display_list(
+                &DisplayList {
+                    rectangles: self.label_backdrops,
+                    ..DisplayList::default()
+                },
+                self.bounds,
+            )
+            .rectangles,
         );
         match format {
             AutomationSnapshotFormat::Png => write_png_export(
@@ -311,10 +324,17 @@ impl Viewer {
             .extend(self.presented_alignment_label_texts(|panel_id| {
                 !active_only || panel_id == active_panel_id
             }));
+        let label_backdrops = self.presented_alignment_label_backdrops(|panel_id| {
+            !active_only || panel_id == active_panel_id
+        });
         let bytes = (width as usize)
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(16))
-            .and_then(|bytes| bytes.checked_add(generic.rectangles.len().saturating_mul(1024)))
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    (generic.rectangles.len() + label_backdrops.len()).saturating_mul(1024),
+                )
+            })
             .and_then(|bytes| {
                 bytes.checked_add(
                     generic
@@ -334,6 +354,7 @@ impl Viewer {
             rgv_alignment_scene::ReservationKind::Normal,
         )?;
         Ok(SemanticExportCapture {
+            label_backdrops,
             interactions,
             ledger: self.session.alignment_scene_ledger.clone(),
             theme: crate::theme::active(),

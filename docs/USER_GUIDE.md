@@ -284,6 +284,13 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   transaction, and commits never fade. Resize, pane, density, vertical-scroll, track-presentation,
   or display-scale changes invalidate an incompatible preview safely.
 - Drag horizontally to pan and use the wheel or trackpad to zoom around the pointer.
+- Like IGV, zooming stops at 40 bases across the panel (about 35 points per base in a 1,400-point
+  panel). The wheel, pinch, `+`, the zoom slider and automation zoom stop exactly on that limit,
+  keeping the base under the pointer in place, and the zoom-in button is disabled there. A locus
+  narrower than 40 bases (`chr3:52694306-52694307`, a one-base history entry, a saved session or
+  an automation `goto`) opens centred in a 40-base window, shifted inward at a contig end;
+  contigs shorter than 40 bases are shown whole. Automation `goto` reports the widened view in
+  `effective_loci`.
 - Annotation tracks occupy the upper pane and reads occupy the lower pane. They are independent
   presentation channels even when both rows refer to the same alignment source. Every row has an
   eye that controls its content without removing its restore header. Groups have a separate eye
@@ -385,6 +392,17 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   while label-sized events use a prominent red `I` (10 bp or longer for new tracks by default).
   Compact rows retain the high-contrast red tick. Same-row events landing in one pixel are collapsed
   deterministically and the gutter reports shown, collapsed, and omitted counts.
+- In the read stack an insertion is a purple I-beam on the boundary between two bases: a bar at
+  most 3 points wide with short serifs across the top and bottom of the read, never as wide as a
+  base. Below 1 point per base it is a 1-point line, and below 0.1 it is hidden. Where there is
+  room, a purple label sits just beside the I-beam, the read's height tall. It shows the inserted
+  bases for insertions of up to 4 bases (`+T`, `+AG`) and the length for longer ones (`+12`). The
+  label appears for every insertion once base letters are drawn (7 points per base). From 2 points
+  per base it also appears, as a length, for insertions at least “Label events ≥” long. It is
+  dropped where it would cover another read in the row or another label, and on reads shorter than
+  8 points. Insertions hidden by “Show indels ≥” have no label. Base letters under the label are
+  hidden. Clicking the I-beam selects the insertion; the
+  inspector lists its length, position and sequence.
 - Reference, coverage, Sashimi, aggregate-modification, and read lanes have independent visibility
   controls. Click the eye beside a lane in the track gutter to hide or show it. A hidden lane
   collapses to a compact labelled row with a closed eye, so it can be restored in the same place;
@@ -661,6 +679,16 @@ uses the conventional stable nucleotide palette (A green, C blue, G amber, T red
 track settings control minimum base quality, minimum allele fraction, quality-weighted colouring,
 and the optional coverage centre line. Minimum base quality changes allele evidence but does not
 silently change the unfiltered read depth.
+
+At the same zoom, a purple I-shaped mark on the boundary between two bases flags an insertion
+carried by at least the minimum allele fraction (default 20%) of the reads spanning the base
+before it, as IGV does. The stem grows with that fraction. Insertion counts honour the read filters
+(mapping quality, duplicate, QC-fail, secondary and supplementary, and view filters) and the
+overlapping-mates policy, but not minimum base quality, which applies to aligned bases only. Between
+one and two bases per point, boundaries that share a point column keep the largest fraction; at
+coarser, binned zoom levels the marks are hidden. Headless snapshots and figure export draw the same
+marks. In the pileup inspector, the base on either side of a marked boundary reports the insertion
+count, the fraction, whether it passes the mark threshold, and the most common inserted sequences.
 
 Click a coverage bar to open the pileup inspector. It reports the one-based locus, reference base,
 total and strand-specific depth, forward/reverse nucleotide counts, insertion and deletion support, unweighted

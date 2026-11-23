@@ -31,7 +31,9 @@ pub fn resolve_initial_locus(
         return Ok((interval, first.name().to_owned(), first.length()));
     };
     let resolved = Locus::resolve(requested, dictionary, aliases)?;
-    let interval = resolved.interval(SINGLE_POSITION_FLANK)?;
+    let interval = resolved
+        .interval(SINGLE_POSITION_FLANK)?
+        .widened_to_minimum_view(resolved.contig_length);
     Ok((interval, resolved.contig_name, resolved.contig_length))
 }
 
@@ -203,7 +205,7 @@ pub fn standalone_locus(locus: &str) -> Result<(GenomicInterval, String, u64)> {
     };
     let contig_length = end.saturating_mul(2).max(end.saturating_add(1_000_000));
     Ok((
-        GenomicInterval::new(ContigId::new(0), start, end)?,
+        GenomicInterval::new(ContigId::new(0), start, end)?.widened_to_minimum_view(contig_length),
         parsed.contig,
         contig_length,
     ))
@@ -360,7 +362,11 @@ pub fn resolve_history_entry(
         let contig = dictionary
             .get(interval.contig())
             .context("reference dictionary is inconsistent")?;
-        return Ok((interval, contig.name().to_owned(), contig.length()));
+        return Ok((
+            interval.widened_to_minimum_view(contig.length()),
+            contig.name().to_owned(),
+            contig.length(),
+        ));
     }
     let interval = entry
         .interval(current.id)
@@ -373,7 +379,11 @@ pub fn resolve_history_entry(
             .saturating_mul(2)
             .max(entry.end.saturating_add(1_000_000))
     };
-    Ok((interval, entry.contig_name.clone(), length))
+    Ok((
+        interval.widened_to_minimum_view(length),
+        entry.contig_name.clone(),
+        length,
+    ))
 }
 
 /// The viewport an automation viewport operation (pan, zoom, fit) leaves a panel on.
@@ -404,7 +414,7 @@ pub fn automation_viewport_after_operation(
             let end = end.min(bounded_length).max(start.saturating_add(1));
             let interval =
                 GenomicInterval::bounded(current.interval().contig(), start, end, contig_length)?;
-            Viewport::new(interval, current.pixel_width())?
+            Viewport::with_minimum_span(interval, current.pixel_width(), contig_length)?
         }
     })
 }

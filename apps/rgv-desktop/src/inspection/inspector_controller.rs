@@ -635,9 +635,20 @@ impl Viewer {
             .active()
             .selected_alignment_track
             .unwrap_or_else(|| self.primary_alignment_track_id());
-        let scene = self
-            .presented_alignment_lane(self.session.panels.active().id, track_id)
-            .and_then(|presented| presented.lane.snapshot.as_ref())?;
+        let presented = self.presented_alignment_lane(self.session.panels.active().id, track_id)?;
+        let scene = presented.lane.snapshot.as_ref()?;
+        // The threshold the coverage lane was drawn with, when it drew insertion marks.
+        let insertion_mark_threshold =
+            presented
+                .lane
+                .derived_lanes
+                .iter()
+                .find_map(|derived| match &derived.options {
+                    rgv_alignment_scene::AlignmentDerivedLaneOptions::Coverage(options) => {
+                        options.alleles.map(|alleles| alleles.minimum_fraction)
+                    }
+                    _ => None,
+                });
         let site = scene.pileup_site_at(position)?;
         let contract = scene.summaries().contract();
         let evidence = site.evidence;
@@ -691,9 +702,17 @@ impl Viewer {
                 bin_interval.end()
             )
         };
+        let insertion_fields =
+            coverage_insertion_fields(scene, position, insertion_mark_threshold, |anchor| {
+                format!(
+                    "{}:{}",
+                    self.session.panels.active().contig_name,
+                    anchor + 1
+                )
+            });
         let weighted = &bin.quality_weighted;
         let weighted_value = |value: u64| value as f64 / QUALITY_WEIGHT_SCALE as f64;
-        let fields = vec![
+        let mut fields = vec![
             (
                 "Track".to_owned(),
                 self.alignment_track_name_for_id(track_id),
@@ -786,6 +805,11 @@ impl Viewer {
             ("Allele detail".to_owned(), allele_detail_description),
             ("Overlapping mates".to_owned(), mate_description),
         ];
+        let after_indels = fields
+            .iter()
+            .position(|(name, _)| name == "Indel support")
+            .map_or(fields.len(), |index| index + 1);
+        fields.splice(after_indels..after_indels, insertion_fields);
         Some(InspectorSnapshot {
             fields,
             auxiliary: Vec::new(),
@@ -1127,6 +1151,60 @@ impl Viewer {
             read_sequence: None,
         })
     }
+}
+
+/// Inspector fields for insertions on the two boundaries of `position` (before and after the
+/// base), from the same scene the coverage lane drew: count, fraction of spanning reads, and the
+/// most common inserted sequences among the scene's selected reads.
+fn coverage_insertion_fields(
+    scene: &std::sync::Arc<rgv_alignment_scene::AlignmentSceneSnapshot>,
+    position: u64,
+    threshold: Option<f64>,
+    locus: impl Fn(u64) -> String,
+) -> Vec<(String, String)> {
+    use crate::inspection::coverage_insertions::{
+        inserted_bases_after, inserted_sequences_text, insertion_support_text,
+        tally_inserted_sequences,
+    };
+    let mut fields = Vec::new();
+    for anchor in [position.checked_sub(1), Some(position)]
+        .into_iter()
+        .flatten()
+    {
+        let Some(site) = scene.pileup_site_at(anchor) else {
+            continue;
+        };
+        let bin = site.evidence.bin;
+        if bin.alleles.insertion == 0 {
+            continue;
+        }
+        let covering = rgv_render::insertion_covering_reads(&bin);
+        fields.push((
+            format!("Insertions after {}", locus(anchor)),
+            insertion_support_text(bin.alleles.insertion, covering, threshold),
+        ));
+        let sequences =
+            GenomicInterval::new(scene.prepared_interval().contig(), anchor, anchor + 1)
+                .ok()
+                .and_then(|interval| scene.reads().evidence().select(interval).ok())
+                .map(|selection| {
+                    let inserted = (0..selection.len()).filter_map(|index| {
+                        let record = selection.record_view(index)?;
+                        let bases = match selection.sequence(index) {
+                            Some(rgv_model::SequenceView::Present { bases, .. }) => bases,
+                            _ => &[][..],
+                        };
+                        inserted_bases_after(record.start(), record.cigar(), bases, anchor)
+                    });
+                    tally_inserted_sequences(inserted)
+                })
+                .unwrap_or_default();
+        fields.push((
+            "Inserted sequences".to_owned(),
+            inserted_sequences_text(&sequences),
+        ));
+    }
+    fields
 }
 
 #[cfg(test)]

@@ -470,9 +470,29 @@ impl Viewer {
             {
                 Ok(_) => {
                     self.bump_workspace_revision();
+                    // What each panel actually shows: a locus narrower than the zoom limit is
+                    // widened, so the request and the view can differ.
+                    let effective_loci = self
+                        .session
+                        .panels
+                        .states()
+                        .map(|panel| {
+                            let interval = panel.viewport.interval();
+                            format!(
+                                "{}:{}-{}",
+                                panel.contig_name,
+                                interval.start().saturating_add(1),
+                                interval.end()
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     AutomationExecution::Complete {
                         message: format!("Navigated to {} ordered loci", loci.len()),
-                        data: serde_json::json!({"loci": loci}),
+                        data: serde_json::json!({
+                            "loci": loci,
+                            "effective_loci": effective_loci,
+                            "minimum_visible_bases": rgv_core::MIN_VISIBLE_BASES,
+                        }),
                     }
                 }
                 Err(error) => automation_failure(AutomationErrorCode::InvalidCommand, error),

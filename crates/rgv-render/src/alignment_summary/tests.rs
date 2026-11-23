@@ -49,9 +49,11 @@ fn exact_authority_over(
     tile_bases: NonZeroU64,
     summary_start: u64,
 ) -> (Arc<EvidenceRoot>, Arc<ExactSummaryRoot>) {
-    let interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
-    let summary_interval = GenomicInterval::new(ContigId::new(0), summary_start, 100).unwrap();
-    let record = AlignmentRecord {
+    exact_authority_with_records(ledger, tile_bases, summary_start, &[summary_record()])
+}
+
+fn summary_record() -> AlignmentRecord {
+    AlignmentRecord {
         contig: ContigId::new(0),
         start: 10,
         end: 23,
@@ -93,14 +95,27 @@ fn exact_authority_over(
                 value: AuxValue::Unsigned(2),
             },
         ],
-    };
+    }
+}
+
+/// [`exact_authority_over`] with caller-chosen evidence records (all eligible).
+fn exact_authority_with_records(
+    ledger: &AllocationLedger,
+    tile_bases: NonZeroU64,
+    summary_start: u64,
+    records: &[AlignmentRecord],
+) -> (Arc<EvidenceRoot>, Arc<ExactSummaryRoot>) {
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
+    let summary_interval = GenomicInterval::new(ContigId::new(0), summary_start, 100).unwrap();
     let mut decoded = AlignmentBatch::default();
-    decoded
-        .push_with_source_position(
-            &record,
-            AlignmentSourcePosition::bam_virtual_offset((5 << 16) | 1),
-        )
-        .unwrap();
+    for (index, record) in records.iter().enumerate() {
+        decoded
+            .push_with_source_position(
+                record,
+                AlignmentSourcePosition::bam_virtual_offset((5 << 16) | (index as u64 + 1)),
+            )
+            .unwrap();
+    }
     let payload_contract = PayloadContract::new_all_auxiliary(
         CapabilityRequirement::Required,
         CapabilityRequirement::Required,
@@ -157,8 +172,8 @@ fn exact_authority_over(
         RECORD_CONTRACT,
         interval,
         FilteredRecordProvenance {
-            records_seen: 1,
-            eligible_records: 1,
+            records_seen: records.len() as u64,
+            eligible_records: records.len() as u64,
             ..FilteredRecordProvenance::default()
         },
     )
@@ -343,7 +358,20 @@ fn test_snapshot_over(
     summary_start: u64,
     reference_bases: Option<Vec<u8>>,
 ) -> Arc<AlignmentSceneSnapshot> {
-    let (evidence, summaries) = exact_authority_over(ledger, tile_bases, summary_start);
+    test_snapshot_from_authority(
+        ledger,
+        prepared_interval,
+        exact_authority_over(ledger, tile_bases, summary_start),
+        reference_bases,
+    )
+}
+
+fn test_snapshot_from_authority(
+    ledger: &AllocationLedger,
+    prepared_interval: Option<GenomicInterval>,
+    (evidence, summaries): (Arc<EvidenceRoot>, Arc<ExactSummaryRoot>),
+    reference_bases: Option<Vec<u8>>,
+) -> Arc<AlignmentSceneSnapshot> {
     let interval = summaries.prepared_interval();
     let prepared_interval = prepared_interval.unwrap_or(interval);
     let reference_revision = ReferenceRevision::new(RevisionFingerprint::new(30, 31));
@@ -3724,4 +3752,185 @@ fn render_test_frame(
     }
     queue.submit([encoder.finish()]);
     Ok(())
+}
+
+fn insertion_read(name: &str, cigar: &[(CigarOpKind, u32)]) -> AlignmentRecord {
+    let reference_span = cigar
+        .iter()
+        .filter(|(kind, _)| *kind == CigarOpKind::Match)
+        .map(|(_, len)| u64::from(*len))
+        .sum::<u64>();
+    let read_length = cigar.iter().map(|(_, len)| *len as usize).sum::<usize>();
+    AlignmentRecord {
+        contig: ContigId::new(0),
+        start: 10,
+        end: 10 + reference_span,
+        flags: AlignmentFlags::from_bits(0),
+        mapping_quality: Some(60),
+        mate_contig: None,
+        mate_start: None,
+        template_length: 0,
+        read_name: name.as_bytes().to_vec(),
+        cigar: cigar
+            .iter()
+            .map(|(kind, len)| CigarOp {
+                kind: *kind,
+                len: *len,
+            })
+            .collect(),
+        sequence: SequenceData::Present {
+            bases: vec![b'A'; read_length],
+            qualities: Some(vec![35; read_length]),
+        },
+        auxiliary_fields: Vec::new(),
+    }
+}
+
+/// Three of four reads insert two bases after base 19; one inserts one base after base 24.
+fn insertion_snapshot(ledger: &AllocationLedger) -> Arc<AlignmentSceneSnapshot> {
+    use CigarOpKind::{Insertion as I, Match as M};
+    let records = [
+        insertion_read("ins-1", &[(M, 10), (I, 2), (M, 10)]),
+        insertion_read("ins-2", &[(M, 10), (I, 2), (M, 10)]),
+        insertion_read("ins-3", &[(M, 10), (I, 2), (M, 10)]),
+        insertion_read("late", &[(M, 15), (I, 1), (M, 5)]),
+    ];
+    test_snapshot_from_authority(
+        ledger,
+        None,
+        exact_authority_with_records(ledger, NonZeroU64::new(32).unwrap(), 0, &records),
+        None,
+    )
+}
+
+#[test]
+fn coverage_insertion_marks_come_from_the_exact_allele_pages() {
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let scene = insertion_snapshot(&ledger);
+    let covered = scene.prepared_interval();
+    let marks = coverage_insertion_marks(&scene, covered, 0.2);
+    assert_eq!(
+        marks
+            .iter()
+            .map(|mark| (mark.anchor, mark.insertions, mark.covering))
+            .collect::<Vec<_>>(),
+        vec![(19, 3, 4), (24, 1, 4)]
+    );
+    // The default 0.2 threshold keeps 25%; a stricter one hides it, as for mismatch colours.
+    let strict = coverage_insertion_marks(&scene, covered, 0.3);
+    assert_eq!(strict.len(), 1);
+    assert!((strict[0].fraction() - 0.75).abs() < 1.0e-12);
+    // Outside the boundary's anchor base there is nothing to mark.
+    let elsewhere = GenomicInterval::new(ContigId::new(0), 40, 90).unwrap();
+    assert!(coverage_insertion_marks(&scene, elsewhere, 0.0).is_empty());
+}
+
+#[test]
+fn coverage_lane_overlays_draw_insertion_marks_only_with_allele_detail() {
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let scene = insertion_snapshot(&ledger);
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 64).unwrap();
+    let mut options = lane_options(true);
+    options.alleles.as_mut().unwrap().minimum_fraction = 0.3;
+    let live = request(&scene, 1, camera(interval), options);
+    let mut overlays = Vec::new();
+    append_summary_overlays(&live, &mut overlays);
+    assert_eq!(overlays.len(), summary_overlay_count(&live));
+    assert_eq!(overlays.len(), INSERTION_MARK_RECTS);
+    assert!(
+        overlays
+            .iter()
+            .all(|overlay| overlay.palette_index == u32::from(PaletteToken::INSERTION.index()))
+    );
+    // The stem is centred on the boundary after base 19: 20 bases × 4 points.
+    let stem = overlays[1];
+    assert_near(f64::from(stem.origin[0] + stem.size[0] * 0.5), 80.0);
+    assert_near(f64::from(stem.size[1]), 96.0 * 0.6 * 0.75);
+    // Without per-base allele detail (overview zoom) the marks are hidden.
+    let binned = request(&scene, 2, camera(interval), lane_options(false));
+    assert_eq!(summary_overlay_count(&binned), 0);
+}
+
+#[test]
+fn semantic_export_draws_the_same_coverage_insertion_marks() {
+    use rgv_alignment_scene::{
+        AlignmentCamera, AlignmentDerivedLaneCapture, AlignmentDerivedLaneOptions,
+        AlignmentPanelLaneFrame, AlignmentPanelSceneFrame, CpuClipRect,
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let scene = insertion_snapshot(&ledger);
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 64).unwrap();
+    let viewport = Viewport::new(interval, 256.0).unwrap();
+    let read_camera = AlignmentCamera::from_viewport(
+        viewport,
+        0.0,
+        10.0,
+        8.0,
+        CpuClipRect {
+            x: 0.0,
+            y: 100.0,
+            width: 256.0,
+            height: f64::from(scene.reads().prepared_rows().end) * 10.0,
+        },
+    )
+    .unwrap();
+    let mut options = lane_options(true);
+    options.alleles.as_mut().unwrap().minimum_fraction = 0.3;
+    let lane = AlignmentPanelLaneFrame {
+        track_id: rgv_core::TrackId::new(1),
+        preparation_camera: read_camera.into(),
+        // Coverage only: the read stack's own insertion glyphs are not under test here.
+        read_camera: None,
+        row_activity: None,
+        derived_lanes: vec![
+            AlignmentDerivedLaneCapture::new(
+                camera(interval).clip(),
+                AlignmentDerivedLaneOptions::Coverage(options),
+            )
+            .unwrap(),
+        ]
+        .into(),
+        source_camera_sequence: 1,
+        snapshot: Some(Arc::clone(&scene)),
+        covered_interval: Some(scene.prepared_interval()),
+        requested_rows: scene.reads().prepared_rows(),
+        covered_rows: scene.reads().prepared_rows(),
+        scene_contracts_current: true,
+    };
+    let frame = AlignmentPanelSceneFrame {
+        panel_id: rgv_core::PanelId::new(1),
+        viewport,
+        camera_revision: 1,
+        authority_revision: 1,
+        lanes: vec![lane].into(),
+        coherence_groups: Vec::new().into(),
+    };
+    let palette = crate::palette::AlignmentPalette::light();
+    let export = crate::project_semantic_alignment_export(
+        std::slice::from_ref(&frame),
+        &ledger,
+        &std::collections::HashMap::new(),
+        &palette,
+    )
+    .unwrap();
+    let insertion = palette.color(PaletteToken::INSERTION);
+    let marks = export
+        .display
+        .rectangles
+        .iter()
+        .filter(|rectangle| {
+            rectangle.color == Rgba::new(insertion[0], insertion[1], insertion[2], insertion[3])
+        })
+        .collect::<Vec<_>>();
+    let live = request(&scene, 1, camera(interval), options);
+    let mut overlays = Vec::new();
+    append_summary_overlays(&live, &mut overlays);
+    assert_eq!(marks.len(), INSERTION_MARK_RECTS);
+    assert_eq!(marks.len(), overlays.len());
+    for (exported, overlay) in marks.iter().zip(&overlays) {
+        assert_near(f64::from(exported.x), f64::from(overlay.origin[0]));
+        assert_near(f64::from(exported.y), f64::from(overlay.origin[1]));
+        assert_near(f64::from(exported.width), f64::from(overlay.size[0]));
+        assert_near(f64::from(exported.height), f64::from(overlay.size[1]));
+    }
 }

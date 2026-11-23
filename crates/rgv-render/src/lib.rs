@@ -94,6 +94,11 @@ pub use alignment_summary::{
     project_alignment_summary_depth_instance, project_alignment_summary_junction_instance,
     project_alignment_summary_modification_instance,
 };
+pub use alignment_summary::{
+    CoverageInsertionMark, INSERTION_MARK_RECTS, InsertionMarkRect,
+    MAXIMUM_INSERTION_MARKS_PER_LANE, coverage_insertion_marks, insertion_covering_reads,
+    insertion_mark_rects,
+};
 pub use context_scene::{
     ContextSceneGpuCamera, ContextSceneGpuCameraCaptureError, ContextSceneGpuCoherenceKey,
     ContextSceneGpuFrame, ContextSceneGpuLaneKey, ContextSceneGpuLaneRequest,

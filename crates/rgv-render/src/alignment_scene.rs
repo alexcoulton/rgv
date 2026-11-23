@@ -206,14 +206,15 @@ impl AlignmentGpuInstance {
 pub enum AlignmentGpuShape {
     Rectangle = 0,
     EventLine = 1,
-    /// Narrow bar centred on the start edge of its one-base span.
+    /// An insertion's I-beam (bar plus top and bottom serifs) centred on the start edge of its
+    /// one-base span; see `rgv_alignment_scene::point_marker_extent`.
     PointMarker = 2,
     /// A shape cut by its read's direction arrowhead (pointing right, or left): the one-base
     /// terminal, a block or base cell ending on the tip, or a cell or block piece
     /// [`AlignmentGpuInstance::bases_from_tip`] bases short of it.
     DirectionTerminalRight = 3,
     DirectionTerminalLeft = 4,
-    /// Narrow bar centred on the end edge of its one-base span (a read's right boundary).
+    /// The same I-beam centred on the end edge of its one-base span (a read's right boundary).
     PointMarkerAtEnd = 5,
     /// Clip cut edges, `6 + at_end + 2 x hard + 4 x behind_arrow` (see [`ClipEdgeToken`] and
     /// `rgv_alignment_scene::clip_edge_extent`): a soft clip's sawtooth or a hard clip's bar,

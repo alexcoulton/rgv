@@ -37,6 +37,18 @@ const BOUNDARY_MARK_HAIRLINE_WIDTH: f32 = 1.0;
 // Soft-clip ghost cells are drawn only once their lowercase letters fit (the CPU label
 // projector's minimum base glyph width), so no pale letterless blocks appear zoomed out.
 const CLIP_GHOST_MINIMUM_POINTS_PER_BASE: f32 = 7.0;
+// Point markers are I-beams: a bar a quarter of a base wide within [MINIMUM, MAXIMUM] points,
+// with serifs across the top and bottom of the read reaching `INSERTION_SERIF_WIDTH` points
+// beyond the bar on each side, `INSERTION_SERIF_THICKNESS_FRACTION` of the read height thick
+// within [MINIMUM, MAXIMUM] points. Mirrored by the `INSERTION_*` constants, `point_marker_extent`
+// and `insertion_mark_covers` in `rgv-alignment-scene`.
+const INSERTION_BAR_BASE_FRACTION: f32 = 0.25;
+const INSERTION_BAR_MINIMUM_WIDTH: f32 = 2.0;
+const INSERTION_BAR_MAXIMUM_WIDTH: f32 = 3.0;
+const INSERTION_SERIF_WIDTH: f32 = 2.5;
+const INSERTION_SERIF_THICKNESS_FRACTION: f32 = 0.15;
+const INSERTION_SERIF_MINIMUM_THICKNESS: f32 = 1.0;
+const INSERTION_SERIF_MAXIMUM_THICKNESS: f32 = 2.0;
 
 // One sixteen-byte instance (`AlignmentGpuInstance`):
 //   span.x     whole bases from the page start to the primitive's start (bits 0..30)
@@ -154,14 +166,20 @@ fn project_instance(
     let full_marks = points_per_base >= BOUNDARY_MARK_FULL;
     let hidden_marks = points_per_base < BOUNDARY_MARK_HAIRLINE;
     var output_shape = shape;
-    // Point markers (2: start edge, 5: end edge of the one-base span) are narrow bars centred on
-    // that base boundary, a quarter of a base wide but within [2, 6] points (a one-point
-    // hairline when zoomed out, nothing further out); mirrored by `point_marker_extent` in
-    // `rgv-alignment-scene`.
+    // Point markers (2: start edge, 5: end edge of the one-base span) are I-beams centred on
+    // that base boundary: the quad spans the bar plus both serifs and `fragment_main` cuts the
+    // I out of it. Zoomed out they are a plain one-point hairline (drawn as a rectangle, shape
+    // 0), and further out nothing; mirrored by `point_marker_extent` in `rgv-alignment-scene`.
     if shape == 2u || shape == 5u {
         var marker_width = BOUNDARY_MARK_HAIRLINE_WIDTH;
         if full_marks {
-            marker_width = clamp((right - left) * 0.25, 2.0, 6.0);
+            marker_width = clamp(
+                (right - left) * INSERTION_BAR_BASE_FRACTION,
+                INSERTION_BAR_MINIMUM_WIDTH,
+                INSERTION_BAR_MAXIMUM_WIDTH,
+            ) + 2.0 * INSERTION_SERIF_WIDTH;
+        } else {
+            output_shape = 0u;
         }
         let boundary = select(left, right, shape == 5u);
         left = boundary - marker_width * 0.5;
@@ -276,6 +294,21 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
             if abs(input.local_point.y - half_height) > allowed {
                 discard;
             }
+        }
+    }
+    if input.shape == 2u || input.shape == 5u {
+        // An insertion's I-beam: the centred bar, plus a serif across the top and bottom of the
+        // read. Mirrored by `insertion_mark_covers` in `rgv-alignment-scene`.
+        let bar = max(input.size.x - 2.0 * INSERTION_SERIF_WIDTH, 0.0);
+        let serif = clamp(
+            input.size.y * INSERTION_SERIF_THICKNESS_FRACTION,
+            INSERTION_SERIF_MINIMUM_THICKNESS,
+            INSERTION_SERIF_MAXIMUM_THICKNESS,
+        );
+        let in_bar = abs(input.local_point.x - input.size.x * 0.5) < bar * 0.5;
+        let in_serif = input.local_point.y < serif || input.local_point.y > input.size.y - serif;
+        if !in_bar && !in_serif {
+            discard;
         }
     }
     if input.shape >= 6u && input.shape <= 13u && ((input.shape - 6u) & 2u) == 0u {

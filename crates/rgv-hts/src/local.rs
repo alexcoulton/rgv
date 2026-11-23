@@ -2865,6 +2865,61 @@ mod tests {
         assert_eq!(bin.alleles.deletion, 5);
     }
 
+    /// Coverage insertion marks read `alleles.insertion` at the anchor base. The count follows
+    /// the read filters (mapping quality, flags, duplicates) but not `minimum_base_quality`,
+    /// which applies to aligned bases only.
+    #[test]
+    fn insertion_anchor_counts_follow_read_filters_but_not_base_quality() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmark-data/variants.bam");
+        if !path.exists() {
+            return;
+        }
+        let interval = GenomicInterval::new(ContigId::new(0), 9_999, 10_000).unwrap();
+        let query = |options: QueryOptions| {
+            let mut source =
+                LocalAlignmentSource::open(&path, &AlignmentOpenOptions::default()).unwrap();
+            source
+                .query(
+                    interval,
+                    QueryOptions {
+                        coverage_bins: NonZeroUsize::new(1).unwrap(),
+                        collect_alleles: true,
+                        ..options
+                    },
+                    &|| true,
+                )
+                .unwrap()
+                .pileup
+                .bins[0]
+        };
+        let all = query(QueryOptions::default());
+        assert_eq!(all.alleles.insertion, 4);
+        let strict_bases = query(QueryOptions {
+            minimum_base_quality: 60,
+            ..QueryOptions::default()
+        });
+        assert_eq!(strict_bases.alleles.insertion, 4);
+        assert_eq!(strict_bases.alleles.base_observations(), 0);
+        let strict_mapping = query(QueryOptions {
+            filter: crate::AlignmentFilter {
+                minimum_mapping_quality: Some(61),
+                ..crate::AlignmentFilter::default()
+            },
+            ..QueryOptions::default()
+        });
+        assert_eq!(strict_mapping.alleles.insertion, 0);
+        assert_eq!(strict_mapping.depth, 0);
+        // Only reverse-strand reads (there are none here): the forward insertions drop out.
+        let reverse_only = query(QueryOptions {
+            filter: crate::AlignmentFilter {
+                required_flags: 0x10,
+                ..crate::AlignmentFilter::default()
+            },
+            ..QueryOptions::default()
+        });
+        assert_eq!(reverse_only.alleles.insertion, 0);
+    }
+
     #[test]
     fn malformed_alignment_is_reported_without_panicking() {
         let directory = tempfile::tempdir().unwrap();

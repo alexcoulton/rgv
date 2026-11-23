@@ -3,6 +3,40 @@ use thiserror::Error;
 
 use crate::{DetailLevel, GenomicInterval, IntervalError};
 
+/// Fewest bases a view panel may span across its width. IGV stops zooming at
+/// roughly 40 bases across the window; any narrower view only magnifies one or
+/// two bases. Contigs shorter than this are shown whole.
+pub const MIN_VISIBLE_BASES: u64 = 40;
+
+/// The narrowest span, in bases, a panel on a contig of `contig_length` may show.
+pub fn minimum_visible_span(contig_length: u64) -> u64 {
+    MIN_VISIBLE_BASES.min(contig_length.max(1))
+}
+
+impl GenomicInterval {
+    /// This interval, or, when it is narrower than [`MIN_VISIBLE_BASES`], an
+    /// interval of exactly that many bases centred on it and clamped to the
+    /// contig. A contig shorter than the minimum is returned whole. An interval
+    /// that already extends past `contig_length` (a provisional length) is
+    /// treated as bounding the contig.
+    #[must_use]
+    pub fn widened_to_minimum_view(self, contig_length: u64) -> Self {
+        let bound = contig_length.max(self.end());
+        let minimum = minimum_visible_span(bound);
+        if self.len() >= minimum {
+            return self;
+        }
+        let extra = minimum - self.len();
+        let mut start = self.start().saturating_sub(extra / 2);
+        let mut end = start.saturating_add(minimum);
+        if end > bound {
+            end = bound;
+            start = end - minimum;
+        }
+        Self::new(self.contig(), start, end).unwrap_or(self)
+    }
+}
+
 /// Deserialization validates the pixel width (and, through
 /// [`GenomicInterval`], the interval) and sanitises the fractional camera, so
 /// a decoded viewport upholds the same invariants as [`Viewport::new`].
@@ -57,6 +91,40 @@ impl Viewport {
             start_offset: 0.0,
             exact_width: interval.len() as f64,
         })
+    }
+
+    /// A viewport on `interval`, widened symmetrically to at least
+    /// [`MIN_VISIBLE_BASES`] (see [`GenomicInterval::widened_to_minimum_view`]).
+    /// Every navigation that lands a panel on a requested locus uses this.
+    pub fn with_minimum_span(
+        interval: GenomicInterval,
+        pixel_width: f64,
+        contig_length: u64,
+    ) -> Result<Self, ViewportError> {
+        Self::new(interval.widened_to_minimum_view(contig_length), pixel_width)
+    }
+
+    /// Whether the view already spans the fewest bases a panel may show.
+    pub fn is_at_minimum_span(self, contig_length: u64) -> bool {
+        self.span() <= minimum_visible_span(contig_length) as f64 + MINIMUM_SPAN_TOLERANCE
+    }
+
+    /// This viewport, or one widened about its centre to [`MIN_VISIBLE_BASES`]
+    /// when it is narrower (a restored session, a computed camera). Views that
+    /// already meet the minimum are returned unchanged, bit for bit.
+    pub fn clamped_to_minimum_span(self, contig_length: u64) -> Result<Self, ViewportError> {
+        let minimum = minimum_visible_span(contig_length) as f64;
+        if self.span() + MINIMUM_SPAN_TOLERANCE >= minimum {
+            return Ok(self);
+        }
+        let centre = self.exact_start() + self.span() * 0.5;
+        Self::from_exact(
+            self.interval.contig(),
+            centre - minimum * 0.5,
+            minimum,
+            self.pixel_width,
+            contig_length,
+        )
     }
 
     pub const fn interval(self) -> GenomicInterval {
@@ -152,6 +220,12 @@ impl Viewport {
     }
 
     /// Zoom around a pixel anchor. Factors below one zoom in and above one zoom out.
+    ///
+    /// The span never falls below [`MIN_VISIBLE_BASES`]: a zoom that would cross
+    /// the limit stops exactly on it with the genomic position under `anchor_x`
+    /// kept fixed (unless a contig edge forces the camera over), and a zoom-in
+    /// requested at the limit returns the viewport unchanged, so repeated wheel
+    /// events neither jitter nor drift.
     pub fn zoom_at(
         self,
         anchor_x: f64,
@@ -162,7 +236,12 @@ impl Viewport {
             return Err(ViewportError::InvalidZoomFactor(factor));
         }
 
-        let new_width = (self.span() * factor).clamp(1.0, contig_length.max(1) as f64);
+        let contig_width = contig_length.max(1) as f64;
+        let minimum = minimum_visible_span(contig_length) as f64;
+        if factor <= 1.0 && self.span() <= minimum + MINIMUM_SPAN_TOLERANCE {
+            return Ok(self);
+        }
+        let new_width = (self.span() * factor).clamp(minimum, contig_width);
         let anchor_fraction = (anchor_x / self.pixel_width).clamp(0.0, 1.0);
         let anchor_position = self.genomic_at_pixel(anchor_x);
         Self::from_exact(
@@ -211,6 +290,10 @@ impl Viewport {
         })
     }
 }
+
+/// Spans within this many bases of the minimum count as being at it, so float
+/// rounding in a fractional camera never re-triggers the clamp.
+const MINIMUM_SPAN_TOLERANCE: f64 = 1.0e-9;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum ViewportError {
@@ -321,7 +404,103 @@ mod tests {
             view = view.zoom_at(anchor_x, 0.8, 10_000).unwrap();
         }
         assert!((view.genomic_at_pixel(anchor_x) - anchor).abs() < 1.0e-9);
-        assert!(view.span() < 1.0 + f64::EPSILON);
+        // The zoom stops on the IGV-like limit instead of magnifying single bases.
+        assert!((view.span() - MIN_VISIBLE_BASES as f64).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn wheel_zoom_stops_on_the_limit_without_drift() {
+        let mut view = viewport();
+        let anchor_x = 612.5;
+        let anchor = view.genomic_at_pixel(anchor_x);
+        let mut at_limit = None;
+        for _ in 0..200 {
+            view = view.zoom_at(anchor_x, 0.9, 10_000).unwrap();
+            assert!(view.span() >= MIN_VISIBLE_BASES as f64 - 1.0e-9);
+            if view.is_at_minimum_span(10_000) {
+                // Further zoom-in at the limit is an exact no-op: no jitter, no drift.
+                let first = *at_limit.get_or_insert(view);
+                assert_eq!(view, first);
+            }
+        }
+        assert!(at_limit.is_some());
+        assert!((view.genomic_at_pixel(anchor_x) - anchor).abs() < 1.0e-9);
+        // Zooming back out still works from the limit.
+        let out = view.zoom_at(anchor_x, 1.25, 10_000).unwrap();
+        assert!((out.span() - 50.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn zoom_limit_keeps_the_anchor_unless_a_contig_edge_intervenes() {
+        let contig = ContigId::new(0);
+        let view = Viewport::new(GenomicInterval::new(contig, 0, 100).unwrap(), 1_000.0).unwrap();
+        // Anchored at the left edge: the left edge stays put.
+        let left = view.zoom_at(0.0, 0.01, 10_000).unwrap();
+        assert!((left.exact_start() - 0.0).abs() < 1.0e-9);
+        assert!((left.span() - 40.0).abs() < 1.0e-9);
+        // Anchored on the right edge of a contig: the right edge stays put.
+        let right_view =
+            Viewport::new(GenomicInterval::new(contig, 900, 1_000).unwrap(), 1_000.0).unwrap();
+        let right = right_view.zoom_at(1_000.0, 0.01, 1_000).unwrap();
+        assert_eq!(right.interval().end(), 1_000);
+        assert!((right.span() - 40.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn narrow_requests_widen_symmetrically_within_the_contig() {
+        let contig = ContigId::new(0);
+        // chr3:52694306-52694307 is the zero-based half-open 52694305..52694307.
+        let two = GenomicInterval::new(contig, 52_694_305, 52_694_307).unwrap();
+        let widened = two.widened_to_minimum_view(200_000_000);
+        assert_eq!(widened.len(), MIN_VISIBLE_BASES);
+        assert_eq!((widened.start(), widened.end()), (52_694_286, 52_694_326));
+        // One base: as centred as whole bases allow.
+        let one = GenomicInterval::new(contig, 1_000, 1_001).unwrap();
+        let widened = one.widened_to_minimum_view(10_000);
+        assert_eq!((widened.start(), widened.end()), (981, 1_021));
+        // Contig edges shift the window instead of leaving the contig.
+        let left = GenomicInterval::new(contig, 0, 1).unwrap();
+        assert_eq!(left.widened_to_minimum_view(10_000).start(), 0);
+        assert_eq!(left.widened_to_minimum_view(10_000).end(), 40);
+        let right = GenomicInterval::new(contig, 9_999, 10_000).unwrap();
+        let widened = right.widened_to_minimum_view(10_000);
+        assert_eq!((widened.start(), widened.end()), (9_960, 10_000));
+        // A contig shorter than the minimum is shown whole.
+        let tiny = GenomicInterval::new(contig, 3, 5).unwrap();
+        let widened = tiny.widened_to_minimum_view(25);
+        assert_eq!((widened.start(), widened.end()), (0, 25));
+        // Wide intervals are untouched.
+        let wide = GenomicInterval::new(contig, 100, 1_100).unwrap();
+        assert_eq!(wide.widened_to_minimum_view(10_000), wide);
+        let viewport = Viewport::with_minimum_span(one, 1_400.0, 10_000).unwrap();
+        assert_eq!(viewport.interval().len(), MIN_VISIBLE_BASES);
+        assert!(viewport.bases_per_pixel() * 1_400.0 >= MIN_VISIBLE_BASES as f64);
+    }
+
+    #[test]
+    fn narrow_cameras_clamp_about_their_centre() {
+        let contig = ContigId::new(0);
+        let narrow = Viewport::new(GenomicInterval::new(contig, 500, 502).unwrap(), 1_400.0)
+            .unwrap()
+            .pan_pixels(350.0, 10_000)
+            .unwrap();
+        let centre = narrow.exact_start() + narrow.span() * 0.5;
+        let clamped = narrow.clamped_to_minimum_span(10_000).unwrap();
+        assert!((clamped.span() - 40.0).abs() < 1.0e-9);
+        assert!((clamped.exact_start() + 20.0 - centre).abs() < 1.0e-9);
+        assert!((clamped.pixel_width() - 1_400.0).abs() < f64::EPSILON);
+        // At or above the minimum: unchanged. Small contigs: whole contig.
+        assert_eq!(clamped.clamped_to_minimum_span(10_000).unwrap(), clamped);
+        assert_eq!(
+            viewport().clamped_to_minimum_span(10_000).unwrap(),
+            viewport()
+        );
+        let small = Viewport::new(GenomicInterval::new(contig, 2, 4).unwrap(), 800.0).unwrap();
+        let small = small.clamped_to_minimum_span(12).unwrap();
+        assert_eq!((small.interval().start(), small.interval().end()), (0, 12));
+        assert!(small.is_at_minimum_span(12));
+        // A small contig cannot zoom in at all.
+        assert_eq!(small.zoom_at(400.0, 0.5, 12).unwrap(), small);
     }
 
     #[test]

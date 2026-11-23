@@ -9,9 +9,9 @@
 //! `Viewer::submit_ui_frame`. Exports read it the same way.
 
 use crate::{AlignmentGpuFrameBundle, Viewer, alignment_gpu_bundle_is_current};
-use rgv_alignment_scene::{AlignmentComponent, CpuProjectedPrimitive};
+use rgv_alignment_scene::{AlignmentComponent, CpuProjectedPrimitive, is_insertion_label};
 use rgv_core::PanelId;
-use rgv_layout::{Rgba, TextPrimitive};
+use rgv_layout::{RectPrimitive, RectShape, Rgba, TextPrimitive};
 use rgv_render::AlignmentSummaryGpuJunctionLabel;
 
 /// Styles one projected read label (base letter, event length, clip ghost letter) as text
@@ -25,6 +25,10 @@ pub(crate) fn alignment_text_primitive(label: &CpuProjectedPrimitive) -> Option<
             b'A' | b'G' => Rgba::new(0.06, 0.07, 0.08, 0.96),
             _ => Rgba::new(1.0, 1.0, 1.0, 0.98),
         },
+        // An insertion's label sits on its purple chip (see `alignment_label_backdrop`); white
+        // reads on the light theme's deep purple, and the dark theme maps it to near-black on
+        // its lighter purple.
+        component if is_insertion_label(component) => Rgba::new(1.0, 1.0, 1.0, 1.0),
         // Soft-clipped ghost bases sit on a faint tint of their read (or on the canvas): a
         // muted mid-grey stays legible on either theme and reads as "not aligned".
         AlignmentComponent::ClipGhostBase { .. } => Rgba::new(0.42, 0.43, 0.47, 0.95),
@@ -45,6 +49,47 @@ pub(crate) fn alignment_text_primitive(label: &CpuProjectedPrimitive) -> Option<
         font_size,
         color,
     })
+}
+
+/// The chip an insertion's label is written on: the label's box (the read's height, just beside
+/// the I-beam; see `place_insertion_label` in `rgv-alignment-scene`) filled with `fill`, the
+/// palette's insertion colour. `None` for every other label.
+pub(crate) fn alignment_label_backdrop(
+    label: &CpuProjectedPrimitive,
+    fill: Rgba,
+) -> Option<RectPrimitive> {
+    if !is_insertion_label(label.component) || label.text.is_none() {
+        return None;
+    }
+    Some(RectPrimitive {
+        x: label.x as f32,
+        y: label.y as f32,
+        width: label.width as f32,
+        height: label.height as f32,
+        color: fill,
+        object_id: 0,
+        shape: RectShape::Rectangle,
+    })
+}
+
+/// The label chips of every panel accepted by the caller, from the same label frames as
+/// [`presented_label_texts`], in the same panel order.
+pub(crate) fn presented_label_backdrops(
+    read_frames: &[(PanelId, &[CpuProjectedPrimitive])],
+    panels: impl IntoIterator<Item = PanelId>,
+    fill: Rgba,
+) -> Vec<RectPrimitive> {
+    let mut backdrops = Vec::new();
+    for panel_id in panels {
+        backdrops.extend(
+            read_frames
+                .iter()
+                .filter(|(owner, _)| *owner == panel_id)
+                .flat_map(|(_, labels)| labels.iter())
+                .filter_map(|label| alignment_label_backdrop(label, fill)),
+        );
+    }
+    backdrops
 }
 
 /// Styles one junction-count label of the summary frame.
@@ -114,6 +159,33 @@ impl Viewer {
             })
     }
 
+    /// Each label frame of the presented read frame, with the panel of its read authority.
+    fn presented_read_label_frames(
+        bundle: &AlignmentGpuFrameBundle,
+    ) -> Vec<(PanelId, &[CpuProjectedPrimitive])> {
+        bundle
+            .reads
+            .as_ref()
+            .map(|frame| {
+                bundle
+                    .read_authorities
+                    .iter()
+                    .zip(frame.label_frames())
+                    .map(|(authority, labels)| (authority.panel_id, &*labels.labels))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The panels, in order, accepted by `include`.
+    fn included_panels(&self, include: impl Fn(PanelId) -> bool) -> impl Iterator<Item = PanelId> {
+        self.session
+            .panels
+            .iter()
+            .map(|panel| panel.id)
+            .filter(move |panel_id| include(*panel_id))
+    }
+
     /// Read-level text of the panels accepted by `include`, taken from the bundle the GPU pass
     /// draws right now. Call it after the last capture of a frame; see `submit_ui_frame`.
     pub(crate) fn presented_alignment_label_texts(
@@ -128,26 +200,29 @@ impl Viewer {
             .as_ref()
             .map(|frame| self.alignment_summary_gpu_renderer.junction_labels(frame))
             .unwrap_or_default();
-        let read_frames = bundle
-            .reads
-            .as_ref()
-            .map(|frame| {
-                bundle
-                    .read_authorities
-                    .iter()
-                    .zip(frame.label_frames())
-                    .map(|(authority, labels)| (authority.panel_id, &*labels.labels))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
         presented_label_texts(
-            &read_frames,
+            &Self::presented_read_label_frames(bundle),
             &junction_labels,
-            self.session
-                .panels
-                .iter()
-                .map(|panel| panel.id)
-                .filter(|panel_id| include(*panel_id)),
+            self.included_panels(include),
+        )
+    }
+
+    /// The insertion label chips beneath [`Self::presented_alignment_label_texts`], from the same
+    /// bundle, in the active theme's insertion colour (already a theme colour: not adapted).
+    pub(crate) fn presented_alignment_label_backdrops(
+        &self,
+        include: impl Fn(PanelId) -> bool,
+    ) -> Vec<RectPrimitive> {
+        let Some(bundle) = self.drawable_alignment_gpu_bundle() else {
+            return Vec::new();
+        };
+        let [red, green, blue, alpha] = crate::theme::active()
+            .palette()
+            .color(rgv_render::palette::PaletteToken::INSERTION);
+        presented_label_backdrops(
+            &Self::presented_read_label_frames(bundle),
+            self.included_panels(include),
+            Rgba::new(red, green, blue, alpha),
         )
     }
 
@@ -161,12 +236,14 @@ impl Viewer {
         pixels_per_point: f32,
     ) {
         let texts = self.presented_alignment_label_texts(|_| true);
+        let backdrops = self.presented_alignment_label_backdrops(|_| true);
         let context = self.egui_context.clone();
         let (options, tessellation) = (
             context.fonts(|fonts| *fonts.options()),
             context.tessellation_options(|options| *options),
         );
         let frame = self.presented_text_painter.paint(
+            &backdrops,
             &texts,
             self.workspace_layout.canvas_geometry().genomic,
             pixels_per_point,
@@ -236,6 +313,7 @@ mod tests {
             text: Some(Arc::from(char::from(base).to_string())),
             row: 0,
             arrow: None,
+            insertion_mark: None,
         }
     }
 
@@ -323,6 +401,51 @@ mod tests {
                 .iter()
                 .all(|text| text.text == "99")
         );
+    }
+
+    /// An insertion's label is drawn as white text centred on a chip of the insertion colour,
+    /// both laid out from the very label frame handed in, so they move with the geometry of the
+    /// capture the GPU draws.
+    #[test]
+    fn insertion_labels_are_white_text_on_a_chip_from_the_presented_frame() {
+        let panel = PanelId::new(1);
+        let mut chip = base_label(105.0, 20.0, b'A');
+        chip.width = 16.32;
+        chip.height = 11.0;
+        chip.component = AlignmentComponent::Label {
+            kind: rgv_alignment_scene::AlignmentLabelKind::ShortInsertion,
+            id: rgv_alignment_scene::ContractFingerprint::new(9),
+        };
+        chip.text = Some(Arc::from("+T"));
+        let fill = Rgba::new(0.55, 0.20, 0.70, 1.0);
+        let letter = base_label(200.0, 20.0, b'C');
+        for dy in [0.0, 37.0] {
+            let mut moved = chip.clone();
+            moved.y += dy;
+            let labels = [moved, letter.clone()];
+            let texts = presented_label_texts(&[(panel, &labels[..])], &[], [panel]);
+            assert_eq!(texts[0].text, "+T");
+            assert_eq!(texts[0].color, Rgba::new(1.0, 1.0, 1.0, 1.0));
+            assert!((texts[0].x - (105.0 + 16.32 * 0.5) as f32).abs() < 1.0e-4);
+            assert!((texts[0].y - (20.0 + dy as f32 + 5.5)).abs() < 1.0e-4);
+            let backdrops = presented_label_backdrops(&[(panel, &labels[..])], [panel], fill);
+            // Only the insertion label has a chip, exactly its box.
+            assert_eq!(backdrops.len(), 1);
+            let backdrop = backdrops[0];
+            for (actual, expected) in [
+                (backdrop.x, 105.0),
+                (backdrop.y, 20.0 + dy as f32),
+                (backdrop.width, 16.32),
+                (backdrop.height, 11.0),
+            ] {
+                assert!((actual - expected).abs() < 1.0e-4, "{backdrop:?}");
+            }
+            assert_eq!(backdrop.color, fill);
+            assert!(
+                presented_label_backdrops(&[(panel, &labels[..])], [PanelId::new(2)], fill)
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

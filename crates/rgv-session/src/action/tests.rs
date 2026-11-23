@@ -740,3 +740,178 @@ fn region_and_review_edits_round_trip_and_typing_is_one_step() {
     );
     assert!(!idle.regions_changed && !idle.review_changed && inverse.is_none());
 }
+
+// ----- Zoom limit: every reducer entry path spans at least `MIN_VISIBLE_BASES` ---------------
+
+/// Start, end and whole-base span of a panel's view.
+fn span_of(panels: &PanelWorkspace, id: PanelId) -> (u64, u64, u64) {
+    let viewport = panels.get(id).unwrap().viewport;
+    let span = viewport.span();
+    assert!(
+        (span - span.round()).abs() < 1.0e-9,
+        "fractional span {span}"
+    );
+    (
+        viewport.interval().start(),
+        viewport.interval().end(),
+        span.round() as u64,
+    )
+}
+
+#[test]
+fn a_one_base_locus_is_widened_to_the_zoom_limit_and_reported() {
+    let harness = Harness::new();
+    let mut panels = two_panels();
+    let reduced = harness
+        .reduce(
+            &mut panels,
+            &Action::GoToLocus {
+                panel_id: A,
+                locus: "chr1:52694-52695".to_owned(),
+            },
+        )
+        .unwrap();
+    // The two requested bases (52693..52695) sit centred in a 40-base view.
+    assert_eq!(span_of(&panels, A), (52_674, 52_714, 40));
+    let reported = reduced.outcome.interval.unwrap();
+    assert_eq!((reported.start(), reported.end()), (52_674, 52_714));
+    // History records the effective view, so Back/Forward land on it again.
+    let entry = panels.get(A).unwrap().navigation_history.current();
+    assert_eq!((entry.start, entry.end), (52_674, 52_714));
+
+    // Contig edges shift the window instead of shrinking it.
+    harness
+        .reduce(
+            &mut panels,
+            &Action::GoToLocus {
+                panel_id: A,
+                locus: "chr2:500000".to_owned(),
+            },
+        )
+        .unwrap();
+    assert_eq!(span_of(&panels, A), (499_960, 500_000, 40));
+    harness
+        .reduce(
+            &mut panels,
+            &Action::GoToLocus {
+                panel_id: A,
+                locus: "chr1:1-2".to_owned(),
+            },
+        )
+        .unwrap();
+    assert_eq!(span_of(&panels, A), (0, 40, 40));
+}
+
+#[test]
+fn automation_zoom_fit_and_window_cameras_stop_at_the_zoom_limit() {
+    let harness = Harness::new();
+    let mut panels = two_panels();
+    for _ in 0..20 {
+        harness
+            .reduce(
+                &mut panels,
+                &Action::ChangeViewport {
+                    panel_id: A,
+                    operation: AutomationViewportOperation::Zoom {
+                        factor: 4.0,
+                        anchor_position: Some(15_000),
+                    },
+                    commit: ViewportCommit::Step,
+                },
+            )
+            .unwrap();
+    }
+    let viewport = panels.get(A).unwrap().viewport;
+    assert!((viewport.span() - 40.0).abs() < 1.0e-9);
+    // The anchor stays on screen at the same relative place it started (the centre).
+    assert!((viewport.genomic_at_pixel(300.0) - 15_000.0).abs() < 1.0e-6);
+
+    harness
+        .reduce(
+            &mut panels,
+            &Action::ChangeViewport {
+                panel_id: A,
+                operation: AutomationViewportOperation::FitInterval {
+                    start: 1_000,
+                    end: 1_001,
+                },
+                commit: ViewportCommit::Discrete,
+            },
+        )
+        .unwrap();
+    assert_eq!(span_of(&panels, A).2, 40);
+
+    // A narrow camera computed by the window is widened about its centre.
+    let narrow = Viewport::new(
+        GenomicInterval::new(ContigId::new(0), 7_000, 7_002).unwrap(),
+        600.0,
+    )
+    .unwrap();
+    harness
+        .reduce(
+            &mut panels,
+            &Action::SetViewport {
+                panel_id: B,
+                viewport: narrow,
+                commit: ViewportCommit::Gesture,
+            },
+        )
+        .unwrap();
+    assert_eq!(span_of(&panels, B), (6_981, 7_021, 40));
+}
+
+#[test]
+fn added_panels_and_history_entries_respect_the_zoom_limit() {
+    let harness = Harness::new();
+    let mut panels = two_panels();
+    let added = harness
+        .reduce(
+            &mut panels,
+            &Action::AddPanel {
+                locus: "chr2:100-100".to_owned(),
+            },
+        )
+        .unwrap()
+        .outcome
+        .panel_id
+        .unwrap();
+    assert_eq!(span_of(&panels, added).2, 40);
+    // A legacy one-base history entry is revisited at the limit.
+    let entry = rgv_core::NavigationEntry {
+        contig_name: "chr1".to_owned(),
+        start: 900,
+        end: 901,
+    };
+    harness
+        .reduce(
+            &mut panels,
+            &Action::NavigateToEntry {
+                panel_id: A,
+                entry,
+                record: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(span_of(&panels, A), (881, 921, 40));
+}
+
+#[test]
+fn a_saved_view_narrower_than_the_limit_loads_widened() {
+    let session = rgv_core::SessionDocument::new(rgv_core::SessionLocus {
+        contig: "chr3".to_owned(),
+        start: 52_694_305,
+        end: 52_694_307,
+    });
+    let workspace =
+        PanelWorkspace::<ViewPanelController>::from_session(&session, 1_400.0, 0.0).unwrap();
+    let viewport = workspace.active().viewport;
+    assert_eq!(
+        (viewport.interval().start(), viewport.interval().end()),
+        (52_694_286, 52_694_326)
+    );
+    // The requested locus is kept as typed; the dictionary resolution widens it again.
+    assert_eq!(
+        workspace.active().requested_locus.as_deref(),
+        Some("chr3:52694306-52694307")
+    );
+}

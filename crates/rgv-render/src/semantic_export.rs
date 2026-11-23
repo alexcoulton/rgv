@@ -230,6 +230,30 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                         });
                     }
                 }
+                // IGV-style insertion marks, the same rectangles the live overlay draws.
+                if let AlignmentDerivedLaneOptions::Coverage(options) = &derived.options
+                    && let Some(alleles) = options.alleles
+                    && let Some(covered) = camera.interval().intersection(scene.prepared_interval())
+                {
+                    let marks = crate::alignment_summary::coverage_insertion_marks(
+                        scene,
+                        covered,
+                        alleles.minimum_fraction,
+                    );
+                    let rects = crate::alignment_summary::insertion_mark_rects(camera, &marks);
+                    output.reserve(ledger, rects.len())?;
+                    for rect in rects {
+                        output.display.rectangles.push(RectPrimitive {
+                            x: rect.origin[0],
+                            y: rect.origin[1],
+                            width: rect.size[0],
+                            height: rect.size[1],
+                            color: rgba(palette.color(PaletteToken::INSERTION)),
+                            object_id: 0,
+                            shape: RectShape::Rectangle,
+                        });
+                    }
+                }
             }
             if let Some(camera) = lane.read_camera {
                 let default_interaction = rgv_alignment_scene::AlignmentInteractionState::default();
@@ -255,13 +279,21 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                     .iter()
                     .map(directional_part_count)
                     .fold(0_usize, usize::saturating_add);
+                // An insertion's I-beam is exported as its bar and two serifs.
+                let insertion_parts = frame
+                    .primitives
+                    .iter()
+                    .filter(|primitive| primitive.insertion_mark.is_some())
+                    .count()
+                    .saturating_mul(3);
                 output.reserve(
                     ledger,
                     frame
                         .primitives
                         .len()
                         .saturating_add(sawtooth_slices)
-                        .saturating_add(arrow_parts),
+                        .saturating_add(arrow_parts)
+                        .saturating_add(insertion_parts),
                 )?;
                 for primitive in frame
                     .primitives
@@ -297,6 +329,15 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                                 shape: part.shape,
                             });
                         });
+                        continue;
+                    }
+                    if let Some(mark) = primitive.insertion_mark {
+                        push_insertion_mark_parts(
+                            &mut output.display.rectangles,
+                            primitive,
+                            mark,
+                            Rgba::new(r, g, b, a),
+                        );
                         continue;
                     }
                     output.display.rectangles.push(RectPrimitive {
@@ -423,6 +464,36 @@ pub(crate) fn directional_parts(
             }
         }
         slice_top = slice_bottom;
+    }
+}
+
+/// Exports an insertion's I-beam as the GPU's `fragment_main` paints it
+/// (`rgv_alignment_scene::insertion_mark_covers`): its bar and its top and bottom serifs, each
+/// clipped to the primitive's on-pane box.
+fn push_insertion_mark_parts(
+    rectangles: &mut Vec<RectPrimitive>,
+    primitive: &rgv_alignment_scene::CpuProjectedPrimitive,
+    mark: rgv_alignment_scene::CpuInsertionMark,
+    color: Rgba,
+) {
+    let (clip_right, clip_bottom) = (
+        primitive.x + primitive.width,
+        primitive.y + primitive.height,
+    );
+    for (x, y, width, height) in mark.parts() {
+        let (left, top) = (x.max(primitive.x), y.max(primitive.y));
+        let (right, bottom) = ((x + width).min(clip_right), (y + height).min(clip_bottom));
+        if right > left && bottom > top {
+            rectangles.push(RectPrimitive {
+                x: left as f32,
+                y: top as f32,
+                width: (right - left) as f32,
+                height: (bottom - top) as f32,
+                color,
+                object_id: 0,
+                shape: RectShape::Rectangle,
+            });
+        }
     }
 }
 
@@ -756,6 +827,7 @@ mod tests {
             text: None,
             row: 0,
             arrow: None,
+            insertion_mark: None,
         };
         assert_eq!(sawtooth_slice_count(&edge), 22);
         let mut slices = Vec::new();
@@ -848,6 +920,7 @@ mod tests {
                 text: None,
                 row: 0,
                 arrow: Some(arrow),
+                insertion_mark: None,
             };
         // A read 11 points tall whose tip is at x = 100 (right) or x = 20 (left); at 2 points
         // per base the head is 0.55 x 11 = 6.05 points long.
@@ -985,5 +1058,89 @@ mod tests {
         let mut slices = Vec::new();
         push_clipped_arc_slices(&mut slices, &outside, CLIP, Rgba::new(0.0, 0.0, 0.0, 1.0));
         assert!(slices.is_empty());
+    }
+
+    /// An insertion's I-beam is exported as its bar and two serifs, exactly the parts
+    /// `insertion_mark_covers` (and the GPU) paint; where the pane clips the mark's box, each
+    /// part is clipped to it rather than moved.
+    #[test]
+    fn insertion_i_beam_exports_as_its_bar_and_serifs() {
+        use rgv_alignment_scene::{
+            AlignmentBodyColorToken, AlignmentComponent, AlignmentGeometryToken, AlignmentHandle,
+            AlignmentInteractionToken, AlignmentSourceRevision, AlignmentStyleToken,
+            CpuInsertionMark, CpuProjectedPrimitive, RevisionFingerprint, SourceFingerprint,
+        };
+        // An eight-point I-beam (three-point bar) on an 11-point read: serifs 1.65 thick.
+        let mark = CpuInsertionMark {
+            x: 96.0,
+            y: 10.0,
+            width: 8.0,
+            height: 11.0,
+        };
+        let mut primitive = CpuProjectedPrimitive {
+            x: 96.0,
+            y: 10.0,
+            width: 8.0,
+            height: 11.0,
+            shape: CpuPrimitiveShape::PointMarker,
+            geometry: AlignmentGeometryToken::PointMarker,
+            handle: AlignmentHandle::new(
+                AlignmentSourceRevision::new(
+                    SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+                    RevisionFingerprint::new(3, 4),
+                ),
+                rgv_model::AlignmentSourcePosition::bam_virtual_offset(5),
+            ),
+            component: AlignmentComponent::Insertion {
+                cigar_index: 1,
+                read_start: 79,
+                length: 1,
+            },
+            style: AlignmentStyleToken {
+                flags: 0,
+                mapping_quality: None,
+                operation: None,
+                body: AlignmentBodyColorToken::Neutral,
+            },
+            interaction: AlignmentInteractionToken::default(),
+            draw_order: 0,
+            text: None,
+            row: 0,
+            arrow: None,
+            insertion_mark: Some(mark),
+        };
+        let colour = Rgba::new(0.55, 0.2, 0.7, 1.0);
+        let mut parts = Vec::new();
+        push_insertion_mark_parts(&mut parts, &primitive, mark, colour);
+        let rounded = |part: &RectPrimitive| {
+            [part.x, part.y, part.width, part.height].map(|value| (value * 100.0).round() / 100.0)
+        };
+        assert_eq!(
+            parts.iter().map(rounded).collect::<Vec<_>>(),
+            [
+                [98.5, 10.0, 3.0, 11.0],
+                [96.0, 10.0, 8.0, 1.65],
+                [96.0, 19.35, 8.0, 1.65],
+            ]
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.color == colour && part.shape == RectShape::Rectangle)
+        );
+
+        // The pane's left edge at x = 99 cuts the box: the bar and serifs keep their place.
+        primitive.x = 99.0;
+        primitive.width = 5.0;
+        let mut clipped = Vec::new();
+        push_insertion_mark_parts(&mut clipped, &primitive, mark, colour);
+        assert_eq!(
+            clipped.iter().map(rounded).collect::<Vec<_>>(),
+            [
+                [99.0, 10.0, 2.5, 11.0],
+                [99.0, 10.0, 5.0, 1.65],
+                [99.0, 19.35, 5.0, 1.65],
+            ]
+        );
     }
 }

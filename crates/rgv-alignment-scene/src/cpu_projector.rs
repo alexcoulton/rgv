@@ -223,6 +223,10 @@ pub struct CpuProjectedPrimitive {
     /// so a primitive clipped by the pane keeps the read's own tip and diagonal rather than
     /// growing a point at the pane edge.
     pub arrow: Option<CpuArrowhead>,
+    /// For a full-size point marker ([`CpuPrimitiveShape::PointMarker`]), the I-beam it draws,
+    /// unclipped: picking hits its bar and serifs, not the empty corners of its box, exactly as
+    /// the GPU paints it.
+    pub insertion_mark: Option<CpuInsertionMark>,
 }
 
 impl CpuProjectedPrimitive {
@@ -231,7 +235,9 @@ impl CpuProjectedPrimitive {
         if x < self.x || x >= self.x + self.width || y < self.y || y >= self.y + self.height {
             return false;
         }
-        self.arrow.is_none_or(|arrow| arrow.covers(x, y))
+        self.insertion_mark.is_none_or(|mark| {
+            insertion_mark_covers(x - mark.x, y - mark.y, mark.width, mark.height)
+        }) && self.arrow.is_none_or(|arrow| arrow.covers(x, y))
     }
 }
 
@@ -855,8 +861,8 @@ fn pick_captured_scene(
     {
         return None;
     }
-    // A point marker is centred on a base boundary and overhangs by at most half its maximum
-    // width, and a clip edge lies at most an arrowhead plus its own width inside its boundary,
+    // A point marker (an I-beam) is centred on a base boundary and overhangs by at most half
+    // its maximum width, and a clip edge lies at most an arrowhead plus its own width inside its boundary,
     // so marks whose one-base span lies a cell (plus that reach) away from the pointer's base
     // can still be under it.
     let covered_interval = covered_interval?;
@@ -923,20 +929,33 @@ fn pick_captured_scene(
 /// `project_instance` in `rgv-render`'s `alignment_scene.wgsl`.
 const MINIMUM_PRIMITIVE_EXTENT: f64 = 1.0;
 
-/// Point markers (insertions, clips, padding, specialist insertions) are narrow bars centred on
-/// a base boundary: a quarter of a base wide, but never narrower than two points (so they stay
-/// visible zoomed out) nor wider than six (so they never read as a base cell). Keep in lockstep
-/// with shapes 2 and 5 of `project_instance` in `rgv-render`'s `alignment_scene.wgsl` and with
+/// Point markers (insertions, padding, specialist insertions) are I-beams centred on a base
+/// boundary: a narrow vertical bar, a quarter of a base wide but within
+/// [`INSERTION_BAR_MINIMUM_WIDTH`, `INSERTION_BAR_MAXIMUM_WIDTH`] points, with a horizontal
+/// serif across the top and bottom of the read that reaches [`INSERTION_SERIF_WIDTH`] points
+/// beyond the bar on each side. Every size is in points and capped, never a whole base, so the
+/// mark cannot be mistaken for a base cell at any zoom. Keep in lockstep with shapes 2 and 5 of
+/// `project_instance` and `fragment_main` in `rgv-render`'s `alignment_scene.wgsl` and with
 /// `project_alignment_gpu_instance`.
-const POINT_MARKER_BASE_FRACTION: f64 = 0.25;
-const POINT_MARKER_MINIMUM_WIDTH: f64 = 2.0;
-const POINT_MARKER_MAXIMUM_WIDTH: f64 = 6.0;
+pub const INSERTION_BAR_BASE_FRACTION: f64 = 0.25;
+pub const INSERTION_BAR_MINIMUM_WIDTH: f64 = 2.0;
+pub const INSERTION_BAR_MAXIMUM_WIDTH: f64 = 3.0;
+/// How far each serif reaches beyond the bar, in points.
+pub const INSERTION_SERIF_WIDTH: f64 = 2.5;
+/// A serif's thickness is this fraction of the read height, within
+/// [`INSERTION_SERIF_MINIMUM_THICKNESS`, `INSERTION_SERIF_MAXIMUM_THICKNESS`] points.
+pub const INSERTION_SERIF_THICKNESS_FRACTION: f64 = 0.15;
+pub const INSERTION_SERIF_MINIMUM_THICKNESS: f64 = 1.0;
+pub const INSERTION_SERIF_MAXIMUM_THICKNESS: f64 = 2.0;
+/// The widest an I-beam ever is: the widest bar plus both serifs.
+const POINT_MARKER_MAXIMUM_WIDTH: f64 = INSERTION_BAR_MAXIMUM_WIDTH + 2.0 * INSERTION_SERIF_WIDTH;
 
 /// Horizontal extent `(left, width)` of a point marker whose one-base span projects to
 /// `cell_left..cell_right`, under a camera of `points_per_base`: centred on the cell's start
-/// edge, or on its end edge when `at_end` (`AlignmentGeometryToken::PointMarkerAtEnd`). Below
-/// [`BOUNDARY_MARK_FULL_POINTS_PER_BASE`] it is a one-point hairline on that boundary, and below
-/// [`BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE`] it is not drawn (`None`).
+/// edge, or on its end edge when `at_end` (`AlignmentGeometryToken::PointMarkerAtEnd`). From
+/// [`BOUNDARY_MARK_FULL_POINTS_PER_BASE`] it is the whole I-beam (its bar plus both serifs; see
+/// [`insertion_mark_covers`] for the shape inside); below that a one-point hairline on that
+/// boundary, and below [`BOUNDARY_MARK_HAIRLINE_POINTS_PER_BASE`] it is not drawn (`None`).
 #[must_use]
 pub fn point_marker_extent(
     cell_left: f64,
@@ -945,13 +964,65 @@ pub fn point_marker_extent(
     points_per_base: f64,
 ) -> Option<(f64, f64)> {
     let width = match boundary_mark_detail(points_per_base) {
-        BoundaryMarkDetail::Full => ((cell_right - cell_left) * POINT_MARKER_BASE_FRACTION)
-            .clamp(POINT_MARKER_MINIMUM_WIDTH, POINT_MARKER_MAXIMUM_WIDTH),
+        BoundaryMarkDetail::Full => {
+            insertion_bar_width(cell_right - cell_left) + 2.0 * INSERTION_SERIF_WIDTH
+        }
         BoundaryMarkDetail::Hairline => BOUNDARY_MARK_HAIRLINE_WIDTH,
         BoundaryMarkDetail::Hidden => return None,
     };
     let boundary = if at_end { cell_right } else { cell_left };
     Some((boundary - width * 0.5, width))
+}
+
+/// Width of an I-beam's vertical bar when one base is `cell` points wide.
+#[must_use]
+pub fn insertion_bar_width(cell: f64) -> f64 {
+    (cell * INSERTION_BAR_BASE_FRACTION)
+        .clamp(INSERTION_BAR_MINIMUM_WIDTH, INSERTION_BAR_MAXIMUM_WIDTH)
+}
+
+/// Thickness of an I-beam's serifs on a read drawn `height` points tall.
+#[must_use]
+pub fn insertion_serif_thickness(height: f64) -> f64 {
+    (height * INSERTION_SERIF_THICKNESS_FRACTION).clamp(
+        INSERTION_SERIF_MINIMUM_THICKNESS,
+        INSERTION_SERIF_MAXIMUM_THICKNESS,
+    )
+}
+
+/// Whether the point `(local_x, local_y)`, relative to the top-left of a full-size I-beam of
+/// `width` x `height` points (see [`point_marker_extent`]), is painted: inside the centred bar,
+/// or inside the top or bottom serif. Mirrors `fragment_main` in `alignment_scene.wgsl`.
+#[must_use]
+pub fn insertion_mark_covers(local_x: f64, local_y: f64, width: f64, height: f64) -> bool {
+    let bar = (width - 2.0 * INSERTION_SERIF_WIDTH).max(0.0);
+    let serif = insertion_serif_thickness(height);
+    (local_x - width * 0.5).abs() < bar * 0.5 || local_y < serif || local_y > height - serif
+}
+
+/// The I-beam a full-size point marker draws, in unclipped pane coordinates, so a presenter or
+/// exporter can draw its three parts even where the pane clips the primitive's box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CpuInsertionMark {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl CpuInsertionMark {
+    /// The bar, the top serif and the bottom serif, as `(x, y, width, height)` rectangles; see
+    /// [`insertion_mark_covers`].
+    #[must_use]
+    pub fn parts(self) -> [(f64, f64, f64, f64); 3] {
+        let bar = (self.width - 2.0 * INSERTION_SERIF_WIDTH).max(0.0);
+        let serif = insertion_serif_thickness(self.height);
+        [
+            (self.x + (self.width - bar) * 0.5, self.y, bar, self.height),
+            (self.x, self.y, self.width, serif),
+            (self.x, self.y + self.height - serif, self.width, serif),
+        ]
+    }
 }
 
 /// Clip cut edges (shapes 6..=13 of `project_instance` and `fragment_main` in `rgv-render`'s
@@ -1073,6 +1144,7 @@ fn project_primitive(
     let body_height = camera.read_height.max(MINIMUM_PRIMITIVE_EXTENT);
     let points_per_base = 1.0 / camera.bases_per_pixel();
     let mut arrow = None;
+    let mut insertion_mark = None;
     let (shape, y, height) = match primitive.geometry {
         AlignmentGeometryToken::EventLine => {
             width = width.max(MINIMUM_PRIMITIVE_EXTENT);
@@ -1085,16 +1157,25 @@ fn project_primitive(
         AlignmentGeometryToken::PointMarker | AlignmentGeometryToken::PointMarkerAtEnd => {
             let at_end = primitive.geometry == AlignmentGeometryToken::PointMarkerAtEnd;
             if matches!(primitive.component, AlignmentComponent::Label { .. }) {
-                // A boundary-anchored label keeps its one-base box (so its visibility rules are
-                // unchanged) but centres it on the boundary its event's marker is drawn on.
+                // A boundary-anchored label is a one-point box centred on the boundary its
+                // event's I-beam is drawn on; `reconcile_labels` places the text beside the
+                // I-beam. A one-base box would be clipped off-centre near the pane edge.
                 let boundary = if at_end { x + width } else { x };
-                width = width.max(MINIMUM_PRIMITIVE_EXTENT);
+                width = MINIMUM_PRIMITIVE_EXTENT;
                 x = boundary - width * 0.5;
                 (CpuPrimitiveShape::TextLabel, row_top, body_height)
             } else {
                 (x, width) = point_marker_extent(x, x + width, at_end, points_per_base)?;
                 let shape = match boundary_mark_detail(points_per_base) {
-                    BoundaryMarkDetail::Full => CpuPrimitiveShape::PointMarker,
+                    BoundaryMarkDetail::Full => {
+                        insertion_mark = Some(CpuInsertionMark {
+                            x,
+                            y: row_top,
+                            width,
+                            height: body_height,
+                        });
+                        CpuPrimitiveShape::PointMarker
+                    }
                     _ => CpuPrimitiveShape::BoundaryHairline,
                 };
                 (shape, row_top, body_height)
@@ -1201,6 +1282,7 @@ fn project_primitive(
         text,
         row: global_row,
         arrow,
+        insertion_mark,
     })
 }
 
@@ -1236,10 +1318,131 @@ fn merge_label_fragments(existing: &mut CpuProjectedPrimitive, fragment: &CpuPro
 ///
 /// * a span event (deletion, reference skip) shows its length only when the text fits inside
 ///   the event's on-screen extent;
-/// * a point event (insertion, clip) has no on-screen extent, so its length shows only from
-///   this many points per base, and only when the text fits in the width its `length` unseen
-///   bases would occupy at the current zoom (`length x points per base`).
+/// * a clip has no on-screen extent, so its length shows only from this many points per base,
+///   and only when the text fits in the width its `length` unseen bases would occupy at the
+///   current zoom (`length x points per base`);
+/// * an insertion is labelled beside its I-beam; see [`insertion_label_text`] for the text and
+///   `place_insertion_label` for when and where it is shown.
 pub const EVENT_LABEL_MINIMUM_POINTS_PER_BASE: f64 = 2.0;
+
+/// Insertions of at most this many bases are labelled with the inserted bases themselves (`+T`,
+/// `+AG`); longer ones with their length (`+12`).
+pub const INSERTION_LABEL_MAXIMUM_BASES: u32 = 4;
+/// Reads drawn shorter than this many points carry no insertion label: its chip could not hold
+/// the smallest text.
+pub const INSERTION_LABEL_MINIMUM_HEIGHT: f64 = 8.0;
+/// Gap, in points, between an I-beam's serifs and its label.
+const INSERTION_LABEL_GAP: f64 = 1.0;
+/// Points per base from which base letters (and so insertion bases) are drawn.
+const MINIMUM_BASE_GLYPH_WIDTH: f64 = CLIP_GHOST_MINIMUM_POINTS_PER_BASE;
+const LABEL_HORIZONTAL_PADDING: f64 = 2.0;
+const LABEL_GLYPH_ASPECT_RATIO: f64 = 0.56;
+
+/// The label of an insertion of `length` bases: `+` and the inserted read bases (upper case)
+/// when there are at most [`INSERTION_LABEL_MAXIMUM_BASES`] and the record carries them as
+/// letters, otherwise `+` and the length. `bases` is the inserted slice of the read's `SEQ`.
+#[must_use]
+pub fn insertion_label_text(bases: Option<&[u8]>, length: u32) -> String {
+    match bases {
+        Some(bases)
+            if length <= INSERTION_LABEL_MAXIMUM_BASES
+                && !bases.is_empty()
+                && u32::try_from(bases.len()) == Ok(length)
+                && bases.iter().all(u8::is_ascii_alphabetic) =>
+        {
+            std::iter::once('+')
+                .chain(
+                    bases
+                        .iter()
+                        .map(|base| char::from(base.to_ascii_uppercase())),
+                )
+                .collect()
+        }
+        _ => format!("+{length}"),
+    }
+}
+
+/// The length-only form of an insertion label (`+AG` becomes `+2`); `None` when it already is.
+fn insertion_length_only(text: &str) -> Option<String> {
+    let bases = text.strip_prefix('+')?;
+    (!bases.is_empty() && !bases.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| format!("+{}", bases.chars().count()))
+}
+
+/// Estimated width of `text` laid out on a read `height` points tall, padding included.
+fn label_text_width(text: &str, height: f64) -> f64 {
+    text.chars().count().max(1) as f64 * height * LABEL_GLYPH_ASPECT_RATIO
+        + LABEL_HORIZONTAL_PADDING * 2.0
+}
+
+/// Places an insertion's label (a [`AlignmentLabelKind::InsertionLength`] or
+/// [`AlignmentLabelKind::ShortInsertion`] label whose one-point box is centred on the
+/// insertion's boundary) as a chip the read's height tall, just beside the I-beam: after it,
+/// or before it when that side has no room. The rules depend only on the zoom and the read
+/// height:
+///
+/// * from the base-letter width ([`CLIP_GHOST_MINIMUM_POINTS_PER_BASE`] points per base) every
+///   insertion is labelled, with its bases or its length (see [`insertion_label_text`]);
+/// * from [`EVENT_LABEL_MINIMUM_POINTS_PER_BASE`] only insertions at least
+///   `minimum_event_label_size` long ([`AlignmentLabelKind::InsertionLength`]) are, and only
+///   with their length (`+2`, never `+AG`);
+/// * never coarser than that, nor on reads under [`INSERTION_LABEL_MINIMUM_HEIGHT`] points.
+///
+/// A chip that would leave the pane or cover another read of the same row is dropped rather
+/// than moved further; collisions with other labels are resolved by the caller's sweep.
+fn place_insertion_label(
+    mut label: CpuProjectedPrimitive,
+    kind: AlignmentLabelKind,
+    points_per_base: f64,
+    clip: CpuClipRect,
+    read_bodies: &ReadBodiesByRow,
+) -> Option<CpuProjectedPrimitive> {
+    if points_per_base < EVENT_LABEL_MINIMUM_POINTS_PER_BASE
+        || label.height < INSERTION_LABEL_MINIMUM_HEIGHT
+    {
+        return None;
+    }
+    if points_per_base < MINIMUM_BASE_GLYPH_WIDTH {
+        if kind != AlignmentLabelKind::InsertionLength {
+            return None;
+        }
+        if let Some(length) = label.text.as_deref().and_then(insertion_length_only) {
+            label.text = Some(Arc::from(length));
+        }
+    }
+    let text_width = label_text_width(label.text.as_deref()?, label.height);
+    let boundary = label.x + label.width * 0.5;
+    let reach = point_marker_extent(boundary, boundary + points_per_base, false, points_per_base)
+        .map_or(0.0, |(_, width)| width * 0.5);
+    let clip_right = clip.x + clip.width;
+    let has_room = |left: f64| {
+        let right = left + text_width;
+        left >= clip.x
+            && right <= clip_right
+            && !read_bodies.get(&label.row).is_some_and(|bodies| {
+                bodies.iter().any(|&(start, end, handle)| {
+                    handle != label.handle && start < right && end > left
+                })
+            })
+    };
+    let after = boundary + reach + INSERTION_LABEL_GAP;
+    let before = boundary - reach - INSERTION_LABEL_GAP - text_width;
+    label.x = [after, before].into_iter().find(|&left| has_room(left))?;
+    label.width = text_width;
+    Some(label)
+}
+
+/// Whether `label` is an insertion's label chip; see [`place_insertion_label`].
+#[must_use]
+pub const fn is_insertion_label(component: AlignmentComponent) -> bool {
+    matches!(
+        component,
+        AlignmentComponent::Label {
+            kind: AlignmentLabelKind::InsertionLength | AlignmentLabelKind::ShortInsertion,
+            ..
+        }
+    )
+}
 
 /// The event length a point-event label states: its leading decimal digits (a hard clip's
 /// length carries an `H` suffix). The page builder writes these texts, so they always parse.
@@ -1280,10 +1483,7 @@ fn reconcile_labels(
     read_bodies: &ReadBodiesByRow,
 ) {
     const MIN_TEXT_HEIGHT: f64 = 5.0;
-    const MINIMUM_BASE_GLYPH_WIDTH: f64 = CLIP_GHOST_MINIMUM_POINTS_PER_BASE;
-    const HORIZONTAL_PADDING: f64 = 2.0;
     const COLLISION_GAP: f64 = 2.0;
-    const GLYPH_ASPECT_RATIO: f64 = 0.56;
 
     let clip = camera.clip;
     let points_per_base = 1.0 / camera.bases_per_pixel();
@@ -1291,6 +1491,11 @@ fn reconcile_labels(
     let mut base_labels = Vec::new();
     let mut candidates = labels
         .filter_map(|mut label| {
+            if let AlignmentComponent::Label { kind, .. } = label.component
+                && is_insertion_label(label.component)
+            {
+                return place_insertion_label(label, kind, points_per_base, clip, read_bodies);
+            }
             let text = label.text.as_deref()?;
             if matches!(
                 label.component,
@@ -1308,9 +1513,7 @@ fn reconcile_labels(
             if label.height < MIN_TEXT_HEIGHT {
                 return None;
             }
-            let glyph_count = text.chars().count().max(1) as f64;
-            let text_width =
-                glyph_count * label.height * GLYPH_ASPECT_RATIO + HORIZONTAL_PADDING * 2.0;
+            let text_width = label_text_width(text, label.height);
             if text_width > clip.width {
                 return None;
             }
@@ -1325,7 +1528,7 @@ fn reconcile_labels(
                     ..
                 } => text_width <= label.width,
                 AlignmentComponent::Label {
-                    kind: AlignmentLabelKind::InsertionLength | AlignmentLabelKind::ClipLength,
+                    kind: AlignmentLabelKind::ClipLength,
                     ..
                 } => {
                     points_per_base >= EVENT_LABEL_MINIMUM_POINTS_PER_BASE
@@ -1372,8 +1575,6 @@ fn reconcile_labels(
         })
         .collect::<Vec<_>>();
 
-    primitives.append(&mut base_labels);
-
     candidates.sort_by(|left, right| {
         left.x
             .total_cmp(&right.x)
@@ -1386,6 +1587,8 @@ fn reconcile_labels(
     // A sweep line keeps only accepted labels whose horizontal bounds can still collide.
     // The active set is therefore bounded by current screen geometry, not a record-count cap.
     let mut active = Vec::<CpuProjectedPrimitive>::new();
+    // Accepted insertion chips per row, as horizontal extents.
+    let mut chips = HashMap::<u32, Vec<(f64, f64)>>::new();
     for candidate in candidates {
         active.retain(|accepted| accepted.x + accepted.width + COLLISION_GAP > candidate.x);
         let collides = active.iter().any(|accepted| {
@@ -1393,10 +1596,28 @@ fn reconcile_labels(
                 && candidate.y < accepted.y + accepted.height + COLLISION_GAP
         });
         if !collides {
+            if is_insertion_label(candidate.component) {
+                chips
+                    .entry(candidate.row)
+                    .or_default()
+                    .push((candidate.x, candidate.x + candidate.width));
+            }
             active.push(candidate.clone());
             primitives.push(candidate);
         }
     }
+
+    // An insertion's chip covers the cells beside its I-beam, so a base letter of its row whose
+    // glyph would overlap the chip is not drawn (it would otherwise paint over the chip).
+    base_labels.retain(|letter| {
+        let centre = letter.x + letter.width * 0.5;
+        let half_glyph = letter.height * LABEL_GLYPH_ASPECT_RATIO * 0.5;
+        !chips.get(&letter.row).is_some_and(|row| {
+            row.iter()
+                .any(|&(left, right)| centre - half_glyph < right && centre + half_glyph > left)
+        })
+    });
+    primitives.append(&mut base_labels);
 }
 
 fn cpu_projection_scratch_bytes(primitives: usize, labels: usize) -> usize {
@@ -1654,10 +1875,12 @@ mod tests {
                 1.0,
                 Some(CpuPrimitiveShape::BoundaryHairline),
             ),
+            // Full size: an I-beam whose bar is a quarter base within [2, 3] points, plus two
+            // 2.5-point serifs.
             (
                 2.0,
                 6.05,
-                2.0,
+                7.0,
                 2.0,
                 2.0,
                 Some(CpuPrimitiveShape::PointMarker),
@@ -1665,7 +1888,7 @@ mod tests {
             (
                 40.0,
                 6.05,
-                6.0,
+                8.0,
                 6.0,
                 2.0,
                 Some(CpuPrimitiveShape::PointMarker),
@@ -1775,7 +1998,7 @@ mod tests {
     }
 
     #[test]
-    fn point_markers_are_narrow_bars_on_a_base_boundary_and_labels_follow_them() {
+    fn point_markers_are_i_beams_on_a_base_boundary_and_labels_follow_them() {
         // 112 points per base.
         let camera = AlignmentCamera::new(
             GenomicInterval::new(ContigId::new(0), 1_000, 1_010).unwrap(),
@@ -1796,13 +2019,24 @@ mod tests {
             (AlignmentGeometryToken::PointMarker, start_edge),
             (AlignmentGeometryToken::PointMarkerAtEnd, end_edge),
         ] {
+            // A three-point bar plus two 2.5-point serifs, centred on the boundary.
             let marker = project(primitive(5, 6, geometry), 0, camera).unwrap();
             assert_eq!(marker.shape, CpuPrimitiveShape::PointMarker);
-            assert!((marker.width - 6.0).abs() < 1.0e-9, "{marker:?}");
-            assert!((marker.x + 3.0 - boundary).abs() < 1.0e-9, "{marker:?}");
+            assert!((marker.width - 8.0).abs() < 1.0e-9, "{marker:?}");
+            assert!((marker.x + 4.0 - boundary).abs() < 1.0e-9, "{marker:?}");
             assert!((marker.height - 11.0).abs() < 1.0e-9);
+            assert_eq!(
+                marker.insertion_mark,
+                Some(CpuInsertionMark {
+                    x: marker.x,
+                    y: marker.y,
+                    width: 8.0,
+                    height: 11.0,
+                })
+            );
 
-            // A label carrying the same token keeps its one-base box, centred on the boundary.
+            // A label carrying the same token is a one-point box centred on the boundary
+            // (changed from a one-base box, which the pane could clip off-centre).
             let mut label = primitive(5, 6, geometry);
             label.component = AlignmentComponent::Label {
                 kind: AlignmentLabelKind::InsertionLength,
@@ -1810,7 +2044,7 @@ mod tests {
             };
             let label = project(label, 0, camera).unwrap();
             assert_eq!(label.shape, CpuPrimitiveShape::TextLabel);
-            assert!((label.width - 112.0).abs() < 1.0e-9);
+            assert!((label.width - 1.0).abs() < 1.0e-9);
             assert!((label.x + label.width * 0.5 - boundary).abs() < 1.0e-9);
         }
         // A span-anchored label is unchanged: centred on its base cell.
@@ -1822,6 +2056,26 @@ mod tests {
         let label = project(label, 0, camera).unwrap();
         assert!((label.x - start_edge).abs() < 1.0e-9);
         assert!((label.width - 112.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn insertion_labels_state_short_insertions_by_their_bases_and_long_ones_by_length() {
+        for (bases, length, text) in [
+            (Some(&b"t"[..]), 1, "+T"),
+            (Some(&b"AG"[..]), 2, "+AG"),
+            (Some(&b"acgt"[..]), 4, "+ACGT"),
+            // Longer than INSERTION_LABEL_MAXIMUM_BASES: the length.
+            (Some(&b"ACGTA"[..]), 5, "+5"),
+            (None, 12, "+12"),
+            // Missing or unusable bases fall back to the length.
+            (Some(&b"*"[..]), 1, "+1"),
+            (Some(&b"AC"[..]), 3, "+3"),
+        ] {
+            assert_eq!(insertion_label_text(bases, length), text);
+        }
+        assert_eq!(INSERTION_LABEL_MAXIMUM_BASES, 4);
+        assert_eq!(insertion_length_only("+AG").as_deref(), Some("+2"));
+        assert_eq!(insertion_length_only("+12"), None);
     }
 
     #[test]
