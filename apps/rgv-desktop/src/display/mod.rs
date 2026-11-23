@@ -63,9 +63,15 @@ fn alignment_text_primitive(
             b'A' | b'G' => Rgba::new(0.06, 0.07, 0.08, 0.96),
             _ => Rgba::new(1.0, 1.0, 1.0, 0.98),
         },
+        // Soft-clipped ghost bases sit on a faint tint of their read (or on the canvas): a
+        // muted mid-grey stays legible on either theme and reads as "not aligned".
+        AlignmentComponent::ClipGhostBase { .. } => Rgba::new(0.42, 0.43, 0.47, 0.95),
         _ => Rgba::new(0.08, 0.09, 0.11, 0.94),
     };
-    let font_size = if matches!(label.component, AlignmentComponent::Base { .. }) {
+    let font_size = if matches!(
+        label.component,
+        AlignmentComponent::Base { .. } | AlignmentComponent::ClipGhostBase { .. }
+    ) {
         (label.width.min(label.height) as f32 - 1.0).clamp(8.0, 12.0)
     } else {
         (label.height as f32 - 2.0).clamp(8.0, 12.0)

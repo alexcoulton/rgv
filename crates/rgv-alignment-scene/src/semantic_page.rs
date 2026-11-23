@@ -302,6 +302,16 @@ pub enum AlignmentComponent {
         quality: Option<u8>,
         classification: AlignedBaseClassification,
     },
+    /// A soft-clipped base drawn beyond the read's cut edge at base-level detail (its `SEQ`
+    /// base, as stored). `obscured` when another read's aligned extent, or another read's ghost
+    /// base, occupies the same cell of the row: the cell still draws beneath that read, but its
+    /// letter is not shown.
+    ClipGhostBase {
+        cigar_index: u32,
+        read_index: u32,
+        base: u8,
+        obscured: bool,
+    },
 }
 
 impl AlignmentComponent {
@@ -338,6 +348,27 @@ pub enum AlignmentGeometryToken {
     PointMarkerAtEnd,
     DirectionalTerminalLeft,
     DirectionalTerminalRight,
+    /// The cut edge of a clipped read end, drawn just inside the read's aligned boundary on the
+    /// start (or end) edge of its one-base span: a dark zigzag for a soft clip, a straight bar
+    /// for a hard clip. It never fills a base cell. On a label (a clip length) the same token
+    /// anchors the text OUTSIDE the read: before the span's start, or after its end.
+    ClipEdge(ClipEdgeToken),
+    /// One soft-clipped base drawn faintly beyond the cut edge at base-level detail. Ghost cells
+    /// paint beneath all other read geometry of their row, so a neighbouring read covers them.
+    ClipGhost,
+}
+
+/// Which clipped boundary a [`AlignmentGeometryToken::ClipEdge`] marks and how it is drawn.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ClipEdgeToken {
+    /// The clip is on the read's right boundary: the end edge of the one-base span (the last
+    /// aligned base). Otherwise it is on the left boundary, the span's start edge.
+    pub at_end: bool,
+    /// A hard clip: a straight bar. Otherwise a soft clip's sawtooth.
+    pub hard: bool,
+    /// The read's direction arrowhead is on the same boundary, so the cut edge is drawn just
+    /// inside the arrowhead's base and the strand stays visible.
+    pub behind_arrow: bool,
 }
 
 impl AlignmentGeometryToken {
@@ -345,6 +376,31 @@ impl AlignmentGeometryToken {
     #[must_use]
     pub const fn is_point_marker(self) -> bool {
         matches!(self, Self::PointMarker | Self::PointMarkerAtEnd)
+    }
+
+    /// Marks drawn on a base boundary (point markers and clip cut edges) whose drawn extent may
+    /// overhang their one-base span.
+    #[must_use]
+    pub const fn is_boundary_mark(self) -> bool {
+        matches!(
+            self,
+            Self::PointMarker | Self::PointMarkerAtEnd | Self::ClipEdge(_)
+        )
+    }
+
+    /// Paint order within one row, shared by the semantic page (and so the GPU), the CPU
+    /// projector and picking: clip ghosts first (beneath every read of the row), then read
+    /// bodies and bases, then boundary marks (which overhang neighbouring cells).
+    #[must_use]
+    pub const fn paint_layer(self) -> u8 {
+        match self {
+            Self::ClipGhost => 0,
+            Self::PointMarker | Self::PointMarkerAtEnd | Self::ClipEdge(_) => 2,
+            Self::Rectangle
+            | Self::EventLine
+            | Self::DirectionalTerminalLeft
+            | Self::DirectionalTerminalRight => 1,
+        }
     }
 
     /// Boundary geometry for a point event at `position`, whose valid aligned bases are
@@ -852,8 +908,9 @@ impl AlignmentSemanticPage {
                 0
             };
             maximum_labels = maximum_labels.saturating_add(event_labels);
+            // A length is at most ten digits plus a hard clip's `H`.
             maximum_label_bytes =
-                maximum_label_bytes.saturating_add(event_labels.saturating_mul(10));
+                maximum_label_bytes.saturating_add(event_labels.saturating_mul(11));
             maximum_primitives = maximum_primitives
                 .saturating_add(overlays.len())
                 .saturating_add(event_labels)
@@ -896,6 +953,15 @@ impl AlignmentSemanticPage {
         let mut primitives = Vec::with_capacity(maximum_primitives);
         let mut labels = Vec::<PendingLabel>::with_capacity(maximum_labels);
         let tile_start = interval.start();
+        // Base-detail read geometry draws soft-clip ghost cells, whose letters are suppressed
+        // where another read of the row covers them; that needs every record's extent.
+        let clip_ghost_page =
+            key.family == AlignmentPageFamily::ReadGeometry && key.lod == GeometryLod::Base;
+        let mut row_extents = Vec::<(u32, u64, u64)>::with_capacity(if clip_ghost_page {
+            atlas_records.len()
+        } else {
+            0
+        });
         for hit in atlas_records {
             let selection_index = *by_handle.get(&hit.record.handle()).ok_or(
                 SemanticPageError::MissingEvidenceHandle(hit.record.handle()),
@@ -907,6 +973,17 @@ impl AlignmentSemanticPage {
             let prepared = prepared.remove(&hit.record.handle()).ok_or(
                 SemanticPageError::MissingPreparedSemantics(hit.record.handle()),
             )?;
+            if clip_ghost_page
+                && let Some((start, end)) =
+                    visible_reference_bounds(record, prepared.hidden_sbx_tail)
+                && start.max(interval.start()) < end.min(interval.end())
+            {
+                row_extents.push((
+                    row_offset,
+                    start.max(interval.start()) - tile_start,
+                    end.min(interval.end()) - tile_start,
+                ));
+            }
             emit_record_primitives(
                 &mut primitives,
                 &mut labels,
@@ -994,13 +1071,18 @@ impl AlignmentSemanticPage {
             "semantic page emitted {} labels but reserved {maximum_labels}",
             labels.len(),
         );
-        // Within a row, point markers come last: they sit on a base boundary and overhang the
-        // neighbouring cells, so they must paint over the read body and bases on both sides
-        // (the GPU draws a page's instances in this order).
+        if clip_ghost_page {
+            mark_obscured_clip_ghosts(&mut primitives, row_extents);
+        }
+        // Within a row, soft-clip ghost cells come first, beneath every read of the row, so a
+        // neighbouring read covers them; boundary marks (point markers and clip cut edges) come
+        // last: they sit on a base boundary and overhang the neighbouring cells, so they must
+        // paint over the read body and bases on both sides (the GPU draws a page's instances in
+        // this order). See `AlignmentGeometryToken::paint_layer`.
         primitives.sort_unstable_by_key(|primitive| {
             (
                 primitive.row_offset,
-                primitive.geometry.is_point_marker(),
+                primitive.geometry.paint_layer(),
                 primitive.start_offset,
                 primitive.end_offset,
                 primitive.draw_order,
@@ -1180,11 +1262,12 @@ impl AlignmentSemanticPage {
             .copied()
     }
 
-    /// [`Self::primitive_candidates`] plus every point marker of `row` whose one-base span
-    /// intersects `marker_search`. A point marker is drawn centred on a base boundary, so it
-    /// overhangs into the neighbouring base cell (and, when zoomed out, possibly further) and can
-    /// be under the pointer while its own span is not. Like `primitive_candidates`, this borrows
-    /// the page and allocates nothing.
+    /// [`Self::primitive_candidates`] plus every boundary mark (point marker or clip edge) of
+    /// `row` whose one-base span intersects `marker_search`. A point marker is drawn centred on
+    /// a base boundary, and a clip edge may sit behind an arrowhead, so either can overhang into
+    /// neighbouring base cells (and, when zoomed out, possibly further) and be under the pointer
+    /// while its own span is not. Like `primitive_candidates`, this borrows the page and
+    /// allocates nothing.
     pub fn pick_candidates(
         &self,
         row: u32,
@@ -1198,7 +1281,7 @@ impl AlignmentSemanticPage {
                 let start = page_start.saturating_add(primitive.start_offset);
                 let end = page_start.saturating_add(primitive.end_offset);
                 (start <= genomic_position && genomic_position < end)
-                    || (primitive.geometry.is_point_marker()
+                    || (primitive.geometry.is_boundary_mark()
                         && start < marker_search.end
                         && marker_search.start < end)
             })
@@ -2055,6 +2138,24 @@ fn emit_record_primitives(
         )?;
     }
 
+    // The read's visible extent decides where its single direction arrowhead goes (the true
+    // terminal: the right end of a forward read, the left end of a reverse one), and so whether
+    // a clip's cut edge shares its boundary with that arrowhead.
+    let visible_bounds = if emit_geometry {
+        visible_reference_bounds(record, hidden_sbx_tail)
+    } else {
+        None
+    };
+    let arrow_bounds = visible_bounds.filter(|_| style_contract.show_direction_terminals);
+    let reverse = record.flags().is_reverse();
+    let arrow_at_start = reverse && arrow_bounds.is_some_and(|(start, _)| start == record.start());
+    let arrow_at_end = !reverse && arrow_bounds.is_some_and(|(_, end)| end == record.end());
+    // Soft-clipped bases are drawn as faint ghost cells beyond the cut edge only at base-level
+    // detail, when read bases are shown at all and the record carries its sequence.
+    let clip_ghosts_drawn = lod == GeometryLod::Base
+        && style_contract.base_display != ReadBaseDisplayMode::Hidden
+        && matches!(sequence, Some(SequenceView::Present { .. }));
+
     let mut reference_position = record.start();
     let mut read_position = 0_u32;
     let cigar = record.cigar();
@@ -2246,11 +2347,35 @@ fn emit_record_primitives(
                 }
                 read_position = read_position.saturating_add(operation.len);
             }
-            CigarOpKind::SoftClip => {
+            CigarOpKind::SoftClip | CigarOpKind::HardClip => {
+                let hard = operation.kind == CigarOpKind::HardClip;
+                // A clip lies on the read's left boundary (its position is the first aligned
+                // base) or right boundary (one past the last aligned base).
+                let at_end = reference_position >= record.end();
+                let edge = ClipEdgeToken {
+                    at_end,
+                    hard,
+                    behind_arrow: if at_end { arrow_at_end } else { arrow_at_start },
+                };
+                let component = if hard {
+                    AlignmentComponent::HardClip {
+                        cigar_index,
+                        length: operation.len,
+                    }
+                } else {
+                    AlignmentComponent::SoftClip {
+                        cigar_index,
+                        read_start: read_position,
+                        length: operation.len,
+                    }
+                };
+                let ghosts = !hard && clip_ghosts_drawn;
                 if emit_geometry
-                    && visible_read_range(read_position, operation.len, hidden_sbx_tail).is_some()
+                    && (hard
+                        || visible_read_range(read_position, operation.len, hidden_sbx_tail)
+                            .is_some())
                 {
-                    push_point(
+                    push_clip_edge(
                         output,
                         handle,
                         row_offset,
@@ -2259,18 +2384,37 @@ fn emit_record_primitives(
                         record.end(),
                         tile,
                         tile_start,
-                        AlignmentComponent::SoftClip {
-                            cigar_index,
-                            read_start: read_position,
-                            length: operation.len,
-                        },
+                        component,
+                        edge,
                         operation_style,
                         draw_order,
                     );
                     draw_order = draw_order.saturating_add(1);
+                    if ghosts {
+                        emit_clip_ghosts(
+                            output,
+                            handle,
+                            row_offset,
+                            cigar_index,
+                            reference_position,
+                            at_end,
+                            read_position,
+                            operation.len,
+                            sequence,
+                            tile,
+                            tile_start,
+                            hidden_sbx_tail,
+                            operation_style,
+                        )?;
+                    }
                 }
                 if emit_labels && operation.len >= style_contract.minimum_event_label_size {
-                    push_label_point(
+                    let text = if hard {
+                        format!("{}H", operation.len)
+                    } else {
+                        operation.len.to_string()
+                    };
+                    push_clip_length_label(
                         output,
                         labels,
                         handle,
@@ -2278,54 +2422,18 @@ fn emit_record_primitives(
                         reference_position,
                         record.start(),
                         record.end(),
+                        if ghosts { operation.len } else { 0 },
                         tile,
                         tile_start,
-                        AlignmentLabelKind::ClipLength,
-                        &operation.len.to_string(),
+                        &text,
+                        edge,
                         operation_style,
                         draw_order,
                     )?;
                     draw_order = draw_order.saturating_add(1);
                 }
-                read_position = read_position.saturating_add(operation.len);
-            }
-            CigarOpKind::HardClip => {
-                if emit_geometry {
-                    push_point(
-                        output,
-                        handle,
-                        row_offset,
-                        reference_position,
-                        record.start(),
-                        record.end(),
-                        tile,
-                        tile_start,
-                        AlignmentComponent::HardClip {
-                            cigar_index,
-                            length: operation.len,
-                        },
-                        operation_style,
-                        draw_order,
-                    );
-                    draw_order = draw_order.saturating_add(1);
-                }
-                if emit_labels && operation.len >= style_contract.minimum_event_label_size {
-                    push_label_point(
-                        output,
-                        labels,
-                        handle,
-                        row_offset,
-                        reference_position,
-                        record.start(),
-                        record.end(),
-                        tile,
-                        tile_start,
-                        AlignmentLabelKind::ClipLength,
-                        &operation.len.to_string(),
-                        operation_style,
-                        draw_order,
-                    )?;
-                    draw_order = draw_order.saturating_add(1);
+                if !hard {
+                    read_position = read_position.saturating_add(operation.len);
                 }
             }
             CigarOpKind::Padding => {
@@ -2351,12 +2459,8 @@ fn emit_record_primitives(
             }
         }
     }
-    if emit_geometry
-        && style_contract.show_direction_terminals
-        && let Some((visible_start, visible_end)) =
-            visible_reference_bounds(record, hidden_sbx_tail)
-    {
-        let terminal = if record.flags().is_reverse() {
+    if let Some((visible_start, visible_end)) = arrow_bounds {
+        let terminal = if reverse {
             visible_start
         } else {
             visible_end.saturating_sub(1)
@@ -2378,7 +2482,8 @@ fn emit_record_primitives(
             &mut output[first_record_primitive..],
             handle,
             row_offset,
-            record,
+            terminal,
+            reverse,
             tile,
             tile_start,
         );
@@ -2386,81 +2491,165 @@ fn emit_record_primitives(
     Ok(())
 }
 
+/// Shapes the read's single arrowhead: every body primitive of this record that covers the
+/// read's true terminal base (`terminal`: the last visible aligned base of a forward read, the
+/// first of a reverse one). Only that end of the read carries the arrow; the inner ends of the
+/// blocks of a spliced read stay square, so the read still reads as one molecule.
+///
 /// `output` must be the primitives of this one record. Scanning the whole page here made page
 /// construction quadratic in the number of reads.
 fn mark_directional_read_geometry(
     output: &mut [AlignmentSemanticPrimitive],
     handle: AlignmentHandle,
     row_offset: u32,
-    record: rgv_model::AlignmentRecordView<'_>,
+    terminal: u64,
+    reverse: bool,
     tile: GenomicInterval,
     tile_start: u64,
 ) {
-    let geometry = if record.flags().is_reverse() {
+    if !tile.contains(terminal) {
+        return;
+    }
+    let geometry = if reverse {
         AlignmentGeometryToken::DirectionalTerminalLeft
     } else {
         AlignmentGeometryToken::DirectionalTerminalRight
     };
-    let mut mark_block = |start: u64, end: u64| {
-        if start >= end {
-            return;
-        }
-        let terminal = if record.flags().is_reverse() {
-            start
-        } else {
-            end.saturating_sub(1)
-        };
-        if !tile.contains(terminal) {
-            return;
-        }
-        let offset = terminal.saturating_sub(tile_start);
-        for primitive in output.iter_mut().filter(|primitive| {
-            primitive.handle == handle
-                && primitive.row_offset == row_offset
-                && primitive.contains_offset(offset)
-                && matches!(
-                    primitive.component,
-                    AlignmentComponent::ReadSpan
-                        | AlignmentComponent::AlignedSegment { .. }
-                        | AlignmentComponent::Base { .. }
-                        | AlignmentComponent::DirectionTerminal
-                )
-        }) {
-            primitive.geometry = geometry;
-        }
-    };
+    let offset = terminal - tile_start;
+    for primitive in output.iter_mut().filter(|primitive| {
+        primitive.handle == handle
+            && primitive.row_offset == row_offset
+            && primitive.contains_offset(offset)
+            && matches!(
+                primitive.component,
+                AlignmentComponent::ReadSpan
+                    | AlignmentComponent::AlignedSegment { .. }
+                    | AlignmentComponent::Base { .. }
+                    | AlignmentComponent::DirectionTerminal
+            )
+    }) {
+        primitive.geometry = geometry;
+    }
+}
 
-    if record.cigar().is_empty() {
-        mark_block(record.start(), record.end());
-        return;
+/// Reference interval `[start, end)` of the ghost cells of a soft clip of `length` bases on the
+/// read boundary `boundary`: just before it for a leading clip, from it onwards for a trailing
+/// one (`at_end`). Not clipped to any tile.
+fn clip_ghost_span(boundary: u64, at_end: bool, length: u32) -> (u64, u64) {
+    if at_end {
+        (boundary, boundary.saturating_add(u64::from(length)))
+    } else {
+        (boundary.saturating_sub(u64::from(length)), boundary)
     }
-    let mut reference_position = record.start();
-    let mut block_start = None;
-    let mut block_end = None;
-    for operation in record.cigar().iter().copied() {
-        match operation.kind {
-            CigarOpKind::Match | CigarOpKind::SequenceMatch | CigarOpKind::SequenceMismatch => {
-                block_start.get_or_insert(reference_position);
-                reference_position = reference_position.saturating_add(u64::from(operation.len));
-                block_end = Some(reference_position);
-            }
-            CigarOpKind::Deletion => {
-                reference_position = reference_position.saturating_add(u64::from(operation.len));
-            }
-            CigarOpKind::ReferenceSkip => {
-                if let (Some(start), Some(end)) = (block_start.take(), block_end.take()) {
-                    mark_block(start, end);
-                }
-                reference_position = reference_position.saturating_add(u64::from(operation.len));
-            }
-            CigarOpKind::Insertion
-            | CigarOpKind::SoftClip
-            | CigarOpKind::HardClip
-            | CigarOpKind::Padding => {}
+}
+
+/// Emits one ghost cell per soft-clipped base, extending outward from the read boundary
+/// `boundary` (one cell per reference position, clipped to the tile and so to the contig). The
+/// base is the record's `SEQ` base at that read index, exactly as aligned bases read it.
+#[allow(clippy::too_many_arguments)]
+fn emit_clip_ghosts(
+    output: &mut Vec<AlignmentSemanticPrimitive>,
+    handle: AlignmentHandle,
+    row_offset: u32,
+    cigar_index: u32,
+    boundary: u64,
+    at_end: bool,
+    read_start: u32,
+    length: u32,
+    sequence: Option<SequenceView<'_>>,
+    tile: GenomicInterval,
+    tile_start: u64,
+    hidden_sbx_tail: Option<SbxTailBounds>,
+    style: AlignmentStyleToken,
+) -> Result<(), SemanticPageError> {
+    let Some(SequenceView::Present { bases, .. }) = sequence else {
+        return Ok(());
+    };
+    let (span_start, span_end) = clip_ghost_span(boundary, at_end, length);
+    for position in span_start.max(tile.start())..span_end.min(tile.end()) {
+        // Index of this base within the clip: a leading clip's base `i` lies `length - i` cells
+        // before the boundary, a trailing clip's base `i` lies `i` cells after it. (A leading
+        // span clamped at the contig start simply omits the clip's first bases.)
+        let offset = if at_end {
+            position - boundary
+        } else {
+            position + u64::from(length) - boundary
+        };
+        let read_index = u32::try_from(offset)
+            .ok()
+            .and_then(|offset| read_start.checked_add(offset))
+            .ok_or(SemanticPageError::ReadCoordinateOverflow)?;
+        let index =
+            usize::try_from(read_index).map_err(|_| SemanticPageError::ReadCoordinateOverflow)?;
+        if hidden_sbx_tail.is_some_and(|tail| tail.is_tail(index)) {
+            continue;
+        }
+        let base = *bases
+            .get(index)
+            .ok_or(SemanticPageError::InvalidSequenceGeometry)?;
+        output.push(AlignmentSemanticPrimitive {
+            start_offset: position - tile_start,
+            end_offset: position - tile_start + 1,
+            row_offset,
+            handle,
+            component: AlignmentComponent::ClipGhostBase {
+                cigar_index,
+                read_index,
+                base,
+                obscured: false,
+            },
+            geometry: AlignmentGeometryToken::ClipGhost,
+            style,
+            draw_order: 0,
+        });
+    }
+    Ok(())
+}
+
+/// Marks every ghost cell whose letter must not be drawn: its cell lies inside another read's
+/// aligned extent in the same row (that read paints over the cell), or another read's ghost
+/// cell shares it (two overlapping letters would be illegible). `extents` holds the
+/// tile-clipped `(row offset, start offset, end offset)` of every record of the page; a ghost
+/// never lies in its own read's extent, so no record needs excluding.
+fn mark_obscured_clip_ghosts(
+    primitives: &mut [AlignmentSemanticPrimitive],
+    mut extents: Vec<(u32, u64, u64)>,
+) {
+    extents.sort_unstable();
+    let mut covered = Vec::<(u32, u64, u64)>::with_capacity(extents.len());
+    for (row, start, end) in extents {
+        match covered.last_mut() {
+            Some(last) if last.0 == row && start <= last.2 => last.2 = last.2.max(end),
+            _ => covered.push((row, start, end)),
         }
     }
-    if let (Some(start), Some(end)) = (block_start, block_end) {
-        mark_block(start, end);
+    let mut ghosts = primitives
+        .iter()
+        .enumerate()
+        .filter(|(_, primitive)| {
+            matches!(
+                primitive.component,
+                AlignmentComponent::ClipGhostBase { .. }
+            )
+        })
+        .map(|(index, primitive)| (primitive.row_offset, primitive.start_offset, index))
+        .collect::<Vec<_>>();
+    ghosts.sort_unstable();
+    for cell in ghosts.chunk_by(|left, right| left.0 == right.0 && left.1 == right.1) {
+        let (row, offset, _) = cell[0];
+        let inside_another_read = {
+            let next = covered.partition_point(|&(r, start, _)| (r, start) <= (row, offset));
+            next > 0 && covered[next - 1].0 == row && offset < covered[next - 1].2
+        };
+        if cell.len() > 1 || inside_another_read {
+            for &(_, _, index) in cell {
+                if let AlignmentComponent::ClipGhostBase { obscured, .. } =
+                    &mut primitives[index].component
+                {
+                    *obscured = true;
+                }
+            }
+        }
     }
 }
 
@@ -2849,6 +3038,97 @@ fn push_point(
     });
 }
 
+/// A clip's cut edge on the one-base span of the aligned base at the clipped boundary: the
+/// first aligned base for a leading clip, the last for a trailing one (`edge.at_end`, whose
+/// position, one past that base, is clamped onto it).
+#[allow(clippy::too_many_arguments)]
+fn push_clip_edge(
+    output: &mut Vec<AlignmentSemanticPrimitive>,
+    handle: AlignmentHandle,
+    row_offset: u32,
+    position: u64,
+    record_start: u64,
+    record_end: u64,
+    tile: GenomicInterval,
+    tile_start: u64,
+    component: AlignmentComponent,
+    edge: ClipEdgeToken,
+    style: AlignmentStyleToken,
+    draw_order: u32,
+) {
+    let position = position.min(record_end.saturating_sub(1)).max(record_start);
+    if !tile.contains(position) {
+        return;
+    }
+    output.push(AlignmentSemanticPrimitive {
+        start_offset: position - tile_start,
+        end_offset: position - tile_start + 1,
+        row_offset,
+        handle,
+        component,
+        geometry: AlignmentGeometryToken::ClipEdge(edge),
+        style,
+        draw_order,
+    });
+}
+
+/// A clip's length, anchored OUTSIDE the read: its span runs from the aligned base at the
+/// clipped boundary over the `ghost_cells` ghost bases drawn beyond it, and its
+/// [`AlignmentGeometryToken::ClipEdge`] token tells the label projector to place the text
+/// before the span's start (leading clip) or after its end (trailing clip). Each page only
+/// carries the fragment inside its tile, and only pages holding the record (and so drawing its
+/// ghosts) carry one, so the merged span ends exactly where the drawn ghosts do.
+#[allow(clippy::too_many_arguments)]
+fn push_clip_length_label(
+    output: &mut Vec<AlignmentSemanticPrimitive>,
+    labels: &mut Vec<PendingLabel>,
+    handle: AlignmentHandle,
+    row_offset: u32,
+    position: u64,
+    record_start: u64,
+    record_end: u64,
+    ghost_cells: u32,
+    tile: GenomicInterval,
+    tile_start: u64,
+    text: &str,
+    edge: ClipEdgeToken,
+    style: AlignmentStyleToken,
+    draw_order: u32,
+) -> Result<(), SemanticPageError> {
+    let boundary_base = position.min(record_end.saturating_sub(1)).max(record_start);
+    let (start, end) = if edge.at_end {
+        (
+            boundary_base,
+            boundary_base
+                .saturating_add(1)
+                .saturating_add(u64::from(ghost_cells)),
+        )
+    } else {
+        (
+            boundary_base.saturating_sub(u64::from(ghost_cells)),
+            boundary_base.saturating_add(1),
+        )
+    };
+    push_label_with_geometry(
+        output,
+        labels,
+        handle,
+        row_offset,
+        start,
+        end,
+        tile,
+        tile_start,
+        AlignmentLabelKind::ClipLength,
+        text,
+        style,
+        draw_order,
+        AlignmentGeometryToken::ClipEdge(ClipEdgeToken {
+            behind_arrow: false,
+            ..edge
+        }),
+    )
+}
+
 fn geometry_for(
     component: AlignmentComponent,
     style: AlignmentStyleToken,
@@ -2863,9 +3143,20 @@ fn geometry_for(
             kind: UltimaIndelToken::Deletion,
             ..
         } => AlignmentGeometryToken::Rectangle,
+        // Clip edges are emitted by `push_clip_edge`, which also decides the boundary and the
+        // arrow composition; this is only the token's default form.
+        AlignmentComponent::SoftClip { .. } => AlignmentGeometryToken::ClipEdge(ClipEdgeToken {
+            at_end: false,
+            hard: false,
+            behind_arrow: false,
+        }),
+        AlignmentComponent::HardClip { .. } => AlignmentGeometryToken::ClipEdge(ClipEdgeToken {
+            at_end: false,
+            hard: true,
+            behind_arrow: false,
+        }),
+        AlignmentComponent::ClipGhostBase { .. } => AlignmentGeometryToken::ClipGhost,
         AlignmentComponent::Insertion { .. }
-        | AlignmentComponent::SoftClip { .. }
-        | AlignmentComponent::HardClip { .. }
         | AlignmentComponent::Padding { .. }
         | AlignmentComponent::UltimaIndel { .. }
         | AlignmentComponent::SbxInsertion { .. } => AlignmentGeometryToken::PointMarker,
@@ -3055,6 +3346,9 @@ fn semantic_page_dynamic_scratch_bytes(
     let mut pending_label_slots = 0_usize;
     let mut pending_label_bytes = 0_usize;
     let detailed = matches!(key.lod, GeometryLod::Read | GeometryLod::Base);
+    let clip_ghost_page =
+        key.family == AlignmentPageFamily::ReadGeometry && key.lod == GeometryLod::Base;
+    let mut clip_ghost_slots = 0_usize;
 
     for hit in atlas_records {
         let index = *by_handle.get(&hit.record.handle()).ok_or(
@@ -3071,6 +3365,9 @@ fn semantic_page_dynamic_scratch_bytes(
         let auxiliary_bytes = selection.auxiliary_encoded_len(index).unwrap_or_default();
         // Decoded tag values, kinetics arrays, and modification calls are temporary owned values.
         bytes = bytes.saturating_add(auxiliary_bytes.saturating_mul(8));
+        if clip_ghost_page {
+            clip_ghost_slots = clip_ghost_slots.saturating_add(clip_ghost_bound(record, tile));
+        }
 
         if key.family == AlignmentPageFamily::Labels && detailed {
             let read_label_bytes = match presentation.style.read_labels {
@@ -3103,7 +3400,7 @@ fn semantic_page_dynamic_scratch_bytes(
                 })
                 .count();
             pending_label_slots = pending_label_slots.saturating_add(events);
-            pending_label_bytes = pending_label_bytes.saturating_add(events.saturating_mul(10));
+            pending_label_bytes = pending_label_bytes.saturating_add(events.saturating_mul(11));
         }
 
         if key.family == AlignmentPageFamily::SpecialistOverlay && detailed {
@@ -3173,7 +3470,46 @@ fn semantic_page_dynamic_scratch_bytes(
                 .saturating_mul(size_of::<PendingLabel>()),
         )
         .saturating_add(pending_label_bytes);
+    if clip_ghost_page {
+        // `mark_obscured_clip_ghosts`: every record's extent and their per-row union, and one
+        // sort entry per ghost cell.
+        bytes = bytes
+            .saturating_add(
+                atlas_records
+                    .len()
+                    .saturating_mul(2)
+                    .saturating_mul(size_of::<(u32, u64, u64)>()),
+            )
+            .saturating_add(clip_ghost_slots.saturating_mul(size_of::<(u32, u64, usize)>()));
+    }
     Ok(bytes)
+}
+
+/// Ghost cells the record's soft clips can place inside `tile` (see `emit_clip_ghosts`).
+fn clip_ghost_bound(record: rgv_model::AlignmentRecordView<'_>, tile: GenomicInterval) -> usize {
+    let mut cells = 0_usize;
+    let mut reference_position = record.start();
+    for operation in record.cigar() {
+        match operation.kind {
+            CigarOpKind::Match
+            | CigarOpKind::SequenceMatch
+            | CigarOpKind::SequenceMismatch
+            | CigarOpKind::Deletion
+            | CigarOpKind::ReferenceSkip => {
+                reference_position = reference_position.saturating_add(u64::from(operation.len));
+            }
+            CigarOpKind::SoftClip => {
+                let (start, end) = clip_ghost_span(
+                    reference_position,
+                    reference_position >= record.end(),
+                    operation.len,
+                );
+                cells = cells.saturating_add(clipped_len(start, end, tile));
+            }
+            CigarOpKind::Insertion | CigarOpKind::HardClip | CigarOpKind::Padding => {}
+        }
+    }
+    cells
 }
 
 /// Upper bounds stated by one `MM` value: decoded calls and distinct modification series.
@@ -3310,6 +3646,16 @@ fn record_primitive_bound(
                 if point_visible(reference_position) {
                     bound.geometry = bound.geometry.saturating_add(1);
                     bound.event_labels = bound.event_labels.saturating_add(labelled);
+                }
+                if lod == GeometryLod::Base && operation.kind == CigarOpKind::SoftClip {
+                    // Ghost cells extend outward from the boundary, past the read's own extent,
+                    // so they are counted wherever they meet the tile.
+                    let (start, end) = clip_ghost_span(
+                        reference_position,
+                        reference_position >= record.end(),
+                        operation.len,
+                    );
+                    bound.geometry = bound.geometry.saturating_add(clipped_len(start, end, tile));
                 }
             }
             CigarOpKind::Padding => {
@@ -4617,9 +4963,13 @@ mod tests {
         // The bound is never below what the decoder yields.
         let sequence = b"CCACCACCCCAAACCC";
         let mm = AuxValue::String("C+mh,0,1,2;A+a?,3;".to_owned());
-        let decoded =
-            rgv_model::decode_modified_bases_parts(sequence, AlignmentFlags::from_bits(0), &mm, None)
-                .unwrap();
+        let decoded = rgv_model::decode_modified_bases_parts(
+            sequence,
+            AlignmentFlags::from_bits(0),
+            &mm,
+            None,
+        )
+        .unwrap();
         let bound = modified_base_call_bound(&mm);
         assert_eq!(decoded.len(), 7);
         assert_eq!(bound.calls, 7);
@@ -5466,6 +5816,865 @@ mod tests {
         assert!(ledger.snapshot().unwrap().transient > 0);
         drop(cloned);
         assert_eq!(ledger.snapshot().unwrap().transient, 0);
+    }
+
+    /// Handle of the `ordinal`-th record given to `evidence_and_atlas_for_records`.
+    fn handle_of(ordinal: usize) -> AlignmentHandle {
+        AlignmentHandle::new(
+            source_revision(),
+            AlignmentSourcePosition::bam_virtual_offset(
+                (7 << 16) | u64::try_from(ordinal + 1).unwrap(),
+            ),
+        )
+    }
+
+    /// Every page (three 100-base tiles, every required family) of `records` at `lod`, with an
+    /// all-`A` reference at base detail.
+    fn scene_for_records(
+        ledger: &AllocationLedger,
+        records: &[AlignmentRecord],
+        lod: GeometryLod,
+        style: crate::AlignmentStyleContract,
+    ) -> Arc<crate::AlignmentPresentationScene> {
+        let (evidence, atlas) = evidence_and_atlas_for_records(ledger, records, layout_contract());
+        let reference = ReferenceSlice {
+            interval: GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+            bases: vec![b'A'; 300],
+        };
+        let reference = (lod == GeometryLod::Base).then_some(&reference);
+        let presentation = PresentationContract {
+            geometry_lod: lod,
+            style,
+            reference: reference
+                .map(|_| crate::ReferenceRevision::new(RevisionFingerprint::new(10, 11))),
+            annotation: None,
+        };
+        let mut pages = Vec::new();
+        for tile in 0..3 {
+            for family in presentation.required_page_families() {
+                pages.push(page_with_style(
+                    ledger, &evidence, &atlas, tile, lod, reference, style, family,
+                ));
+            }
+        }
+        let rows = 0..u32::try_from(atlas.row_count()).unwrap();
+        crate::AlignmentPresentationScene::new(
+            crate::SceneRevision::new(RevisionFingerprint::new(61, 62)),
+            evidence,
+            atlas,
+            presentation,
+            GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+            rows,
+            pages,
+            ledger,
+            ReservationKind::Normal,
+            63,
+        )
+        .unwrap()
+    }
+
+    /// A camera over `start..end` drawn `width` points wide from pane x = 10, reads 11 points
+    /// tall in 14-point rows.
+    fn clip_camera(start: u64, end: u64, width: f64) -> crate::AlignmentCamera {
+        crate::AlignmentCamera::new(
+            GenomicInterval::new(ContigId::new(0), start, end).unwrap(),
+            0.0,
+            14.0,
+            11.0,
+            crate::CpuClipRect {
+                x: 10.0,
+                y: 0.0,
+                width,
+                height: 140.0,
+            },
+        )
+        .unwrap()
+    }
+
+    fn pane_x(camera: crate::AlignmentCamera, position: u64) -> f64 {
+        10.0 + (position as f64 - camera.exact_start()) / camera.bases_per_pixel()
+    }
+
+    fn with_flags(mut record: AlignmentRecord, flags: u16) -> AlignmentRecord {
+        record.flags = AlignmentFlags::from_bits(flags);
+        record
+    }
+
+    /// The reported defect: a spliced read drew an arrowhead at the end of every exon block,
+    /// so one molecule looked like several reads. Only the read's true terminal is directional:
+    /// the right end of a forward read's last block, the left end of a reverse read's first.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn spliced_reads_carry_their_direction_arrow_only_at_the_true_terminal() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let sequence = |length: usize| vec![b'A'; length];
+        let records = [
+            // Reverse 44M112N57M: blocks [50, 94) and [206, 263).
+            with_flags(
+                record(
+                    b"reverse-spliced",
+                    50,
+                    263,
+                    &[
+                        (CigarOpKind::Match, 44),
+                        (CigarOpKind::ReferenceSkip, 112),
+                        (CigarOpKind::Match, 57),
+                    ],
+                    &sequence(101),
+                ),
+                0x10,
+            ),
+            // Forward 30M100N20M60N10M: blocks [20, 50), [150, 170), [230, 240).
+            record(
+                b"forward-spliced",
+                20,
+                240,
+                &[
+                    (CigarOpKind::Match, 30),
+                    (CigarOpKind::ReferenceSkip, 100),
+                    (CigarOpKind::Match, 20),
+                    (CigarOpKind::ReferenceSkip, 60),
+                    (CigarOpKind::Match, 10),
+                ],
+                &sequence(60),
+            ),
+            // Unspliced controls, one per strand, the forward one with a deletion.
+            record(
+                b"forward",
+                110,
+                130,
+                &[
+                    (CigarOpKind::Match, 8),
+                    (CigarOpKind::Deletion, 2),
+                    (CigarOpKind::Match, 10),
+                ],
+                &sequence(18),
+            ),
+            with_flags(
+                record(
+                    b"reverse",
+                    270,
+                    290,
+                    &[(CigarOpKind::Match, 20)],
+                    &sequence(20),
+                ),
+                0x10,
+            ),
+        ];
+        // (record, terminal base, directional geometry)
+        let expected = [
+            (0, 50, AlignmentGeometryToken::DirectionalTerminalLeft),
+            (1, 239, AlignmentGeometryToken::DirectionalTerminalRight),
+            (2, 129, AlignmentGeometryToken::DirectionalTerminalRight),
+            (3, 270, AlignmentGeometryToken::DirectionalTerminalLeft),
+        ];
+        for lod in [GeometryLod::Span, GeometryLod::Read, GeometryLod::Base] {
+            let scene = scene_for_records(
+                &ledger,
+                &records,
+                lod,
+                crate::AlignmentStyleContract {
+                    base_display: ReadBaseDisplayMode::All,
+                    ..crate::AlignmentStyleContract::default()
+                },
+            );
+            for (ordinal, terminal, geometry) in expected {
+                let handle = handle_of(ordinal);
+                let mut terminals = 0;
+                let mut directional_segments = 0;
+                let mut square_segments = 0;
+                for page in scene.pages() {
+                    if page.key().family() != AlignmentPageFamily::ReadGeometry {
+                        continue;
+                    }
+                    let start = page.interval().start();
+                    for primitive in page.primitives().iter().filter(|p| p.handle == handle) {
+                        let directional = matches!(
+                            primitive.geometry,
+                            AlignmentGeometryToken::DirectionalTerminalLeft
+                                | AlignmentGeometryToken::DirectionalTerminalRight
+                        );
+                        let covers_terminal = start + primitive.start_offset <= terminal
+                            && terminal < start + primitive.end_offset;
+                        if directional {
+                            assert_eq!(primitive.geometry, geometry, "{lod:?} {primitive:?}");
+                            assert!(
+                                covers_terminal,
+                                "{lod:?} arrow off the terminal: {primitive:?}"
+                            );
+                        }
+                        match primitive.component {
+                            AlignmentComponent::DirectionTerminal => {
+                                assert!(directional && covers_terminal);
+                                terminals += 1;
+                            }
+                            AlignmentComponent::AlignedSegment { .. } if directional => {
+                                directional_segments += 1;
+                            }
+                            AlignmentComponent::AlignedSegment { .. } => {
+                                assert_eq!(primitive.geometry, AlignmentGeometryToken::Rectangle);
+                                square_segments += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // One arrowhead per read, wherever its tiles split it.
+                assert_eq!(terminals, 1, "{lod:?} record {ordinal}");
+                assert_eq!(directional_segments, 1, "{lod:?} record {ordinal}");
+                // Every other aligned block keeps square ends: the reverse read's [206, 263),
+                // the forward read's [20, 50) and [150, 170), and the block before the
+                // unspliced forward read's deletion.
+                let square = [1, 2, 1, 0][ordinal];
+                assert_eq!(square_segments, square, "{lod:?} record {ordinal}");
+            }
+        }
+    }
+
+    /// Clips are cut edges on the read's own boundary, never purple point markers: a soft
+    /// clip's sawtooth or a hard clip's bar, just inside the boundary, moved behind the
+    /// arrowhead when the clip is at the read's terminal. The CPU projector places them as the
+    /// shared extent rule says at every zoom.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn clips_are_cut_edges_inside_the_boundary_and_compose_with_the_arrowhead() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let records = [
+            // Forward: leading soft clip (no arrow there), trailing soft clip at the arrow.
+            record(
+                b"forward",
+                100,
+                120,
+                &[
+                    (CigarOpKind::SoftClip, 5),
+                    (CigarOpKind::Match, 20),
+                    (CigarOpKind::SoftClip, 3),
+                ],
+                &[b'A'; 28],
+            ),
+            // Reverse: leading hard clip at the arrow, trailing hard clip without one.
+            with_flags(
+                record(
+                    b"reverse",
+                    150,
+                    170,
+                    &[
+                        (CigarOpKind::HardClip, 4),
+                        (CigarOpKind::Match, 20),
+                        (CigarOpKind::HardClip, 6),
+                    ],
+                    &[b'A'; 20],
+                ),
+                0x10,
+            ),
+        ];
+        let scene = scene_for_records(
+            &ledger,
+            &records,
+            GeometryLod::Read,
+            crate::AlignmentStyleContract::default(),
+        );
+        let edge = |at_end, hard, behind_arrow| ClipEdgeToken {
+            at_end,
+            hard,
+            behind_arrow,
+        };
+        // (record, clip boundary, token, component is soft)
+        let clips = [
+            (0, 100, edge(false, false, false), true),
+            (0, 120, edge(true, false, true), true),
+            (1, 150, edge(false, true, true), false),
+            (1, 170, edge(true, true, false), false),
+        ];
+        for page in scene.pages() {
+            for primitive in page.primitives() {
+                if matches!(
+                    primitive.component,
+                    AlignmentComponent::SoftClip { .. } | AlignmentComponent::HardClip { .. }
+                ) {
+                    assert!(!primitive.geometry.is_point_marker(), "{primitive:?}");
+                    assert!(matches!(
+                        primitive.geometry,
+                        AlignmentGeometryToken::ClipEdge(_)
+                    ));
+                }
+            }
+        }
+        // 0.5, 4, 12 and 40 points per base.
+        for (start, end, width) in [
+            (0, 300, 150.0),
+            (90, 180, 360.0),
+            (95, 175, 960.0),
+            (95, 180, 3_400.0),
+        ] {
+            let camera = clip_camera(start, end, width);
+            let points_per_base = 1.0 / camera.bases_per_pixel();
+            let frame = crate::CpuAlignmentProjector::project(&scene, 0, camera).unwrap();
+            for (ordinal, boundary, token, soft) in clips {
+                let projected = frame
+                    .primitives
+                    .iter()
+                    .filter(|primitive| {
+                        primitive.handle == handle_of(ordinal)
+                            && primitive.geometry == AlignmentGeometryToken::ClipEdge(token)
+                            // (The clip's length label shares the token as its anchor.)
+                            && primitive.shape != crate::CpuPrimitiveShape::TextLabel
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(projected.len(), 1, "{points_per_base} {token:?}");
+                let projected = projected[0];
+                assert_eq!(projected.shape, crate::CpuPrimitiveShape::ClipEdge);
+                assert_eq!(
+                    matches!(projected.component, AlignmentComponent::SoftClip { .. }),
+                    soft
+                );
+                // Written out independently of `clip_edge_extent`.
+                let expected_width = if token.hard {
+                    2.0
+                } else {
+                    (points_per_base * 0.5).clamp(2.0, 6.0)
+                };
+                let arrowhead = if token.behind_arrow {
+                    (11.0_f64 * 0.55).min(points_per_base.max(1.0) * 0.35)
+                } else {
+                    0.0
+                };
+                let boundary_x = pane_x(camera, boundary);
+                // The arrow tip: the terminal base cell keeps a one-point minimum width, so
+                // below one point per base it reaches a little past the boundary.
+                let tip = boundary_x - points_per_base + points_per_base.max(1.0);
+                let expected_left = if token.at_end && token.behind_arrow {
+                    tip - arrowhead - expected_width
+                } else if token.at_end {
+                    boundary_x - expected_width
+                } else {
+                    boundary_x + arrowhead
+                };
+                assert!(
+                    (projected.x - expected_left).abs() < 1.0e-9
+                        && (projected.width - expected_width).abs() < 1.0e-9,
+                    "{points_per_base} {token:?}: {projected:?}"
+                );
+                assert!((projected.height - 11.0).abs() < 1.0e-9);
+                // Inside the read, and once a base is wider than the edge it never fills one.
+                if points_per_base >= 4.0 {
+                    if token.at_end {
+                        assert!(projected.x + projected.width <= boundary_x + 1.0e-9);
+                    } else {
+                        assert!(projected.x >= boundary_x - 1.0e-9);
+                    }
+                    assert!(projected.width < points_per_base);
+                }
+                if token.behind_arrow {
+                    // The direction terminal of the same read, on the same boundary base: the
+                    // cut edge starts exactly where its arrowhead's base is.
+                    let terminal = frame
+                        .primitives
+                        .iter()
+                        .find(|primitive| {
+                            primitive.handle == handle_of(ordinal)
+                                && primitive.component == AlignmentComponent::DirectionTerminal
+                        })
+                        .unwrap();
+                    let head = (terminal.height * 0.55).min(terminal.width * 0.35);
+                    if token.at_end {
+                        let terminal_tip = terminal.x + terminal.width;
+                        assert!((terminal_tip - tip).abs() < 1.0e-9);
+                        assert!(
+                            (projected.x + projected.width - (terminal_tip - head)).abs() < 1.0e-9
+                        );
+                    } else {
+                        assert!((terminal.x - boundary_x).abs() < 1.0e-9);
+                        assert!((projected.x - (terminal.x + head)).abs() < 1.0e-9);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The soft clip's sawtooth zigzags between the boundary and the inner side; a hard clip's
+    /// bar is solid.
+    #[test]
+    fn soft_clip_edges_are_a_zigzag_and_hard_clip_edges_a_solid_bar() {
+        let soft = ClipEdgeToken {
+            at_end: false,
+            hard: false,
+            behind_arrow: false,
+        };
+        let (width, height) = (6.0, 11.0);
+        // Three teeth of 11 / 3 points: the stroke centre is on the boundary at y = 0 and at
+        // the inner side half a tooth later.
+        let period: f64 = 11.0 / 3.0;
+        let painted = |y: f64, edge: ClipEdgeToken| {
+            (0..600)
+                .map(|step| (f64::from(step) + 0.5) / 100.0)
+                .filter(|x| crate::clip_edge_covers(*x, y, width, height, edge))
+                .collect::<Vec<_>>()
+        };
+        let at_vertex = painted(0.01, soft);
+        let at_inner = painted(period * 0.5, soft);
+        assert!(at_vertex.iter().all(|x| *x < 3.0), "{at_vertex:?}");
+        assert!(at_inner.iter().all(|x| *x > 3.0), "{at_inner:?}");
+        assert!(!at_vertex.is_empty() && !at_inner.is_empty());
+        // The trailing edge is the mirror image.
+        let trailing = ClipEdgeToken {
+            at_end: true,
+            ..soft
+        };
+        assert!(painted(0.01, trailing).iter().all(|x| *x > 3.0));
+        // Every scanline has its stroke, and no scanline is solid.
+        for row in 0..110 {
+            let y = (f64::from(row) + 0.5) / 10.0;
+            let columns = painted(y, soft).len();
+            assert!(columns > 0 && columns < 600, "{y}: {columns}");
+        }
+        let hard = ClipEdgeToken { hard: true, ..soft };
+        assert_eq!(painted(period * 0.5, hard).len(), 600);
+    }
+
+    fn ghosts_of(
+        scene: &crate::AlignmentPresentationScene,
+        handle: AlignmentHandle,
+    ) -> Vec<(u64, u32, u8, bool, u32)> {
+        let mut ghosts = scene
+            .pages()
+            .iter()
+            .flat_map(|page| {
+                let start = page.interval().start();
+                let row_start = page.row_range().start;
+                page.primitives()
+                    .iter()
+                    .filter_map(move |primitive| match primitive.component {
+                        AlignmentComponent::ClipGhostBase {
+                            read_index,
+                            base,
+                            obscured,
+                            ..
+                        } if primitive.handle == handle => {
+                            assert_eq!(primitive.geometry, AlignmentGeometryToken::ClipGhost);
+                            assert_eq!(primitive.end_offset, primitive.start_offset + 1);
+                            Some((
+                                start + primitive.start_offset,
+                                read_index,
+                                base,
+                                obscured,
+                                row_start + primitive.row_offset,
+                            ))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        ghosts.sort_unstable();
+        ghosts
+    }
+
+    /// Soft-clipped bases are drawn as ghosts beyond the cut edge only at base detail, one per
+    /// reference position outward from the boundary, outside the aligned extent, carrying the
+    /// record's own SEQ bases (as stored, also for a reverse read), and labelled in lowercase.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn soft_clip_ghosts_come_from_seq_only_at_base_detail_and_lie_outside_the_read() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let records = [
+            // Forward 3S10M4S at 110: SEQ TGC | AAAAAAAAAA | GTCA. (Ghosts are drawn by the
+            // pages holding the read, so these all lie inside the [100, 200) tile.)
+            record(
+                b"forward",
+                110,
+                120,
+                &[
+                    (CigarOpKind::SoftClip, 3),
+                    (CigarOpKind::Match, 10),
+                    (CigarOpKind::SoftClip, 4),
+                ],
+                b"TGCAAAAAAAAAAGTCA",
+            ),
+            // Reverse 2S8M at 150: SEQ (reference orientation) CG | AAAAAAAA.
+            with_flags(
+                record(
+                    b"reverse",
+                    150,
+                    158,
+                    &[(CigarOpKind::SoftClip, 2), (CigarOpKind::Match, 8)],
+                    b"CGAAAAAAAA",
+                ),
+                0x10,
+            ),
+            // A leading clip longer than the distance to the contig start: clamped there.
+            record(
+                b"contig-start",
+                2,
+                12,
+                &[(CigarOpKind::SoftClip, 5), (CigarOpKind::Match, 10)],
+                b"ACGTCAAAAAAAAAA",
+            ),
+        ];
+        let style = crate::AlignmentStyleContract::default();
+        for lod in [GeometryLod::Span, GeometryLod::Read] {
+            let scene = scene_for_records(&ledger, &records, lod, style);
+            for ordinal in 0..records.len() {
+                assert!(ghosts_of(&scene, handle_of(ordinal)).is_empty(), "{lod:?}");
+            }
+        }
+        let hidden = scene_for_records(
+            &ledger,
+            &records,
+            GeometryLod::Base,
+            crate::AlignmentStyleContract {
+                base_display: ReadBaseDisplayMode::Hidden,
+                ..style
+            },
+        );
+        assert!(ghosts_of(&hidden, handle_of(0)).is_empty());
+
+        let scene = scene_for_records(&ledger, &records, GeometryLod::Base, style);
+        let simple = |ghosts: Vec<(u64, u32, u8, bool, u32)>| {
+            ghosts
+                .into_iter()
+                .map(|(position, read_index, base, obscured, _)| {
+                    assert!(!obscured);
+                    (position, read_index, base)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            simple(ghosts_of(&scene, handle_of(0))),
+            [
+                (107, 0, b'T'),
+                (108, 1, b'G'),
+                (109, 2, b'C'),
+                (120, 13, b'G'),
+                (121, 14, b'T'),
+                (122, 15, b'C'),
+                (123, 16, b'A'),
+            ]
+        );
+        // Not complemented or reversed: SEQ is already in reference orientation.
+        assert_eq!(
+            simple(ghosts_of(&scene, handle_of(1))),
+            [(148, 0, b'C'), (149, 1, b'G')]
+        );
+        // Five clipped bases but only two reference positions before the read: the outermost
+        // three are not drawn.
+        assert_eq!(
+            simple(ghosts_of(&scene, handle_of(2))),
+            [(0, 3, b'T'), (1, 4, b'C')]
+        );
+
+        // Letters: lowercase, on the ghost cells, once the cells are legible (12 points/base).
+        let camera = clip_camera(100, 160, 720.0);
+        let labels = crate::CpuAlignmentProjector::project_labels(&scene, 0, camera).unwrap();
+        let mut ghost_letters = labels
+            .labels
+            .iter()
+            .filter(|label| matches!(label.component, AlignmentComponent::ClipGhostBase { .. }))
+            .map(|label| {
+                (
+                    ((label.x - 10.0) / 12.0).round() as u64 + 100,
+                    label.text.as_deref().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        ghost_letters.sort();
+        assert_eq!(
+            ghost_letters,
+            [
+                (107, "t"),
+                (108, "g"),
+                (109, "c"),
+                (120, "g"),
+                (121, "t"),
+                (122, "c"),
+                (123, "a"),
+                (148, "c"),
+                (149, "g"),
+            ]
+            .map(|(position, text)| (position, text.to_owned()))
+        );
+        // The CPU frame draws them as translucent ghost cells, ahead of everything else in
+        // their row.
+        let frame = crate::CpuAlignmentProjector::project(&scene, 0, camera).unwrap();
+        let ghost_cells = frame
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.shape == crate::CpuPrimitiveShape::ClipGhostCell)
+            .count();
+        assert_eq!(ghost_cells, 9);
+    }
+
+    /// Ghost cells paint beneath every other read of their row (so a neighbour covers them),
+    /// and their letters are suppressed wherever another read's aligned extent, or another
+    /// read's ghost, occupies the cell.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn soft_clip_ghosts_draw_beneath_neighbouring_reads_and_lose_their_letters_there() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let records = [
+            // A: [100, 110) with five trailing clipped bases, ghosts at 110..115.
+            record(
+                b"a",
+                100,
+                110,
+                &[(CigarOpKind::Match, 10), (CigarOpKind::SoftClip, 5)],
+                b"AAAAAAAAAACGTCG",
+            ),
+            // B: [112, 122), packed into A's row; it covers A's ghosts at 112..115.
+            record(b"b", 112, 122, &[(CigarOpKind::Match, 10)], b"AAAAAAAAAA"),
+            // C: [200, 210) with five trailing clipped bases (ghosts 210..215) and D: [217, 227)
+            // with four leading ones (ghosts 213..217): the two reads' ghosts share 213 and 214.
+            record(
+                b"c",
+                200,
+                210,
+                &[(CigarOpKind::Match, 10), (CigarOpKind::SoftClip, 5)],
+                b"AAAAAAAAAACGTCG",
+            ),
+            record(
+                b"d",
+                217,
+                227,
+                &[(CigarOpKind::SoftClip, 4), (CigarOpKind::Match, 10)],
+                b"TTTTAAAAAAAAAA",
+            ),
+        ];
+        let scene = scene_for_records(
+            &ledger,
+            &records,
+            GeometryLod::Base,
+            crate::AlignmentStyleContract::default(),
+        );
+        let a = ghosts_of(&scene, handle_of(0));
+        let obscured = |ghosts: &[(u64, u32, u8, bool, u32)]| {
+            ghosts
+                .iter()
+                .map(|(position, _, _, obscured, _)| (*position, *obscured))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            obscured(&a),
+            [
+                (110, false),
+                (111, false),
+                (112, true),
+                (113, true),
+                (114, true)
+            ]
+        );
+        let row = a[0].4;
+        assert!(a.iter().all(|ghost| ghost.4 == row));
+        // B shares A's row, and within that row (in page draw order, which the GPU follows)
+        // every ghost precedes B's body.
+        let page = scene
+            .pages()
+            .iter()
+            .find(|page| {
+                page.key().family() == AlignmentPageFamily::ReadGeometry
+                    && page.interval().contains(112)
+            })
+            .unwrap();
+        let local_row = row - page.row_range().start;
+        let row_primitives = page
+            .primitives()
+            .iter()
+            .filter(|primitive| primitive.row_offset == local_row)
+            .collect::<Vec<_>>();
+        let b_body = row_primitives
+            .iter()
+            .position(|primitive| {
+                primitive.handle == handle_of(1)
+                    && matches!(
+                        primitive.component,
+                        AlignmentComponent::AlignedSegment { .. }
+                    )
+            })
+            .expect("B is in A's row");
+        let last_ghost = row_primitives
+            .iter()
+            .rposition(|primitive| {
+                matches!(
+                    primitive.component,
+                    AlignmentComponent::ClipGhostBase { .. }
+                )
+            })
+            .unwrap();
+        assert!(last_ghost < b_body);
+        assert!(
+            row_primitives[..=last_ghost]
+                .iter()
+                .all(|primitive| primitive.geometry == AlignmentGeometryToken::ClipGhost)
+        );
+        // The CPU projector paints in the same order.
+        let camera = clip_camera(95, 230, 1_620.0);
+        let frame = crate::CpuAlignmentProjector::project(&scene, 0, camera).unwrap();
+        let in_row = frame
+            .primitives
+            .iter()
+            .filter(|primitive| primitive.row == row)
+            .collect::<Vec<_>>();
+        let first_body = in_row
+            .iter()
+            .position(|primitive| primitive.shape != crate::CpuPrimitiveShape::ClipGhostCell)
+            .unwrap();
+        assert!(
+            in_row[first_body..]
+                .iter()
+                .all(|primitive| primitive.shape != crate::CpuPrimitiveShape::ClipGhostCell)
+        );
+        // Picking a covered ghost cell selects the read on top of it.
+        let x = pane_x(camera, 113) + 6.0;
+        let y = (f64::from(row) + 0.5) * 14.0;
+        let hit =
+            crate::CpuAlignmentProjector::pick(&scene, rgv_core::TrackId::new(1), &frame, x, y)
+                .unwrap()
+                .unwrap();
+        assert_eq!(hit.handle, handle_of(1));
+
+        // C and D: shared cells lose both letters, unshared ones keep theirs.
+        assert_eq!(
+            obscured(&ghosts_of(&scene, handle_of(2))),
+            [
+                (210, false),
+                (211, false),
+                (212, false),
+                (213, true),
+                (214, true)
+            ]
+        );
+        assert_eq!(
+            obscured(&ghosts_of(&scene, handle_of(3))),
+            [(213, true), (214, true), (215, false), (216, false)]
+        );
+        let labels = crate::CpuAlignmentProjector::project_labels(&scene, 0, camera).unwrap();
+        let mut lettered = labels
+            .labels
+            .iter()
+            .filter(|label| matches!(label.component, AlignmentComponent::ClipGhostBase { .. }))
+            .map(|label| (label.x - 10.0) / 12.0 + 95.0)
+            .map(|position| position.round() as u64)
+            .collect::<Vec<_>>();
+        lettered.sort_unstable();
+        assert_eq!(lettered, [110, 111, 210, 211, 212, 215, 216]);
+    }
+
+    fn event_labels(
+        scene: &Arc<crate::AlignmentPresentationScene>,
+        camera: crate::AlignmentCamera,
+        kind: AlignmentLabelKind,
+    ) -> Vec<crate::CpuProjectedPrimitive> {
+        crate::CpuAlignmentProjector::project_labels(scene, 0, camera)
+            .unwrap()
+            .labels
+            .iter()
+            .filter(|label| {
+                matches!(label.component, AlignmentComponent::Label { kind: found, .. } if found == kind)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// A clip's length is written outside the read, just beyond its cut edge and beyond any
+    /// ghost bases drawn there, never over the read body; a hard clip's carries an `H`.
+    #[test]
+    fn clip_length_labels_sit_outside_the_read_beyond_any_ghosts() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let records = [record(
+            b"clipped",
+            120,
+            140,
+            &[
+                (CigarOpKind::SoftClip, 5),
+                (CigarOpKind::Match, 20),
+                (CigarOpKind::HardClip, 3),
+            ],
+            &[b'A'; 25],
+        )];
+        // 20 points per base.
+        let camera = clip_camera(100, 160, 1_200.0);
+        for (lod, ghost_cells) in [(GeometryLod::Read, 0), (GeometryLod::Base, 5)] {
+            let scene = scene_for_records(
+                &ledger,
+                &records,
+                lod,
+                crate::AlignmentStyleContract::default(),
+            );
+            let labels = event_labels(&scene, camera, AlignmentLabelKind::ClipLength);
+            assert_eq!(labels.len(), 2, "{lod:?} {labels:?}");
+            let soft = labels
+                .iter()
+                .find(|label| label.text.as_deref() == Some("5"))
+                .unwrap();
+            let hard = labels
+                .iter()
+                .find(|label| label.text.as_deref() == Some("3H"))
+                .unwrap();
+            // Leading: the text ends where the drawn ghosts (or, without them, the read) begin.
+            let read_left = pane_x(camera, 120);
+            let read_right = pane_x(camera, 140);
+            assert!(
+                (soft.x + soft.width - pane_x(camera, 120 - ghost_cells)).abs() < 1.0e-9,
+                "{lod:?} {soft:?}"
+            );
+            assert!(soft.x + soft.width <= read_left + 1.0e-9);
+            // Trailing hard clip: no ghosts, the text starts on the read's right boundary.
+            assert!((hard.x - read_right).abs() < 1.0e-9, "{lod:?} {hard:?}");
+        }
+    }
+
+    /// Event lengths only appear where they have room. Span events (deletions, skips) need the
+    /// text to fit inside their on-screen extent; point events (insertions, clips) need at
+    /// least two points per base and the text to fit in the width their bases would take.
+    #[test]
+    fn event_length_labels_are_hidden_until_the_text_fits() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let records = [record(
+            b"events",
+            40,
+            175,
+            &[
+                (CigarOpKind::SoftClip, 5),
+                (CigarOpKind::Match, 10),
+                (CigarOpKind::Insertion, 2),
+                (CigarOpKind::Match, 10),
+                (CigarOpKind::Deletion, 3),
+                (CigarOpKind::Match, 10),
+                (CigarOpKind::ReferenceSkip, 100),
+                (CigarOpKind::Match, 12),
+            ],
+            &[b'A'; 49],
+        )];
+        let scene = scene_for_records(
+            &ledger,
+            &records,
+            GeometryLod::Read,
+            crate::AlignmentStyleContract::default(),
+        );
+        // Text is 0.56 x 11 points per glyph plus 2 x 2 points of padding: one digit is 10.16
+        // points, three are 22.48.
+        let visible = |points_per_base: f64| {
+            let width = 300.0 * points_per_base;
+            let camera = clip_camera(0, 300, width);
+            [
+                AlignmentLabelKind::ClipLength,
+                AlignmentLabelKind::InsertionLength,
+                AlignmentLabelKind::DeletionLength,
+                AlignmentLabelKind::SkipLength,
+            ]
+            .map(|kind| !event_labels(&scene, camera, kind).is_empty())
+        };
+        // Coarse: the 100-base skip is 5 points long, too short for "100"; nothing shows.
+        assert_eq!(visible(0.05), [false, false, false, false]);
+        // 0.25 points per base: the skip is 25 points long and fits its "100".
+        assert_eq!(visible(0.25), [false, false, false, true]);
+        // Below two points per base no point event is labelled, even a long one.
+        assert_eq!(visible(1.9), [false, false, false, true]);
+        // 2.1: "5" fits in five clipped bases (10.5 points); "2" does not fit in 4.2, nor "3"
+        // in the 6.3-point deletion.
+        assert_eq!(visible(2.1), [true, false, false, true]);
+        // 4: the deletion is 12 points long; the insertion's two bases are 8.
+        assert_eq!(visible(4.0), [true, false, true, true]);
+        // 6: everything fits.
+        assert_eq!(visible(6.0), [true, true, true, true]);
     }
 
     /// SCENE-9. Pins the in-memory size of one semantic primitive and of its parts, so a field

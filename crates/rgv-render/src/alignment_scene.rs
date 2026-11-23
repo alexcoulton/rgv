@@ -16,8 +16,9 @@ use rgv_alignment_scene::{
     AlignmentStyleToken, AllocationBundleActual, AllocationBundleDemand, AllocationBundleError,
     AllocationBundleLease, AllocationBundleReservation, AllocationBundleSlot, AllocationClass,
     AllocationId, AllocationLease, AllocationLedger, AllocationRetirementClaimSet,
-    AllocationRetirementToken, CpuAlignmentLabelFrame, CpuAlignmentProjector, CpuProjectionError,
-    LedgerError, PinnedAllocationLease, ReservationKind, SceneRevision, TransientResourceClass,
+    AllocationRetirementToken, ClipEdgeToken, CpuAlignmentLabelFrame, CpuAlignmentProjector,
+    CpuProjectionError, LedgerError, PinnedAllocationLease, ReservationKind, SceneRevision,
+    TransientResourceClass,
 };
 use thiserror::Error;
 
@@ -181,6 +182,55 @@ pub enum AlignmentGpuShape {
     DirectionTerminalLeft = 4,
     /// Narrow bar centred on the end edge of its one-base span (a read's right boundary).
     PointMarkerAtEnd = 5,
+    /// Clip cut edges, `6 + at_end + 2 x hard + 4 x behind_arrow` (see [`ClipEdgeToken`] and
+    /// `rgv_alignment_scene::clip_edge_extent`): a soft clip's sawtooth or a hard clip's bar,
+    /// just inside the start (or end) edge of the one-base span, moved inside the arrowhead
+    /// when the read's direction arrow shares that boundary.
+    SoftClipEdgeStart = 6,
+    SoftClipEdgeEnd = 7,
+    HardClipEdgeStart = 8,
+    HardClipEdgeEnd = 9,
+    SoftClipEdgeStartBehindArrow = 10,
+    SoftClipEdgeEndBehindArrow = 11,
+    HardClipEdgeStartBehindArrow = 12,
+    HardClipEdgeEndBehindArrow = 13,
+    /// A soft-clipped ghost base cell: a rectangle drawn in the translucent ghost tint of its
+    /// read's colour (`AlignmentPalette::clip_ghost_color`).
+    ClipGhostCell = 14,
+}
+
+impl AlignmentGpuShape {
+    const FIRST_CLIP_EDGE: u32 = Self::SoftClipEdgeStart as u32;
+    const LAST_CLIP_EDGE: u32 = Self::HardClipEdgeEndBehindArrow as u32;
+
+    /// The shape drawing `edge`.
+    #[must_use]
+    pub const fn clip_edge(edge: ClipEdgeToken) -> Self {
+        match (edge.behind_arrow, edge.hard, edge.at_end) {
+            (false, false, false) => Self::SoftClipEdgeStart,
+            (false, false, true) => Self::SoftClipEdgeEnd,
+            (false, true, false) => Self::HardClipEdgeStart,
+            (false, true, true) => Self::HardClipEdgeEnd,
+            (true, false, false) => Self::SoftClipEdgeStartBehindArrow,
+            (true, false, true) => Self::SoftClipEdgeEndBehindArrow,
+            (true, true, false) => Self::HardClipEdgeStartBehindArrow,
+            (true, true, true) => Self::HardClipEdgeEndBehindArrow,
+        }
+    }
+
+    /// The clip edge a packed shape discriminant draws, if it is one.
+    #[must_use]
+    pub const fn clip_edge_token(shape: u32) -> Option<ClipEdgeToken> {
+        if shape < Self::FIRST_CLIP_EDGE || shape > Self::LAST_CLIP_EDGE {
+            return None;
+        }
+        let bits = shape - Self::FIRST_CLIP_EDGE;
+        Some(ClipEdgeToken {
+            at_end: bits & 1 != 0,
+            hard: bits & 2 != 0,
+            behind_arrow: bits & 4 != 0,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,6 +283,10 @@ pub fn project_alignment_gpu_instance(
             right,
             shape == AlignmentGpuShape::PointMarkerAtEnd as u32,
         );
+        x = left;
+        right = left + width;
+    } else if let Some(edge) = AlignmentGpuShape::clip_edge_token(shape) {
+        let (left, width) = rgv_alignment_scene::clip_edge_extent(x, right, height, edge);
         x = left;
         right = left + width;
     } else {
@@ -3916,6 +3970,8 @@ const fn shape_for(geometry: AlignmentGeometryToken) -> AlignmentGpuShape {
         AlignmentGeometryToken::DirectionalTerminalRight => {
             AlignmentGpuShape::DirectionTerminalRight
         }
+        AlignmentGeometryToken::ClipEdge(edge) => AlignmentGpuShape::clip_edge(edge),
+        AlignmentGeometryToken::ClipGhost => AlignmentGpuShape::ClipGhostCell,
     }
 }
 
@@ -3941,11 +3997,10 @@ pub(crate) fn semantic_alignment_color(
             rgv_alignment_scene::BisulfiteObservationToken::Converted => T::BISULFITE_CONVERTED,
         },
         AlignmentComponent::Insertion { .. }
-        | AlignmentComponent::SoftClip { .. }
-        | AlignmentComponent::HardClip { .. }
         | AlignmentComponent::Padding { .. }
         | AlignmentComponent::UltimaIndel { .. }
         | AlignmentComponent::SbxInsertion { .. } => T::INSERTION,
+        AlignmentComponent::SoftClip { .. } | AlignmentComponent::HardClip { .. } => T::CLIP_EDGE,
         AlignmentComponent::Deletion { .. } => T::DELETION,
         AlignmentComponent::ReferenceSkip { .. } | AlignmentComponent::PairConnector { .. } => {
             T::SKIP
@@ -3953,10 +4008,12 @@ pub(crate) fn semantic_alignment_color(
         AlignmentComponent::SmrtKinetics { .. } => T::SMRT_KINETICS,
         AlignmentComponent::SbxTailBase { .. } => T::SBX_TAIL,
         AlignmentComponent::SpecialistUnavailable { .. } => T::SPECIALIST_UNAVAILABLE,
+        // A ghost base carries its read's colour; the ghost shape (14) tints it.
         AlignmentComponent::DirectionTerminal
         | AlignmentComponent::Label { .. }
         | AlignmentComponent::ReadSpan
-        | AlignmentComponent::AlignedSegment { .. } => return style_color(style),
+        | AlignmentComponent::AlignedSegment { .. }
+        | AlignmentComponent::ClipGhostBase { .. } => return style_color(style),
     })
 }
 

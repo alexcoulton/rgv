@@ -39,9 +39,15 @@ fn primitive(component: AlignmentComponent) -> AlignmentSemanticPrimitive {
         AlignmentComponent::Deletion { .. }
         | AlignmentComponent::ReferenceSkip { .. }
         | AlignmentComponent::PairConnector { .. } => AlignmentGeometryToken::EventLine,
+        AlignmentComponent::SoftClip { .. } | AlignmentComponent::HardClip { .. } => {
+            AlignmentGeometryToken::ClipEdge(rgv_alignment_scene::ClipEdgeToken {
+                at_end: false,
+                hard: matches!(component, AlignmentComponent::HardClip { .. }),
+                behind_arrow: false,
+            })
+        }
+        AlignmentComponent::ClipGhostBase { .. } => AlignmentGeometryToken::ClipGhost,
         AlignmentComponent::Insertion { .. }
-        | AlignmentComponent::SoftClip { .. }
-        | AlignmentComponent::HardClip { .. }
         | AlignmentComponent::Padding { .. }
         | AlignmentComponent::UltimaIndel { .. }
         | AlignmentComponent::SbxInsertion { .. } => AlignmentGeometryToken::PointMarker,
@@ -290,7 +296,6 @@ pub(crate) fn test_scene_over(
 /// [`test_scene_over`] with an explicit colour mode. With a colour mode the reads also differ in
 /// mapping quality (including one above the nominal maximum of 60) and in mate contig, so the
 /// continuous and hashed colour paths each see several distinct values.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn test_scene_colored(
     ledger: &AllocationLedger,
     interval: GenomicInterval,
@@ -299,6 +304,32 @@ pub(crate) fn test_scene_colored(
     reads: &[TestRead],
     row_block_rows: NonZeroU32,
     color_mode: Option<rgv_core::AlignmentColorMode>,
+) -> Arc<AlignmentPresentationScene> {
+    test_scene_detailed(
+        ledger,
+        interval,
+        contig_length,
+        tile_bases,
+        reads,
+        row_block_rows,
+        color_mode,
+        GeometryLod::Read,
+    )
+}
+
+/// [`test_scene_colored`] at an explicit level of detail. At [`GeometryLod::Base`] the pages
+/// are built against an all-`A` reference over `interval`, so every read base that is not `A`
+/// is a drawn mismatch and soft clips draw their ghost bases.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn test_scene_detailed(
+    ledger: &AllocationLedger,
+    interval: GenomicInterval,
+    contig_length: u64,
+    tile_bases: NonZeroU64,
+    reads: &[TestRead],
+    row_block_rows: NonZeroU32,
+    color_mode: Option<rgv_core::AlignmentColorMode>,
+    lod: GeometryLod,
 ) -> Arc<AlignmentPresentationScene> {
     let source_revision = AlignmentSourceRevision::new(
         SourceFingerprint::new(RevisionFingerprint::new(11, 12)),
@@ -461,14 +492,20 @@ pub(crate) fn test_scene_colored(
     )
     .unwrap();
     let default_style = rgv_alignment_scene::AlignmentStyleContract::default();
+    let reference = (lod == GeometryLod::Base).then(|| rgv_model::ReferenceSlice {
+        interval,
+        bases: vec![b'A'; usize::try_from(interval.len()).unwrap()],
+    });
     let presentation = PresentationContract {
-        geometry_lod: GeometryLod::Read,
+        geometry_lod: lod,
         style: rgv_alignment_scene::AlignmentStyleContract {
             read_labels: AlignmentReadLabelMode::ReadName,
             color_mode: color_mode.unwrap_or(default_style.color_mode),
             ..default_style
         },
-        reference: None,
+        reference: reference
+            .as_ref()
+            .map(|_| rgv_alignment_scene::ReferenceRevision::new(RevisionFingerprint::new(22, 23))),
         annotation: None,
     };
     let rows = 0..u32::try_from(atlas.row_count()).unwrap();
@@ -489,7 +526,7 @@ pub(crate) fn test_scene_colored(
                     tile,
                     CanonicalRowBlock::new(row_block, row_block_rows),
                     family,
-                    GeometryLod::Read,
+                    lod,
                 );
                 let page = AlignmentSemanticPage::build(
                     key,
@@ -497,7 +534,7 @@ pub(crate) fn test_scene_colored(
                     &atlas,
                     presentation,
                     contig_length,
-                    None,
+                    reference.as_ref(),
                     ledger,
                     ReservationKind::Normal,
                     4,
@@ -661,6 +698,40 @@ fn semantic_component_families_map_to_stable_gpu_shapes_without_labels() {
         }))
         .unwrap()
         .is_none()
+    );
+    // Every clip edge has its own shape, and the shape decodes back to the same edge.
+    let mut shapes = std::collections::BTreeSet::new();
+    for bits in 0..8_u32 {
+        let edge = rgv_alignment_scene::ClipEdgeToken {
+            at_end: bits & 1 != 0,
+            hard: bits & 2 != 0,
+            behind_arrow: bits & 4 != 0,
+        };
+        let mut semantic = primitive(AlignmentComponent::SoftClip {
+            cigar_index: 0,
+            read_start: 0,
+            length: 2,
+        });
+        semantic.geometry = AlignmentGeometryToken::ClipEdge(edge);
+        let shape = pack_primitive(semantic).unwrap().unwrap().shape();
+        assert_eq!(shape, 6 + bits);
+        assert_eq!(AlignmentGpuShape::clip_edge_token(shape), Some(edge));
+        shapes.insert(shape);
+    }
+    assert_eq!(shapes.len(), 8);
+    assert_eq!(AlignmentGpuShape::clip_edge_token(5), None);
+    assert_eq!(AlignmentGpuShape::clip_edge_token(14), None);
+    assert_eq!(
+        pack_primitive(primitive(AlignmentComponent::ClipGhostBase {
+            cigar_index: 0,
+            read_index: 0,
+            base: b'a',
+            obscured: false,
+        }))
+        .unwrap()
+        .unwrap()
+        .shape(),
+        AlignmentGpuShape::ClipGhostCell as u32
     );
 }
 
@@ -3456,11 +3527,16 @@ pub(crate) fn legacy_semantic_alignment_color(
             rgv_alignment_scene::BisulfiteObservationToken::Converted => [0.18, 0.62, 0.78, 1.0],
         },
         AlignmentComponent::Insertion { .. }
-        | AlignmentComponent::SoftClip { .. }
-        | AlignmentComponent::HardClip { .. }
         | AlignmentComponent::Padding { .. }
         | AlignmentComponent::UltimaIndel { .. }
         | AlignmentComponent::SbxInsertion { .. } => [0.55, 0.20, 0.70, 1.0],
+        // Deliberate change after the palette migration: clips are no longer purple point
+        // markers but dark cut edges, and their soft-clipped bases are ghost cells carrying the
+        // read's own colour (tinted by the ghost shape, not by this table).
+        AlignmentComponent::SoftClip { .. } | AlignmentComponent::HardClip { .. } => {
+            [0.12, 0.12, 0.14, 1.0]
+        }
+        AlignmentComponent::ClipGhostBase { .. } => style_color(style),
         AlignmentComponent::Deletion { .. } => [0.18, 0.18, 0.20, 1.0],
         AlignmentComponent::ReferenceSkip { .. } | AlignmentComponent::PairConnector { .. } => {
             [0.38, 0.40, 0.46, 1.0]
@@ -4097,7 +4173,11 @@ pub(crate) const BOUNDARY_FIXTURE_ORIGIN: u64 = 50_000;
 ///   insertion between origin + 21 and origin + 22;
 /// - `M6 S4` at origin + 400: a trailing clip on its right boundary (origin + 406);
 /// - `M8 I2` at origin + 800: an insertion at the very end of the CIGAR, on its right boundary
-///   (origin + 808).
+///   (origin + 808);
+/// - reverse `H3 M10` at origin + 1200: a leading hard clip on the boundary that also carries
+///   the reverse read's arrowhead (origin + 1200);
+/// - reverse `M7 S3` at origin + 1600: a trailing soft clip away from the arrowhead
+///   (origin + 1607).
 pub(crate) fn boundary_marker_reads() -> Vec<TestRead> {
     let cigar = |operations: &[(CigarOpKind, u32)]| {
         operations
@@ -4129,6 +4209,16 @@ pub(crate) fn boundary_marker_reads() -> Vec<TestRead> {
             start: origin + 800,
             reverse: false,
             cigar: cigar(&[(CigarOpKind::Match, 8), (CigarOpKind::Insertion, 2)]),
+        },
+        TestRead {
+            start: origin + 1200,
+            reverse: true,
+            cigar: cigar(&[(CigarOpKind::HardClip, 3), (CigarOpKind::Match, 10)]),
+        },
+        TestRead {
+            start: origin + 1600,
+            reverse: true,
+            cigar: cigar(&[(CigarOpKind::Match, 7), (CigarOpKind::SoftClip, 3)]),
         },
     ]
 }
@@ -4329,58 +4419,230 @@ fn insertion_markers_are_narrow_bars_centred_on_the_start_edge_of_their_base() {
     assert!((marker.centre() - boundary_x(zoomed_out, 22)).abs() < 1.0e-9);
 }
 
-/// Clips and an insertion at the end of the CIGAR sit on the read's own boundaries: a leading
-/// clip on the start edge of the first aligned base, a trailing event on the end edge of the
-/// last aligned base (its position, one past that base, was clamped onto it).
+/// One clip cut edge as projected by both the GPU oracle and the CPU projector, which must
+/// agree exactly.
+fn agreed_clip_edge(
+    scene: &Arc<AlignmentPresentationScene>,
+    camera: AlignmentCamera,
+    component_matches: impl Fn(AlignmentComponent) -> bool,
+) -> AgreedMarker {
+    let is_edge =
+        |geometry: AlignmentGeometryToken| matches!(geometry, AlignmentGeometryToken::ClipEdge(_));
+    let gpu = oracle_bounds(scene, camera, |primitive| {
+        component_matches(primitive.component) && is_edge(primitive.geometry)
+    });
+    let cpu = cpu_primitives(scene, camera, |primitive| {
+        component_matches(primitive.component)
+            && primitive.shape == rgv_alignment_scene::CpuPrimitiveShape::ClipEdge
+    });
+    assert_eq!(gpu.len(), 1, "{gpu:?}");
+    assert_eq!(cpu.len(), 1, "{cpu:?}");
+    let (primitive, bounds) = gpu[0];
+    let projected = &cpu[0];
+    assert_eq!(projected.geometry, primitive.geometry);
+    for (gpu, cpu) in [
+        (bounds.x, projected.x),
+        (bounds.width, projected.width),
+        (bounds.y, projected.y),
+        (bounds.height, projected.height),
+    ] {
+        assert!((gpu - cpu).abs() < 1.0e-9, "{bounds:?} {projected:?}");
+    }
+    AgreedMarker {
+        left: bounds.x,
+        width: bounds.width,
+        y: bounds.y,
+        height: bounds.height,
+        geometry: primitive.geometry,
+        handle: primitive.handle,
+    }
+}
+
+/// Clips are cut edges just inside the read's own boundary, no longer purple point markers
+/// centred on it; an insertion at the end of the CIGAR keeps its bar on the right boundary. The
+/// GPU oracle and the CPU projector agree at every zoom, a soft clip's edge is half a base wide
+/// within [2, 6] points and a hard clip's two, and a clip on the arrowhead's boundary sits just
+/// inside the arrowhead's base.
 #[test]
-fn clip_and_terminal_insertion_markers_sit_on_the_read_boundaries() {
+fn clip_edges_and_terminal_insertion_markers_sit_on_the_read_boundaries() {
+    use rgv_alignment_scene::ClipEdgeToken;
     let ledger = boundary_ledger();
     let scene = boundary_marker_scene(&ledger);
-    // Horizontal extent of the read's own body (everything but its markers and labels).
-    let body_edges = |camera: AlignmentCamera, handle: AlignmentHandle| {
-        let body = cpu_primitives(&scene, camera, |primitive| {
-            primitive.handle == handle
-                && primitive.shape != rgv_alignment_scene::CpuPrimitiveShape::PointMarker
-                && primitive.shape != rgv_alignment_scene::CpuPrimitiveShape::TextLabel
-        });
-        assert!(!body.is_empty());
-        (
-            body.iter().map(|p| p.x).fold(f64::INFINITY, f64::min),
-            body.iter()
-                .map(|p| p.x + p.width)
-                .fold(f64::NEG_INFINITY, f64::max),
-        )
+    let edge = |at_end, hard, behind_arrow| {
+        AlignmentGeometryToken::ClipEdge(ClipEdgeToken {
+            at_end,
+            hard,
+            behind_arrow,
+        })
     };
-
-    // 10 points per base.
-    let leading = boundary_camera(15, 35, 200.0);
-    let marker = agreed_marker(&scene, leading, |component| {
-        matches!(
-            component,
-            AlignmentComponent::SoftClip { cigar_index: 0, .. }
-        )
-    });
-    assert_eq!(marker.geometry, AlignmentGeometryToken::PointMarker);
-    assert!((marker.width - 2.5).abs() < 1.0e-9);
-    assert!((marker.centre() - boundary_x(leading, 20)).abs() < 1.0e-9);
-    assert!((marker.centre() - body_edges(leading, marker.handle).0).abs() < 1.0e-9);
-
-    let trailing = boundary_camera(390, 410, 200.0);
-    let marker = agreed_marker(&scene, trailing, |component| {
-        matches!(
-            component,
-            AlignmentComponent::SoftClip { cigar_index: 1, .. }
-        )
-    });
-    assert_eq!(marker.geometry, AlignmentGeometryToken::PointMarkerAtEnd);
-    assert!((marker.centre() - boundary_x(trailing, 406)).abs() < 1.0e-9);
-    assert!((marker.centre() - body_edges(trailing, marker.handle).1).abs() < 1.0e-9);
+    // (read start, CIGAR index, boundary, geometry)
+    let clips = [
+        (20, 0, 20, edge(false, false, false)),
+        (400, 1, 406, edge(true, false, true)),
+        (1200, 0, 1200, edge(false, true, true)),
+        (1600, 1, 1607, edge(true, false, false)),
+    ];
+    for points_per_base in [0.5_f64, 2.0, 10.0, 64.0, 112.0] {
+        for (read, cigar_index, boundary, geometry) in clips {
+            // Twenty points of margin around the boundary base.
+            let span = (40.0 / points_per_base).ceil() as u64;
+            let camera = AlignmentCamera::new(
+                GenomicInterval::new(
+                    ContigId::new(0),
+                    BOUNDARY_FIXTURE_ORIGIN + boundary - span,
+                    BOUNDARY_FIXTURE_ORIGIN + boundary + span,
+                )
+                .unwrap(),
+                0.0,
+                14.0,
+                11.0,
+                rgv_alignment_scene::CpuClipRect {
+                    x: 10.0,
+                    y: 20.0,
+                    width: 2.0 * span as f64 * points_per_base,
+                    height: 50.0,
+                },
+            )
+            .unwrap();
+            let marker = agreed_clip_edge(&scene, camera, |component| {
+                matches!(component,
+                    AlignmentComponent::SoftClip { cigar_index: index, .. }
+                    | AlignmentComponent::HardClip { cigar_index: index, .. }
+                        if index == cigar_index)
+            });
+            assert_eq!(marker.geometry, geometry, "read {read}");
+            let AlignmentGeometryToken::ClipEdge(token) = geometry else {
+                unreachable!()
+            };
+            let width = if token.hard {
+                2.0
+            } else {
+                (points_per_base * 0.5).clamp(2.0, 6.0)
+            };
+            let terminal = points_per_base.max(1.0);
+            let arrowhead = if token.behind_arrow {
+                (11.0_f64 * 0.55).min(terminal * 0.35)
+            } else {
+                0.0
+            };
+            let boundary_x = boundary_x(camera, boundary);
+            let expected_left = match (token.at_end, token.behind_arrow) {
+                (false, _) => boundary_x + arrowhead,
+                (true, false) => boundary_x - width,
+                // The arrow tip is the terminal base cell's right edge (one point minimum).
+                (true, true) => boundary_x - points_per_base + terminal - arrowhead - width,
+            };
+            assert!(
+                (marker.left - expected_left).abs() < 1.0e-9
+                    && (marker.width - width).abs() < 1.0e-9,
+                "read {read} at {points_per_base}: {marker:?}, expected {expected_left}"
+            );
+            assert!((marker.height - 11.0).abs() < 1.0e-9);
+            if points_per_base >= 10.0 {
+                // Inside the read's own body, and narrower than one base cell.
+                let body = cpu_primitives(&scene, camera, |primitive| {
+                    primitive.handle == marker.handle
+                        && matches!(
+                            primitive.shape,
+                            rgv_alignment_scene::CpuPrimitiveShape::ReadBody
+                                | rgv_alignment_scene::CpuPrimitiveShape::DirectionTerminalLeft
+                                | rgv_alignment_scene::CpuPrimitiveShape::DirectionTerminalRight
+                        )
+                });
+                let left = body.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
+                let right = body
+                    .iter()
+                    .map(|p| p.x + p.width)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                assert!(
+                    marker.left >= left - 1.0e-9 && marker.left + marker.width <= right + 1.0e-9
+                );
+                assert!(marker.width < points_per_base);
+            }
+        }
+    }
 
     let terminal_insertion = boundary_camera(790, 810, 200.0);
     let marker = agreed_marker(&scene, terminal_insertion, is_insertion_of_read_at(800));
     assert_eq!(marker.geometry, AlignmentGeometryToken::PointMarkerAtEnd);
     assert!((marker.centre() - boundary_x(terminal_insertion, 808)).abs() < 1.0e-9);
-    assert!((marker.centre() - body_edges(terminal_insertion, marker.handle).1).abs() < 1.0e-9);
+}
+
+/// Clips are drawn in their own dark, neutral cut-edge colour (never the insertion purple) in
+/// every theme, contrasting with the ordinary read bodies it is drawn on; ghost bases carry
+/// their read's colour, which the ghost shape tints.
+#[test]
+fn clip_edges_use_their_own_colour_and_ghosts_their_reads() {
+    use crate::palette::ThemeId;
+    let style = primitive(AlignmentComponent::ReadSpan).style;
+    for component in [
+        AlignmentComponent::SoftClip {
+            cigar_index: 0,
+            read_start: 0,
+            length: 4,
+        },
+        AlignmentComponent::HardClip {
+            cigar_index: 0,
+            length: 4,
+        },
+    ] {
+        assert_eq!(
+            semantic_alignment_color(component, style),
+            PaletteColor::Token(PaletteToken::CLIP_EDGE)
+        );
+    }
+    assert_eq!(
+        semantic_alignment_color(
+            AlignmentComponent::ClipGhostBase {
+                cigar_index: 0,
+                read_index: 0,
+                base: b'C',
+                obscured: false,
+            },
+            style
+        ),
+        semantic_alignment_color(AlignmentComponent::ReadSpan, style)
+    );
+    let luminance = |color: [f32; 4]| {
+        let linear = |channel: f32| {
+            let channel = f64::from(channel);
+            if channel <= 0.040_45 {
+                channel / 12.92
+            } else {
+                ((channel + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color[0]) + 0.7152 * linear(color[1]) + 0.0722 * linear(color[2])
+    };
+    let contrast = |left: [f32; 4], right: [f32; 4]| {
+        let (high, low) = (
+            luminance(left).max(luminance(right)),
+            luminance(left).min(luminance(right)),
+        );
+        (high + 0.05) / (low + 0.05)
+    };
+    for theme in ThemeId::ALL {
+        let palette = AlignmentPalette::for_theme(theme);
+        let edge = palette.color(PaletteToken::CLIP_EDGE);
+        let insertion = palette.color(PaletteToken::INSERTION);
+        assert!(
+            (0..3).any(|channel| (edge[channel] - insertion[channel]).abs() > 0.2),
+            "{theme:?}: the cut edge looks like an insertion"
+        );
+        assert!((edge[0] - edge[2]).abs() < 0.05, "{theme:?}: not neutral");
+        for body in [
+            PaletteToken::READ_NEUTRAL,
+            PaletteToken::STRAND_FORWARD,
+            PaletteToken::STRAND_REVERSE,
+        ] {
+            let ratio = contrast(edge, palette.color(body));
+            assert!(ratio >= 3.0, "{theme:?} {body:?}: contrast {ratio}");
+        }
+        // A ghost is a faint, translucent version of its read.
+        let read = palette.color(PaletteToken::STRAND_FORWARD);
+        let ghost = palette.clip_ghost_color(read);
+        assert!(ghost[3] > 0.2 && ghost[3] < 0.7, "{theme:?} {ghost:?}");
+    }
 }
 
 /// The insertion length is centred on the same boundary as the insertion's bar.

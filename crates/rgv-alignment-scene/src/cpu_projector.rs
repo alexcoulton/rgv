@@ -6,8 +6,9 @@ use thiserror::Error;
 use crate::{
     AlignmentComponent, AlignmentGeometryToken, AlignmentHandle, AlignmentInteractionState,
     AlignmentInteractionToken, AlignmentLabelKind, AlignmentPageFamily, AlignmentPanelLaneFrame,
-    AlignmentPresentationScene, AlignmentSemanticPrimitive, AlignmentStyleToken, LedgerError,
-    ReservationKind, SceneRevision, TransientResourceClass, TransientResourceReservation,
+    AlignmentPresentationScene, AlignmentSemanticPrimitive, AlignmentStyleToken, ClipEdgeToken,
+    LedgerError, ReservationKind, SceneRevision, TransientResourceClass,
+    TransientResourceReservation,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -187,6 +188,10 @@ pub enum CpuPrimitiveShape {
     DirectionTerminalLeft,
     DirectionTerminalRight,
     TextLabel,
+    /// A clip's cut edge (see [`clip_edge_extent`]); its `geometry` says which kind.
+    ClipEdge,
+    /// A soft-clipped ghost base cell, drawn translucent beneath every other read of its row.
+    ClipGhostCell,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -196,6 +201,9 @@ pub struct CpuProjectedPrimitive {
     pub width: f64,
     pub height: f64,
     pub shape: CpuPrimitiveShape,
+    /// The semantic geometry token this was projected from (which clip edge, which label
+    /// anchoring), so presenters and exporters need not re-derive it.
+    pub geometry: AlignmentGeometryToken,
     pub handle: AlignmentHandle,
     pub component: AlignmentComponent,
     pub style: AlignmentStyleToken,
@@ -394,15 +402,16 @@ impl CpuAlignmentProjector {
                 }
             }
         }
-        reconcile_labels(&mut primitives, labels.into_values(), camera.clip);
-        // Paint order: point markers overhang the neighbouring cells of their row, so (as on
-        // the GPU) they follow the rest of the row.
+        reconcile_labels(&mut primitives, labels.into_values(), camera);
+        // Paint order, as on the GPU: clip ghosts lie beneath the rest of their row, and boundary
+        // marks (point markers, clip edges) overhang the neighbouring cells, so they follow it.
         primitives.sort_by(|left, right| {
             left.row
                 .cmp(&right.row)
                 .then_with(|| {
-                    (left.shape == CpuPrimitiveShape::PointMarker)
-                        .cmp(&(right.shape == CpuPrimitiveShape::PointMarker))
+                    left.geometry
+                        .paint_layer()
+                        .cmp(&right.geometry.paint_layer())
                 })
                 .then_with(|| left.y.total_cmp(&right.y))
                 .then_with(|| left.x.total_cmp(&right.x))
@@ -474,17 +483,21 @@ impl CpuAlignmentProjector {
             visible_text_pages
                 .iter()
                 .fold((0_usize, 0_usize), |(all_labels, all_bases), page| {
-                    let bases = page
-                        .primitives()
-                        .iter()
-                        .filter(|primitive| {
-                            matches!(primitive.component, AlignmentComponent::Base { .. })
-                        })
-                        .count();
+                    // Aligned base cells, and soft-clip ghost bases (which also carry a letter
+                    // but are not counted as base anchors).
+                    let (bases, ghosts) = page.primitives().iter().fold(
+                        (0_usize, 0_usize),
+                        |(bases, ghosts), primitive| match primitive.component {
+                            AlignmentComponent::Base { .. } => (bases + 1, ghosts),
+                            AlignmentComponent::ClipGhostBase { .. } => (bases, ghosts + 1),
+                            _ => (bases, ghosts),
+                        },
+                    );
                     (
                         all_labels
                             .saturating_add(page.label_anchor_count())
-                            .saturating_add(bases),
+                            .saturating_add(bases)
+                            .saturating_add(ghosts),
                         all_bases.saturating_add(bases),
                     )
                 });
@@ -502,7 +515,12 @@ impl CpuAlignmentProjector {
                 for primitive in page.primitives().iter().copied().filter(|primitive| {
                     matches!(
                         primitive.component,
-                        AlignmentComponent::Label { .. } | AlignmentComponent::Base { .. }
+                        AlignmentComponent::Label { .. }
+                            | AlignmentComponent::Base { .. }
+                            | AlignmentComponent::ClipGhostBase {
+                                obscured: false,
+                                ..
+                            }
                     )
                 }) {
                     let global_row = page.row_range().start.saturating_add(primitive.row_offset);
@@ -513,6 +531,10 @@ impl CpuAlignmentProjector {
                         AlignmentComponent::Label { id, .. } => page.label_arc(id),
                         AlignmentComponent::Base { base, .. } => Some(Arc::<str>::from(
                             char::from(base.to_ascii_uppercase()).to_string(),
+                        )),
+                        // Clipped bases are not part of the alignment: lowercase marks them.
+                        AlignmentComponent::ClipGhostBase { base, .. } => Some(Arc::<str>::from(
+                            char::from(base.to_ascii_lowercase()).to_string(),
                         )),
                         _ => unreachable!("the iterator retains only text-bearing primitives"),
                     };
@@ -536,7 +558,7 @@ impl CpuAlignmentProjector {
             }
         }
         let mut labels = Vec::with_capacity(maximum_labels);
-        reconcile_labels(&mut labels, fragments.into_values(), camera.clip);
+        reconcile_labels(&mut labels, fragments.into_values(), camera);
         let base_labels_projected = labels
             .iter()
             .filter(|label| matches!(label.component, AlignmentComponent::Base { .. }))
@@ -654,11 +676,14 @@ fn pick_captured_scene(
         return None;
     }
     // A point marker is centred on a base boundary and overhangs by at most half its maximum
-    // width, so markers whose one-base span lies a cell (plus that overhang) away from the
-    // pointer's base can still be under it.
+    // width, and a clip edge lies at most an arrowhead plus its own width inside its boundary,
+    // so marks whose one-base span lies a cell (plus that reach) away from the pointer's base
+    // can still be under it.
     let covered_interval = covered_interval?;
     let pointer = camera.viewport.genomic_at_pixel(x - camera.clip.x);
-    let reach = POINT_MARKER_MAXIMUM_WIDTH * 0.5 * camera.bases_per_pixel();
+    let reach = (POINT_MARKER_MAXIMUM_WIDTH * 0.5).max(
+        SOFT_CLIP_EDGE_MAXIMUM_WIDTH + camera.read_height.max(MINIMUM_PRIMITIVE_EXTENT) * 0.55,
+    ) * camera.bases_per_pixel();
     let marker_start = ((pointer - reach).floor() - 1.0).max(0.0) as u64;
     let marker_end = ((pointer + reach).floor() as u64).saturating_add(2);
     let search_interval = GenomicInterval::new(
@@ -692,10 +717,11 @@ fn pick_captured_scene(
                 })
         })
         .filter(|primitive| primitive.contains(x, y))
-        // Point markers paint over their row (see the semantic page order), so they win here too.
+        // Boundary marks paint over their row and clip ghosts beneath it (see the semantic page
+        // order), so the paint layer decides here too.
         .max_by_key(|primitive| {
             (
-                primitive.shape == CpuPrimitiveShape::PointMarker,
+                primitive.geometry.paint_layer(),
                 primitive.draw_order,
                 primitive.component,
                 primitive.handle,
@@ -732,6 +758,95 @@ pub fn point_marker_extent(cell_left: f64, cell_right: f64, at_end: bool) -> (f6
         .clamp(POINT_MARKER_MINIMUM_WIDTH, POINT_MARKER_MAXIMUM_WIDTH);
     let boundary = if at_end { cell_right } else { cell_left };
     (boundary - width * 0.5, width)
+}
+
+/// Clip cut edges (shapes 6..=13 of `project_instance` and `fragment_main` in `rgv-render`'s
+/// `alignment_scene.wgsl`, mirrored by `project_alignment_gpu_instance`; keep in lockstep). A
+/// soft clip's sawtooth is half a base wide within [2, 6] points; a hard clip's bar is two.
+const SOFT_CLIP_EDGE_BASE_FRACTION: f64 = 0.5;
+const SOFT_CLIP_EDGE_MINIMUM_WIDTH: f64 = 2.0;
+const SOFT_CLIP_EDGE_MAXIMUM_WIDTH: f64 = 6.0;
+const HARD_CLIP_EDGE_WIDTH: f64 = 2.0;
+/// Stroke of the sawtooth, measured across the stroke, and the target height of one tooth.
+const CLIP_EDGE_STROKE: f64 = 1.5;
+const CLIP_EDGE_TOOTH_HEIGHT: f64 = 4.0;
+/// The direction arrowhead of `fragment_main` (shapes 3 and 4): its length along the read is
+/// this fraction of the read height, but at most [`ARROWHEAD_WIDTH_FRACTION`] of the shape.
+const ARROWHEAD_HEIGHT_FRACTION: f64 = 0.55;
+const ARROWHEAD_WIDTH_FRACTION: f64 = 0.35;
+
+/// Horizontal extent `(left, width)` of a clip's cut edge whose one-base span (the aligned base
+/// at the clipped boundary) projects to `cell_left..cell_right`, for a read drawn `height`
+/// points tall. The edge lies just inside the read: its outer side is the boundary (the cell's
+/// start edge, or its end edge when `edge.at_end`), so it never covers a ghost base beyond it.
+///
+/// When the read's direction arrowhead is on the same boundary (`edge.behind_arrow`) the edge
+/// is moved inward by exactly the arrowhead's length, which is the head of the one-base
+/// direction terminal on that same cell: `min(0.55 x height, 0.35 x max(cell, 1))`, measured
+/// from that terminal's tip (the cell, widened to its one-point minimum). The edge then starts
+/// where the arrowhead's base is, so tip and cut both stay visible.
+#[must_use]
+pub fn clip_edge_extent(
+    cell_left: f64,
+    cell_right: f64,
+    height: f64,
+    edge: ClipEdgeToken,
+) -> (f64, f64) {
+    let cell = cell_right - cell_left;
+    let width = if edge.hard {
+        HARD_CLIP_EDGE_WIDTH
+    } else {
+        (cell * SOFT_CLIP_EDGE_BASE_FRACTION)
+            .clamp(SOFT_CLIP_EDGE_MINIMUM_WIDTH, SOFT_CLIP_EDGE_MAXIMUM_WIDTH)
+    };
+    if !edge.behind_arrow {
+        return if edge.at_end {
+            (cell_right - width, width)
+        } else {
+            (cell_left, width)
+        };
+    }
+    // The terminal cell keeps the one-point minimum width, grown rightwards like every shape,
+    // so its tip (and hence the arrowhead's base) is measured from that widened cell.
+    let terminal = cell.max(MINIMUM_PRIMITIVE_EXTENT);
+    let arrowhead = (height * ARROWHEAD_HEIGHT_FRACTION).min(terminal * ARROWHEAD_WIDTH_FRACTION);
+    if edge.at_end {
+        (cell_left + terminal - arrowhead - width, width)
+    } else {
+        (cell_left + arrowhead, width)
+    }
+}
+
+/// Whether the point `(local_x, local_y)`, relative to the top-left of a clip edge of `width` x
+/// `height` points, is painted. A hard clip's bar is solid. A soft clip's edge is a zigzag
+/// stroke whose vertices alternate between the read boundary (the outer side) and the inner
+/// side, with teeth about four points tall. Mirrors `fragment_main` in `alignment_scene.wgsl`.
+#[must_use]
+pub fn clip_edge_covers(
+    local_x: f64,
+    local_y: f64,
+    width: f64,
+    height: f64,
+    edge: ClipEdgeToken,
+) -> bool {
+    if edge.hard {
+        return true;
+    }
+    let teeth = (height / CLIP_EDGE_TOOTH_HEIGHT + 0.5).floor().max(1.0);
+    let period = height / teeth;
+    let cycles = local_y / period;
+    let phase = cycles - cycles.floor();
+    let triangle = 1.0 - (2.0 * phase - 1.0).abs();
+    let amplitude = (width - CLIP_EDGE_STROKE).max(0.0);
+    let centre = CLIP_EDGE_STROKE * 0.5 + amplitude * triangle;
+    let slope = 2.0 * amplitude / period;
+    let half_stroke = CLIP_EDGE_STROKE * 0.5 * (1.0 + slope * slope).sqrt();
+    let from_boundary = if edge.at_end {
+        width - local_x
+    } else {
+        local_x
+    };
+    (from_boundary - centre).abs() <= half_stroke
 }
 
 fn project_primitive(
@@ -780,6 +895,21 @@ fn project_primitive(
                 (CpuPrimitiveShape::PointMarker, row_top, body_height)
             }
         }
+        AlignmentGeometryToken::ClipEdge(edge) => {
+            if matches!(primitive.component, AlignmentComponent::Label { .. }) {
+                // A clip length keeps its anchor span; `reconcile_labels` places the text
+                // outside the read, beyond that span.
+                width = width.max(MINIMUM_PRIMITIVE_EXTENT);
+                (CpuPrimitiveShape::TextLabel, row_top, body_height)
+            } else {
+                (x, width) = clip_edge_extent(x, x + width, body_height, edge);
+                (CpuPrimitiveShape::ClipEdge, row_top, body_height)
+            }
+        }
+        AlignmentGeometryToken::ClipGhost => {
+            width = width.max(MINIMUM_PRIMITIVE_EXTENT);
+            (CpuPrimitiveShape::ClipGhostCell, row_top, body_height)
+        }
         AlignmentGeometryToken::DirectionalTerminalLeft => {
             width = width.max(MINIMUM_PRIMITIVE_EXTENT);
             (
@@ -824,6 +954,7 @@ fn project_primitive(
         width,
         height,
         shape,
+        geometry: primitive.geometry,
         handle: primitive.handle,
         component: primitive.component,
         style: primitive.style,
@@ -847,10 +978,27 @@ fn merge_label_fragments(existing: &mut CpuProjectedPrimitive, fragment: &CpuPro
     existing.draw_order = existing.draw_order.min(fragment.draw_order);
 }
 
+/// CIGAR event lengths (insertions, deletions, skips, clips) are drawn only where the text has
+/// room, so coarse views are not covered in numbers:
+///
+/// * a span event (deletion, reference skip) shows its length only when the text fits inside
+///   the event's on-screen extent;
+/// * a point event (insertion, clip) has no on-screen extent, so its length shows only from
+///   this many points per base, and only when the text fits in the width its `length` unseen
+///   bases would occupy at the current zoom (`length x points per base`).
+pub const EVENT_LABEL_MINIMUM_POINTS_PER_BASE: f64 = 2.0;
+
+/// The event length a point-event label states: its leading decimal digits (a hard clip's
+/// length carries an `H` suffix). The page builder writes these texts, so they always parse.
+fn point_event_label_length(text: &str) -> f64 {
+    let digits = text.trim_end_matches(|character: char| !character.is_ascii_digit());
+    digits.parse::<u32>().map_or(1.0, f64::from).max(1.0)
+}
+
 fn reconcile_labels(
     primitives: &mut Vec<CpuProjectedPrimitive>,
     labels: impl Iterator<Item = CpuProjectedPrimitive>,
-    clip: CpuClipRect,
+    camera: AlignmentCamera,
 ) {
     const MIN_TEXT_HEIGHT: f64 = 5.0;
     const MINIMUM_BASE_GLYPH_WIDTH: f64 = 7.0;
@@ -858,12 +1006,17 @@ fn reconcile_labels(
     const COLLISION_GAP: f64 = 2.0;
     const GLYPH_ASPECT_RATIO: f64 = 0.56;
 
+    let clip = camera.clip;
+    let points_per_base = 1.0 / camera.bases_per_pixel();
     let clip_right = clip.x + clip.width;
     let mut base_labels = Vec::new();
     let mut candidates = labels
         .filter_map(|mut label| {
             let text = label.text.as_deref()?;
-            if matches!(label.component, AlignmentComponent::Base { .. }) {
+            if matches!(
+                label.component,
+                AlignmentComponent::Base { .. } | AlignmentComponent::ClipGhostBase { .. }
+            ) {
                 // Match the accepted reference/read presentation boundary: seven horizontal
                 // points make one nucleotide distinguishable, while the normal five-point read
                 // body is already tall enough for its compact glyph. Requiring an eight-point
@@ -882,18 +1035,45 @@ fn reconcile_labels(
             if text_width > clip.width {
                 return None;
             }
-            let must_fit_anchor = matches!(
-                label.component,
+            let fits = match label.component {
+                // Read labels and span-event lengths must fit inside their on-screen extent.
                 AlignmentComponent::Label {
-                    kind: AlignmentLabelKind::ReadName | AlignmentLabelKind::AuxiliaryTag(_),
+                    kind:
+                        AlignmentLabelKind::ReadName
+                        | AlignmentLabelKind::AuxiliaryTag(_)
+                        | AlignmentLabelKind::DeletionLength
+                        | AlignmentLabelKind::SkipLength,
                     ..
+                } => text_width <= label.width,
+                AlignmentComponent::Label {
+                    kind: AlignmentLabelKind::InsertionLength | AlignmentLabelKind::ClipLength,
+                    ..
+                } => {
+                    points_per_base >= EVENT_LABEL_MINIMUM_POINTS_PER_BASE
+                        && text_width <= point_event_label_length(text) * points_per_base
                 }
-            );
-            if must_fit_anchor && text_width > label.width {
+                _ => true,
+            };
+            if !fits {
                 return None;
             }
-            let anchor = label.x + label.width * 0.5;
-            label.x = (anchor - text_width * 0.5).clamp(clip.x, clip_right - text_width);
+            if let AlignmentGeometryToken::ClipEdge(edge) = label.geometry {
+                // A clip length sits outside the read, just beyond its anchor (the clipped
+                // boundary and any ghost bases drawn past it), never over the read body: when
+                // that place is off the pane the label is dropped rather than moved inwards.
+                let left = if edge.at_end {
+                    label.x + label.width
+                } else {
+                    label.x - text_width
+                };
+                if left < clip.x || left + text_width > clip_right {
+                    return None;
+                }
+                label.x = left;
+            } else {
+                let anchor = label.x + label.width * 0.5;
+                label.x = (anchor - text_width * 0.5).clamp(clip.x, clip_right - text_width);
+            }
             label.width = text_width;
             Some(label)
         })
@@ -1019,13 +1199,24 @@ mod tests {
         AlignmentBodyColorToken, AlignmentSourceRevision, RevisionFingerprint, SourceFingerprint,
     };
 
-    const GEOMETRIES: [AlignmentGeometryToken; 6] = [
+    const GEOMETRIES: [AlignmentGeometryToken; 9] = [
         AlignmentGeometryToken::Rectangle,
         AlignmentGeometryToken::EventLine,
         AlignmentGeometryToken::PointMarker,
         AlignmentGeometryToken::PointMarkerAtEnd,
         AlignmentGeometryToken::DirectionalTerminalLeft,
         AlignmentGeometryToken::DirectionalTerminalRight,
+        AlignmentGeometryToken::ClipEdge(ClipEdgeToken {
+            at_end: false,
+            hard: false,
+            behind_arrow: true,
+        }),
+        AlignmentGeometryToken::ClipEdge(ClipEdgeToken {
+            at_end: true,
+            hard: true,
+            behind_arrow: false,
+        }),
+        AlignmentGeometryToken::ClipGhost,
     ];
 
     fn primitive(

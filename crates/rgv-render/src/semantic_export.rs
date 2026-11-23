@@ -242,7 +242,16 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                         .unwrap_or(&default_interaction),
                 )
                 .map_err(export_error)?;
-                output.reserve(ledger, frame.primitives.len())?;
+                // A soft clip's sawtooth is exported as horizontal slices of its zigzag.
+                let sawtooth_slices = frame
+                    .primitives
+                    .iter()
+                    .map(sawtooth_slice_count)
+                    .fold(0_usize, usize::saturating_add);
+                output.reserve(
+                    ledger,
+                    frame.primitives.len().saturating_add(sawtooth_slices),
+                )?;
                 for primitive in frame
                     .primitives
                     .iter()
@@ -252,7 +261,19 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
                         primitive.component,
                         primitive.style,
                     ));
-                    let [r, g, b, a] = palette.interaction_color(color, primitive.interaction);
+                    let mut color = palette.interaction_color(color, primitive.interaction);
+                    if primitive.shape == CpuPrimitiveShape::ClipGhostCell {
+                        color = palette.clip_ghost_color(color);
+                    }
+                    let [r, g, b, a] = color;
+                    if sawtooth_slice_count(primitive) > 0 {
+                        push_sawtooth_slices(
+                            &mut output.display.rectangles,
+                            primitive,
+                            Rgba::new(r, g, b, a),
+                        );
+                        continue;
+                    }
                     output.display.rectangles.push(RectPrimitive {
                         x: primitive.x as f32,
                         y: primitive.y as f32,
@@ -275,6 +296,73 @@ pub fn project_semantic_alignment_export<S: std::hash::BuildHasher>(
         }
     }
     Ok(output)
+}
+
+/// Height, in points, of the slices that trace a soft clip's sawtooth cut edge.
+const SAWTOOTH_SLICE_HEIGHT: f64 = 0.5;
+/// The painted columns of one sawtooth scanline form one run, found on a grid this fine.
+const SAWTOOTH_SCAN_STEPS: usize = 64;
+
+/// Number of display rectangles [`push_sawtooth_slices`] emits for `primitive`; zero unless it
+/// is a soft clip's cut edge.
+fn sawtooth_slice_count(primitive: &rgv_alignment_scene::CpuProjectedPrimitive) -> usize {
+    match primitive.geometry {
+        rgv_alignment_scene::AlignmentGeometryToken::ClipEdge(edge)
+            if !edge.hard && primitive.shape == CpuPrimitiveShape::ClipEdge =>
+        {
+            (primitive.height / SAWTOOTH_SLICE_HEIGHT).ceil().max(1.0) as usize
+        }
+        _ => 0,
+    }
+}
+
+/// Exports a soft clip's zigzag cut edge as thin horizontal slices, each spanning the columns
+/// `rgv_alignment_scene::clip_edge_covers` paints at the slice's mid-height (the GPU's
+/// `fragment_main` rule), clipped to the edge's own extent. The display list has no shape for a
+/// zigzag, and `rgv-layout` is outside this change.
+fn push_sawtooth_slices(
+    rectangles: &mut Vec<RectPrimitive>,
+    primitive: &rgv_alignment_scene::CpuProjectedPrimitive,
+    color: Rgba,
+) {
+    let rgv_alignment_scene::AlignmentGeometryToken::ClipEdge(edge) = primitive.geometry else {
+        return;
+    };
+    let mut top = primitive.y;
+    let bottom = primitive.y + primitive.height;
+    while top < bottom {
+        let slice_bottom = (top + SAWTOOTH_SLICE_HEIGHT).min(bottom);
+        let local_y = (top + slice_bottom) * 0.5 - primitive.y;
+        let mut run: Option<(f64, f64)> = None;
+        for step in 0..SAWTOOTH_SCAN_STEPS {
+            let local_x = (step as f64 + 0.5) / SAWTOOTH_SCAN_STEPS as f64 * primitive.width;
+            if rgv_alignment_scene::clip_edge_covers(
+                local_x,
+                local_y,
+                primitive.width,
+                primitive.height,
+                edge,
+            ) {
+                let cell = primitive.width / SAWTOOTH_SCAN_STEPS as f64;
+                let (left, right) = (local_x - cell * 0.5, local_x + cell * 0.5);
+                run = Some(run.map_or((left, right), |(start, end)| {
+                    (start.min(left), end.max(right))
+                }));
+            }
+        }
+        if let Some((left, right)) = run {
+            rectangles.push(RectPrimitive {
+                x: (primitive.x + left) as f32,
+                y: top as f32,
+                width: (right - left) as f32,
+                height: (slice_bottom - top) as f32,
+                color,
+                object_id: 0,
+                shape: RectShape::Rectangle,
+            });
+        }
+        top = slice_bottom;
+    }
 }
 
 /// Width, in points, of the slices that stand in for a junction arc leaving its lane.
@@ -493,6 +581,87 @@ mod tests {
         // A downward arc starts on its top edge (the baseline) and descends.
         assert!((slices[0].y - 10.0).abs() < 1.0e-3);
         assert!(last.y > slices[0].y);
+    }
+
+    /// A soft clip's zigzag is exported as one slice per half point of height, each covering
+    /// exactly the columns the shader keeps at that height, inside the edge's own extent; a
+    /// hard clip's bar is not sliced.
+    #[test]
+    fn soft_clip_sawtooth_exports_as_slices_that_trace_the_shader_zigzag() {
+        use rgv_alignment_scene::{
+            AlignmentBodyColorToken, AlignmentComponent, AlignmentGeometryToken, AlignmentHandle,
+            AlignmentInteractionToken, AlignmentSourceRevision, AlignmentStyleToken, ClipEdgeToken,
+            CpuProjectedPrimitive, RevisionFingerprint, SourceFingerprint,
+        };
+        let soft = ClipEdgeToken {
+            at_end: true,
+            hard: false,
+            behind_arrow: true,
+        };
+        let mut edge = CpuProjectedPrimitive {
+            x: 40.0,
+            y: 10.0,
+            width: 6.0,
+            height: 11.0,
+            shape: CpuPrimitiveShape::ClipEdge,
+            geometry: AlignmentGeometryToken::ClipEdge(soft),
+            handle: AlignmentHandle::new(
+                AlignmentSourceRevision::new(
+                    SourceFingerprint::new(RevisionFingerprint::new(1, 2)),
+                    RevisionFingerprint::new(3, 4),
+                ),
+                rgv_model::AlignmentSourcePosition::bam_virtual_offset(5),
+            ),
+            component: AlignmentComponent::SoftClip {
+                cigar_index: 1,
+                read_start: 6,
+                length: 4,
+            },
+            style: AlignmentStyleToken {
+                flags: 0,
+                mapping_quality: None,
+                operation: None,
+                body: AlignmentBodyColorToken::Neutral,
+            },
+            interaction: AlignmentInteractionToken::default(),
+            draw_order: 0,
+            text: None,
+            row: 0,
+        };
+        assert_eq!(sawtooth_slice_count(&edge), 22);
+        let mut slices = Vec::new();
+        push_sawtooth_slices(&mut slices, &edge, Rgba::new(0.0, 0.0, 0.0, 1.0));
+        assert_eq!(slices.len(), 22);
+        let mut centres = Vec::new();
+        for slice in &slices {
+            let (left, right) = (f64::from(slice.x), f64::from(slice.x + slice.width));
+            assert!(left >= 40.0 - 1.0e-4 && right <= 46.0 + 1.0e-4, "{slice:?}");
+            assert!(right - left < 6.0, "{slice:?} fills the edge");
+            let local_y = f64::from(slice.y) + f64::from(slice.height) * 0.5 - 10.0;
+            // The slice's middle column is painted by the shader rule, its outside is not.
+            let middle = (left + right) * 0.5 - 40.0;
+            assert!(rgv_alignment_scene::clip_edge_covers(
+                middle, local_y, 6.0, 11.0, soft
+            ));
+            if left > 40.2 {
+                assert!(!rgv_alignment_scene::clip_edge_covers(
+                    left - 40.0 - 0.1,
+                    local_y,
+                    6.0,
+                    11.0,
+                    soft
+                ));
+            }
+            centres.push(middle);
+        }
+        let (low, high) = centres
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), centre| {
+                (low.min(*centre), high.max(*centre))
+            });
+        assert!(high - low > 3.0, "{centres:?}");
+        edge.geometry = AlignmentGeometryToken::ClipEdge(ClipEdgeToken { hard: true, ..soft });
+        assert_eq!(sawtooth_slice_count(&edge), 0);
     }
 
     #[test]

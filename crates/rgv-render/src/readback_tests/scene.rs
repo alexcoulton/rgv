@@ -114,6 +114,32 @@ fn unclipped_quad(
         let boundary = if at_end { right } else { left };
         left = boundary - width * 0.5;
         right = left + width;
+    } else if (6..=13).contains(&instance.shape()) {
+        // Written out independently of `clip_edge_extent`. Shape bits: 1 end edge, 2 hard clip,
+        // 4 behind the arrowhead. A soft clip's edge is half a base wide within [2, 6] points, a
+        // hard clip's two; behind an arrowhead it moves inward by the one-base terminal's head
+        // length, min(0.55 x height, 0.35 x max(base, 1)).
+        let bits = instance.shape() - 6;
+        let base = right - left;
+        let width = if bits & 2 == 0 {
+            (base * 0.5).clamp(2.0, 6.0)
+        } else {
+            2.0
+        };
+        let inset = if bits & 4 == 0 {
+            0.0
+        } else {
+            // Measured from the direction terminal's tip: that cell keeps its one-point minimum.
+            right = left + base.max(1.0);
+            (height * 0.55).min(base.max(1.0) * 0.35)
+        };
+        if bits & 1 == 0 {
+            left += inset;
+            right = left + width;
+        } else {
+            right -= inset;
+            left = right - width;
+        }
     } else {
         right = right.max(left + 1.0);
     }
@@ -125,8 +151,24 @@ fn unclipped_quad(
     }
 }
 
-/// Mirror of `alignment_scene.wgsl`'s fragment stage: only direction terminals are shaped.
+/// Mirror of `alignment_scene.wgsl`'s fragment stage: direction terminals are cut to an
+/// arrowhead and a soft clip's edge to a zigzag stroke; everything else is solid.
 fn fragment_is_kept(shape: u32, local: [f64; 2], size: [f64; 2]) -> bool {
+    if (6..=13).contains(&shape) && (shape - 6) & 2 == 0 {
+        // Written out independently of `clip_edge_covers`: a 1.5-point stroke zigzagging
+        // between the boundary side and the inner side, round(height / 4) teeth (at least one).
+        let teeth = (size[1] / 4.0 + 0.5).floor().max(1.0);
+        let period = size[1] / teeth;
+        let phase = (local[1] / period).rem_euclid(1.0);
+        let centre = 0.75 + (size[0] - 1.5).max(0.0) * (1.0 - (2.0 * phase - 1.0).abs());
+        let slope = 2.0 * (size[0] - 1.5).max(0.0) / period;
+        let from_boundary = if (shape - 6) & 1 == 0 {
+            local[0]
+        } else {
+            size[0] - local[0]
+        };
+        return (from_boundary - centre).abs() <= 0.75 * (1.0 + slope * slope).sqrt();
+    }
     if shape != AlignmentGpuShape::DirectionTerminalRight as u32
         && shape != AlignmentGpuShape::DirectionTerminalLeft as u32
     {
@@ -200,6 +242,21 @@ fn oracle_with_palette(
             } else {
                 let primitive = page.primitives()[semantic_index as usize];
                 legacy_semantic_alignment_color(primitive.component, primitive.style)
+            };
+            let colour = if instance.shape() == AlignmentGpuShape::ClipGhostCell as u32 {
+                // Ghost cells: the read colour moved half way to the ghost slot, at its alpha.
+                let tint = palette
+                    .copied()
+                    .unwrap_or_else(AlignmentPalette::light)
+                    .color(crate::palette::PaletteToken::CLIP_GHOST);
+                [
+                    colour[0] + (tint[0] - colour[0]) * 0.5,
+                    colour[1] + (tint[1] - colour[1]) * 0.5,
+                    colour[2] + (tint[2] - colour[2]) * 0.5,
+                    tint[3],
+                ]
+            } else {
+                colour
             }
             .map(f64::from);
             let shape = instance.shape();
@@ -744,6 +801,305 @@ fn insertion_bar_is_painted_on_the_base_boundary_and_not_over_its_base_cell() {
     }
     eprintln!(
         "insertion bar on {}: columns {first}..{end} around boundary {boundary}",
+        gpu.description
+    );
+}
+
+/// 8-bit colour of `token` under the Light palette.
+fn light_rgb(token: crate::palette::PaletteToken) -> [u8; 3] {
+    let [r, g, b, _] = AlignmentPalette::light()
+        .color(token)
+        .map(|channel| (f64::from(channel) * 255.0).round() as u8);
+    [r, g, b]
+}
+
+/// 8-bit body colour of the read `handle` as the CPU projector resolves it under Light.
+fn body_rgb(
+    scene: &Arc<AlignmentPresentationScene>,
+    camera: AlignmentCamera,
+    handle: rgv_alignment_scene::AlignmentHandle,
+) -> [u8; 3] {
+    let frame = rgv_alignment_scene::CpuAlignmentProjector::project(scene, 1, camera).unwrap();
+    let body = frame
+        .primitives
+        .iter()
+        .find(|primitive| {
+            primitive.handle == handle
+                && matches!(
+                    primitive.component,
+                    rgv_alignment_scene::AlignmentComponent::AlignedSegment { .. }
+                )
+        })
+        .expect("the read body is projected");
+    let [r, g, b, _] = AlignmentPalette::light()
+        .resolve(crate::alignment_scene::semantic_alignment_color(
+            body.component,
+            body.style,
+        ))
+        .map(|channel| (f64::from(channel) * 255.0).round() as u8);
+    [r, g, b]
+}
+
+fn rgb_at(image: &image::RgbaImage, column: u32, row: u32) -> [u8; 3] {
+    let [r, g, b, _] = image.get_pixel(column, row).0;
+    [r, g, b]
+}
+
+fn close(left: [u8; 3], right: [u8; 3]) -> bool {
+    (0..3).all(|channel| left[channel].abs_diff(right[channel]) <= super::CHANNEL_TOLERANCE)
+}
+
+/// A forward read's trailing soft clip on the real GPU at 64 points per base: the dark zigzag
+/// sits just inside the arrowhead's base, the arrow tip is still cut to a point on the read's
+/// boundary, and the zigzag's columns move from scanline to scanline.
+#[test]
+fn soft_clip_sawtooth_sits_just_inside_the_arrowhead_on_the_gpu() {
+    use crate::palette::PaletteToken;
+    use rgv_alignment_scene::AlignmentComponent;
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20);
+    let scene = boundary_marker_scene(&ledger);
+    let origin = BOUNDARY_FIXTURE_ORIGIN;
+    // The `M6 S4` read at origin + 400 ends (with its arrowhead and its clip) at origin + 406,
+    // drawn at 16.4 + 3 x 64 = 208.4.
+    let camera = AlignmentCamera::new(
+        GenomicInterval::new(ContigId::new(0), origin + 403, origin + 407).unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        CLIP,
+    )
+    .unwrap();
+    let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    let image = render_scene(&gpu, &mut renderer, &scene, camera, &ledger, 1);
+    let (oracle, expected) = oracle_for(&scene, camera);
+    assert!(
+        expected
+            .iter()
+            .any(|instance| instance.shape == AlignmentGpuShape::SoftClipEdgeEndBehindArrow as u32)
+    );
+    oracle.assert_matches(&image, "soft clip sawtooth behind the arrowhead");
+
+    let boundary = CLIP.x + 3.0 * 64.0;
+    // The arrowhead is min(0.55 x 11, 0.35 x 64) = 6.05 points long; the six-point edge ends
+    // at its base.
+    let (edge_left, edge_right) = (boundary - 6.05 - 6.0, boundary - 6.05);
+    let edge = light_rgb(PaletteToken::CLIP_EDGE);
+    let white = [255, 255, 255];
+    let frame = rgv_alignment_scene::CpuAlignmentProjector::project(&scene, 1, camera).unwrap();
+    let handle = frame
+        .primitives
+        .iter()
+        .find(|primitive| matches!(primitive.component, AlignmentComponent::SoftClip { .. }))
+        .unwrap()
+        .handle;
+    let body = body_rgb(&scene, camera, handle);
+    // Row 0: the read occupies y = 9.8 .. 20.8.
+    let mut mean_columns = Vec::new();
+    for row in 10..=20_u32 {
+        let painted = (0..TARGET[0])
+            .filter(|column| close(rgb_at(&image, *column, row), edge))
+            .collect::<Vec<_>>();
+        assert!(!painted.is_empty(), "scanline {row} has no cut edge");
+        for column in &painted {
+            let centre = f64::from(*column) + 0.5;
+            assert!(
+                centre > edge_left - 0.5 && centre < edge_right + 0.5,
+                "scanline {row}: edge pixel at {column} outside {edge_left}..{edge_right}"
+            );
+        }
+        // The stroke never fills the edge's whole width: it is a zigzag, not a bar.
+        assert!(painted.len() < 6, "scanline {row}: {painted:?}");
+        mean_columns
+            .push(painted.iter().map(|c| f64::from(*c)).sum::<f64>() / painted.len() as f64);
+    }
+    let (low, high) = mean_columns
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), value| {
+            (low.min(*value), high.max(*value))
+        });
+    assert!(
+        high - low >= 2.5,
+        "the edge does not zigzag: {mean_columns:?}"
+    );
+    // The arrowhead is intact: one pixel inside the tip, the middle scanline is the read and
+    // the top scanline is cut away; the body before the edge is the read's colour.
+    let tip_column = (boundary - 1.0) as u32;
+    assert_eq!(rgb_at(&image, tip_column, 15), body);
+    assert_eq!(rgb_at(&image, tip_column, 10), white);
+    assert_eq!(rgb_at(&image, (edge_left - 20.0) as u32, 15), body);
+    eprintln!(
+        "soft clip sawtooth on {}: edge {edge_left:.2}..{edge_right:.2}, scanline means {mean_columns:?}",
+        gpu.description
+    );
+}
+
+/// A reverse read's leading hard clip on the real GPU: a solid two-point bar in the cut-edge
+/// colour on every scanline, just inside the arrowhead that points left from the boundary.
+#[test]
+fn hard_clip_bar_is_solid_and_sits_inside_the_arrowhead_on_the_gpu() {
+    use crate::palette::PaletteToken;
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20);
+    let scene = boundary_marker_scene(&ledger);
+    let origin = BOUNDARY_FIXTURE_ORIGIN;
+    // The reverse `H3 M10` read starts (arrowhead and clip) at origin + 1200, drawn at 80.4.
+    let camera = AlignmentCamera::new(
+        GenomicInterval::new(ContigId::new(0), origin + 1199, origin + 1203).unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        CLIP,
+    )
+    .unwrap();
+    let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    let image = render_scene(&gpu, &mut renderer, &scene, camera, &ledger, 1);
+    let (oracle, expected) = oracle_for(&scene, camera);
+    assert!(
+        expected.iter().any(
+            |instance| instance.shape == AlignmentGpuShape::HardClipEdgeStartBehindArrow as u32
+        )
+    );
+    oracle.assert_matches(&image, "hard clip bar behind the arrowhead");
+
+    let boundary = CLIP.x + 64.0;
+    let (bar_left, bar_right) = (boundary + 6.05, boundary + 6.05 + 2.0);
+    let edge = light_rgb(PaletteToken::CLIP_EDGE);
+    let painted_columns = |row: u32| {
+        (0..TARGET[0])
+            .filter(|column| close(rgb_at(&image, *column, row), edge))
+            .collect::<Vec<_>>()
+    };
+    let expected_columns = (super::first_column_at_or_after(bar_left) as u32
+        ..super::first_column_at_or_after(bar_right) as u32)
+        .collect::<Vec<_>>();
+    assert_eq!(expected_columns.len(), 2);
+    for row in 10..=20_u32 {
+        assert_eq!(painted_columns(row), expected_columns, "scanline {row}");
+    }
+    // Left of the bar is the arrowhead: the read colour on the middle scanline, cut away at
+    // the top, one pixel inside the tip.
+    let tip_column = (boundary + 1.0) as u32;
+    assert_ne!(rgb_at(&image, tip_column, 15), [255, 255, 255]);
+    assert_eq!(rgb_at(&image, tip_column, 10), [255, 255, 255]);
+    eprintln!(
+        "hard clip bar on {}: columns {expected_columns:?}",
+        gpu.description
+    );
+}
+
+/// Soft-clipped ghost bases on the real GPU at base detail: translucent cells beyond the cut
+/// edge where the row is empty, and covered by a neighbouring read that starts on one of them.
+#[test]
+fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
+    use crate::alignment_scene::tests::test_scene_detailed;
+    use rgv_alignment_scene::{AlignmentComponent, GeometryLod};
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(256 << 20, 32 << 20, 32 << 20);
+    // A: `M7 S3` over [10, 17), SEQ ACGTACG|TAC, ghosts at 17, 18, 19. B: [19, 29) in the
+    // same row, on top of A's third ghost.
+    let reads = [
+        TestRead {
+            start: 10,
+            reverse: false,
+            cigar: cigar(&[(CigarOpKind::Match, 7), (CigarOpKind::SoftClip, 3)]),
+        },
+        TestRead::forward(19),
+    ];
+    let scene = test_scene_detailed(
+        &ledger,
+        GenomicInterval::new(ContigId::new(0), 0, 100).unwrap(),
+        100,
+        NonZeroU64::new(8).unwrap(),
+        &reads,
+        NonZeroU32::new(4).unwrap(),
+        None,
+        GeometryLod::Base,
+    );
+    // 32 points per base over 14..22: base p starts at 16.4 + 32 (p - 14).
+    let camera = AlignmentCamera::new(
+        GenomicInterval::new(ContigId::new(0), 14, 22).unwrap(),
+        0.0,
+        14.0,
+        11.0,
+        CLIP,
+    )
+    .unwrap();
+    let mut ghost_rows = Vec::new();
+    for page in scene.visible_pages(camera.interval(), camera.visible_rows()) {
+        for primitive in page.primitives() {
+            if let AlignmentComponent::ClipGhostBase { obscured, .. } = primitive.component {
+                ghost_rows.push((
+                    page.interval().start() + primitive.start_offset,
+                    page.row_range().start + primitive.row_offset,
+                    obscured,
+                ));
+            }
+        }
+    }
+    ghost_rows.sort_unstable();
+    assert_eq!(ghost_rows, [(17, 0, false), (18, 0, false), (19, 0, true)]);
+
+    let mut renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    let image = render_scene(&gpu, &mut renderer, &scene, camera, &ledger, 1);
+    let (oracle, expected) = oracle_for(&scene, camera);
+    assert_eq!(
+        expected
+            .iter()
+            .filter(|instance| instance.shape == AlignmentGpuShape::ClipGhostCell as u32)
+            .count(),
+        3
+    );
+    oracle.assert_matches(&image, "soft clip ghost bases");
+
+    let frame = rgv_alignment_scene::CpuAlignmentProjector::project(&scene, 1, camera).unwrap();
+    let handle_at = |position: u64| {
+        frame
+            .primitives
+            .iter()
+            .find(|primitive| {
+                matches!(
+                    primitive.component,
+                    AlignmentComponent::AlignedSegment { .. }
+                ) && primitive.x <= CLIP.x + 32.0 * (position as f64 - 14.0) + 1.0
+                    && primitive.x + primitive.width
+                        >= CLIP.x + 32.0 * (position as f64 - 13.0) - 1.0
+            })
+            .unwrap()
+            .handle
+    };
+    let a = body_rgb(&scene, camera, handle_at(15));
+    let b = body_rgb(&scene, camera, handle_at(20));
+    // The ghost colour over the white target: the read colour moved half way to the ghost
+    // slot, at the ghost slot's alpha.
+    let tint = AlignmentPalette::light().color(crate::palette::PaletteToken::CLIP_GHOST);
+    let ghost = std::array::from_fn::<u8, 3, _>(|channel| {
+        let read = f64::from(a[channel]) / 255.0;
+        let mixed = read + (f64::from(tint[channel]) - read) * 0.5;
+        let alpha = f64::from(tint[3]);
+        ((mixed * alpha + (1.0 - alpha)) * 255.0).round() as u8
+    });
+    let cell_centre = |position: u64| (CLIP.x + 32.0 * (position as f64 - 14.0) + 16.0) as u32;
+    for position in [17, 18] {
+        let pixel = rgb_at(&image, cell_centre(position), 15);
+        assert!(
+            close(pixel, ghost),
+            "ghost {position}: {pixel:?} vs {ghost:?}"
+        );
+        assert_ne!(pixel, a);
+        assert_ne!(pixel, [255, 255, 255]);
+    }
+    // Position 19 holds A's third ghost, but B (whose first base matches the reference) is
+    // drawn over it in B's own colour.
+    assert_eq!(rgb_at(&image, cell_centre(19), 15), b);
+    eprintln!(
+        "ghost bases on {}: ghost {ghost:?}, covered cell {b:?}",
         gpu.description
     );
 }

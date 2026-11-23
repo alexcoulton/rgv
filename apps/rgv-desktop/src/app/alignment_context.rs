@@ -125,6 +125,7 @@ fn alignment_context_component_kind(component: AlignmentComponent) -> &'static s
         AlignmentComponent::SbxTailBase { .. } => "sbx_tail_base",
         AlignmentComponent::SpecialistUnavailable { .. } => "specialist_unavailable",
         AlignmentComponent::Base { .. } => "base",
+        AlignmentComponent::ClipGhostBase { .. } => "clip_ghost_base",
     }
 }
 

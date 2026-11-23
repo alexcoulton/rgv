@@ -167,7 +167,7 @@ impl PaletteToken {
     pub const CANONICAL_BASE: Self = Self(38);
     pub const BISULFITE_PROTECTED: Self = Self(39);
     pub const BISULFITE_CONVERTED: Self = Self(40);
-    /// Insertions, clips, padding and the specialist indel markers.
+    /// Insertions, padding and the specialist indel markers.
     pub const INSERTION: Self = Self(41);
     pub const DELETION: Self = Self(42);
     /// Reference skips and pair connectors.
@@ -196,8 +196,15 @@ impl PaletteToken {
     pub const COVERAGE_SELECTED_POSITION: Self = Self(63);
     pub const MODIFICATION_SELECTED_POSITION: Self = Self(64);
     pub const SASHIMI_SELECTED_POSITION: Self = Self(65);
+    /// A clipped read end's cut edge (soft-clip sawtooth, hard-clip bar), drawn over the read
+    /// body: dark and neutral, distinct from the insertion colour.
+    pub const CLIP_EDGE: Self = Self(66);
+    /// Soft-clipped ghost bases: the read's own colour is mixed towards this slot's colour by
+    /// [`CLIP_GHOST_TINT`] and drawn with this slot's alpha. See
+    /// [`AlignmentPalette::clip_ghost_color`].
+    pub const CLIP_GHOST: Self = Self(67);
     /// One past the last assigned slot.
-    pub const END: Self = Self(66);
+    pub const END: Self = Self(68);
 
     #[must_use]
     pub const fn index(self) -> u8 {
@@ -247,6 +254,10 @@ impl PaletteToken {
 /// Flag bit of the eight-bit palette index carried by an instance: the colour is a ramp between
 /// the indexed slot and the next one, and the parameter word holds the f32 bits of the position.
 pub const PALETTE_INDEX_RAMP_FLAG: u8 = 0x80;
+
+/// How far a ghost base's colour moves from its read's colour towards [`PaletteToken::CLIP_GHOST`].
+/// Mirrored by `CLIP_GHOST_TINT` in `alignment_scene.wgsl`.
+pub const CLIP_GHOST_TINT: f32 = 0.5;
 const PALETTE_INDEX_SLOT_MASK: u8 = 0x7F;
 
 /// The colour of one instance, before a palette is applied.
@@ -362,6 +373,20 @@ impl AlignmentPalette {
         color
     }
 
+    /// The faint, translucent tint a soft-clipped ghost base is drawn in, from the colour its
+    /// read is drawn in (after any interaction emphasis), exactly as `fragment_main` in
+    /// `alignment_scene.wgsl` derives it for shape 14.
+    #[must_use]
+    pub fn clip_ghost_color(&self, read: [f32; 4]) -> [f32; 4] {
+        let tint = self.color(PaletteToken::CLIP_GHOST);
+        [
+            read[0] + (tint[0] - read[0]) * CLIP_GHOST_TINT,
+            read[1] + (tint[1] - read[1]) * CLIP_GHOST_TINT,
+            read[2] + (tint[2] - read[2]) * CLIP_GHOST_TINT,
+            tint[3],
+        ]
+    }
+
     fn set(&mut self, token: PaletteToken, color: [f32; 4]) {
         self.colors[usize::from(token.0)] = color;
     }
@@ -426,6 +451,8 @@ impl AlignmentPalette {
         palette.set(T::COVERAGE_SELECTED_POSITION, [1.0, 0.78, 0.18, 0.92]);
         palette.set(T::MODIFICATION_SELECTED_POSITION, [0.08, 0.08, 0.08, 0.34]);
         palette.set(T::SASHIMI_SELECTED_POSITION, [0.16, 0.42, 0.92, 0.40]);
+        palette.set(T::CLIP_EDGE, [0.12, 0.12, 0.14, 1.0]);
+        palette.set(T::CLIP_GHOST, [1.0, 1.0, 1.0, 0.45]);
         palette
     }
 
@@ -497,6 +524,11 @@ impl AlignmentPalette {
         palette.set(T::COVERAGE_CENTER_LINE, [0.50, 0.53, 0.60, 0.72]);
         palette.set(T::MODIFICATION_SELECTED_POSITION, [0.95, 0.95, 0.95, 0.34]);
         palette.set(T::SASHIMI_SELECTED_POSITION, [0.40, 0.62, 1.00, 0.40]);
+        // Drawn on the read body, whose dark-theme colours are mid-tones, so near-black still
+        // separates clearly from every body colour.
+        palette.set(T::CLIP_EDGE, [0.04, 0.04, 0.05, 1.0]);
+        // Ghosts fade towards the dark canvas rather than towards white.
+        palette.set(T::CLIP_GHOST, [0.10, 0.11, 0.13, 0.55]);
         palette
     }
 
@@ -944,6 +976,7 @@ mod tests {
             ("JUNCTION_NOVEL", T::JUNCTION_NOVEL),
             ("SUMMARY_NEUTRAL", T::SUMMARY_NEUTRAL),
             ("JUNCTION_INTERACTION", T::JUNCTION_INTERACTION),
+            ("CLIP_GHOST", T::CLIP_GHOST),
         ];
         let shader = shader_tokens();
         assert_eq!(shader.len(), expected.len(), "{shader:?}");

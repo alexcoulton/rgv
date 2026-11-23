@@ -16,6 +16,10 @@ struct Camera {
 @group(0) @binding(0)
 var<uniform> camera: Camera;
 
+// How far a soft-clipped ghost base moves from its read's colour towards the ghost slot's
+// colour; mirrored by `CLIP_GHOST_TINT` in `palette.rs`.
+const CLIP_GHOST_TINT: f32 = 0.5;
+
 // One sixteen-byte instance (`AlignmentGpuInstance`):
 //   span.x     whole bases from the page start to the primitive's start
 //   span.y     whole bases covered
@@ -109,6 +113,33 @@ fn project_instance(
         let boundary = select(left, right, shape == 5u);
         left = boundary - marker_width * 0.5;
         right = left + marker_width;
+    } else if shape >= 6u && shape <= 13u {
+        // Clip cut edges (6 + at_end + 2 hard + 4 behind_arrow), just inside the start (or end)
+        // edge of the one-base span: a soft clip's sawtooth is half a base wide within [2, 6]
+        // points, a hard clip's bar two. Behind an arrowhead on the same boundary the edge moves
+        // inward by the arrowhead's length (the one-base terminal's head, see `fragment_main`).
+        // Mirrored by `clip_edge_extent` in `rgv-alignment-scene`.
+        let bits = shape - 6u;
+        let cell = right - left;
+        var edge_width = 2.0;
+        if (bits & 2u) == 0u {
+            edge_width = clamp(cell * 0.5, 2.0, 6.0);
+        }
+        var inset = 0.0;
+        if (bits & 4u) != 0u {
+            // Behind the arrowhead: measured from the terminal's tip, the cell widened to its
+            // one-point minimum (rightwards, like every shape).
+            let terminal = max(cell, 1.0);
+            inset = min(height * 0.55, terminal * 0.35);
+            right = left + terminal;
+        }
+        if (bits & 1u) != 0u {
+            right = right - inset;
+            left = right - edge_width;
+        } else {
+            left = left + inset;
+            right = left + edge_width;
+        }
     } else {
         right = max(right, left + 1.0);
     }
@@ -120,6 +151,12 @@ fn project_instance(
     var output: VertexOutput;
     output.position = points_to_clip(point, camera.screen_size);
     output.color = color;
+    if shape == 14u {
+        // A soft-clipped ghost base: its read's colour (after any interaction emphasis), faded
+        // towards the ghost slot and drawn with its alpha; see `clip_ghost_color`.
+        let tint = palette_slot(TOKEN_CLIP_GHOST);
+        output.color = vec4<f32>(mix(color.rgb, tint.rgb, CLIP_GHOST_TINT), tint.a);
+    }
     output.local_point = corner * vec2<f32>(right - left, height);
     output.size = vec2<f32>(right - left, height);
     output.shape = shape;
@@ -161,6 +198,29 @@ fn fragment_main(input: VertexOutput) -> @location(0) vec4<f32> {
             if abs(input.local_point.y - half_height) > allowed {
                 discard;
             }
+        }
+    }
+    if input.shape >= 6u && input.shape <= 13u && ((input.shape - 6u) & 2u) == 0u {
+        // A soft clip's cut edge: a zigzag stroke 1.5 points thick whose vertices alternate
+        // between the read boundary and the inner side, with teeth about four points tall.
+        // Mirrored by `clip_edge_covers` in `rgv-alignment-scene`.
+        let width = input.size.x;
+        let height = input.size.y;
+        let teeth = max(floor(height / 4.0 + 0.5), 1.0);
+        let period = height / teeth;
+        let cycles = input.local_point.y / period;
+        let phase = cycles - floor(cycles);
+        let triangle = 1.0 - abs(2.0 * phase - 1.0);
+        let amplitude = max(width - 1.5, 0.0);
+        let centre = 0.75 + amplitude * triangle;
+        let slope = 2.0 * amplitude / period;
+        let half_stroke = 0.75 * sqrt(1.0 + slope * slope);
+        var from_boundary = input.local_point.x;
+        if ((input.shape - 6u) & 1u) != 0u {
+            from_boundary = width - input.local_point.x;
+        }
+        if abs(from_boundary - centre) > half_stroke {
+            discard;
         }
     }
     return input.color;

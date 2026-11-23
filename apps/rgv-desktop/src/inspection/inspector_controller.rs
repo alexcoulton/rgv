@@ -81,7 +81,9 @@ fn alignment_component_event(
         | AlignmentComponent::HardClip { cigar_index, .. }
         | AlignmentComponent::Padding { cigar_index, .. }
         | AlignmentComponent::UltimaIndel { cigar_index, .. }
-        | AlignmentComponent::SbxInsertion { cigar_index, .. } => cigar_event(cigar_index),
+        | AlignmentComponent::SbxInsertion { cigar_index, .. }
+        // A ghost base is one base of its soft clip; the clip is the event inspected.
+        | AlignmentComponent::ClipGhostBase { cigar_index, .. } => cigar_event(cigar_index),
         AlignmentComponent::Base {
             cigar_index,
             read_index,
@@ -1252,6 +1254,19 @@ mod scene_inspection_tests {
                 &record,
             ),
             Some((1, None))
+        );
+        // A soft-clip ghost base inspects its clip operation as a whole.
+        assert_eq!(
+            alignment_component_event(
+                AlignmentComponent::ClipGhostBase {
+                    cigar_index: 0,
+                    read_index: 1,
+                    base: b'A',
+                    obscured: false,
+                },
+                &record,
+            ),
+            Some((0, None))
         );
     }
 }

@@ -28,6 +28,7 @@ const TOKEN_JUNCTION_ANNOTATED: u32 = 58u;
 const TOKEN_JUNCTION_NOVEL: u32 = 59u;
 const TOKEN_SUMMARY_NEUTRAL: u32 = 60u;
 const TOKEN_JUNCTION_INTERACTION: u32 = 61u;
+const TOKEN_CLIP_GHOST: u32 = 67u;
 
 fn palette_slot(token: u32) -> vec4<f32> {
     return palette.colors[token & 127u];

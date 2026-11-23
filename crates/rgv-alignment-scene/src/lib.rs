@@ -60,7 +60,8 @@ pub use coverage::{
 pub use cpu_projector::{
     AlignmentCamera, AlignmentHit, CpuAlignmentFrame, CpuAlignmentLabelFrame,
     CpuAlignmentProjector, CpuClipRect, CpuFrameCoverage, CpuInteractionError, CpuPrimitiveShape,
-    CpuProjectedPrimitive, CpuProjectionError, point_marker_extent,
+    CpuProjectedPrimitive, CpuProjectionError, EVENT_LABEL_MINIMUM_POINTS_PER_BASE,
+    clip_edge_covers, clip_edge_extent, point_marker_extent,
 };
 pub use cpu_summary_projector::{
     CoverageAlleleInterpretation, CpuAlleleProjectionOptions, CpuAlleleToken,
@@ -160,8 +161,8 @@ pub use semantic_page::{
     AlignmentBodyColorToken, AlignmentComponent, AlignmentGeometryToken, AlignmentLabelKind,
     AlignmentOperation, AlignmentPageKey, AlignmentSemanticLabel, AlignmentSemanticPage,
     AlignmentSemanticPrimitive, AlignmentStyleToken, BisulfiteObservationToken, CanonicalRowBlock,
-    ModificationState, SbxInsertionToken, SemanticPageError, SemanticPageHit, SpecialistMode,
-    SpecialistUnavailableReason, UltimaIndelToken, UltimaQualitySourceToken,
+    ClipEdgeToken, ModificationState, SbxInsertionToken, SemanticPageError, SemanticPageHit,
+    SpecialistMode, SpecialistUnavailableReason, UltimaIndelToken, UltimaQualitySourceToken,
     UltimaUnavailableToken,
 };
 pub use store::{
