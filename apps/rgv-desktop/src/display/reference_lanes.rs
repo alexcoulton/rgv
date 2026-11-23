@@ -87,23 +87,28 @@ impl Viewer {
                 self.session.settings.read_browsing_buffer_percent,
                 Some(MAX_REFERENCE_QUERY_BASES),
             );
+            let sequence_drawn = reference_sequence_is_drawn(
+                self.session.panels.panel(panel_id).viewport.bases_per_pixel(),
+            );
             if reference_expanded {
                 visible_context_lanes.insert(
                     ContextLaneKey::Reference,
                     (TrackFrameKey::Reference, Some(reference_context_interval)),
                 );
-                if self
-                    .session
-                    .panels
-                    .panel(panel_id)
-                    .pending_queries
-                    .reference
-                    || self
+                // Zoomed out, no reference is fetched for display, so nothing is pending.
+                if sequence_drawn
+                    && (self
                         .session
                         .panels
                         .panel(panel_id)
-                        .reference_settled_generation
-                        != Some(generation)
+                        .pending_queries
+                        .reference
+                        || self
+                            .session
+                            .panels
+                            .panel(panel_id)
+                            .reference_settled_generation
+                            != Some(generation))
                 {
                     pending_context_lanes.insert(ContextLaneKey::Reference);
                 }
@@ -117,7 +122,19 @@ impl Viewer {
                     unavailable_context_lanes.insert(ContextLaneKey::Reference);
                 }
             }
-            if reference_expanded
+            if reference_expanded && !sequence_drawn {
+                // Publish an empty lane rather than nothing: a lane with no draft keeps its
+                // previous lease on screen while it overlaps the view, so a sequence drawn at a
+                // closer zoom would otherwise stay up, rescaled, as a partial colour band.
+                context_lane_drafts.push(ContextLaneDraft {
+                    key: ContextLaneKey::Reference,
+                    generation,
+                    source_viewport: target_viewport,
+                    frame_key: TrackFrameKey::Reference,
+                    frame_top,
+                    display: DisplayList::default(),
+                });
+            } else if reference_expanded
                 && let Some(reference) = self
                     .session
                     .panels
@@ -129,11 +146,6 @@ impl Viewer {
                             == self.session.reference_revision
                     })
                     .filter(|slice| retained_data_overlaps(slice.interval, viewport_interval))
-                    .filter(|_| {
-                        reference_sequence_is_drawn(
-                            self.session.panels.panel(panel_id).viewport.bases_per_pixel(),
-                        )
-                    })
             {
                 let source_viewport =
                     prepared_context_viewport(reference.interval, target_viewport);

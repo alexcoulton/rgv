@@ -1041,6 +1041,71 @@ mod tests {
         }
     }
 
+    /// A lane with no draft keeps its committed lease on screen while it overlaps the view; a
+    /// lane that is deliberately empty (the reference lane zoomed out past base marks) must
+    /// therefore publish an empty draft, and that draft must replace the old picture.
+    #[test]
+    fn an_empty_draft_replaces_a_lanes_previous_picture_instead_of_retaining_it() {
+        let key = ContextLaneKey::Reference;
+        let target = viewport(1_000, 2_000, 1_000.0);
+        let visible = BTreeMap::from([(
+            key,
+            (
+                TrackFrameKey::Reference,
+                Some(viewport(0, 3_000, 3_000.0).interval()),
+            ),
+        )]);
+        let mut scene = PanelContextScene::default();
+        scene.reconcile(
+            1,
+            target,
+            &visible,
+            vec![draft(key, 1, 7)],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &[],
+        );
+        commit_candidates(&mut scene, &[key]);
+        assert!(
+            !scene.lanes[&key]
+                .lease
+                .as_ref()
+                .unwrap()
+                .display
+                .rectangles
+                .is_empty()
+        );
+
+        // Zoomed out: no draft at all would retain the sequence...
+        let zoomed_out = viewport(0, 400_000, 1_000.0);
+        scene.reconcile(2, zoomed_out, &visible, Vec::new(), &BTreeSet::new(), &BTreeSet::new(), &[]);
+        assert!(scene.candidates.is_empty());
+        assert!(
+            !scene.lanes[&key]
+                .lease
+                .as_ref()
+                .unwrap()
+                .display
+                .rectangles
+                .is_empty(),
+            "a lane without a draft keeps its old picture (the retention this guards against)"
+        );
+        // ...an empty draft replaces it.
+        let empty = ContextLaneDraft {
+            key,
+            generation: 2,
+            source_viewport: zoomed_out,
+            frame_key: TrackFrameKey::Reference,
+            frame_top: 40.0,
+            display: DisplayList::default(),
+        };
+        scene.reconcile(2, zoomed_out, &visible, vec![empty], &BTreeSet::new(), &BTreeSet::new(), &[]);
+        commit_candidates(&mut scene, &[key]);
+        let lease = scene.lanes[&key].lease.as_ref().unwrap();
+        assert!(lease.display.rectangles.is_empty() && lease.display.texts.is_empty());
+        assert_eq!(lease.generation, 2);
+    }
+
     #[test]
     fn coherence_group_retains_its_prior_epoch_until_every_member_is_ready() {
         let left = ContextLaneKey::Auxiliary(TrackId::new(1));
