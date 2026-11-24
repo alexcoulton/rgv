@@ -21,8 +21,11 @@ reference is read on demand over the network; the small resources are saved loca
 time, so the same genome opens offline afterwards. `--genome hg38` does the same at launch, and
 also accepts the path or URL of an IGV genome JSON file. Such a file can be opened with
 **Genomes → Open genome configuration** or dropped onto the window. References may be FASTA with
-a `.fai`, or UCSC `.2bit`. This feature has automated tests only and has not yet been checked
-against the live hosting.
+a `.fai`, or UCSC `.2bit`; when a genome offers both, RGV reads the `.2bit`, which for the common
+assemblies is UCSC's copy. The list comes from the IGV team's public `igv-data` repository on
+GitHub (igv.org's own copy now serves only the IGV applications); `RGV_GENOME_LIST_URL` names a
+different list, as a URL or a local file. Loading hg38 this way was checked against the live
+hosts on 24 November 2026.
 
 A small remote BED, GFF3, GTF, genePred, refFlat, narrowPeak, broadPeak or PSL file (up to
 256 MiB) can be opened by URL; it is downloaded whole rather than read by range request.

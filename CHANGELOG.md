@@ -5,6 +5,13 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Hosted genomes work again. igv.org's genome list now serves only the IGV applications, so RGV
+  reads the same list from the IGV team's public `igv-data` repository on GitHub (IGV Desktop 3's
+  `genomes3.tsv` layout; the older layout is still accepted). GenBank entries, which RGV cannot
+  open, are left out.
+- A gene search whose exact matches are several transcripts of one gene (RefSeq lists GAPDH
+  twice) goes to the gene instead of asking which transcript.
+
 ## 0.1.2 — 2026-11-24
 
 - Built-in genes for human (GRCh38, GRCh37, T2T-CHM13) and mouse (GRCm38, GRCm39). The gene

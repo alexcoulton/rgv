@@ -3585,6 +3585,41 @@ fn annotation_search_requires_a_unique_exact_match_before_navigation() {
         ..TrackSearchResults::default()
     };
     assert_eq!(preferred_annotation_search_hit(&ambiguous, "brca1"), None);
+
+    // Two transcripts of one gene (RefSeq lists GAPDH twice): the search shows the gene, using
+    // the widest transcript, which covers the other.
+    let long = hit(1, "gapdh", "GAPDH", 1_000);
+    let short = TrackSearchHit {
+        record: rgv_hts::FeatureRecord {
+            start: 1_050,
+            end: 1_100,
+            ..long.record.clone()
+        },
+        ..long.clone()
+    };
+    let transcripts = TrackSearchResults {
+        query: "gapdh".to_owned(),
+        hits: vec![short, long.clone(), hit(1, "gapdh-dt", "GAPDH-DT", 800)],
+        ..TrackSearchResults::default()
+    };
+    assert_eq!(
+        preferred_annotation_search_hit(&transcripts, "GAPDH"),
+        Some(&long)
+    );
+    // The same name on another contig is a different gene: still the user's choice.
+    let elsewhere = TrackSearchHit {
+        record: rgv_hts::FeatureRecord {
+            contig: "chr2".to_owned(),
+            ..long.record.clone()
+        },
+        ..long.clone()
+    };
+    let two_genes = TrackSearchResults {
+        query: "gapdh".to_owned(),
+        hits: vec![long, elsewhere],
+        ..TrackSearchResults::default()
+    };
+    assert_eq!(preferred_annotation_search_hit(&two_genes, "GAPDH"), None);
 }
 
 #[test]

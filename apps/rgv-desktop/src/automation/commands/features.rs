@@ -982,10 +982,20 @@ mod tests {
             GeneMatch::Preferred(&exact.hits[1])
         );
 
-        // Two exact matches (the gene in two tracks), or several prefixes, are not guessed.
+        // Exact matches that overlap on one contig are one gene (in two tracks, or as several
+        // transcripts): its widest span is shown.
+        let one_gene = results(vec![
+            hit(3, "brca1", "BRCA1", 120, 180),
+            hit(4, "brca1", "BRCA1", 100, 200),
+        ]);
+        assert_eq!(
+            gene_match(&one_gene, "BRCA1"),
+            GeneMatch::Preferred(&one_gene.hits[1])
+        );
+        // Exact matches in separate places, or several prefixes, are not guessed.
         let twice = results(vec![
             hit(3, "brca1", "BRCA1", 100, 200),
-            hit(4, "brca1", "BRCA1", 100, 200),
+            hit(4, "brca1", "BRCA1", 5_000, 5_100),
         ]);
         assert_eq!(gene_match(&twice, "BRCA1"), GeneMatch::Ambiguous);
         let prefixes = results(vec![

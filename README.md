@@ -78,6 +78,10 @@ an Apple or Microsoft developer certificate, so the system cannot vouch for it. 
    For human (GRCh38/hg38, GRCh37/hg19, T2T-CHM13) and mouse (GRCm38/mm10, GRCm39/mm39)
    references, RGV recognises the genome and adds a **Genes** track and chromosome bands
    automatically. Nothing to download.
+
+   No FASTA to hand? **Genomes → Hosted genomes** offers about 35 genomes, from human and mouse
+   to fly, worm, zebrafish and yeast, read over the internet with their gene tracks. From the
+   command line: `rgv-desktop --genome hg38 --bam sample.bam`.
 3. **Go somewhere.** Type a gene name such as `EGFR`, or a position such as
    `chr7:55,019,017-55,211,628`, in the **Locus** box and press Enter.
 4. **Add more tracks.** **Tracks → Add track…** (or drag files onto the window) adds genes,
@@ -128,11 +132,9 @@ image export, batch automation and the rest.
 
 ## Known limitations
 
-- **Hosted genomes do not work yet.** The **Genomes → Hosted genomes** menu reads IGV's genome
-  list, but IGV's servers now serve only IGV itself. For now, open a reference FASTA (step 2
-  above).
-- **Other genomes** (anything besides the human and mouse builds above) have no built-in genes:
-  add a gene annotation file such as a GTF to see genes and search them by name.
+- **Genomes without built-in genes.** Besides the human and mouse builds above, use
+  **Genomes → Hosted genomes** (which downloads a gene track) or add your own gene annotation
+  file, such as a GTF, to see genes and search them by name.
 - **Remote files** are newly supported and have had less real-world use than local files.
 
 ## Learn more

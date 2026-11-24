@@ -12,8 +12,10 @@ use thiserror::Error;
 
 use crate::{ContigAliases, MAXIMUM_CONTIG_ALIASES};
 
-/// The hosted genome list read by IGV Desktop.
-pub const IGV_HOSTED_GENOME_LIST_URL: &str = "https://igv.org/genomes/genomes.tsv";
+/// IGV's hosted genome list, as published in the IGV team's MIT-licensed `igv-data` repository
+/// (the list IGV Desktop 3 reads). igv.org's own copy now serves only the IGV applications.
+pub const IGV_HOSTED_GENOME_LIST_URL: &str =
+    "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/genomes3.tsv";
 pub const MAXIMUM_IGV_GENOME_TRACKS: usize = 256;
 pub const MAXIMUM_IGV_GENOME_LIST_ENTRIES: usize = 100_000;
 
@@ -214,7 +216,15 @@ pub struct IgvGenomeListEntry {
     pub id: String,
 }
 
-/// Parses IGV's hosted genome list: `name<TAB>url<TAB>id` per line, with `<`/`#` header lines.
+/// Parses an IGV hosted genome list in either of IGV's layouts, skipping `<`/`#` header lines:
+///
+/// - IGV Desktop 3 (`genomes3.tsv`):
+///   `url<TAB>accession<TAB>assembly<TAB>scientific name<TAB>common name<TAB>taxon id`, named by its
+///   common name (else scientific name, else assembly) and identified by its assembly;
+/// - IGV Desktop 2 (`genomes.tsv`): `name<TAB>url<TAB>id`.
+///
+/// Rows whose first field is a URL are the first layout. GenBank (`.gbk`) genomes, which RGV
+/// cannot open, are left out, as are repeated ids.
 pub fn parse_igv_genome_list(document: &str) -> Vec<IgvGenomeListEntry> {
     let mut seen = BTreeSet::new();
     document
@@ -222,10 +232,19 @@ pub fn parse_igv_genome_list(document: &str) -> Vec<IgvGenomeListEntry> {
         .map(str::trim_end)
         .filter(|line| !line.is_empty() && !line.starts_with(['#', '<']))
         .filter_map(|line| {
-            let mut fields = line.split('\t').map(str::trim);
-            let name = fields.next().filter(|name| !name.is_empty())?;
-            let url = fields.next().filter(|url| !url.is_empty())?;
-            let id = fields.next().filter(|id| !id.is_empty())?;
+            let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
+            let present =
+                |index: usize| fields.get(index).copied().filter(|field| !field.is_empty());
+            let (name, url, id) = if present(0).is_some_and(looks_like_location) {
+                let id = present(2)?;
+                let name = present(4).or_else(|| present(3)).unwrap_or(id);
+                (name, present(0)?, id)
+            } else {
+                (present(0)?, present(1)?, present(2)?)
+            };
+            if url.to_ascii_lowercase().ends_with(".gbk") {
+                return None;
+            }
             seen.insert(id.to_owned()).then(|| IgvGenomeListEntry {
                 name: name.to_owned(),
                 url: url.to_owned(),
@@ -234,6 +253,12 @@ pub fn parse_igv_genome_list(document: &str) -> Vec<IgvGenomeListEntry> {
         })
         .take(MAXIMUM_IGV_GENOME_LIST_ENTRIES)
         .collect()
+}
+
+/// Whether a list field is a genome description's location rather than a name.
+fn looks_like_location(field: &str) -> bool {
+    let lower = field.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://") || lower.ends_with(".json")
 }
 
 /// Converts an IGV chromosome alias table into explicit `alias -> canonical` entries.
@@ -366,6 +391,32 @@ mod tests {
         assert_eq!(list[0].id, "hg38");
         assert_eq!(list[0].name, "Human (hg38)");
         assert_eq!(list[1].url, "https://x/mm39.json");
+    }
+
+    #[test]
+    fn igv_desktop_3_genome_lists_name_genomes_by_common_name_and_skip_genbank() {
+        let list = parse_igv_genome_list(
+            "#url\taccession\tassembly\tscientific name\tcommon name\ttaxonId\n\
+             https://x/hg38.json\tGCA_000001405.29\thg38\tHomo sapiens\tHuman (hg38)\t9606\n\
+             https://x/ce10.json\t\tce10\tCaenorhabditis elegans\t\t6239\n\
+             https://x/NC_012920.1.gbk\t\tNC_012920.1\tHomo sapiens\tHuman mitochondrion\t9606\n\
+             https://x/hg38_1kg.json\t\thg38\tHomo sapiens\tHuman (hg38 1kg)\t9606\n",
+        );
+        assert_eq!(
+            list,
+            [
+                IgvGenomeListEntry {
+                    name: "Human (hg38)".to_owned(),
+                    url: "https://x/hg38.json".to_owned(),
+                    id: "hg38".to_owned(),
+                },
+                IgvGenomeListEntry {
+                    name: "Caenorhabditis elegans".to_owned(),
+                    url: "https://x/ce10.json".to_owned(),
+                    id: "ce10".to_owned(),
+                },
+            ]
+        );
     }
 
     #[test]

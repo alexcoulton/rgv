@@ -222,23 +222,43 @@ pub fn split_locus_expression(expression: &str) -> Result<Vec<&str>> {
     Ok(loci)
 }
 
+/// The hit a search for `query` navigates to: the only exact match; when several exact matches
+/// are transcripts of one gene (one contig, each overlapping the widest), the widest; with no
+/// exact match, the only hit. `None` asks the user to choose.
 pub fn preferred_annotation_search_hit<'a>(
     results: &'a TrackSearchResults,
     query: &str,
 ) -> Option<&'a TrackSearchHit> {
     let normalized = query.trim().to_lowercase();
-    let mut exact = results
+    let exact = results
         .hits
         .iter()
-        .filter(|hit| hit.matched_term == normalized);
-    let first_exact = exact.next();
-    if first_exact.is_some() && exact.next().is_none() {
-        return first_exact;
+        .filter(|hit| hit.matched_term == normalized)
+        .collect::<Vec<_>>();
+    match exact.as_slice() {
+        [] if results.hits.len() == 1 => results.hits.first(),
+        [] => None,
+        [only] => Some(only),
+        several => one_gene_span(several),
     }
-    if first_exact.is_none() && results.hits.len() == 1 {
-        return results.hits.first();
-    }
-    None
+}
+
+/// The widest of `hits` when every hit lies on its contig and overlaps it: several transcripts
+/// (or several tracks' copies) of one gene, which a gene search shows as one locus.
+fn one_gene_span<'a>(hits: &[&'a TrackSearchHit]) -> Option<&'a TrackSearchHit> {
+    let widest = *hits.iter().max_by_key(|hit| {
+        (
+            hit.record.end.saturating_sub(hit.record.start),
+            std::cmp::Reverse(hit.record.start),
+        )
+    })?;
+    hits.iter()
+        .all(|hit| {
+            hit.record.contig == widest.record.contig
+                && hit.record.start < widest.record.end
+                && widest.record.start < hit.record.end
+        })
+        .then_some(widest)
 }
 
 pub fn annotation_search_hit_locus(hit: &TrackSearchHit) -> String {

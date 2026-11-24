@@ -685,7 +685,7 @@ mod tests {
 
     /// Opens the real hosted hg38 genome. Needs network access; run with `--ignored`.
     #[test]
-    #[ignore = "requires network access to igv.org and its data hosts"]
+    #[ignore = "requires network access to GitHub, igv.org and UCSC"]
     fn hosted_hg38_opens_from_the_igv_genome_list() {
         let directory = tempdir().unwrap();
         let remote = HttpRangeConfig::default();
