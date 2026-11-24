@@ -5,6 +5,11 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Gene tracks from UCSC's RefSeq bigGenePred files (the hosted T2T/hs1 genome's gene track)
+  show one transcript per gene again: those files repeat each transcript's accession as its gene
+  name, which no longer counts as a gene id, so transcripts group by gene symbol (BRCA1 shows as
+  `BRCA1 +367` instead of 368 rows).
+
 ## 0.1.3 — 2026-11-24
 
 - Hosted genomes work again. igv.org's genome list now serves only the IGV applications, so RGV

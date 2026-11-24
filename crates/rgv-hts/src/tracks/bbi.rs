@@ -974,7 +974,10 @@ pub(super) fn parse_big_gene_pred_record(
         ("cds_end_status".to_owned(), fields[11].to_owned()),
         ("exon_frames".to_owned(), fields[12].to_owned()),
     ];
-    if !gene_name.is_empty() && gene_name != "." {
+    // A geneName that only repeats the transcript's own name identifies nothing beyond the
+    // transcript (UCSC's ncbiRefSeq bigGenePred files store the accession there), so it is not a
+    // gene id: the transcript is then grouped by its gene symbol.
+    if !gene_name.is_empty() && gene_name != "." && gene_name != transcript_name {
         attributes.push(("gene_id".to_owned(), gene_name.to_owned()));
     }
     if !display_name.is_empty() && display_name != "." {

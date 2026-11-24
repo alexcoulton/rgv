@@ -764,6 +764,43 @@ fn big_gene_pred_prefers_the_human_readable_gene_symbol() {
 }
 
 #[test]
+fn big_gene_pred_transcripts_named_as_their_own_gene_are_grouped_by_symbol() {
+    // UCSC's ncbiRefSeq bigGenePred (the hosted T2T gene track) repeats each transcript's
+    // accession as its geneName: that names no gene, so the transcripts group by symbol.
+    let transcript = |accession: &str, end: u64| {
+        let length = end - 100;
+        parse_big_gene_pred_record(
+            "chr17",
+            100,
+            end,
+            &format!(
+                "{accession}\t0\t-\t100\t{end}\t0\t1\t{length},\t0,\tBRCA1\tcmpl\tcmpl\t0,\t\t{accession}\tBRCA1\t"
+            ),
+        )
+        .unwrap()
+    };
+    let mut records = vec![transcript("NM_1.1", 400), transcript("NM_2.1", 300)];
+    for record in &records {
+        assert_eq!(attribute_value(&record.attributes, &["gene_id"]), None);
+        assert_eq!(record.display_label(), Some("BRCA1"));
+    }
+    assert_eq!(
+        rgv_model::transcript_gene_key(&records[0]),
+        rgv_model::transcript_gene_key(&records[1])
+    );
+    rgv_model::annotate_transcript_choices(&mut records);
+    let representatives = records
+        .iter()
+        .filter(|record| {
+            record
+                .transcript_choice()
+                .is_some_and(|choice| choice.is_representative() && choice.count == 2)
+        })
+        .count();
+    assert_eq!(representatives, 1);
+}
+
+#[test]
 fn big_gene_pred_accepts_and_preserves_extension_columns() {
     let record = parse_big_gene_pred_record(
         "chr1",
