@@ -60,6 +60,7 @@ pub use alignment_scene::{
     AlignmentGpuRetirement, AlignmentGpuSceneRequest, AlignmentGpuScissor, AlignmentGpuShape,
     AlignmentGpuStagedReplacement, AlignmentGpuVisibleAdmission, MAXIMUM_ALIGNMENT_GPU_PAGE_OFFSET,
     MAXIMUM_ALIGNMENT_GPU_PAGE_ROWS, PackedAlignmentPage, project_alignment_gpu_instance,
+    semantic_alignment_color,
 };
 pub use alignment_summary::{
     ALIGNMENT_DEPTH_PYRAMID_DEFAULT_GPU_BYTES, ALIGNMENT_DEPTH_PYRAMID_ENVELOPE_BAND_ALPHA,

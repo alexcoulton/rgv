@@ -128,10 +128,7 @@ fn the_tooltip_appears_after_its_delay_and_at_once_once_warm() {
     let first = hover(AlignmentComponent::Deletion { cigar_index: 4 });
     assert!(animator.set(start, Some(first), None, false));
     assert_eq!(animator.tooltip(start), None);
-    assert_eq!(
-        animator.tooltip(start + Duration::from_millis(249)),
-        None
-    );
+    assert_eq!(animator.tooltip(start + Duration::from_millis(249)), None);
     assert_eq!(animator.tooltip(start + TOOLTIP_DELAY), Some(first));
     // The same target again is no change; the pointer's base is updated in place.
     assert!(!animator.set(start + TOOLTIP_DELAY, Some(first), Some(12), false));
@@ -675,32 +672,123 @@ fn the_tooltip_cache_builds_each_target_once() {
 }
 
 #[test]
-fn highlights_follow_the_outline_with_their_fade() {
-    let outline = [[10.0, 20.0], [20.0, 20.0], [20.0, 31.0], [10.0, 31.0]];
+fn highlights_ring_the_shape_outside_it_and_grow_out_as_they_fade_in() {
+    // A 10 x 11 box; `outline_at(gap)` is that box grown by `gap` on every side.
+    let outline_at = |gap: f64| {
+        vec![
+            [10.0 - gap, 20.0 - gap],
+            [20.0 + gap, 20.0 - gap],
+            [20.0 + gap, 31.0 + gap],
+            [10.0 - gap, 31.0 + gap],
+        ]
+    };
     let clip = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(100.0, 100.0));
-    let glow = egui::Color32::from_rgba_unmultiplied(255, 176, 0, 150);
-    let ring = egui::Color32::from_gray(20);
-    let shapes = highlight_shapes(&outline, 0.5, clip, glow, ring);
-    assert_eq!(shapes.len(), 2);
-    for (shape, (width, color)) in shapes.iter().zip([(4.0, glow), (1.5, ring)]) {
-        assert_eq!(shape.clip_rect, clip);
-        let egui::Shape::Path(path) = &shape.shape else {
-            panic!("a closed outline");
-        };
-        assert!(path.closed);
-        assert_eq!(path.points.len(), 4);
-        assert_eq!(path.points[2], egui::pos2(20.0, 31.0));
-        let egui::epaint::PathStroke {
-            width: drawn,
-            color: drawn_color,
-            ..
-        } = &path.stroke;
-        assert!((drawn - width).abs() < f32::EPSILON);
-        let egui::epaint::ColorMode::Solid(drawn_color) = drawn_color else {
-            panic!("solid");
-        };
-        assert_eq!(*drawn_color, color.gamma_multiply(0.5));
+    let color = egui::Color32::from_rgb(71, 133, 240);
+    let paths = |alpha: f32| {
+        highlight_shapes(outline_at, alpha, clip, color)
+            .into_iter()
+            .map(|shape| {
+                assert_eq!(shape.clip_rect, clip);
+                let egui::Shape::Path(path) = shape.shape else {
+                    panic!("a closed outline");
+                };
+                assert!(path.closed);
+                let egui::epaint::ColorMode::Solid(drawn) = path.stroke.color else {
+                    panic!("solid");
+                };
+                (path.points[0], path.stroke.width, drawn)
+            })
+            .collect::<Vec<_>>()
+    };
+    let settled = paths(1.0);
+    assert_eq!(settled.len(), 3, "two halo layers and the ring");
+    let (ring_corner, ring_width, ring_color) = settled[2];
+    // The ring sits the settled gap clear of the shape, in the hover colour.
+    let gap = HIGHLIGHT_RING_GAP as f32;
+    assert_eq!(ring_corner, egui::pos2(10.0 - gap, 20.0 - gap));
+    assert_eq!(ring_color, color.gamma_multiply(0.95));
+    // No layer's stroke reaches into the shape, and the halo fades outward.
+    for (corner, width, _) in &settled {
+        assert!(10.0 - corner.x - width / 2.0 >= 0.0, "{corner:?} {width}");
     }
+    assert!(settled[0].2.a() < settled[1].2.a() && settled[1].2.a() < ring_color.a());
+    assert!((ring_width - 1.5).abs() < f32::EPSILON);
+    // Half faded in, every layer is fainter and the ring is still closer to the shape.
+    let entering = paths(0.5);
+    assert!(entering[2].0.x > ring_corner.x);
+    assert_eq!(entering[2].2, color.gamma_multiply(0.95 * 0.5));
+}
+
+#[test]
+fn a_tooltip_card_splits_the_first_line_and_names_the_copy_shortcut() {
+    let event = [
+        TooltipLine::text("Substitution C>T · chr3:52,694,330 · base quality 37".to_owned()),
+        TooltipLine::text("T in 12 of 40 reads (30%)".to_owned()),
+    ];
+    let card = TooltipCard::new(&event).expect("a card");
+    assert_eq!(card.heading.text, "Substitution C>T");
+    assert_eq!(
+        card.subtitle.as_deref(),
+        Some("chr3:52,694,330 · base quality 37")
+    );
+    assert_eq!(texts(&card.body), ["T in 12 of 40 reads (30%)"]);
+    assert_eq!(card.hint, format!("{COPY_SHORTCUT} to copy"));
+    // A read: its monospace name is the whole heading and the click hint becomes the footer.
+    let read = [
+        TooltipLine::sequence("A00201R:287:HLF75DSXY:2:1302:3667:20306".to_owned()),
+        TooltipLine::text("Forward strand · MAPQ 60 · 101 bp".to_owned()),
+        TooltipLine::text("Click for details".to_owned()),
+    ];
+    let card = TooltipCard::new(&read).expect("a card");
+    assert!(card.heading.monospace);
+    assert_eq!(card.subtitle, None);
+    assert_eq!(texts(&card.body), ["Forward strand · MAPQ 60 · 101 bp"]);
+    assert_eq!(
+        card.hint,
+        format!("Click for details · {COPY_SHORTCUT} to copy")
+    );
+    assert_eq!(
+        tooltip_copy_text(&read),
+        "A00201R:287:HLF75DSXY:2:1302:3667:20306\nForward strand · MAPQ 60 · 101 bp"
+    );
+    assert_eq!(TooltipCard::new(&[]), None);
+}
+
+#[test]
+fn modifier_keys_and_copy_keep_the_hover_but_navigation_keys_hide_it() {
+    use winit::keyboard::{Key, NamedKey};
+    let character = |text: &str| Key::Character(text.into());
+    for modifier in [
+        NamedKey::Super,
+        NamedKey::Shift,
+        NamedKey::Control,
+        NamedKey::Alt,
+    ] {
+        assert!(!key_moves_view(&Key::Named(modifier), false));
+        assert!(!key_moves_view(&Key::Named(modifier), true));
+    }
+    // Copying the tooltip, or a screenshot chord such as Cmd+Shift+4.
+    assert!(!key_moves_view(&character("c"), true));
+    assert!(!key_moves_view(&character("4"), true));
+    // Feature jumps, undo and plain navigation keys move the view.
+    for jump in ["f", "b", "z"] {
+        assert!(key_moves_view(&character(jump), true));
+    }
+    assert!(key_moves_view(&character("+"), false));
+    assert!(key_moves_view(&Key::Named(NamedKey::ArrowLeft), false));
+}
+
+#[test]
+fn a_pointer_is_over_the_content_area_only_inside_it() {
+    let (origin, size) = ((100.0, 50.0), (800.0, 600.0));
+    assert!(content_contains(origin, size, (100.0, 50.0)));
+    assert!(content_contains(origin, size, (500.0, 400.0)));
+    assert!(!content_contains(origin, size, (900.0, 400.0)));
+    assert!(!content_contains(origin, size, (500.0, 49.0)));
+    assert_eq!(
+        palette_color32([0.28, 0.52, 0.94, 1.0]),
+        egui::Color32::from_rgb(71, 133, 240)
+    );
 }
 
 #[test]

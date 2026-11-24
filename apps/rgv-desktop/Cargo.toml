@@ -42,5 +42,10 @@ uuid.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 
+# The system pointer's location, to tell a covered window from a pointer that left it. Already
+# in the build through winit.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.23"
+
 [lints]
 workspace = true

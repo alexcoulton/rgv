@@ -398,8 +398,12 @@ impl Viewer {
             return Vec::new();
         }
         let reduced_motion = self.session.settings.reduced_motion;
-        let glow = crate::theme::adapt(egui::Color32::from_rgba_unmultiplied(255, 176, 0, 150));
-        let ring = crate::theme::adapt(egui::Color32::from_gray(20));
+        // The theme's hover blue, the colour the GPU pass gives a hovered read.
+        let color = crate::ui::read_hover::palette_color32(
+            crate::theme::active()
+                .palette()
+                .color(rgv_render::palette::PaletteToken::INTERACTION_HOVERED),
+        );
         let mut shapes = Vec::new();
         for (hover, alpha) in self.read_hover.highlights(now, reduced_motion) {
             if !self
@@ -434,14 +438,16 @@ impl Viewer {
             let Some(projected) = projected else {
                 continue;
             };
-            let outline = rgv_alignment_scene::hover_outline(&projected, camera, 1.0);
             let clip = egui::Rect::from_min_size(
                 egui::pos2(clip.x as f32, clip.y as f32),
                 egui::vec2(clip.width as f32, clip.height as f32),
             )
             .intersect(genomic);
             shapes.extend(crate::ui::read_hover::highlight_shapes(
-                &outline, alpha, clip, glow, ring,
+                |gap| rgv_alignment_scene::hover_outline(&projected, camera, gap),
+                alpha,
+                clip,
+                color,
             ));
         }
         shapes

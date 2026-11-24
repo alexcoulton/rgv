@@ -5,7 +5,8 @@
 use crate::Viewer;
 use crate::inspection::read_hover_facts::scene_locus_facts;
 use crate::ui::read_hover::{
-    JunctionFacts, LocusFacts, PairFacts, ReadHover, TooltipContext, TooltipLine, tooltip_lines,
+    JunctionFacts, LocusFacts, PairFacts, ReadHover, TooltipCard, TooltipContext, TooltipLine,
+    tooltip_copy_text, tooltip_lines,
 };
 use rgv_alignment_scene::{AlignmentComponent, AlignmentSceneSnapshot};
 use rgv_hts::AlignmentRecord;
@@ -25,6 +26,13 @@ impl Viewer {
         {
             self.window.request_redraw();
         }
+    }
+
+    /// Whether a showing tooltip should be held because the pointer still rests over the
+    /// window although the window stopped receiving it (covered, or another window focused).
+    pub(crate) fn read_hover_is_covered(&self) -> bool {
+        self.read_hover.tooltip(Instant::now()).is_some()
+            && crate::ui::read_hover::system_pointer_over(&self.window)
     }
 
     /// A gesture began: the hover highlight, its read's tint and the tooltip disappear at once
@@ -232,55 +240,168 @@ impl Viewer {
         {
             return;
         }
-        let Some(pointer) = ui.ctx().input(|input| input.pointer.hover_pos()) else {
+        // A held hover (the window covered or unfocused over a resting pointer) has no egui
+        // pointer: it stays where it was last placed.
+        let live = ui.ctx().input(|input| input.pointer.hover_pos());
+        let Some(pointer) = live.or_else(|| {
+            self.read_hover_held
+                .then(|| self.read_hover_anchor.get())
+                .flatten()
+        }) else {
             return;
         };
         if !genomic.contains(pointer) {
             return;
         }
+        self.read_hover_anchor.set(Some(pointer));
         let lines = self.read_hover_tooltip_lines(&hover);
-        if lines.is_empty() {
+        let Some(card) = TooltipCard::new(&lines) else {
             return;
+        };
+        // Copy the tooltip unless a text field (which copies its own selection) has focus.
+        let copy = ui.ctx().input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Copy))
+        }) && ui.ctx().memory(|memory| memory.focused().is_none());
+        if copy {
+            ui.ctx().copy_text(tooltip_copy_text(&lines));
         }
-        let tooltip_painter = ui.ctx().layer_painter(egui::LayerId::new(
-            egui::Order::Tooltip,
-            egui::Id::new("read-hover-tooltip"),
-        ));
-        let text_color = crate::theme::adapt(egui::Color32::from_gray(24));
-        let galleys = lines
-            .into_iter()
-            .map(|line| {
-                let font = if line.monospace {
-                    egui::FontId::monospace(11.0)
-                } else {
-                    egui::FontId::proportional(11.0)
-                };
-                tooltip_painter.layout_no_wrap(line.text, font, text_color)
-            })
-            .collect::<Vec<_>>();
-        let width = galleys
-            .iter()
-            .map(|galley| galley.size().x)
-            .fold(0.0_f32, f32::max);
-        let height = galleys
-            .iter()
-            .map(|galley| galley.size().y + 1.0)
-            .sum::<f32>();
-        let padding = egui::vec2(8.0, 6.0);
-        let size = egui::vec2(width, height) + padding * 2.0;
-        let rect = crate::ui::read_hover::tooltip_rect(pointer, size, ui.ctx().content_rect());
-        tooltip_painter.rect(
-            rect,
-            4.0,
-            crate::theme::adapt(egui::Color32::from_rgba_unmultiplied(252, 252, 250, 245)),
-            egui::Stroke::new(1.0, crate::theme::adapt(egui::Color32::from_gray(170))),
-            egui::StrokeKind::Inside,
+        let swatch =
+            crate::ui::read_hover::palette_color32(crate::theme::active().palette().resolve(
+                rgv_render::semantic_alignment_color(
+                    hover.target.primitive.component,
+                    hover.target.primitive.style,
+                ),
+            ));
+        paint_tooltip_card(ui.ctx(), pointer, &card, swatch);
+    }
+}
+
+/// Paints `card` beside `anchor` (the pointer) in the theme's popup style: a shadowed panel
+/// with a colour swatch of the hovered element before its heading, a quieter subtitle, a
+/// hairline above the body and a small footer hint.
+#[allow(clippy::too_many_lines)]
+fn paint_tooltip_card(
+    ctx: &egui::Context,
+    anchor: egui::Pos2,
+    card: &TooltipCard,
+    swatch: egui::Color32,
+) {
+    const SWATCH: f32 = 10.0;
+    const SWATCH_GAP: f32 = 6.0;
+    const LINE_GAP: f32 = 2.0;
+    const SECTION_GAP: f32 = 6.0;
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("read-hover-tooltip"),
+    ));
+    let visuals = ctx.global_style().visuals.clone();
+    let font = |line: &TooltipLine, size: f32| {
+        if line.monospace {
+            egui::FontId::monospace(size)
+        } else {
+            egui::FontId::proportional(size)
+        }
+    };
+    let heading = painter.layout_no_wrap(
+        card.heading.text.clone(),
+        font(&card.heading, 13.0),
+        visuals.strong_text_color(),
+    );
+    let subtitle = card.subtitle.as_ref().map(|subtitle| {
+        painter.layout_no_wrap(
+            subtitle.clone(),
+            egui::FontId::proportional(11.0),
+            visuals.weak_text_color(),
+        )
+    });
+    let body = card
+        .body
+        .iter()
+        .map(|line| {
+            painter.layout_no_wrap(line.text.clone(), font(line, 11.5), visuals.text_color())
+        })
+        .collect::<Vec<_>>();
+    let hint = painter.layout_no_wrap(
+        card.hint.clone(),
+        egui::FontId::proportional(10.0),
+        visuals.weak_text_color(),
+    );
+    let heading_width = SWATCH + SWATCH_GAP + heading.size().x;
+    let width = std::iter::once(heading_width)
+        .chain(subtitle.iter().map(|galley| galley.size().x))
+        .chain(body.iter().map(|galley| galley.size().x))
+        .chain(std::iter::once(hint.size().x))
+        .fold(0.0_f32, f32::max);
+    let body_height = body
+        .iter()
+        .map(|galley| galley.size().y + LINE_GAP)
+        .sum::<f32>();
+    let height = heading.size().y
+        + subtitle
+            .as_ref()
+            .map_or(0.0, |galley| LINE_GAP + galley.size().y)
+        + if body.is_empty() {
+            0.0
+        } else {
+            2.0 * SECTION_GAP + body_height
+        }
+        + SECTION_GAP
+        + hint.size().y;
+    let padding = egui::vec2(10.0, 8.0);
+    let size = egui::vec2(width, height) + padding * 2.0;
+    let rect = crate::ui::read_hover::tooltip_rect(anchor, size, ctx.content_rect());
+    let corner_radius = visuals.menu_corner_radius;
+    painter.add(visuals.popup_shadow.as_shape(rect, corner_radius));
+    painter.rect(
+        rect,
+        corner_radius,
+        visuals.window_fill,
+        visuals.window_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let left = rect.left() + padding.x;
+    let mut y = rect.top() + padding.y;
+    // Swatch, centred on the heading's first line, with a hairline so pale colours still show.
+    let swatch_rect = egui::Rect::from_center_size(
+        egui::pos2(left + SWATCH * 0.5, y + heading.size().y * 0.5),
+        egui::vec2(SWATCH, SWATCH),
+    );
+    painter.rect(
+        swatch_rect,
+        2.0,
+        swatch,
+        egui::Stroke::new(1.0, visuals.weak_text_color().gamma_multiply(0.5)),
+        egui::StrokeKind::Inside,
+    );
+    let heading_height = heading.size().y;
+    painter.galley(
+        egui::pos2(left + SWATCH + SWATCH_GAP, y),
+        heading,
+        visuals.strong_text_color(),
+    );
+    y += heading_height;
+    if let Some(subtitle) = subtitle {
+        y += LINE_GAP;
+        let height = subtitle.size().y;
+        painter.galley(egui::pos2(left, y), subtitle, visuals.weak_text_color());
+        y += height;
+    }
+    if !body.is_empty() {
+        y += SECTION_GAP;
+        painter.line_segment(
+            [egui::pos2(left, y), egui::pos2(rect.right() - padding.x, y)],
+            egui::Stroke::new(1.0, visuals.widgets.noninteractive.bg_stroke.color),
         );
-        let mut y = rect.top() + padding.y;
-        for galley in galleys {
-            let line_height = galley.size().y + 1.0;
-            tooltip_painter.galley(egui::pos2(rect.left() + padding.x, y), galley, text_color);
-            y += line_height;
+        y += SECTION_GAP;
+        for galley in body {
+            let height = galley.size().y;
+            painter.galley(egui::pos2(left, y), galley, visuals.text_color());
+            y += height + LINE_GAP;
         }
     }
+    y += SECTION_GAP;
+    painter.galley(egui::pos2(left, y), hint, visuals.weak_text_color());
 }

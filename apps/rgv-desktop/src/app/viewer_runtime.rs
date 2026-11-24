@@ -985,6 +985,8 @@ impl Viewer {
             sashimi_hover_annotation: None,
             read_hover: crate::ui::read_hover::ReadHoverAnimator::default(),
             read_hover_tooltip: std::cell::RefCell::default(),
+            read_hover_held: false,
+            read_hover_anchor: std::cell::Cell::new(None),
             workspace_layout,
             genomic_canvas_layer_id: None,
             pane_divider_rect: None,

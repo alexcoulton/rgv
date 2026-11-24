@@ -4291,7 +4291,8 @@ fn color_for(primitive: AlignmentSemanticPrimitive) -> PaletteColor {
 /// The semantic colour of one read component. Closed categories are palette tokens, continuous
 /// quantities (mapping quality, modification-call confidence) ramps between two slots; only
 /// hashed open-ended categories carry an inline colour.
-pub(crate) fn semantic_alignment_color(
+#[must_use]
+pub fn semantic_alignment_color(
     component: AlignmentComponent,
     style: AlignmentStyleToken,
 ) -> PaletteColor {

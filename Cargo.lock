@@ -4057,6 +4057,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "core-graphics",
  "egui",
  "egui-wgpu",
  "egui-winit",

@@ -147,8 +147,14 @@ impl ApplicationHandler for Application {
                 if event.state == ElementState::Pressed && !egui_response.consumed =>
             {
                 Viewer::mark_native_input_handled(&mut recording_observation);
-                // Keys navigate the view: like a scroll, they hide the read hover.
-                viewer.suspend_read_hover();
+                // Keys navigate the view: like a scroll, they hide the read hover. Modifier keys
+                // and shortcuts that leave the view in place (copy, a screenshot chord) keep it.
+                if crate::ui::read_hover::key_moves_view(
+                    &event.logical_key,
+                    viewer.modifiers.control_key() || viewer.modifiers.super_key(),
+                ) {
+                    viewer.suspend_read_hover();
+                }
                 viewer.keyboard_input(&event.logical_key);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
@@ -166,8 +172,15 @@ impl ApplicationHandler for Application {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 Viewer::mark_native_input_handled(&mut recording_observation);
+                viewer.read_hover_held = false;
                 viewer.update_vertical_scrollbar_drag(position);
                 viewer.cursor_moved(position, egui_response.consumed);
+            }
+            // The pointer is reported gone while it still rests over the window: something
+            // covered the window (the macOS screenshot overlay does). The tooltip stays where it
+            // is until the pointer moves again.
+            WindowEvent::CursorLeft { .. } if viewer.read_hover_is_covered() => {
+                viewer.read_hover_held = true;
             }
             WindowEvent::CursorLeft { .. } => {
                 viewer.set_read_hover(None, None);
@@ -203,7 +216,13 @@ impl ApplicationHandler for Application {
             }
             WindowEvent::Focused(false) => {
                 Viewer::mark_native_input_handled(&mut recording_observation);
-                viewer.suspend_read_hover();
+                // Another window took focus over a resting pointer (a screenshot tool, say):
+                // keep the tooltip showing, as background windows' tooltips do.
+                if viewer.read_hover_is_covered() {
+                    viewer.read_hover_held = true;
+                } else {
+                    viewer.suspend_read_hover();
+                }
                 viewer.finish_overview_capture();
                 viewer.finish_vertical_scrollbar_drag();
                 let was_canvas_dragging = viewer.dragging;

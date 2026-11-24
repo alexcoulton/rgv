@@ -1331,6 +1331,11 @@ struct Viewer {
     read_hover: ui::read_hover::ReadHoverAnimator,
     /// The hovered target's tooltip lines and its read's record, built once per target.
     read_hover_tooltip: std::cell::RefCell<ui::read_hover::ReadHoverTooltipCache>,
+    /// The hover is held in place: the window was covered or lost focus while the pointer
+    /// rested over it, so egui no longer reports a pointer. Released by the next pointer move.
+    read_hover_held: bool,
+    /// Where the tooltip was last placed from, in points: the anchor a held tooltip stays at.
+    read_hover_anchor: std::cell::Cell<Option<egui::Pos2>>,
     /// Annotation status line of the hovered junction's tooltip, keyed by that junction.
     sashimi_hover_annotation: Option<((TrackId, u64, u64), Option<String>)>,
     /// Resolved Sashimi presentation of each captured `(panel, track)` lane.

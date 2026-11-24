@@ -226,6 +226,152 @@ impl TooltipLine {
     }
 }
 
+/// The closing hint of a read's tooltip, which a card shows as its footer.
+const CLICK_HINT: &str = "Click for details";
+
+/// The copy shortcut as this platform names it.
+pub(crate) const COPY_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "Cmd+C"
+} else {
+    "Ctrl+C"
+};
+
+/// A tooltip's lines arranged as a card: a heading naming the element, a quieter subtitle with
+/// the rest of the first line (its size, locus, quality), the body lines, and a footer hint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TooltipCard {
+    pub(crate) heading: TooltipLine,
+    pub(crate) subtitle: Option<String>,
+    pub(crate) body: Vec<TooltipLine>,
+    pub(crate) hint: String,
+}
+
+impl TooltipCard {
+    /// The card of `lines`: the first line splits at its first ` · ` into heading and subtitle
+    /// (a monospace first line, a read name, is all heading); a closing "Click for details"
+    /// becomes the footer, which always names the copy shortcut.
+    pub(crate) fn new(lines: &[TooltipLine]) -> Option<Self> {
+        let (first, rest) = lines.split_first()?;
+        let (heading, subtitle) = match first.text.split_once(" · ") {
+            Some((heading, subtitle)) if !first.monospace => (
+                TooltipLine::text(heading.to_owned()),
+                Some(subtitle.to_owned()),
+            ),
+            _ => (first.clone(), None),
+        };
+        let (body, clickable) = match rest.split_last() {
+            Some((last, body)) if !last.monospace && last.text == CLICK_HINT => (body, true),
+            _ => (rest, false),
+        };
+        Some(Self {
+            heading,
+            subtitle,
+            body: body.to_vec(),
+            hint: if clickable {
+                format!("{CLICK_HINT} · {COPY_SHORTCUT} to copy")
+            } else {
+                format!("{COPY_SHORTCUT} to copy")
+            },
+        })
+    }
+}
+
+/// What the copy shortcut puts on the clipboard while a tooltip shows: its lines as text,
+/// without the click hint.
+pub(crate) fn tooltip_copy_text(lines: &[TooltipLine]) -> String {
+    lines
+        .iter()
+        .filter(|line| line.monospace || line.text != CLICK_HINT)
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a pressed key moves the view and so hides the read hover, as a scroll does. Modifier
+/// keys alone do not, nor do shortcuts held with Cmd/Ctrl (`primary`) other than the feature
+/// jumps and undo, which do move it: copying the tooltip or a system screenshot chord keeps the
+/// hover showing.
+pub(crate) fn key_moves_view(key: &winit::keyboard::Key, primary: bool) -> bool {
+    use winit::keyboard::{Key, NamedKey};
+    match key {
+        Key::Named(
+            NamedKey::Shift
+            | NamedKey::Control
+            | NamedKey::Alt
+            | NamedKey::AltGraph
+            | NamedKey::Super
+            | NamedKey::Meta
+            | NamedKey::Hyper
+            | NamedKey::Fn
+            | NamedKey::FnLock
+            | NamedKey::CapsLock
+            | NamedKey::Symbol
+            | NamedKey::SymbolLock,
+        ) => false,
+        Key::Character(character) if primary => {
+            matches!(character.to_ascii_lowercase().as_str(), "f" | "b" | "z")
+        }
+        _ => true,
+    }
+}
+
+/// A palette colour (unmultiplied sRGB in 0..=1) as egui paints it.
+pub(crate) fn palette_color32([red, green, blue, alpha]: [f32; 4]) -> egui::Color32 {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        channel(red),
+        channel(green),
+        channel(blue),
+        channel(alpha),
+    )
+}
+
+/// Whether `point` lies inside the content area at `origin` of `size`, all in one coordinate
+/// space.
+pub(crate) fn content_contains(origin: (f64, f64), size: (f64, f64), point: (f64, f64)) -> bool {
+    point.0 >= origin.0
+        && point.1 >= origin.1
+        && point.0 < origin.0 + size.0
+        && point.1 < origin.1 + size.1
+}
+
+/// Whether the system pointer rests over `window`'s content area now, whatever window is in
+/// front of it. Unknown (false) off macOS.
+pub(crate) fn system_pointer_over(window: &winit::window::Window) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use core_graphics::event::CGEvent;
+        use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+        // Global display coordinates in points, origin at the main display's top left, as
+        // winit's window positions are once divided by the scale factor.
+        let Some(pointer) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)
+            .and_then(CGEvent::new)
+            .ok()
+            .map(|event| event.location())
+        else {
+            return false;
+        };
+        let Ok(origin) = window.inner_position() else {
+            return false;
+        };
+        let scale = window.scale_factor();
+        let size = window.inner_size();
+        content_contains(
+            (f64::from(origin.x) / scale, f64::from(origin.y) / scale),
+            (
+                f64::from(size.width) / scale,
+                f64::from(size.height) / scale,
+            ),
+            (pointer.x, pointer.y),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window;
+        false
+    }
+}
+
 /// Allele counts at one base, exactly as the coverage lane and pileup inspector have them (the
 /// scene's allele summary: same read filters, base-quality threshold and mate policy).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1090,27 +1236,42 @@ impl ReadHoverTooltipCache {
     }
 }
 
-/// The highlight around one hovered shape: a soft glow and a crisp ring along `outline` (pane
-/// points), both at `alpha` of their full strength, clipped to `clip`.
+/// Gap, in points, between a hovered shape and its ring once the highlight has fully entered.
+pub(crate) const HIGHLIGHT_RING_GAP: f64 = 1.0;
+
+/// The layers of a highlight from the outside in: how far beyond the ring each one's centre
+/// line sits, its stroke width and its opacity. The two halo layers lie wholly outside the ring,
+/// so the highlight never covers the shape it marks.
+const HIGHLIGHT_LAYERS: [(f64, f32, f32); 3] =
+    [(2.75, 3.0, 0.10), (1.25, 2.0, 0.22), (0.0, 1.5, 0.95)];
+
+/// The highlight around one hovered shape, in `color` (the theme's hover blue): a soft halo
+/// fading outward and a crisp ring, at `alpha` of full strength and clipped to `clip`.
+/// `outline_at(gap)` is the shape's outline `gap` points clear of it. The ring settles at
+/// [`HIGHLIGHT_RING_GAP`] as `alpha` reaches 1, so it grows out from the shape as it fades in
+/// (and appears in place when reduced motion makes `alpha` jump to 1).
 pub(crate) fn highlight_shapes(
-    outline: &[[f64; 2]],
+    outline_at: impl Fn(f64) -> Vec<[f64; 2]>,
     alpha: f32,
     clip: egui::Rect,
-    glow: egui::Color32,
-    ring: egui::Color32,
+    color: egui::Color32,
 ) -> Vec<egui::epaint::ClippedShape> {
-    let points = outline
-        .iter()
-        .map(|[x, y]| egui::pos2(*x as f32, *y as f32))
-        .collect::<Vec<_>>();
-    [(4.0, glow), (1.5, ring)]
+    let alpha = alpha.clamp(0.0, 1.0);
+    let ring_gap = HIGHLIGHT_RING_GAP * f64::from(alpha);
+    HIGHLIGHT_LAYERS
         .into_iter()
-        .map(|(width, color)| egui::epaint::ClippedShape {
-            clip_rect: clip,
-            shape: egui::Shape::closed_line(
-                points.clone(),
-                egui::Stroke::new(width, color.gamma_multiply(alpha.clamp(0.0, 1.0))),
-            ),
+        .map(|(beyond, width, opacity)| {
+            let points = outline_at(ring_gap + beyond)
+                .into_iter()
+                .map(|[x, y]| egui::pos2(x as f32, y as f32))
+                .collect::<Vec<_>>();
+            egui::epaint::ClippedShape {
+                clip_rect: clip,
+                shape: egui::Shape::closed_line(
+                    points,
+                    egui::Stroke::new(width, color.gamma_multiply(opacity * alpha)),
+                ),
+            }
         })
         .collect()
 }
