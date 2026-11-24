@@ -36,7 +36,8 @@ def command_output(arguments: list[str], *, required: bool = True) -> str | None
             cwd=ROOT,
             check=required,
             capture_output=True,
-            text=True,
+            # Cargo and git write UTF-8; Windows would otherwise decode with its ANSI code page.
+            encoding="utf-8",
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
         if required:
