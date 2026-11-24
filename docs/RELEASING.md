@@ -33,8 +33,10 @@ Releases are unsigned: there is no Apple Developer ID or Windows code-signing ce
   signing lets Apple Silicon run the app and makes Gatekeeper offer "Open Anyway" (System
   Settings → Privacy & Security) instead of reporting it as damaged.
 - Windows: a WiX MSI that installs to Program Files and adds a Start menu shortcut, plus a
-  portable `.zip`. SmartScreen asks once ("More info → Run anyway"). Not yet released: htslib does not
-  build with MSVC, so tagged releases skip Windows; manual dry runs still attempt it.
+  portable `.zip`. SmartScreen asks once ("More info → Run anyway"). Built for `x86_64-pc-windows-gnu`
+  with MSYS2's UCRT64 MinGW toolchain (`.github/actions/windows-mingw`), because HTSlib does
+  not build with MSVC; the executables need only DLLs that Windows 10 and 11 provide. HTSlib and
+  its Rust bindings are vendored with small Windows patches (`vendor/README.md`).
 - Linux: an x86-64 tarball plus AppImage; distribution packages can follow after beta. The release
   workflow pins and verifies the AppImage packaging tool before executing it.
 

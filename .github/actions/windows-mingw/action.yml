@@ -1,0 +1,28 @@
+name: Windows MinGW toolchain
+description: >
+  Builds for x86_64-pc-windows-gnu, the Windows target HTSlib compiles for. Installs MSYS2's
+  UCRT64 GCC (C compiler and linker) and Clang (libclang for the HTSlib bindings), puts them on
+  the path, adds the Rust target, and exports RGV_TARGET and the per-target compiler variables.
+  Assumes the pinned toolchain from rust-toolchain.toml is already installed.
+runs:
+  using: composite
+  steps:
+    - id: msys2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: UCRT64
+        update: false
+        install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-clang
+    - name: Put the MinGW toolchain on the path and select the target
+      shell: pwsh
+      run: |
+        $bin = Join-Path "${{ steps.msys2.outputs.msys2-location }}" "ucrt64\bin"
+        Add-Content $env:GITHUB_PATH $bin
+        Add-Content $env:GITHUB_ENV "LIBCLANG_PATH=$bin"
+        Add-Content $env:GITHUB_ENV "RGV_TARGET=x86_64-pc-windows-gnu"
+        Add-Content $env:GITHUB_ENV "RGV_PACKAGE_TARGET=x86_64-pc-windows-gnu"
+        Add-Content $env:GITHUB_ENV "CARGO_BUILD_TARGET=x86_64-pc-windows-gnu"
+        Add-Content $env:GITHUB_ENV "CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc"
+        Add-Content $env:GITHUB_ENV "AR_x86_64_pc_windows_gnu=ar"
+        Add-Content $env:GITHUB_ENV "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc"
+        rustup target add x86_64-pc-windows-gnu

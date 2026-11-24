@@ -54,6 +54,9 @@ def cargo_metadata() -> dict:
     )
     if host is None:
         raise ValueError("rustc did not report its host target")
+    # A cross build (Windows is built for x86_64-pc-windows-gnu on an MSVC host) names its
+    # target, so the SBOM lists the dependencies that target actually links.
+    platform = os.environ.get("RGV_PACKAGE_TARGET") or host
     raw = command_output(
         [
             "cargo",
@@ -63,7 +66,7 @@ def cargo_metadata() -> dict:
             "--format-version",
             "1",
             "--filter-platform",
-            host,
+            platform,
         ]
     )
     assert raw is not None

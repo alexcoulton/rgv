@@ -45,7 +45,7 @@ default-members = [
     "tools/interaction-stress",
 ]
 resolver = "2"
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor"]
 
 [workspace.package]
 edition = "2024"
@@ -119,3 +119,9 @@ strip = "debuginfo"
 [profile.dist]
 inherits = "release"
 lto = "fat"
+
+# HTSlib and its Rust bindings, patched to build for Windows with MinGW (x86_64-pc-windows-gnu).
+# Other targets build exactly as from crates.io. See vendor/README.md.
+[patch.crates-io]
+hts-sys = { path = "vendor/hts-sys" }
+rust-htslib = { path = "vendor/rust-htslib" }

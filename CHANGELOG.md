@@ -5,6 +5,11 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Windows packages (MSI installer and portable zip). Windows builds use the MinGW target
+  (`x86_64-pc-windows-gnu`) so they read files through the same HTSlib as macOS and Linux;
+  `hts-sys` and `rust-htslib` are vendored with small Windows patches (see `vendor/README.md`).
+  CI builds and tests Windows the same way.
+
 ## 0.1.0 — 2026-11-24
 
 First release: unsigned packages for macOS (Apple silicon and Intel) and Linux (AppImage and
