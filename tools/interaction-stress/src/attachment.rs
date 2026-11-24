@@ -218,6 +218,7 @@ fn read_secret(path: &Path) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     use super::*;
@@ -227,6 +228,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let secret = directory.path().join("secret");
         std::fs::write(&secret, "0123456789abcdef0123456789abcdef").unwrap();
+        // A control secret must be private to its owner; Windows has no mode bits to set.
+        #[cfg(unix)]
         std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
         let path = directory.path().join("control.json");
         std::fs::write(

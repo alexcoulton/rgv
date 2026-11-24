@@ -28,6 +28,8 @@
       </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
+      <!-- Windows Installer requires a shortcut's key path to be a per-user (HKCU) value, even in
+           a per-machine package (ICE38, ICE43, ICE57). -->
       <Component Id="RgvStartMenuShortcut" Guid="5E0C8F3A-6B2D-4C61-9F7E-2A4D1B8C3E95">
         <Shortcut
             Id="RgvStartMenu"
@@ -36,7 +38,7 @@
             Target="[INSTALLFOLDER]rgv-desktop.exe"
             WorkingDirectory="INSTALLFOLDER" />
         <RegistryValue
-            Root="HKLM"
+            Root="HKCU"
             Key="Software\RGV"
             Name="StartMenuShortcut"
             Type="integer"
