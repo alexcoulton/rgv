@@ -64,6 +64,9 @@ jobs:
           if-no-files-found: error
 
   windows:
+    # Not released yet: htslib does not build with MSVC. Manual dry runs still try it, so the
+    # port to the pure-Rust decoder can be checked here; a tag skips it.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
@@ -143,7 +146,7 @@ jobs:
 
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows, linux]
+    needs: [macos, linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -166,8 +169,9 @@ jobs:
           These packages are not signed with an Apple or Microsoft certificate, so each system asks once before opening RGV.
 
           - **macOS** (`RGV-macos-arm64.dmg` for Apple silicon, `RGV-macos-x86_64.dmg` for Intel): drag RGV to Applications and open it. When macOS says it cannot verify the developer, open System Settings → Privacy & Security and click **Open Anyway**. Or run `xattr -dr com.apple.quarantine /Applications/RGV.app` once.
-          - **Windows** (`RGV-windows-x86_64.msi`, or the portable `.zip`): when SmartScreen says "Windows protected your PC", click **More info → Run anyway**.
           - **Linux** (`RGV-linux-x86_64.AppImage`, or the `.tar.gz`): `chmod +x RGV-linux-x86_64.AppImage` and run it.
+
+          Windows packages are not available yet.
 
           `SHA256SUMS` lists every file's checksum.
           EOF

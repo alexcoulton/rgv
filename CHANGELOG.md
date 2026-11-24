@@ -5,6 +5,11 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.0 — 2026-11-24
+
+First release: unsigned packages for macOS (Apple silicon and Intel) and Linux (AppImage and
+tarball). Windows packages will follow.
+
 - Repository and build hygiene from the 2026-11-20 review: pinned the toolchain in
   `rust-toolchain.toml` (1.93.1) and made every workflow use it; split CI into separate
   build-and-test and formatting/Clippy jobs per operating system; run each fuzz target as its own
