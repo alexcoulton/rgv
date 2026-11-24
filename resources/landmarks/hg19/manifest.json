@@ -696,7 +696,7 @@
     "source_transcripts": 99517,
     "transcripts": 94272
   },
-  "distribution_status": "local_qualification_only_pending_release_review",
+  "distribution_status": "redistribution_reviewed",
   "reference": {
     "downloaded": false,
     "note": "Reference sequence is deliberately not part of the lightweight landmark bundle.",

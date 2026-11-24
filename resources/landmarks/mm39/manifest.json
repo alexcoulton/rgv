@@ -500,7 +500,7 @@
     "source_transcripts": 59080,
     "transcripts": 59080
   },
-  "distribution_status": "local_qualification_only_pending_release_review",
+  "distribution_status": "redistribution_reviewed",
   "reference": {
     "downloaded": false,
     "note": "Reference sequence is deliberately not part of the lightweight landmark bundle.",

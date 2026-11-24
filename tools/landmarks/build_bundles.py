@@ -162,6 +162,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--redistribution-reviewed",
+        action="store_true",
+        help=(
+            "Record that the project has reviewed redistribution of these sources: the manifests "
+            "say so, which tools/landmarks/stage_resources.py requires for release packages."
+        ),
+    )
+    parser.add_argument(
         "--validate-existing",
         action="store_true",
         help="Validate installed bundles and print their gene/cytoband qualification without downloading.",
@@ -174,6 +182,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 # Set by `--offline`: every source must already be on disk.
 NETWORK_ALLOWED = True
+
+# Set by `--redistribution-reviewed`: the project has reviewed redistribution of the sources.
+REDISTRIBUTION_REVIEWED = False
 
 
 def request(url: str) -> urllib.request.Request:
@@ -1116,9 +1127,20 @@ requirements of each named upstream data provider.
 - GENCODE project: https://www.gencodegenes.org/pages/data_format.html
 
 The reference sequence itself is not included. Restricted clinical tracks and liftOver chains are
-not included. This notice records provenance for local qualification; distribution still requires
-the project's explicit legal/release review.
+not included. {distribution_sentence()}
 """
+
+
+def distribution_sentence() -> str:
+    if REDISTRIBUTION_REVIEWED:
+        return (
+            "This notice records the provenance and attribution that must accompany any "
+            "redistribution of the bundle."
+        )
+    return (
+        "This notice records provenance for local qualification; distribution still requires\n"
+        "the project's explicit legal/release review."
+    )
 
 
 def write_notice(spec: BuildSpec, directory: Path, configuration_url: str) -> Path:
@@ -1320,16 +1342,21 @@ def build_bundle(spec: BuildSpec, output_root: Path, force: bool) -> dict[str, A
             "note": "Reference sequence is deliberately not part of the lightweight landmark bundle.",
         },
         "counts": counts,
-        "distribution_status": "local_qualification_only_pending_release_review",
+        "distribution_status": (
+            "redistribution_reviewed"
+            if REDISTRIBUTION_REVIEWED
+            else "local_qualification_only_pending_release_review"
+        ),
     }
     write_text_lines(manifest_path, [json.dumps(manifest, indent=2, sort_keys=True) + "\n"])
     return bundle
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    global NETWORK_ALLOWED
+    global NETWORK_ALLOWED, REDISTRIBUTION_REVIEWED
     args = parse_args(argv)
     NETWORK_ALLOWED = not args.offline
+    REDISTRIBUTION_REVIEWED = args.redistribution_reviewed
     builds = args.builds or list(BUILD_SPECS)
     if args.validate_existing:
         qualifications = [

@@ -122,11 +122,17 @@ locations that holds `catalog.json` (a folder whose `igv/` subfolder holds it, s
 
 The repository carries the complete package in `resources/landmarks` (about 51 MB: every bundle's
 compact context plus its detailed transcripts), and every release package ships it in the
-location above for its platform, so a matching reference needs nothing installed. It was staged
-with `tools/landmarks/stage_resources.py --include-detail --allow-pending-review` from the
-bundles described here; restage it the same way after rebuilding them. Its
-`PACKAGE_MANIFEST.json` still records the distribution-review gate as pending, and each bundle's
-`NOTICE.md` lists the upstream providers whose attribution must travel with it.
+location above for its platform, so a matching reference needs nothing installed. The project
+reviewed redistribution of these sources on 24 November 2026, and the bundle manifests and
+`PACKAGE_MANIFEST.json` record it (`redistribution_reviewed`). Each bundle's `NOTICE.md` lists the
+upstream providers whose attribution must travel with it. The current bundles (`1.1-rgv1`) keep
+the notice wording they were built with.
+
+To refresh the package, rebuild with `build_bundles.py --redistribution-reviewed` (bundles are
+immutable per version, so changed content needs a new `bundle_version`), then stage with
+`tools/landmarks/stage_resources.py resources/landmarks --include-detail`. Rebuilding from the
+network currently fails, because igv.org now serves only the IGV applications; `--offline`
+re-curates from source files already on disk.
 
 For example, with the catalogue on an external drive:
 

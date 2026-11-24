@@ -7,7 +7,7 @@
     "hs1"
   ],
   "catalogue_schema_version": 1,
-  "distribution_status": "local_qualification_only_pending_release_review",
+  "distribution_status": "redistribution_reviewed",
   "files": [
     {
       "bytes": 141927,
@@ -40,9 +40,9 @@
       "sha256": "956c2f4d0a2cb13c096018718dc621835bc8480c4a3160053dd4b5837dc733ca"
     },
     {
-      "bytes": 20583,
+      "bytes": 20559,
       "path": "hg19/manifest.json",
-      "sha256": "d85bc821742fb53116398b9ca18c21ab209cfb05e37f86a3be4454295f9d47de"
+      "sha256": "ab02cc748cea320b13505b05b24f36a5e77d4e475a0ba843e32a43ed939fecb6"
     },
     {
       "bytes": 659947,
@@ -80,9 +80,9 @@
       "sha256": "cac694dc0ab9562ef87aaa1a3d35ba947392cf57ff440646f6effed10c72a003"
     },
     {
-      "bytes": 71351,
+      "bytes": 71327,
       "path": "hg38/manifest.json",
-      "sha256": "b71ab596d502b35123fb077b4b7212ca46aa4002731c9d1a82af51d01d0dfd47"
+      "sha256": "880fb7b2cd50d398ba222f70a9ddabb659d94c704fce6b3162618304d7517670"
     },
     {
       "bytes": 1104272,
@@ -120,9 +120,9 @@
       "sha256": "be92b6539ae97d7451e08bd769da31e31418d75d2be1c020bcf55b751f499730"
     },
     {
-      "bytes": 11104,
+      "bytes": 11080,
       "path": "hs1/manifest.json",
-      "sha256": "04ebe828426ee7a090ffe68a8d1db8c1b70dcf1ebf8b355417750c9a0237ab57"
+      "sha256": "f9bb82dc2fc7fcc82aa11742b261a0dd0d2892e15ae4d8faf59009e06753b458"
     },
     {
       "bytes": 883094,
@@ -160,9 +160,9 @@
       "sha256": "e0296fc2c34ebf318e7d182ceb7b1d993b0b3070b8562345a9b60c2e6eb09269"
     },
     {
-      "bytes": 16452,
+      "bytes": 16428,
       "path": "mm10/manifest.json",
-      "sha256": "e0d787ec76afdc826b1d264ad2161b20229558303943eeffc66d9c0c0cdeed58"
+      "sha256": "a1dfda63778d45ed92b5ed7c2c72069c70269fe4ebcdf56328584ba23536502d"
     },
     {
       "bytes": 803273,
@@ -200,9 +200,9 @@
       "sha256": "eb6755c4337f2a9e0faf55b84c58022243c713711df66faf4dd8c97b9b260883"
     },
     {
-      "bytes": 15846,
+      "bytes": 15822,
       "path": "mm39/manifest.json",
-      "sha256": "dc7dc65ec19c331c9647742451dd5ee7da467aac4e6b849c9328d87e4a877af2"
+      "sha256": "67436f3e02016681648e00538ecece00937741161f9def01a977b37931ebdefe"
     },
     {
       "bytes": 567893,
@@ -217,5 +217,5 @@
   ],
   "package": "complete",
   "schema_version": 1,
-  "total_bytes": 53376330
+  "total_bytes": 53376210
 }
