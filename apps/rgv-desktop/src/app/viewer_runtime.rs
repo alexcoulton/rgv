@@ -935,6 +935,8 @@ impl Viewer {
                 alignment_scene_budget: initial_alignment_scene_budget,
                 workspace_alignment_limit,
                 alignment_scene_identities: Default::default(),
+                alignment_dispatch_telemetry:
+                    rgv_session::alignment::dispatch::AlignmentDispatchTelemetry::default(),
             },
             application_instance_id,
             shell: app::shell_state::ShellState::default(),
@@ -959,6 +961,8 @@ impl Viewer {
             alignment_summary_gpu_renderer,
             alignment_gpu_last_prepare_stats: AlignmentGpuPrepareStats::default(),
             alignment_summary_gpu_last_prepare_stats: AlignmentSummaryGpuPrepareStats::default(),
+            alignment_frame_timings:
+                crate::workspace::alignment_management::frame_timings::AlignmentFrameTimings::default(),
             alignment_presented_epoch: None,
             alignment_gpu_residency_bundle: None,
             alignment_gpu_prefetch: AlignmentGpuPrefetchState::default(),
@@ -971,6 +975,8 @@ impl Viewer {
             alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate::default(),
             alignment_panel_scene_stores,
             alignment_scene_publication_authority: AlignmentScenePublicationAuthority::default(),
+            alignment_frame_work:
+                crate::workspace::alignment_management::frame_work::AlignmentFrameWork::default(),
             egui_context,
             egui_state,
             egui_renderer,
@@ -1492,7 +1498,11 @@ impl Viewer {
             })
         });
         let surface_started = Instant::now();
-        let surface_frame = match self.surface.get_current_texture() {
+        let surface_texture = self.surface.get_current_texture();
+        self.alignment_frame_timings
+            .surface_acquire_wait
+            .push_duration(surface_started.elapsed());
+        let surface_frame = match surface_texture {
             wgpu::CurrentSurfaceTexture::Success(frame) => Some(frame),
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 self.reconfigure_surface();

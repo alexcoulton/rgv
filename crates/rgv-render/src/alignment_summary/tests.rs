@@ -4027,6 +4027,68 @@ fn coverage_insertion_marks_come_from_the_exact_allele_pages() {
     assert!(coverage_insertion_marks(&scene, elsewhere, 0.0).is_empty());
 }
 
+/// The windowed mark query (binary search into each page's start-sorted primitives) returns
+/// exactly what a scan of every primitive of every allele page returns, for every window and
+/// threshold: the overlay work follows the visible bases and can never go stale.
+#[test]
+fn windowed_coverage_insertion_marks_equal_a_scan_of_every_allele_primitive() {
+    use CigarOpKind::{Insertion as I, Match as M};
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let records = (0..12_u32)
+        .map(|index| {
+            let before = 3 + (index * 7) % 60;
+            insertion_read(
+                &format!("ins-{index}"),
+                &[(M, before), (I, 1 + index % 3), (M, 70 - before)],
+            )
+        })
+        .collect::<Vec<_>>();
+    let scene = test_snapshot_from_authority(
+        &ledger,
+        None,
+        exact_authority_with_records(&ledger, NonZeroU64::new(16).unwrap(), 0, &records),
+        None,
+    );
+    let prepared = scene.prepared_interval();
+    let scan = |covered: GenomicInterval, minimum_fraction: f64| {
+        let mut marks = Vec::new();
+        for page in scene.summary_pages_for(SummaryPageFamily::Alleles, covered) {
+            for primitive in page.primitives() {
+                let SummarySemanticComponent::Alleles { bin, .. } = primitive.component else {
+                    continue;
+                };
+                let anchor = page.interval().start() + primitive.start_offset;
+                if covered.contains(anchor)
+                    && let Some(mark) = CoverageInsertionMark::from_bin(anchor, &bin)
+                    && mark.passes(minimum_fraction)
+                {
+                    marks.push(mark);
+                }
+            }
+        }
+        marks.sort_unstable_by_key(|mark| mark.anchor);
+        marks.dedup_by_key(|mark| mark.anchor);
+        marks
+    };
+    let mut nonempty = 0;
+    for start in prepared.start()..prepared.end() {
+        for length in [1, 2, 5, 16, 17, 40, 200] {
+            let end = (start + length).min(prepared.end());
+            let covered = GenomicInterval::new(ContigId::new(0), start, end).unwrap();
+            for minimum_fraction in [0.0, 0.1, 0.3] {
+                let windowed = coverage_insertion_marks(&scene, covered, minimum_fraction);
+                assert_eq!(
+                    windowed,
+                    scan(covered, minimum_fraction),
+                    "{covered:?} at {minimum_fraction}"
+                );
+                nonempty += usize::from(!windowed.is_empty());
+            }
+        }
+    }
+    assert!(nonempty > 100, "only {nonempty} windows held a mark");
+}
+
 #[test]
 fn coverage_lane_overlays_draw_insertion_marks_only_with_allele_detail() {
     let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);

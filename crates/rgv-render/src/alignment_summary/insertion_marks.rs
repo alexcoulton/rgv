@@ -68,6 +68,9 @@ pub fn insertion_covering_reads(bin: &PileupBin) -> u32 {
 
 /// Insertion marks at or above `minimum_fraction` whose boundary lies in `covered`, from the
 /// scene's per-base allele pages, in genomic order. Empty when the scene has no allele detail.
+///
+/// A page's primitives are sorted by start offset, so only those anchored inside `covered` are
+/// visited (found by binary search): the cost follows the visible bases, not the page size.
 #[must_use]
 pub fn coverage_insertion_marks(
     scene: &AlignmentSceneSnapshot,
@@ -77,7 +80,13 @@ pub fn coverage_insertion_marks(
     let mut marks = Vec::new();
     for page in scene.summary_pages_for(SummaryPageFamily::Alleles, covered) {
         let page_start = page.interval().start();
-        for primitive in page.primitives() {
+        let primitives = page.primitives();
+        let first_offset = covered.start().saturating_sub(page_start);
+        let end_offset = covered.end().saturating_sub(page_start);
+        let first = primitives.partition_point(|primitive| primitive.start_offset < first_offset);
+        let end = first
+            + primitives[first..].partition_point(|primitive| primitive.start_offset < end_offset);
+        for primitive in &primitives[first..end] {
             let SummarySemanticComponent::Alleles { bin, .. } = primitive.component else {
                 continue;
             };

@@ -206,6 +206,24 @@ pub struct NavigationQueryTarget {
     pub generation: u64,
 }
 
+/// Why [`NavigationQuerySchedule::take_due_with_reason`] released a target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NavigationDueReason {
+    /// Input has been quiet for [`NAVIGATION_QUERY_IDLE_DELAY`]: the target is the settled one.
+    Idle,
+    /// A gesture is still moving; [`NAVIGATION_QUERY_MAX_CADENCE`] elapsed since the last
+    /// dispatch. More input is expected.
+    Cadence,
+}
+
+/// A target released by the schedule, with why and when its last input arrived.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NavigationDue {
+    pub target: NavigationQueryTarget,
+    pub reason: NavigationDueReason,
+    pub last_input_at: Option<Instant>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct NavigationQuerySchedule {
     pub gesture_active: bool,
@@ -224,6 +242,20 @@ pub struct NavigationQuerySchedule {
     pub cancelled_targets: u64,
     pub committed_targets: u64,
     pub last_commit_micros: u64,
+    /// The alignment half of a mid-gesture cadence dispatch that was a camera-only move. Its
+    /// reference and track halves were dispatched; the alignment target stays queued until input
+    /// has been idle for [`NAVIGATION_QUERY_IDLE_DELAY`] since `last_input_at`, or the gesture
+    /// ends. Newer input supersedes it: the newer pending target owns alignment again.
+    pub deferred_alignment: Option<NavigationDeferredAlignment>,
+    /// Cadence dispatches whose alignment half was deferred as a camera-only move.
+    pub deferred_alignment_targets: u64,
+}
+
+/// See [`NavigationQuerySchedule::deferred_alignment`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NavigationDeferredAlignment {
+    pub target: NavigationQueryTarget,
+    pub last_input_at: Instant,
 }
 
 impl NavigationQuerySchedule {
@@ -249,12 +281,20 @@ impl NavigationQuerySchedule {
         }
         self.pending = Some(target);
         self.last_input_at = Some(now);
+        self.deferred_alignment = None;
         self.gesture_active |= gesture_active;
         self.hold_commit_until_end |= hold_commit_until_end;
     }
 
     pub fn take_due(&mut self, now: Instant) -> Option<NavigationQueryTarget> {
+        self.take_due_with_reason(now).map(|due| due.target)
+    }
+
+    /// [`Self::take_due`], also saying whether the target is settled (idle) or a mid-gesture
+    /// cadence sample.
+    pub fn take_due_with_reason(&mut self, now: Instant) -> Option<NavigationDue> {
         self.pending?;
+        let last_input_at = self.last_input_at;
         let idle_due = self
             .last_input_at
             .is_some_and(|last| now.saturating_duration_since(last) >= NAVIGATION_QUERY_IDLE_DELAY);
@@ -266,9 +306,45 @@ impl NavigationQuerySchedule {
         if idle_due && !self.hold_commit_until_end {
             self.gesture_active = false;
         }
+        let reason = if idle_due {
+            NavigationDueReason::Idle
+        } else {
+            NavigationDueReason::Cadence
+        };
         (idle_due || cadence_due)
             .then(|| self.take_pending(now, false))
             .flatten()
+            .map(|target| NavigationDue {
+                target,
+                reason,
+                last_input_at,
+            })
+    }
+
+    /// Leaves the alignment half of a cadence dispatch queued; see
+    /// [`Self::deferred_alignment`]. Without a known input time the target is due at once.
+    pub fn defer_alignment(&mut self, due: NavigationDue, now: Instant) {
+        self.deferred_alignment = Some(NavigationDeferredAlignment {
+            target: due.target,
+            last_input_at: due.last_input_at.unwrap_or(now),
+        });
+        self.deferred_alignment_targets = self.deferred_alignment_targets.saturating_add(1);
+    }
+
+    /// The deferred alignment target once input has been idle for
+    /// [`NAVIGATION_QUERY_IDLE_DELAY`], or at once when `gesture_end`.
+    pub fn take_due_deferred_alignment(
+        &mut self,
+        now: Instant,
+        gesture_end: bool,
+    ) -> Option<NavigationQueryTarget> {
+        let deferred = self.deferred_alignment?;
+        let idle =
+            now.saturating_duration_since(deferred.last_input_at) >= NAVIGATION_QUERY_IDLE_DELAY;
+        (gesture_end || idle).then(|| {
+            self.deferred_alignment = None;
+            deferred.target
+        })
     }
 
     pub fn take_immediate(
@@ -309,6 +385,7 @@ impl NavigationQuerySchedule {
         self.pending = None;
         self.first_pending_at = None;
         self.last_input_at = None;
+        self.deferred_alignment = None;
     }
 
     pub fn record_superseded_target(&mut self) {
@@ -318,5 +395,111 @@ impl NavigationQuerySchedule {
     pub fn record_commit(&mut self, elapsed: Duration) {
         self.committed_targets = self.committed_targets.saturating_add(1);
         self.last_commit_micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rgv_core::ContigId;
+
+    fn target(start: u64, generation: u64) -> NavigationQueryTarget {
+        let interval = GenomicInterval::new(ContigId::new(0), start, start + 1_000).unwrap();
+        NavigationQueryTarget {
+            fingerprint: NavigationTargetFingerprint::from_viewport(
+                Viewport::new(interval, 1_000.0).unwrap(),
+            ),
+            generation,
+        }
+    }
+
+    /// A gesture that keeps moving past the cadence: the cadence sample's alignment half is
+    /// deferred, later input supersedes it, and the settled (idle) target is released as such.
+    #[test]
+    fn a_cadence_sample_is_distinguished_from_the_settled_target() {
+        let started = Instant::now();
+        let mut schedule = NavigationQuerySchedule::default();
+        let mut now = started;
+        let mut last_input = started;
+        let mut generation = 0;
+        while now.saturating_duration_since(started) < NAVIGATION_QUERY_MAX_CADENCE {
+            generation += 1;
+            schedule.update(target(100 + generation, generation), now, true, false);
+            last_input = now;
+            now += Duration::from_millis(8);
+        }
+        let cadence = schedule.take_due_with_reason(now).unwrap();
+        assert_eq!(cadence.reason, NavigationDueReason::Cadence);
+        assert_eq!(cadence.target, target(100 + generation, generation));
+        assert_eq!(cadence.last_input_at, Some(last_input));
+        schedule.defer_alignment(cadence, now);
+        assert_eq!(schedule.deferred_alignment_targets, 1);
+        assert!(schedule.take_due_deferred_alignment(now, false).is_none());
+
+        // More input: the newer pending target owns alignment again.
+        generation += 1;
+        schedule.update(target(100 + generation, generation), now, true, false);
+        assert!(schedule.deferred_alignment.is_none());
+        let settled = schedule
+            .take_due_with_reason(now + NAVIGATION_QUERY_IDLE_DELAY)
+            .unwrap();
+        assert_eq!(settled.reason, NavigationDueReason::Idle);
+        assert_eq!(settled.target, target(100 + generation, generation));
+    }
+
+    /// The gesture stops right after a deferred cadence sample: the deferred alignment target
+    /// is the settled one and becomes due after the idle delay since its last input.
+    #[test]
+    fn a_deferred_alignment_target_is_released_once_input_is_idle_or_the_gesture_ends() {
+        let started = Instant::now();
+        let mut schedule = NavigationQuerySchedule::default();
+        schedule.update(target(100, 1), started, true, false);
+        let cadence = schedule
+            .take_due_with_reason(started + NAVIGATION_QUERY_MAX_CADENCE)
+            .unwrap();
+        schedule.defer_alignment(cadence, started + NAVIGATION_QUERY_MAX_CADENCE);
+        assert!(
+            schedule.pending.is_none(),
+            "the schedule itself owes nothing more for this target"
+        );
+        assert!(
+            schedule
+                .take_due_deferred_alignment(
+                    started + NAVIGATION_QUERY_IDLE_DELAY.saturating_sub(Duration::from_millis(1)),
+                    false
+                )
+                .is_none()
+        );
+        assert_eq!(
+            schedule.take_due_deferred_alignment(started + NAVIGATION_QUERY_IDLE_DELAY, false),
+            Some(target(100, 1))
+        );
+        assert!(
+            schedule
+                .take_due_deferred_alignment(started + Duration::from_secs(1), true)
+                .is_none(),
+            "released exactly once"
+        );
+
+        schedule.update(target(200, 2), started, true, false);
+        let cadence = schedule
+            .take_due_with_reason(started + NAVIGATION_QUERY_MAX_CADENCE)
+            .unwrap();
+        schedule.defer_alignment(cadence, started);
+        assert_eq!(
+            schedule.take_due_deferred_alignment(started, true),
+            Some(target(200, 2)),
+            "a gesture end releases it at once"
+        );
+        schedule.update(target(300, 3), started, true, false);
+        let cadence = schedule
+            .take_due_with_reason(started + NAVIGATION_QUERY_MAX_CADENCE)
+            .unwrap();
+        schedule.defer_alignment(cadence, started);
+        schedule.cancel();
+        assert!(
+            schedule.deferred_alignment.is_none(),
+            "a refresh supersedes it"
+        );
     }
 }

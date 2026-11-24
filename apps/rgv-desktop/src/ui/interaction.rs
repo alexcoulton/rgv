@@ -125,11 +125,18 @@ impl Viewer {
         let hover_panel = self
             .panel_at_cursor()
             .unwrap_or_else(|| self.session.panels.active().id);
-        let hovered_scene = hover_allowed
-            .then(|| self.alignment_scene_hit_at_cursor(hover_panel))
-            .flatten();
-        let hover_changed =
-            retarget_alignment_hover(&mut self.session.panels, hover_panel, hovered_scene);
+        // While a gesture's scene capture is owed to the next frame the presented epoch still
+        // shows the previous camera: a hit test would name the read that was under the pointer
+        // before the move, and retargeting would capture again for every event. Hover resumes
+        // with the next pointer movement after the frame.
+        let hover_changed = if self.alignment_frame_work.prepare_owed() {
+            Vec::new()
+        } else {
+            let hovered_scene = hover_allowed
+                .then(|| self.alignment_scene_hit_at_cursor(hover_panel))
+                .flatten();
+            retarget_alignment_hover(&mut self.session.panels, hover_panel, hovered_scene)
+        };
         if !hover_changed.is_empty() {
             for panel_id in hover_changed {
                 self.synchronize_alignment_scene_interactions(panel_id);

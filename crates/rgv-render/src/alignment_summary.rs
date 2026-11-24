@@ -573,6 +573,9 @@ pub struct AlignmentSummaryGpuPrepareStats {
     pub page_cache_misses: usize,
     pub resident_pages: usize,
     pub resident_gpu_bytes: usize,
+    /// CPU time spent counting and building the frame's overlays (insertion marks, centre and
+    /// selection lines, junction baselines).
+    pub overlay_preparation_micros: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1153,6 +1156,7 @@ pub struct AlignmentSummaryGpuStagedReplacement {
     geometry_uploaded_bytes: usize,
     range_maximum_queries: usize,
     junction_entries_examined: usize,
+    overlay_preparation: std::time::Duration,
 }
 
 impl AlignmentSummaryGpuStagedReplacement {
@@ -2155,6 +2159,7 @@ impl AlignmentSummaryGpuRenderer {
         let mut pending_draws = Vec::with_capacity(plan.mandatory_draws);
         let mut overlays = Vec::with_capacity(plan.overlay_instances);
         let mut pending_overlay_draws = Vec::with_capacity(plan.overlay_draws);
+        let mut overlay_preparation = std::time::Duration::ZERO;
         let scene_revisions = plan.scene_revisions.to_vec();
         let scene_allocations = plan.scene_allocations.to_vec();
         let mut camera_sequences = Vec::with_capacity(requests.len());
@@ -2263,7 +2268,9 @@ impl AlignmentSummaryGpuRenderer {
             }
             let start = u32::try_from(overlays.len())
                 .expect("overlay address space was validated by the replacement plan");
+            let overlays_started = std::time::Instant::now();
             append_summary_overlays(request, &mut overlays);
+            overlay_preparation += overlays_started.elapsed();
             let end = u32::try_from(overlays.len())
                 .expect("overlay address space was validated by the replacement plan");
             if start != end {
@@ -2505,6 +2512,7 @@ impl AlignmentSummaryGpuRenderer {
             geometry_uploaded_bytes,
             range_maximum_queries,
             junction_entries_examined,
+            overlay_preparation,
             plan,
         })
     }
@@ -2771,6 +2779,8 @@ impl AlignmentSummaryGpuRenderer {
             page_cache_misses: staged.plan.page_cache_misses,
             resident_pages: self.cache.pages.len(),
             resident_gpu_bytes,
+            overlay_preparation_micros: u64::try_from(staged.overlay_preparation.as_micros())
+                .unwrap_or(u64::MAX),
         };
         (frame, stats, staged.admission)
     }
@@ -3167,13 +3177,16 @@ impl AlignmentSummaryGpuRenderer {
             resolve_resident_junction_request_metrics(self, requests, &visible)?;
         range_maximum_queries = range_maximum_queries.saturating_add(junction_range_queries);
 
-        let overlay_count = requests.iter().map(summary_overlay_count).sum::<usize>();
+        let overlays_started = std::time::Instant::now();
+        let overlay_counts = requests
+            .iter()
+            .map(summary_overlay_count)
+            .collect::<Vec<_>>();
+        let mut overlay_preparation = overlays_started.elapsed();
+        let overlay_count = overlay_counts.iter().sum::<usize>();
         u32::try_from(overlay_count)
             .map_err(|_| AlignmentSummaryGpuPrepareError::TooManyOverlayPrimitives)?;
-        let overlay_draws = requests
-            .iter()
-            .filter(|request| summary_overlay_count(request) > 0)
-            .count();
+        let overlay_draws = overlay_counts.iter().filter(|count| **count > 0).count();
         let uniform_count = mandatory_pages.saturating_add(overlay_draws);
         let uniform_bytes = uniform_count.saturating_mul(self.uniform_stride);
         if uniform_count > 0 {
@@ -3301,7 +3314,9 @@ impl AlignmentSummaryGpuRenderer {
             }
             let start = u32::try_from(overlays.len())
                 .expect("overlay address space was validated before allocation");
+            let overlays_started = std::time::Instant::now();
             append_summary_overlays(request, &mut overlays);
+            overlay_preparation += overlays_started.elapsed();
             let end = u32::try_from(overlays.len())
                 .expect("overlay address space was validated before allocation");
             if start != end {
@@ -3508,6 +3523,8 @@ impl AlignmentSummaryGpuRenderer {
             page_cache_misses: 0,
             resident_pages: self.cache.pages.len(),
             resident_gpu_bytes,
+            overlay_preparation_micros: u64::try_from(overlay_preparation.as_micros())
+                .unwrap_or(u64::MAX),
         };
         Ok((frame, stats))
     }

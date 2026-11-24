@@ -82,6 +82,20 @@ impl ApplicationHandler for Application {
         // that response after rendering this same event creates an endless
         // RedrawRequested -> request_redraw feedback loop.
         let request_egui_redraw = should_request_egui_redraw(&event, egui_response.repaint);
+        // Wheel, pinch and pointer-motion events arrive several times per displayed frame.
+        // Their alignment dispatches and scene captures are owed to the next frame, which runs
+        // each once (see `frame_work`).
+        let defers_alignment_frame_work = matches!(
+            event,
+            WindowEvent::MouseWheel { .. }
+                | WindowEvent::PinchGesture { .. }
+                | WindowEvent::CursorMoved { .. }
+        );
+        if defers_alignment_frame_work {
+            viewer.alignment_frame_work.begin_input();
+        } else if matches!(event, WindowEvent::MouseInput { .. }) {
+            viewer.settle_owed_alignment_frame_work();
+        }
         match event {
             WindowEvent::CloseRequested => {
                 // Unsaved changes open the Save / Discard / Cancel prompt instead of exiting.
@@ -355,6 +369,9 @@ impl ApplicationHandler for Application {
             _ => {}
         }
 
+        if defers_alignment_frame_work && viewer.alignment_frame_work.end_input() {
+            viewer.window.request_redraw();
+        }
         viewer.finish_native_input_observation(recording_observation);
 
         if request_egui_redraw {
@@ -439,6 +456,7 @@ impl ApplicationHandler for Application {
                         .autosave_enabled
                         .then_some(viewer.next_autosave),
                     viewer.navigation_gesture_deadline(),
+                    viewer.deferred_alignment_dispatch_deadline(),
                     // After a due attempt the redraw above moves this into the future.
                     gpu_recovery_deadline.filter(|deadline| *deadline > now),
                 ],

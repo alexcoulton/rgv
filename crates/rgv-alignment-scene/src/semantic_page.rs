@@ -686,8 +686,89 @@ pub struct AlignmentSemanticPage {
     /// Immutable page-local anchor directory. The labels remain canonical semantic primitives;
     /// camera capture follows these indices instead of filtering every page primitive again.
     label_primitive_indices: Arc<[u32]>,
+    /// Immutable spatial directory, built once with the page: the primitives of local row `r`
+    /// in paint layer `l` (see [`primitive_paint_layer`]) are
+    /// `layer_offsets[r * PAINT_LAYERS + l]..layer_offsets[r * PAINT_LAYERS + l + 1]`, already
+    /// sorted by start offset by the page's paint order. See [`Self::window_primitive_ranges`].
+    layer_offsets: Arc<[u32]>,
+    /// Ascending indices of the primitives spanning more than [`SPATIAL_INDEX_LONG_SPAN_BASES`]
+    /// bases. Every other primitive that reaches a genomic window starts at most that far before
+    /// it, so a window query finds those by binary search and visits only these individually.
+    long_primitive_indices: Arc<[u32]>,
     labels: Arc<[AlignmentSemanticLabel]>,
     allocation: AllocationLease,
+}
+
+/// Number of within-row paint layers ([`primitive_paint_layer`] is `0..=3`).
+const PAINT_LAYERS: usize = 4;
+
+/// Primitives longer than this many bases are listed individually in a page's spatial
+/// directory; see [`AlignmentSemanticPage::window_primitive_ranges`].
+pub const SPATIAL_INDEX_LONG_SPAN_BASES: u64 = 64;
+
+/// Builds a page's spatial directory over `primitives`, which are in page paint order
+/// (`page_paint_key`). Returns `(layer_offsets, long_primitive_indices)`.
+fn build_spatial_directory(
+    primitives: &[AlignmentSemanticPrimitive],
+    rows: usize,
+) -> Result<(Vec<u32>, Vec<u32>), SemanticPageError> {
+    let slots = rows
+        .checked_mul(PAINT_LAYERS)
+        .and_then(|slots| slots.checked_add(1))
+        .ok_or(SemanticPageError::RowCoordinateOverflow)?;
+    let mut layer_offsets = vec![0_u32; slots];
+    let mut long = Vec::new();
+    for (index, primitive) in primitives.iter().enumerate() {
+        let slot = (primitive.row_offset as usize)
+            .checked_mul(PAINT_LAYERS)
+            .and_then(|slot| {
+                slot.checked_add(usize::from(primitive_paint_layer(
+                    primitive.component,
+                    primitive.geometry,
+                )))
+            })
+            .filter(|slot| slot.saturating_add(1) < slots)
+            .ok_or(SemanticPageError::RowCoordinateOverflow)?;
+        layer_offsets[slot + 1] = layer_offsets[slot + 1].saturating_add(1);
+        if primitive.end_offset.saturating_sub(primitive.start_offset)
+            > SPATIAL_INDEX_LONG_SPAN_BASES
+        {
+            long.push(u32::try_from(index).map_err(|_| SemanticPageError::PrimitiveCountOverflow)?);
+        }
+    }
+    for slot in 1..slots {
+        layer_offsets[slot] = layer_offsets[slot].saturating_add(layer_offsets[slot - 1]);
+    }
+    debug_assert!(
+        primitives.windows(2).all(|pair| {
+            let key = |primitive: &AlignmentSemanticPrimitive| {
+                (
+                    primitive.row_offset,
+                    primitive_paint_layer(primitive.component, primitive.geometry),
+                    primitive.start_offset,
+                )
+            };
+            key(&pair[0]) <= key(&pair[1])
+        }),
+        "the spatial directory requires primitives in page paint order"
+    );
+    Ok((layer_offsets, long))
+}
+
+/// Appends `range` to `output`, merging it into the previous range when they touch and that
+/// range was appended by the same query (at or after `first`).
+fn push_primitive_range(output: &mut Vec<Range<u32>>, first: usize, range: Range<u32>) {
+    if range.start >= range.end {
+        return;
+    }
+    if output.len() > first
+        && let Some(last) = output.last_mut()
+        && last.end >= range.start
+    {
+        last.end = last.end.max(range.end);
+        return;
+    }
+    output.push(range);
 }
 
 #[derive(Clone, Debug)]
@@ -1051,7 +1132,14 @@ impl AlignmentSemanticPage {
             maximum_labels,
             maximum_labels,
             maximum_label_bytes,
-        );
+        )
+        .saturating_add(semantic_page_spatial_directory_bytes(
+            row_offset_count
+                .saturating_sub(1)
+                .saturating_mul(PAINT_LAYERS)
+                .saturating_add(1),
+            maximum_primitives,
+        ));
         let _output_scratch = ledger.reserve_transient(
             TransientResourceClass::SemanticPageBuilder,
             maximum_bytes,
@@ -1255,6 +1343,8 @@ impl AlignmentSemanticPage {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| SemanticPageError::PrimitiveCountOverflow)?;
+        let (layer_offsets, long_primitive_indices) =
+            build_spatial_directory(&primitives, row_offset_count.saturating_sub(1))?;
         primitives.shrink_to_fit();
         row_offsets.shrink_to_fit();
         label_primitive_indices.shrink_to_fit();
@@ -1266,7 +1356,11 @@ impl AlignmentSemanticPage {
             label_primitive_indices.len(),
             labels.len(),
             retained_label_bytes,
-        );
+        )
+        .saturating_add(semantic_page_spatial_directory_bytes(
+            layer_offsets.len(),
+            long_primitive_indices.len(),
+        ));
         let allocation = reservation.register(retained_bytes, publication_revision)?;
         Ok(Arc::new(Self {
             key,
@@ -1277,6 +1371,8 @@ impl AlignmentSemanticPage {
             primitives: primitives.into(),
             row_offsets: row_offsets.into(),
             label_primitive_indices: label_primitive_indices.into(),
+            layer_offsets: layer_offsets.into(),
+            long_primitive_indices: long_primitive_indices.into(),
             labels: labels.into(),
             allocation,
         }))
@@ -1338,6 +1434,73 @@ impl AlignmentSemanticPage {
     #[must_use]
     pub fn label_anchor_count(&self) -> usize {
         self.label_primitive_indices.len()
+    }
+
+    /// Appends to `output`, in ascending order, disjoint ranges of indices into
+    /// [`Self::primitives`] that together contain every primitive of a row in `rows` (canonical
+    /// atlas rows) whose genomic span intersects `window` (absolute positions). The ranges may
+    /// also contain primitives outside the window; callers still project and clip each one.
+    ///
+    /// The query reads the immutable spatial directory built with the page, so its cost is the
+    /// number of rows and paint layers asked for (two binary searches each), plus the primitives
+    /// longer than [`SPATIAL_INDEX_LONG_SPAN_BASES`] that start before the window, plus the size
+    /// of the ranges returned. It never visits the rest of the page.
+    pub fn window_primitive_ranges(
+        &self,
+        rows: Range<u32>,
+        window: Range<u64>,
+        output: &mut Vec<Range<u32>>,
+    ) {
+        let page_start = self.interval.start();
+        if window.start >= window.end || window.end <= page_start {
+            return;
+        }
+        let window_start = window.start.saturating_sub(page_start);
+        let window_end = window.end - page_start;
+        let short_floor = window_start.saturating_sub(SPATIAL_INDEX_LONG_SPAN_BASES);
+        let first_output = output.len();
+        for row in rows.start.max(self.row_start)..rows.end.min(self.row_end) {
+            let first_slot = (row - self.row_start) as usize * PAINT_LAYERS;
+            for layer in 0..PAINT_LAYERS {
+                let (Some(&first), Some(&end)) = (
+                    self.layer_offsets.get(first_slot + layer),
+                    self.layer_offsets.get(first_slot + layer + 1),
+                ) else {
+                    return;
+                };
+                if first >= end {
+                    continue;
+                }
+                let run = &self.primitives[first as usize..end as usize];
+                // Within one row and layer the page is ordered by start offset.
+                let below_end =
+                    run.partition_point(|primitive| primitive.start_offset < window_end);
+                let short_start = run[..below_end]
+                    .partition_point(|primitive| primitive.start_offset < short_floor);
+                let low = first + short_start as u32;
+                let high = first + below_end as u32;
+                // Primitives starting before `short_floor` reach the window only if long.
+                let long = &self.long_primitive_indices;
+                let long_first = long.partition_point(|&index| index < first);
+                let long_end = long.partition_point(|&index| index < low);
+                for &index in &long[long_first..long_end] {
+                    if self.primitives[index as usize].end_offset > window_start {
+                        push_primitive_range(output, first_output, index..index + 1);
+                    }
+                }
+                push_primitive_range(output, first_output, low..high);
+            }
+        }
+    }
+
+    /// Index of `primitive_index`'s GPU instance among the page's drawable (non-label)
+    /// primitives, which keep page order; for a label, the index of the next drawable primitive.
+    #[must_use]
+    pub fn drawable_index(&self, primitive_index: u32) -> u32 {
+        let labels_before = self
+            .label_primitive_indices
+            .partition_point(|&label| label < primitive_index);
+        primitive_index.saturating_sub(labels_before as u32)
     }
 
     #[must_use]
@@ -3973,6 +4136,13 @@ const fn semantic_page_bytes(
         .saturating_add(label_bytes)
 }
 
+/// Retained bytes of a page's spatial directory (`layer_offsets` and the long-primitive list).
+const fn semantic_page_spatial_directory_bytes(layer_offsets: usize, long: usize) -> usize {
+    layer_offsets
+        .saturating_add(long)
+        .saturating_mul(size_of::<u32>())
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum SemanticPageError {
     #[error(transparent)]
@@ -4874,6 +5044,9 @@ mod tests {
                 page.label_primitive_indices.len(),
                 page.labels().len(),
                 page.labels().iter().map(|label| label.text().len()).sum(),
+            ) + semantic_page_spatial_directory_bytes(
+                page.layer_offsets.len(),
+                page.long_primitive_indices.len(),
             )
         );
     }

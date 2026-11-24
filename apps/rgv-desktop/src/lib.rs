@@ -1299,6 +1299,8 @@ struct Viewer {
     alignment_summary_gpu_renderer: AlignmentSummaryGpuRenderer,
     alignment_gpu_last_prepare_stats: AlignmentGpuPrepareStats,
     alignment_summary_gpu_last_prepare_stats: AlignmentSummaryGpuPrepareStats,
+    /// Rolling per-frame timings reported under `alignment_scene_diagnostics`.
+    alignment_frame_timings: workspace::alignment_management::frame_timings::AlignmentFrameTimings,
     alignment_presented_epoch: Option<PresentedAlignmentEpoch>,
     alignment_gpu_residency_bundle: Option<AlignmentGpuResidencyBundle>,
     alignment_gpu_prefetch: AlignmentGpuPrefetchState,
@@ -1317,6 +1319,8 @@ struct Viewer {
     alignment_gpu_speculation_gate: AlignmentGpuSpeculationGate,
     alignment_panel_scene_stores: HashMap<PanelId, AlignmentPanelSceneStore>,
     alignment_scene_publication_authority: AlignmentScenePublicationAuthority,
+    /// Scene-frame preparation and gesture dispatches owed to the next frame by input handling.
+    alignment_frame_work: workspace::alignment_management::frame_work::AlignmentFrameWork,
     egui_context: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,

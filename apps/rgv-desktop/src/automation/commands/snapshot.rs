@@ -99,6 +99,11 @@ impl Viewer {
         let context_bytes = self.context_scene_gpu_renderer.resident_bytes();
         let generic_bytes = self.rectangle_renderer.resident_bytes();
         let read = self.alignment_gpu_last_prepare_stats;
+        let timings = &self.alignment_frame_timings;
+        let label_projection = timings.label_projection.summary();
+        let instance_preparation = timings.instance_preparation.summary();
+        let overlay_preparation = timings.overlay_preparation.summary();
+        let surface_acquire_wait = timings.surface_acquire_wait.summary();
         let summary = self.alignment_summary_gpu_last_prepare_stats;
         let read_operations = self.alignment_gpu_renderer.operation_counters();
         let summary_operations = self.alignment_summary_gpu_renderer.operation_counters();
@@ -116,6 +121,8 @@ impl Viewer {
             progress.charged.saturating_add(progress.reserved)
         });
         let pressure = self.alignment_last_gpu_budget_pressure;
+        let dispatch = self.session.alignment_dispatch_telemetry;
+        let frame_work = self.alignment_frame_work.telemetry;
         AutomationAlignmentSceneDiagnostics {
             aggregate_cache_budget_bytes: self.aggregate_cache_budget_bytes(),
             aggregate_cache_occupied_bytes: alignment_occupied
@@ -176,6 +183,24 @@ impl Viewer {
             read_frame_immutable_upload_bytes: read.geometry_uploaded_bytes,
             read_frame_cache_hits: read.page_cache_hits,
             read_frame_cache_misses: read.page_cache_misses,
+            read_frame_unculled_instances: read.unculled_instances,
+            read_frame_draw_ranges: read.draw_ranges,
+            read_frame_label_projection_micros: label_projection.last,
+            read_frame_label_projection_micros_p50: label_projection.p50,
+            read_frame_label_projection_micros_p95: label_projection.p95,
+            read_frame_instance_preparation_micros: instance_preparation.last,
+            read_frame_instance_preparation_micros_p50: instance_preparation.p50,
+            read_frame_instance_preparation_micros_p95: instance_preparation.p95,
+            summary_frame_overlay_preparation_micros: overlay_preparation.last,
+            summary_frame_overlay_preparation_micros_p50: overlay_preparation.p50,
+            summary_frame_overlay_preparation_micros_p95: overlay_preparation.p95,
+            surface_acquire_wait_micros: surface_acquire_wait.last,
+            surface_acquire_wait_micros_p50: surface_acquire_wait.p50,
+            surface_acquire_wait_micros_p95: surface_acquire_wait.p95,
+            frame_timing_window_samples: label_projection
+                .samples
+                .max(overlay_preparation.samples)
+                .max(surface_acquire_wait.samples),
             summary_frame_mandatory_pages: summary.mandatory_pages,
             summary_frame_depth_instances: summary.depth_instances,
             summary_frame_allele_instances: summary.allele_instances,
@@ -207,6 +232,24 @@ impl Viewer {
             generic_slab_cache_hits: generic_operations.slab_cache_hits,
             generic_total_uploaded_bytes: generic_operations.uploaded_bytes,
             generic_buffer_reallocations: generic_operations.buffer_reallocations,
+            alignment_query_dispatches: dispatch.dispatches,
+            alignment_query_lanes_sent: dispatch.lanes_sent,
+            alignment_query_dispatch_micros_total: dispatch.total_micros,
+            alignment_query_dispatch_micros_last: dispatch.last_micros,
+            alignment_camera_only_gesture_steps: dispatch.camera_only_steps,
+            alignment_deferred_cadence_dispatches: self
+                .session
+                .panels
+                .iter()
+                .map(|panel| panel.navigation_query_schedule.deferred_alignment_targets)
+                .sum(),
+            alignment_frame_coalesced_dispatches: frame_work.dispatches_coalesced,
+            alignment_scene_frame_prepares: frame_work.prepares,
+            alignment_scene_frame_prepares_coalesced: frame_work.prepares_coalesced,
+            alignment_scene_frame_prepare_micros_total: frame_work.prepare_micros_total,
+            alignment_scene_frame_prepare_micros_last: frame_work.prepare_micros_last,
+            display_list_rebuilds: frame_work.display_list_rebuilds,
+            display_list_rebuild_prepares_reused: frame_work.layout_refresh_prepares_reused,
         }
     }
 

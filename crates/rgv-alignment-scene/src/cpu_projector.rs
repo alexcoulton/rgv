@@ -130,6 +130,28 @@ impl AlignmentCamera {
         first..first.saturating_add(visible).saturating_add(1)
     }
 
+    /// Absolute genomic positions, as a half-open range, outside which no primitive can project
+    /// into this camera's clip, on the CPU ([`CpuAlignmentProjector`]) or on the GPU
+    /// (`alignment_scene.wgsl`). A primitive whose span does not intersect it emits nothing.
+    ///
+    /// No shape reaches further beyond its own genomic span than the one-point minimum size, a
+    /// point marker's half width ([`POINT_MARKER_MAXIMUM_WIDTH`] / 2), or a clip edge's width plus
+    /// the arrowhead it may sit behind (at most [`ARROWHEAD_LENGTH_FRACTION`] of the read
+    /// height). The window adds [`PROJECTION_WINDOW_MARGIN_POINTS`] plus twice the drawn read
+    /// height on both sides, and two more bases for rounding, which covers all of those with room
+    /// to spare, including the GPU's single-precision arithmetic and a scissor rounded outwards to
+    /// whole physical pixels.
+    #[must_use]
+    pub fn projection_window(self) -> Range<u64> {
+        let body = self.read_height.max(MINIMUM_PRIMITIVE_EXTENT);
+        let margin = (PROJECTION_WINDOW_MARGIN_POINTS + 2.0 * body) * self.bases_per_pixel() + 2.0;
+        let start = self.exact_start() - margin;
+        let end = self.exact_start() + self.span() + margin;
+        let start = if start > 0.0 { start.floor() as u64 } else { 0 };
+        let end = if end > 0.0 { end.ceil() as u64 } else { 0 };
+        start..end.max(start)
+    }
+
     fn x_for_position(self, position: u64) -> f64 {
         self.clip.x + self.viewport.pixel_at_genomic(position)
     }
@@ -617,10 +639,200 @@ impl CpuAlignmentProjector {
         )
     }
 
-    /// Projects only camera-dependent text. The scan is bounded to intersecting semantic pages
-    /// and row blocks, and its exact temporary capacity is admitted through the scene ledger
-    /// before allocation.
+    /// Projects only camera-dependent text. The scan is bounded to the visible rows of the
+    /// intersecting semantic pages and, through each page's immutable spatial directory, to the
+    /// primitives whose spans reach the camera's [`AlignmentCamera::projection_window`]: its cost
+    /// follows what is on screen, not how much the pages hold. When the drawn read is too short
+    /// for any text no anchor is projected at all. Its exact temporary capacity is admitted
+    /// through the scene ledger before the projection allocates.
+    ///
+    /// `anchors_examined` and `base_anchors_examined` count the text-bearing primitives (labels,
+    /// base cells, clip-ghost bases) of the visible rows inside that window, whether or not the
+    /// camera can make them legible.
     pub fn project_labels_with_interaction(
+        scene: &Arc<AlignmentPresentationScene>,
+        camera_sequence: u64,
+        camera: AlignmentCamera,
+        interaction: &AlignmentInteractionState,
+    ) -> Result<CpuAlignmentLabelFrame, CpuProjectionError> {
+        let requested_rows = camera.visible_rows();
+        let covered_interval = intersect_intervals(camera.interval(), scene.prepared_interval());
+        let covered_rows = intersect_ranges(requested_rows.clone(), scene.prepared_rows());
+        let visible_text_pages = covered_interval.map_or_else(Vec::new, |interval| {
+            scene
+                .visible_pages(interval, covered_rows.clone())
+                .into_iter()
+                .filter(|page| {
+                    matches!(
+                        page.key().family(),
+                        AlignmentPageFamily::Labels | AlignmentPageFamily::ReadGeometry
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        // Every primitive that can project into the clip lies in these index ranges.
+        let window = camera.projection_window();
+        let mut ranges = Vec::new();
+        let mut page_ranges = Vec::with_capacity(visible_text_pages.len());
+        for page in &visible_text_pages {
+            let first = ranges.len();
+            page.window_primitive_ranges(covered_rows.clone(), window.clone(), &mut ranges);
+            page_ranges.push(first..ranges.len());
+        }
+        let windowed = |page_index: usize| {
+            let page = visible_text_pages[page_index];
+            ranges[page_ranges[page_index].clone()]
+                .iter()
+                .flat_map(move |range| &page.primitives()[range.start as usize..range.end as usize])
+                .copied()
+        };
+        let (maximum_labels, base_anchors_examined) = (0..visible_text_pages.len())
+            .flat_map(windowed)
+            .fold((0_usize, 0_usize), |(labels, bases), primitive| {
+                match primitive.component {
+                    AlignmentComponent::Base { .. } => (labels + 1, bases + 1),
+                    // Clip-ghost bases also carry a letter but are not counted as base anchors.
+                    AlignmentComponent::Label { .. } | AlignmentComponent::ClipGhostBase { .. } => {
+                        (labels + 1, bases)
+                    }
+                    _ => (labels, bases),
+                }
+            });
+        let mut projection_resources = scene.metadata_allocation().ledger().reserve_transient(
+            TransientResourceClass::CpuProjection,
+            cpu_label_projection_scratch_bytes(maximum_labels)
+                .saturating_add(ranges.len().saturating_mul(size_of::<Range<u32>>())),
+            ReservationKind::Normal,
+        )?;
+        let mut labels = Vec::new();
+        // No label, base letter or insertion chip is drawn on a read shorter than this, and a
+        // projected anchor is never taller than the drawn read: nothing to project.
+        if camera.read_height.max(MINIMUM_PRIMITIVE_EXTENT) >= LABEL_MINIMUM_TEXT_HEIGHT {
+            let points_per_base = 1.0 / camera.bases_per_pixel();
+            let mut fragments = HashMap::<
+                (AlignmentHandle, AlignmentComponent),
+                CpuProjectedPrimitive,
+            >::with_capacity(maximum_labels);
+            for (page_index, page) in visible_text_pages.iter().enumerate() {
+                for primitive in windowed(page_index).filter(|primitive| {
+                    matches!(
+                        primitive.component,
+                        AlignmentComponent::Label { .. }
+                            | AlignmentComponent::Base { .. }
+                            | AlignmentComponent::ClipGhostBase {
+                                obscured: false,
+                                ..
+                            }
+                    )
+                }) {
+                    if base_glyph_cannot_fit(primitive, points_per_base) {
+                        continue;
+                    }
+                    let global_row = page.row_range().start.saturating_add(primitive.row_offset);
+                    let text = match primitive.component {
+                        AlignmentComponent::Label { id, .. } => page.label_arc(id),
+                        AlignmentComponent::Base { base, .. } => Some(Arc::<str>::from(
+                            char::from(base.to_ascii_uppercase()).to_string(),
+                        )),
+                        // Clipped bases are not part of the alignment: lowercase marks them.
+                        AlignmentComponent::ClipGhostBase { base, .. } => Some(Arc::<str>::from(
+                            char::from(base.to_ascii_lowercase()).to_string(),
+                        )),
+                        _ => unreachable!("the iterator retains only text-bearing primitives"),
+                    };
+                    if let Some(mut projected) = project_primitive(
+                        primitive,
+                        page.interval().start(),
+                        global_row,
+                        camera,
+                        text,
+                        interaction.token(primitive.handle),
+                    ) {
+                        // The same genomic base cell remains GPU geometry. This is a second,
+                        // camera-bound text presentation of its already-retained identity.
+                        projected.shape = CpuPrimitiveShape::TextLabel;
+                        fragments
+                            .entry((projected.handle, projected.component))
+                            .and_modify(|existing| merge_label_fragments(existing, &projected))
+                            .or_insert(projected);
+                    }
+                }
+            }
+            // Read bodies are consulted only by labels placed beside a read: insertion chips
+            // and clip lengths.
+            let mut read_bodies = ReadBodiesByRow::new();
+            if fragments.values().any(|fragment| {
+                is_insertion_label(fragment.component)
+                    || matches!(fragment.geometry, AlignmentGeometryToken::ClipEdge(_))
+            }) {
+                for (page_index, page) in visible_text_pages.iter().enumerate() {
+                    for primitive in
+                        windowed(page_index).filter(|primitive| is_read_body(primitive.component))
+                    {
+                        let global_row =
+                            page.row_range().start.saturating_add(primitive.row_offset);
+                        if let Some(projected) = project_primitive(
+                            primitive,
+                            page.interval().start(),
+                            global_row,
+                            camera,
+                            None,
+                            AlignmentInteractionToken::default(),
+                        ) {
+                            add_read_body(&mut read_bodies, &projected);
+                        }
+                    }
+                }
+            }
+            labels.reserve_exact(fragments.len());
+            reconcile_labels(&mut labels, fragments.into_values(), camera, &read_bodies);
+        }
+        drop(ranges);
+        let base_labels_projected = labels
+            .iter()
+            .filter(|label| matches!(label.component, AlignmentComponent::Base { .. }))
+            .count();
+        labels.sort_by(|left, right| {
+            left.row
+                .cmp(&right.row)
+                .then_with(|| left.y.total_cmp(&right.y))
+                .then_with(|| left.x.total_cmp(&right.x))
+                .then_with(|| left.draw_order.cmp(&right.draw_order))
+                .then_with(|| left.handle.cmp(&right.handle))
+                .then_with(|| left.component.cmp(&right.component))
+        });
+        labels.shrink_to_fit();
+        projection_resources.shrink_to(
+            labels
+                .capacity()
+                .saturating_mul(size_of::<CpuProjectedPrimitive>()),
+        )?;
+        Ok(CpuAlignmentLabelFrame {
+            scene_revision: scene.revision(),
+            camera_sequence,
+            camera,
+            coverage: CpuFrameCoverage {
+                requested_interval: camera.interval(),
+                covered_interval,
+                requested_rows,
+                covered_rows,
+            },
+            labels: labels.into(),
+            anchors_examined: maximum_labels,
+            base_anchors_examined,
+            base_labels_projected,
+            _resources: Arc::new(CpuFrameResources {
+                _projection: projection_resources,
+            }),
+        })
+    }
+
+    /// The label projection as it was before pages carried a spatial directory: every
+    /// text-bearing primitive of every visible page is projected. Kept as the reference the
+    /// windowed projector must reproduce exactly.
+    #[cfg(test)]
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn project_labels_unindexed(
         scene: &Arc<AlignmentPresentationScene>,
         camera_sequence: u64,
         camera: AlignmentCamera,
@@ -928,6 +1140,15 @@ fn pick_captured_scene(
 /// point is at least one physical pixel at every window scale factor. Keep in lockstep with
 /// `project_instance` in `rgv-render`'s `alignment_scene.wgsl`.
 const MINIMUM_PRIMITIVE_EXTENT: f64 = 1.0;
+
+/// Fixed part, in points, of the margin [`AlignmentCamera::projection_window`] adds beyond the
+/// clip on each side. Twice the widest point marker; the read-height part covers arrowheads.
+pub const PROJECTION_WINDOW_MARGIN_POINTS: f64 = 2.0 * POINT_MARKER_MAXIMUM_WIDTH;
+
+/// Shortest drawn read, in points, on which any text is drawn: shorter labels and base letters
+/// are refused by `reconcile_labels`, and insertion chips need more
+/// ([`INSERTION_LABEL_MINIMUM_HEIGHT`]).
+const LABEL_MINIMUM_TEXT_HEIGHT: f64 = 5.0;
 
 /// Point markers (insertions, padding, specialist insertions) are I-beams centred on a base
 /// boundary: a narrow vertical bar, a quarter of a base wide but within
@@ -1432,6 +1653,29 @@ fn place_insertion_label(
     Some(label)
 }
 
+/// Whether a base cell or clip-ghost base anchor certainly projects narrower than a base letter
+/// ([`MINIMUM_BASE_GLYPH_WIDTH`]) under a camera of `points_per_base`, so `reconcile_labels`
+/// would refuse its letter. Only the shapes whose projected width is their span (at least one
+/// point) are decided here, with a margin for rounding; any other anchor is projected and
+/// decided by `reconcile_labels` as before.
+fn base_glyph_cannot_fit(primitive: AlignmentSemanticPrimitive, points_per_base: f64) -> bool {
+    if !matches!(
+        primitive.component,
+        AlignmentComponent::Base { .. } | AlignmentComponent::ClipGhostBase { .. }
+    ) || !matches!(
+        primitive.geometry,
+        AlignmentGeometryToken::Rectangle
+            | AlignmentGeometryToken::ClipGhost
+            | AlignmentGeometryToken::InsideArrowhead(_)
+            | AlignmentGeometryToken::DirectionalTerminalLeft
+            | AlignmentGeometryToken::DirectionalTerminalRight
+    ) {
+        return false;
+    }
+    let span = primitive.end_offset.saturating_sub(primitive.start_offset) as f64;
+    (span * points_per_base).max(MINIMUM_PRIMITIVE_EXTENT) < MINIMUM_BASE_GLYPH_WIDTH - 1.0e-6
+}
+
 /// Whether `label` is an insertion's label chip; see [`place_insertion_label`].
 #[must_use]
 pub const fn is_insertion_label(component: AlignmentComponent) -> bool {
@@ -1482,7 +1726,7 @@ fn reconcile_labels(
     camera: AlignmentCamera,
     read_bodies: &ReadBodiesByRow,
 ) {
-    const MIN_TEXT_HEIGHT: f64 = 5.0;
+    const MIN_TEXT_HEIGHT: f64 = LABEL_MINIMUM_TEXT_HEIGHT;
     const COLLISION_GAP: f64 = 2.0;
 
     let clip = camera.clip;

@@ -137,7 +137,8 @@ fn render_test_frame(
     Ok(())
 }
 
-fn publish_bundled_frame(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_bundled_frame(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     renderer: &mut AlignmentGpuRenderer,
@@ -331,11 +332,6 @@ pub(crate) fn test_scene_detailed(
     color_mode: Option<rgv_core::AlignmentColorMode>,
     lod: GeometryLod,
 ) -> Arc<AlignmentPresentationScene> {
-    let source_revision = AlignmentSourceRevision::new(
-        SourceFingerprint::new(RevisionFingerprint::new(11, 12)),
-        RevisionFingerprint::new(13, 14),
-    );
-    let record_contract = ContractFingerprint::new(15);
     let record = AlignmentRecord {
         contig: ContigId::new(0),
         start: 10,
@@ -356,7 +352,7 @@ pub(crate) fn test_scene_detailed(
         },
         auxiliary_fields: Vec::new(),
     };
-    let mut decoded = AlignmentBatch::default();
+    let mut records = Vec::with_capacity(reads.len());
     for (ordinal, read) in reads.iter().enumerate() {
         let mut record = record.clone();
         record.start = read.start;
@@ -385,9 +381,43 @@ pub(crate) fn test_scene_detailed(
             record.mate_contig = Some(ContigId::new(ordinal as u32 + 1));
             record.mate_start = Some(read.start);
         }
+        records.push(record);
+    }
+    test_scene_from_records(
+        ledger,
+        interval,
+        contig_length,
+        tile_bases,
+        &records,
+        row_block_rows,
+        color_mode,
+        lod,
+    )
+}
+
+/// [`test_scene_detailed`] over arbitrary records, which must lie on contig 0. At
+/// [`GeometryLod::Base`] the reference is all `A`.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) fn test_scene_from_records(
+    ledger: &AllocationLedger,
+    interval: GenomicInterval,
+    contig_length: u64,
+    tile_bases: NonZeroU64,
+    records: &[AlignmentRecord],
+    row_block_rows: NonZeroU32,
+    color_mode: Option<rgv_core::AlignmentColorMode>,
+    lod: GeometryLod,
+) -> Arc<AlignmentPresentationScene> {
+    let source_revision = AlignmentSourceRevision::new(
+        SourceFingerprint::new(RevisionFingerprint::new(11, 12)),
+        RevisionFingerprint::new(13, 14),
+    );
+    let record_contract = ContractFingerprint::new(15);
+    let mut decoded = AlignmentBatch::default();
+    for (ordinal, record) in records.iter().enumerate() {
         decoded
             .push_with_source_position(
-                &record,
+                record,
                 AlignmentSourcePosition::bam_virtual_offset(
                     (1 << 16) | u64::try_from(ordinal).unwrap(),
                 ),
@@ -449,8 +479,8 @@ pub(crate) fn test_scene_detailed(
         record_contract,
         interval,
         FilteredRecordProvenance {
-            records_seen: u64::try_from(reads.len()).unwrap(),
-            eligible_records: u64::try_from(reads.len()).unwrap(),
+            records_seen: u64::try_from(records.len()).unwrap(),
+            eligible_records: u64::try_from(records.len()).unwrap(),
             ..FilteredRecordProvenance::default()
         },
     )

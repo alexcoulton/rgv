@@ -257,6 +257,7 @@ impl Viewer {
                 &tolerated_missing,
             ) {
                 Ok((frame, stats)) => {
+                    self.alignment_frame_timings.record_reads(&stats);
                     self.alignment_gpu_last_prepare_stats = stats;
                     Some(frame)
                 }
@@ -287,6 +288,7 @@ impl Viewer {
                 &self.alignment_gpu_ledger,
             ) {
                 Ok((frame, stats)) => {
+                    self.alignment_frame_timings.record_summaries(&stats);
                     self.alignment_summary_gpu_last_prepare_stats = stats;
                     Some(frame)
                 }
@@ -716,6 +718,7 @@ impl Viewer {
         );
         let reads = publishable_reads.map(|publishable| {
             let (frame, stats, _) = self.alignment_gpu_renderer.publish_replacement(publishable);
+            self.alignment_frame_timings.record_reads(&stats);
             self.alignment_gpu_last_prepare_stats = stats;
             frame
         });
@@ -723,6 +726,7 @@ impl Viewer {
             let (frame, stats, _) = self
                 .alignment_summary_gpu_renderer
                 .publish_replacement(publishable);
+            self.alignment_frame_timings.record_summaries(&stats);
             self.alignment_summary_gpu_last_prepare_stats = stats;
             frame
         });

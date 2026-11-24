@@ -116,6 +116,8 @@ pub struct Session<P: Panel = PanelState> {
     pub workspace_alignment_limit: usize,
     /// Source-owner and request-token identities handed to alignment scene engines.
     pub alignment_scene_identities: crate::alignment::dispatch::AlignmentSceneIdentityClock,
+    /// How often, and for how long, the main thread dispatched alignment scene queries.
+    pub alignment_dispatch_telemetry: crate::alignment::dispatch::AlignmentDispatchTelemetry,
 }
 
 /// What the host's canvas contributes to a panel action: how wide each panel would be, and
@@ -234,6 +236,8 @@ impl<P: Panel> Session<P> {
             workspace_alignment_limit,
             alignment_scene_identities:
                 crate::alignment::dispatch::AlignmentSceneIdentityClock::default(),
+            alignment_dispatch_telemetry:
+                crate::alignment::dispatch::AlignmentDispatchTelemetry::default(),
         }
     }
 

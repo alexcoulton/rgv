@@ -3,6 +3,9 @@ use crate::display::{
     reconcile_read_panel_scroll_for_authority,
 };
 use crate::ui::gestures::{capture_stable_row_camera, vertical_density_camera_padding};
+use crate::workspace::alignment_management::frame_work::{
+    AlignmentScenePanelPrepareInputs, AlignmentScenePrepareInputs,
+};
 use crate::workspace::alignment_management::scene_authority::{
     CapturedAlignmentPanelSceneEpoch, read_panel_display_derivative_authority,
 };
@@ -23,6 +26,7 @@ use rgv_core::{ContigId, PanelId, TrackId};
 use rgv_session::alignment::admission::AlignmentLaneAdmission;
 use rgv_session::lane_layout::PanelLaneLayout;
 use std::sync::Arc;
+use std::time::Instant;
 
 impl Viewer {
     pub(crate) fn request_alignment_query(&mut self, panel_id: PanelId) {
@@ -137,8 +141,16 @@ impl Viewer {
         if changed_by_panel.is_empty() {
             // Workspace geometry, surface scale, or physical extent can change without changing
             // coordinator demand. Still publish (or stale-gate) the native derivative for that
-            // exact target instead of leaving an older layout revision implicitly current.
-            self.prepare_alignment_scene_frame();
+            // exact target instead of leaving an older layout revision implicitly current —
+            // unless this frame already captured it from exactly these inputs (a camera-only
+            // gesture step followed by a rebuild that changed no layout).
+            let inputs = self.alignment_scene_prepare_inputs();
+            if !self
+                .alignment_frame_work
+                .layout_refresh_reuses_frame_prepare(&inputs)
+            {
+                self.prepare_alignment_scene_frame();
+            }
             return;
         }
 
@@ -171,8 +183,71 @@ impl Viewer {
     /// Captures every visible alignment lane from one immutable panel-scene epoch and prepares
     /// its disposable GPU derivative. The source worker is never touched here: held pan and
     /// vertical scroll can call this on every input event using already-published pages.
+    ///
+    /// While an input event is being handled the preparation is owed to the next frame instead
+    /// (see [`super::frame_work`]); several events per frame then capture once.
     pub(crate) fn prepare_alignment_scene_frame(&mut self) {
+        if !self.alignment_frame_work.request_prepare() {
+            self.window.request_redraw();
+            return;
+        }
+        let started = Instant::now();
         self.prepare_alignment_scene_frame_atomic();
+        let inputs = self
+            .alignment_frame_work
+            .records_prepare_inputs()
+            .then(|| self.alignment_scene_prepare_inputs());
+        self.alignment_frame_work
+            .record_prepare(started.elapsed(), inputs);
+    }
+
+    /// What a scene-frame capture reads that a display-list rebuild can change.
+    pub(crate) fn alignment_scene_prepare_inputs(&self) -> AlignmentScenePrepareInputs {
+        AlignmentScenePrepareInputs {
+            workspace_layout_revision: self.workspace_layout.revision,
+            surface: [self.surface_config.width, self.surface_config.height],
+            scale_factor_bits: self.window.scale_factor().to_bits(),
+            budget_bytes: self.session.alignment_scene_budget.budget_bytes,
+            panels: self
+                .session
+                .panels
+                .iter()
+                .map(|panel| AlignmentScenePanelPrepareInputs {
+                    panel_id: panel.id,
+                    viewport: panel.viewport,
+                    lane_layout: self.panel_lane_layout(panel.id),
+                    read_panel_scrolls: panel.read_panel_scrolls.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Runs the alignment work input handling owed to this frame: each owed gesture dispatch
+    /// once, then one scene-frame preparation unless a dispatch already prepared. Called by the
+    /// frame before it rebuilds the display list.
+    pub(crate) fn flush_alignment_frame_work(&mut self) {
+        let owed_dispatches = self.alignment_frame_work.take_owed_dispatches();
+        self.run_owed_alignment_frame_work(owed_dispatches);
+    }
+
+    /// Runs owed alignment work before input that hit-tests the presented scene (a click), so
+    /// it never answers for the camera before a gesture step whose frame has not run yet.
+    pub(crate) fn settle_owed_alignment_frame_work(&mut self) {
+        if self.alignment_frame_work.owes_work() {
+            let owed_dispatches = self.alignment_frame_work.take_owed_dispatches();
+            self.run_owed_alignment_frame_work(owed_dispatches);
+        }
+    }
+
+    fn run_owed_alignment_frame_work(&mut self, owed_dispatches: Vec<PanelId>) {
+        for panel_id in owed_dispatches {
+            if self.session.panels.get(panel_id).is_some() {
+                self.dispatch_alignment_query(panel_id);
+            }
+        }
+        if self.alignment_frame_work.take_owed_prepare() {
+            self.prepare_alignment_scene_frame();
+        }
     }
 
     pub(super) fn uncovered_vertical_candidate_lane_count(

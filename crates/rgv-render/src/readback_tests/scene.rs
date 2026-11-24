@@ -1875,3 +1875,131 @@ fn insertion_fragment_mirror_agrees_with_the_cpu_cover_rule() {
         }
     }
 }
+
+/// Culling a frame to its camera's visible rows and genomic window changes no pixel. Deep
+/// long-read pages are rendered from several cameras (base detail, read detail, zoomed out,
+/// panned by fractions of a point, scrolled by fractions of a row, with hover, selection and
+/// highlight on), through both the bundled replacement path (page-sized interaction buffers)
+/// and the camera capture path (interaction flags compacted to the drawn instances), with
+/// culling on and off; every image must be byte-identical, and culling must actually leave
+/// most instances out.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn culled_long_read_frames_are_pixel_identical_to_unculled_frames() {
+    use crate::alignment_scene::culling_tests::{
+        long_read_camera, long_read_records, long_read_scene,
+    };
+    use rgv_alignment_scene::{AlignmentHandle, AlignmentSourceRevision, SourceFingerprint};
+    use rgv_model::AlignmentSourcePosition;
+    const SIZE: [u32; 2] = [1_540, 860];
+
+    let Some(gpu) = test_gpu() else {
+        return;
+    };
+    let ledger = AllocationLedger::new_with_transient_budget(8 << 30, 64 << 20, 2 << 30);
+    let scene = long_read_scene(&ledger, &long_read_records(5, 160));
+    let handle = |ordinal: u64| {
+        AlignmentHandle::new(
+            AlignmentSourceRevision::new(
+                SourceFingerprint::new(rgv_alignment_scene::RevisionFingerprint::new(11, 12)),
+                rgv_alignment_scene::RevisionFingerprint::new(13, 14),
+            ),
+            AlignmentSourcePosition::bam_virtual_offset((1 << 16) | ordinal),
+        )
+    };
+    let interactions = [
+        AlignmentInteractionState::default(),
+        AlignmentInteractionState::new(Some(handle(3)), Some(handle(5)), [handle(5), handle(8)])
+            .with_highlighted((10..40).map(handle)),
+    ];
+    let scissor = AlignmentGpuScissor {
+        x: 12,
+        y: 41,
+        width: 1_500,
+        height: 800,
+    };
+    let cameras = [
+        long_read_camera(48_000, 27, 0.0, 0.0),
+        long_read_camera(48_000, 27, 3.37, 7.5),
+        long_read_camera(31_000, 180, 11.2, 20.25),
+        long_read_camera(60_000, 4_000, 0.61, 3.0),
+        long_read_camera(20_000, 40_000, 5.0, 0.0),
+    ];
+    let mut culled_renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    let mut unculled_renderer = AlignmentGpuRenderer::new(&gpu.device, FORMAT);
+    unculled_renderer.set_instance_culling(false);
+    let (mut drawn, mut unculled) = (0_usize, 0_usize);
+    let mut compared = 0;
+    for (index, camera) in cameras.into_iter().enumerate() {
+        for interaction in &interactions {
+            let requests = [AlignmentGpuSceneRequest {
+                scene: &scene,
+                camera_sequence: index as u64,
+                camera,
+                screen_size_points: [SIZE[0] as f32, SIZE[1] as f32],
+                scissor,
+                interaction,
+            }];
+            let mut images = Vec::new();
+            for renderer in [&mut culled_renderer, &mut unculled_renderer] {
+                let (bundled, bundled_stats, _) =
+                    crate::alignment_scene::tests::publish_bundled_frame(
+                        &gpu.device,
+                        &gpu.queue,
+                        renderer,
+                        &requests,
+                        &ledger,
+                        None,
+                        1,
+                        index as u64 + 10,
+                    );
+                images.push(render_image(&gpu, SIZE, |pass| {
+                    renderer.render(pass, &bundled)
+                }));
+                let authority = bundled.content_authority().clone();
+                drop(bundled);
+                let (captured, captured_stats) = renderer
+                    .capture_camera_frame(&gpu.device, &gpu.queue, &authority, &requests, &ledger)
+                    .unwrap();
+                assert_eq!(bundled_stats.base_instances, captured_stats.base_instances);
+                assert_eq!(
+                    bundled_stats.unculled_instances,
+                    captured_stats.unculled_instances
+                );
+                if renderer.instance_culling() {
+                    drawn += captured_stats.base_instances;
+                    unculled += captured_stats.unculled_instances;
+                } else {
+                    assert_eq!(
+                        captured_stats.base_instances,
+                        captured_stats.unculled_instances
+                    );
+                }
+                images.push(render_image(&gpu, SIZE, |pass| {
+                    renderer.render(pass, &captured)
+                }));
+            }
+            let painted = images[0]
+                .pixels()
+                .filter(|pixel| pixel.0 != [255, 255, 255, 255])
+                .count();
+            assert!(
+                painted > 10_000,
+                "camera {index} painted only {painted} pixels"
+            );
+            for (other, image) in images.iter().enumerate().skip(1) {
+                assert!(
+                    image.as_raw() == images[0].as_raw(),
+                    "camera {index}: image {other} differs from the culled bundled frame"
+                );
+            }
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 10);
+    // The 40 kb camera sees whole pages; the others see a sliver of theirs.
+    assert!(
+        drawn * 3 < unculled,
+        "culling drew {drawn} of {unculled} instances"
+    );
+}

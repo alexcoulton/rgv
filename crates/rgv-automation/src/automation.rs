@@ -1883,6 +1883,29 @@ pub struct AutomationAlignmentSceneDiagnostics {
     pub read_frame_immutable_upload_bytes: usize,
     pub read_frame_cache_hits: usize,
     pub read_frame_cache_misses: usize,
+    /// Instances the read frame's pages hold; `read_frame_body_instances` are those drawn after
+    /// culling each page to the camera's visible rows and genomic window.
+    pub read_frame_unculled_instances: usize,
+    /// Instanced draw calls the read frame issues.
+    pub read_frame_draw_ranges: usize,
+    /// Per-frame CPU timings, in microseconds: the most recent frame, and the median and 95th
+    /// percentile over the last `frame_timing_window_samples` frames (at most 120). Label
+    /// projection and instance preparation (culling, interaction flags, uniforms) are per read
+    /// frame, overlay preparation per summary frame, and the surface wait is the time blocked
+    /// in `get_current_texture` waiting for a drawable.
+    pub read_frame_label_projection_micros: u64,
+    pub read_frame_label_projection_micros_p50: u64,
+    pub read_frame_label_projection_micros_p95: u64,
+    pub read_frame_instance_preparation_micros: u64,
+    pub read_frame_instance_preparation_micros_p50: u64,
+    pub read_frame_instance_preparation_micros_p95: u64,
+    pub summary_frame_overlay_preparation_micros: u64,
+    pub summary_frame_overlay_preparation_micros_p50: u64,
+    pub summary_frame_overlay_preparation_micros_p95: u64,
+    pub surface_acquire_wait_micros: u64,
+    pub surface_acquire_wait_micros_p50: u64,
+    pub surface_acquire_wait_micros_p95: u64,
+    pub frame_timing_window_samples: usize,
     pub summary_frame_mandatory_pages: usize,
     pub summary_frame_depth_instances: usize,
     pub summary_frame_allele_instances: usize,
@@ -1913,6 +1936,28 @@ pub struct AutomationAlignmentSceneDiagnostics {
     pub generic_slab_cache_hits: u64,
     pub generic_total_uploaded_bytes: u64,
     pub generic_buffer_reallocations: u64,
+    /// Alignment query dispatches the main thread ran (a call with nothing queued is not
+    /// counted), the lanes they sent, and their cumulative and most recent wall time in
+    /// microseconds, including the scene capture each dispatch ends with.
+    pub alignment_query_dispatches: u64,
+    pub alignment_query_lanes_sent: u64,
+    pub alignment_query_dispatch_micros_total: u64,
+    pub alignment_query_dispatch_micros_last: u64,
+    /// Gesture steps inside every lane's prepared scene: camera-only, nothing dispatched.
+    pub alignment_camera_only_gesture_steps: u64,
+    /// Mid-gesture cadence samples whose alignment dispatch waited for the gesture to settle.
+    pub alignment_deferred_cadence_dispatches: u64,
+    /// Gesture steps whose dispatch merged into one the frame already owed.
+    pub alignment_frame_coalesced_dispatches: u64,
+    /// Scene-frame captures that ran, requests merged into a later capture of the same frame,
+    /// and capture wall time (cumulative and most recent, microseconds).
+    pub alignment_scene_frame_prepares: u64,
+    pub alignment_scene_frame_prepares_coalesced: u64,
+    pub alignment_scene_frame_prepare_micros_total: u64,
+    pub alignment_scene_frame_prepare_micros_last: u64,
+    /// Full display-list rebuilds, and those whose layout refresh reused the frame's capture.
+    pub display_list_rebuilds: u64,
+    pub display_list_rebuild_prepares_reused: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

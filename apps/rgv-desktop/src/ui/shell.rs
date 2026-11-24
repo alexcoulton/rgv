@@ -24,6 +24,7 @@ impl Viewer {
         }
         let frame_started = Instant::now();
         self.begin_manual_diagnostic_frame();
+        self.alignment_frame_work.open_frame();
         let phase_started = Instant::now();
         self.poll_background_work();
         self.diagnostics.frame_phase(
@@ -31,7 +32,12 @@ impl Viewer {
             phase_started.elapsed(),
         );
         let phase_started = Instant::now();
+        // Captured overview-drag motion is this frame's gesture step. Together with the input
+        // handled since the last frame it owes at most one dispatch per panel and one scene
+        // capture; run them once, before the display list is rebuilt from that capture.
+        self.alignment_frame_work.begin_input();
         self.apply_captured_motion();
+        self.flush_alignment_frame_work();
         self.diagnostics.frame_phase(
             ManualDiagnosticFramePhase::ApplyCapturedMotion,
             phase_started.elapsed(),
@@ -48,6 +54,7 @@ impl Viewer {
             ManualDiagnosticFramePhase::FirstDisplayRebuild,
             phase_started.elapsed(),
         );
+        self.alignment_frame_work.close_reuse_window();
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let phase_started = Instant::now();
         let (full_output, repaint_delay) = self.render_shell_frame(raw_input);

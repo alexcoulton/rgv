@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod alignment_gpu_policy_tests;
 mod dispatch;
+pub(crate) mod frame_timings;
+pub(crate) mod frame_work;
 mod gpu_budget;
 mod gpu_bundle;
 mod gpu_prefetch;

@@ -18,7 +18,7 @@ use rgv_alignment_scene::{
     AllocationId, AllocationLease, AllocationLedger, AllocationRetirementClaimSet,
     AllocationRetirementToken, ClipEdgeToken, CpuAlignmentLabelFrame, CpuAlignmentProjector,
     CpuProjectionError, LedgerError, PinnedAllocationLease, ReservationKind, SceneRevision,
-    TransientResourceClass,
+    TransientResourceClass, TransientResourceReservation,
 };
 use thiserror::Error;
 
@@ -430,7 +430,19 @@ impl<'a> AlignmentGpuSceneRequest<'a> {
 pub struct AlignmentGpuPrepareStats {
     pub scenes: usize,
     pub mandatory_pages: usize,
+    /// Instances submitted for drawing, after culling each page to the camera's visible rows
+    /// and genomic window.
     pub base_instances: usize,
+    /// Instances of the frame's pages before culling: what `base_instances` was when every
+    /// page was drawn whole.
+    pub unculled_instances: usize,
+    /// Instanced draw calls the frame issues (each a contiguous run of one page's instances).
+    pub draw_ranges: usize,
+    /// CPU time spent projecting the frame's text labels.
+    pub label_projection_micros: u64,
+    /// CPU time spent preparing the frame's draws apart from text: culling, interaction flags,
+    /// camera uniforms and their uploads.
+    pub instance_preparation_micros: u64,
     /// Primitive interaction flags which are non-zero. The field retains its historical name for
     /// diagnostic/API compatibility; no duplicate geometry overlay is constructed.
     pub overlay_instances: usize,
@@ -618,6 +630,70 @@ struct PreparedAlignmentDraw {
     uniform_offset: u32,
     scissor: AlignmentGpuScissor,
     interaction_buffer_index: Option<u32>,
+    /// The page's instances this camera can see, ascending and disjoint (see
+    /// [`culled_draw_ranges`]); drawn in this order, they keep the page's paint order.
+    ranges: Arc<[AlignmentGpuDrawRange]>,
+}
+
+/// One instanced draw of a contiguous run of a page's instances.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AlignmentGpuDrawRange {
+    /// First instance in the page's immutable buffer.
+    first: u32,
+    count: u32,
+    /// Position of the first instance's flags in the draw's interaction buffer: equal to
+    /// `first` for a page-sized buffer, the running total for a compacted one.
+    interaction_first: u32,
+}
+
+/// Off-screen instances between two visible runs of a page are drawn rather than split into
+/// another draw when there are at most this many of them: a draw call costs more than a few
+/// quads the scissor discards.
+const ALIGNMENT_DRAW_RANGE_MERGE_GAP: u32 = 32;
+
+/// The ranges of `page`'s instances that can reach `camera`'s clip, merged across gaps of at
+/// most [`ALIGNMENT_DRAW_RANGE_MERGE_GAP`] primitives, as semantic primitive ranges and the
+/// matching instance ranges. With `culling` off, every instance.
+///
+/// The rows are the camera's visible rows widened by the rows a drawn read can spill into (a
+/// read is at least one point tall however short its row), and the genomic window is
+/// [`AlignmentCamera::projection_window`]: every instance outside both projects to nothing in
+/// the clip, so drawing the rest, in page order, leaves every pixel as drawing all of them
+/// would. The ranges keep page order, so overlapping instances still paint in the same order.
+fn culled_draw_ranges(
+    page: &AlignmentSemanticPage,
+    camera: AlignmentCamera,
+    instance_count: u32,
+    culling: bool,
+) -> Vec<(std::ops::Range<u32>, std::ops::Range<u32>)> {
+    if !culling {
+        let primitives = u32::try_from(page.primitives().len()).unwrap_or(u32::MAX);
+        return vec![(0..primitives, 0..instance_count)];
+    }
+    let visible = camera.visible_rows();
+    let spill = (camera.read_height().max(1.0) / camera.row_height()).ceil() as u32 + 1;
+    let rows = visible.start.saturating_sub(spill)..visible.end.saturating_add(spill);
+    let mut semantic = Vec::new();
+    page.window_primitive_ranges(rows, camera.projection_window(), &mut semantic);
+    let mut merged: Vec<std::ops::Range<u32>> = Vec::with_capacity(semantic.len());
+    for range in semantic {
+        match merged.last_mut() {
+            Some(last)
+                if range.start.saturating_sub(last.end) <= ALIGNMENT_DRAW_RANGE_MERGE_GAP =>
+            {
+                last.end = range.end;
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
+        .into_iter()
+        .filter_map(|range| {
+            let instances = page.drawable_index(range.start).min(instance_count)
+                ..page.drawable_index(range.end).min(instance_count);
+            (instances.start < instances.end).then_some((range, instances))
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -630,6 +706,9 @@ struct PendingAlignmentDraw {
     page_row_start: u32,
     interaction_buffer_index: Option<u32>,
     base_instance_count: u32,
+    /// Instances this draw submits after culling.
+    drawn_instance_count: u32,
+    ranges: Arc<[AlignmentGpuDrawRange]>,
 }
 
 #[derive(Debug)]
@@ -757,6 +836,8 @@ pub struct AlignmentGpuFrame {
     buffers: Arc<GpuAlignmentFrameBuffers>,
     _page_leases: Vec<Arc<AlignmentGpuResidentPageLease>>,
     _pins: Vec<PinnedAllocationLease>,
+    /// Ledger admission of the draws' culled instance ranges, held as long as they are.
+    _draw_range_resources: TransientResourceReservation,
 }
 
 impl AlignmentGpuFrame {
@@ -1007,9 +1088,24 @@ pub struct AlignmentGpuStagedReplacement {
     actuals: Vec<AllocationBundleActual>,
     admission: AlignmentGpuBatchAdmission,
     base_instances: usize,
+    unculled_instances: usize,
+    draw_ranges: usize,
+    draw_range_resources: TransientResourceReservation,
+    timings: AlignmentGpuFrameTimings,
     text_labels: usize,
     camera_uniform_bytes: usize,
     geometry_uploaded_bytes: usize,
+}
+
+/// CPU time a frame's preparation took, by phase; see [`AlignmentGpuPrepareStats`].
+#[derive(Clone, Copy, Debug, Default)]
+struct AlignmentGpuFrameTimings {
+    label_projection_micros: u64,
+    instance_preparation_micros: u64,
+}
+
+fn duration_micros(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 impl AlignmentGpuStagedReplacement {
@@ -1048,6 +1144,9 @@ pub struct AlignmentGpuPublishableReplacement {
     frame_buffers: Vec<Arc<GpuAlignmentFrameBuffers>>,
     admission: AlignmentGpuBatchAdmission,
     base_instances: usize,
+    unculled_instances: usize,
+    draw_ranges: usize,
+    timings: AlignmentGpuFrameTimings,
     text_labels: usize,
     label_anchors_examined: usize,
     camera_uniform_bytes: usize,
@@ -1076,6 +1175,9 @@ pub struct AlignmentGpuRenderer {
     content_manifest_pages_enumerated: AtomicU64,
     prefetch_authority_keys_inspected: AtomicU64,
     reclaim_authority_keys_inspected: AtomicU64,
+    /// Whether frames draw only the instances their camera can see (the default) rather than
+    /// every instance of every visible page. Both draw identical pixels.
+    instance_culling: bool,
 }
 
 impl AlignmentGpuRenderer {
@@ -1201,7 +1303,20 @@ impl AlignmentGpuRenderer {
             content_manifest_pages_enumerated: AtomicU64::new(0),
             prefetch_authority_keys_inspected: AtomicU64::new(0),
             reclaim_authority_keys_inspected: AtomicU64::new(0),
+            instance_culling: true,
         }
+    }
+
+    /// Chooses whether frames prepared from now on draw only the instances their camera can
+    /// see (`true`, the default) or every instance of every visible page. The pictures are
+    /// identical; the switch exists to prove it and to measure the difference.
+    pub fn set_instance_culling(&mut self, enabled: bool) {
+        self.instance_culling = enabled;
+    }
+
+    #[must_use]
+    pub const fn instance_culling(&self) -> bool {
+        self.instance_culling
     }
 
     #[must_use]
@@ -1949,6 +2064,7 @@ impl AlignmentGpuRenderer {
             });
         }
 
+        let labels_started = std::time::Instant::now();
         let mut label_frames = Vec::with_capacity(requests.len());
         for request in requests {
             label_frames.push(CpuAlignmentProjector::project_labels_with_interaction(
@@ -1958,6 +2074,9 @@ impl AlignmentGpuRenderer {
                 request.interaction,
             )?);
         }
+        let label_projection = labels_started.elapsed();
+        let instances_started = std::time::Instant::now();
+        let mut draw_range_count = 0_usize;
         let mut page_requests = Vec::with_capacity(plan.mandatory_draws);
         let mut interaction_pages =
             Vec::<Vec<AlignmentGpuInteractionInstance>>::with_capacity(plan.mandatory_draws);
@@ -2001,6 +2120,18 @@ impl AlignmentGpuRenderer {
                     interaction_pages.push(flags);
                     Some(index)
                 };
+                // A replacement uploads page-sized interaction buffers, so each range reads its
+                // flags at its own instance index.
+                let ranges =
+                    culled_draw_ranges(page, request.camera, instance_count, self.instance_culling)
+                        .into_iter()
+                        .map(|(_, instances)| AlignmentGpuDrawRange {
+                            first: instances.start,
+                            count: instances.end - instances.start,
+                            interaction_first: instances.start,
+                        })
+                        .collect::<Arc<[_]>>();
+                draw_range_count = draw_range_count.saturating_add(ranges.len());
                 page_requests.push(PendingAlignmentDraw {
                     page: page.key(),
                     camera: request.camera,
@@ -2010,6 +2141,8 @@ impl AlignmentGpuRenderer {
                     page_row_start: page.row_range().start,
                     interaction_buffer_index,
                     base_instance_count: instance_count,
+                    drawn_instance_count: ranges.iter().map(|range| range.count).sum(),
+                    ranges,
                 });
             }
         }
@@ -2037,6 +2170,7 @@ impl AlignmentGpuRenderer {
                     .map_err(|_| AlignmentGpuPrepareError::DynamicUniformAddressSpace)?,
                 scissor: request.scissor,
                 interaction_buffer_index: request.interaction_buffer_index,
+                ranges: Arc::clone(&request.ranges),
             });
         }
         let initial_buffers = staged_buffers
@@ -2139,9 +2273,23 @@ impl AlignmentGpuRenderer {
             uploaded_bytes: geometry_uploaded_bytes,
         };
         let base_instances = page_requests.iter().fold(0_usize, |total, request| {
+            total.saturating_add(request.drawn_instance_count as usize)
+        });
+        let unculled_instances = page_requests.iter().fold(0_usize, |total, request| {
             total.saturating_add(request.base_instance_count as usize)
         });
         let text_labels = label_frames.iter().map(|labels| labels.labels.len()).sum();
+        // The draw ranges live as long as the frame; their bytes are admitted like the label
+        // frames' text.
+        let draw_range_resources = ledger.reserve_transient(
+            TransientResourceClass::CpuProjection,
+            draw_range_count.saturating_mul(size_of::<AlignmentGpuDrawRange>()),
+            ReservationKind::Transition,
+        )?;
+        let timings = AlignmentGpuFrameTimings {
+            label_projection_micros: duration_micros(label_projection),
+            instance_preparation_micros: duration_micros(instances_started.elapsed()),
+        };
         Ok(AlignmentGpuStagedReplacement {
             pages: staged_pages,
             page_table,
@@ -2154,6 +2302,10 @@ impl AlignmentGpuRenderer {
             actuals,
             admission,
             base_instances,
+            unculled_instances,
+            draw_ranges: draw_range_count,
+            draw_range_resources,
+            timings,
             text_labels,
             camera_uniform_bytes: uniforms.len(),
             geometry_uploaded_bytes,
@@ -2366,6 +2518,7 @@ impl AlignmentGpuRenderer {
             buffers: initial_frame_buffers,
             _page_leases: Vec::new(),
             _pins: existing_pins,
+            _draw_range_resources: staged.draw_range_resources,
         };
         AlignmentGpuPublishableReplacement {
             plan: staged.plan,
@@ -2376,6 +2529,9 @@ impl AlignmentGpuRenderer {
             frame_buffers,
             admission: staged.admission,
             base_instances: staged.base_instances,
+            unculled_instances: staged.unculled_instances,
+            draw_ranges: staged.draw_ranges,
+            timings: staged.timings,
             text_labels: staged.text_labels,
             label_anchors_examined,
             camera_uniform_bytes: staged.camera_uniform_bytes,
@@ -2429,6 +2585,10 @@ impl AlignmentGpuRenderer {
             scenes: publishable.plan.request_count,
             mandatory_pages: publishable.plan.mandatory_draws,
             base_instances: publishable.base_instances,
+            unculled_instances: publishable.unculled_instances,
+            draw_ranges: publishable.draw_ranges,
+            label_projection_micros: publishable.timings.label_projection_micros,
+            instance_preparation_micros: publishable.timings.instance_preparation_micros,
             overlay_instances: publishable.plan.maximum_interactions,
             text_labels: publishable.text_labels,
             label_anchors_examined: publishable.label_anchors_examined,
@@ -2813,6 +2973,7 @@ impl AlignmentGpuRenderer {
             mandatory_pages,
             mandatory_pages.saturating_add(4),
         );
+        let labels_started = std::time::Instant::now();
         let mut label_frames = Vec::with_capacity(requests.len());
         for request in requests {
             label_frames.push(CpuAlignmentProjector::project_labels_with_interaction(
@@ -2822,6 +2983,8 @@ impl AlignmentGpuRenderer {
                 request.interaction,
             )?);
         }
+        let label_projection = labels_started.elapsed();
+        let instances_started = std::time::Instant::now();
         let (interaction_buffer_count, interaction_buffer_capacity) = if allow_slot_growth {
             let envelope_pages = requests.iter().fold(0_usize, |total, request| {
                 let rows = request.camera.visible_rows();
@@ -2858,6 +3021,7 @@ impl AlignmentGpuRenderer {
         let mut page_requests = Vec::with_capacity(mandatory_pages);
         let mut interaction_pages = Vec::<Vec<AlignmentGpuInteractionInstance>>::new();
         let mut interaction_instances = 0_usize;
+        let mut draw_range_count = 0_usize;
         let mut scene_revisions = Vec::with_capacity(requests.len());
         let mut camera_sequences = Vec::with_capacity(requests.len());
         for (request, pages) in requests.iter().zip(&visible_pages) {
@@ -2867,11 +3031,37 @@ impl AlignmentGpuRenderer {
                 let resident = self
                     .page(page.key())
                     .expect("mandatory page presence was proven in the allocation-free pass");
+                if non_text_primitive_count(page) != resident.instance_count as usize {
+                    return Err(AlignmentGpuPrepareError::InvalidFrameGeometry);
+                }
+                let culled = culled_draw_ranges(
+                    page,
+                    request.camera,
+                    resident.instance_count,
+                    self.instance_culling,
+                );
+                // Interaction flags are written for the drawn instances only, compacted in draw
+                // order: each range reads its flags from where its run starts in the buffer.
+                let mut interaction_first = 0_u32;
+                let ranges = culled
+                    .iter()
+                    .map(|(_, instances)| {
+                        let count = instances.end - instances.start;
+                        let range = AlignmentGpuDrawRange {
+                            first: instances.start,
+                            count,
+                            interaction_first,
+                        };
+                        interaction_first = interaction_first.saturating_add(count);
+                        range
+                    })
+                    .collect::<Arc<[_]>>();
                 let interaction_buffer_index = if request.interaction.is_empty() {
                     None
                 } else {
-                    let (flags, active) = interaction_page_instances(page, request.interaction);
-                    if flags.len() != resident.instance_count as usize {
+                    let (flags, active) =
+                        interaction_range_instances(page, &culled, request.interaction);
+                    if flags.len() != interaction_first as usize {
                         return Err(AlignmentGpuPrepareError::InvalidFrameGeometry);
                     }
                     interaction_instances = interaction_instances.saturating_add(active);
@@ -2880,6 +3070,7 @@ impl AlignmentGpuRenderer {
                     interaction_pages.push(flags);
                     Some(index)
                 };
+                draw_range_count = draw_range_count.saturating_add(ranges.len());
                 page_requests.push(PendingAlignmentDraw {
                     page: page.key(),
                     camera: request.camera,
@@ -2889,6 +3080,8 @@ impl AlignmentGpuRenderer {
                     page_row_start: page.row_range().start,
                     interaction_buffer_index,
                     base_instance_count: resident.instance_count,
+                    drawn_instance_count: interaction_first,
+                    ranges,
                 });
             }
         }
@@ -2933,6 +3126,7 @@ impl AlignmentGpuRenderer {
                 uniform_offset: offset_u32,
                 scissor: request.scissor,
                 interaction_buffer_index: request.interaction_buffer_index,
+                ranges: Arc::clone(&request.ranges),
             });
         }
         if let Some(allocation) = &frame_buffers.camera_allocation {
@@ -2983,6 +3177,14 @@ impl AlignmentGpuRenderer {
             });
         }
         pins.push(frame_buffers.frame_allocation.pin()?);
+        // The draw ranges live as long as the frame; their bytes are admitted like the label
+        // frames' text.
+        let draw_range_resources = ledger.reserve_transient(
+            TransientResourceClass::CpuProjection,
+            draw_range_count.saturating_mul(size_of::<AlignmentGpuDrawRange>()),
+            ReservationKind::Transition,
+        )?;
+        let instance_preparation = instances_started.elapsed();
         let frame = AlignmentGpuFrame {
             deferred_pages: deferred_pages.into(),
             revision: next_revision,
@@ -2995,14 +3197,21 @@ impl AlignmentGpuRenderer {
             buffers: frame_buffers,
             _page_leases: page_leases.into_values().collect(),
             _pins: pins,
+            _draw_range_resources: draw_range_resources,
         };
         let resident_gpu_bytes = self.resident_gpu_bytes()?;
         let stats = AlignmentGpuPrepareStats {
             scenes: requests.len(),
             mandatory_pages,
             base_instances: page_requests.iter().fold(0_usize, |total, request| {
+                total.saturating_add(request.drawn_instance_count as usize)
+            }),
+            unculled_instances: page_requests.iter().fold(0_usize, |total, request| {
                 total.saturating_add(request.base_instance_count as usize)
             }),
+            draw_ranges: draw_range_count,
+            label_projection_micros: duration_micros(label_projection),
+            instance_preparation_micros: duration_micros(instance_preparation),
             overlay_instances: interaction_instances,
             text_labels: frame
                 .label_frames
@@ -3499,22 +3708,53 @@ impl AlignmentGpuRenderer {
             ) else {
                 continue;
             };
+            if draw.ranges.is_empty() {
+                continue;
+            }
             pass.set_scissor_rect(x, y, width, height);
             pass.set_bind_group(0, bind_group, &[draw.uniform_offset]);
             debug_assert!(page.instance_count > 0);
-            pass.set_vertex_buffer(0, page.buffer.slice(..));
-            if let Some(index) = draw.interaction_buffer_index {
-                let interaction = frame
-                    .buffers
-                    .interaction_buffers
-                    .get(index as usize)
-                    .ok_or(AlignmentGpuRenderError::MissingOverlayBuffer)?;
-                pass.set_pipeline(&self.interaction_pipeline);
-                pass.set_vertex_buffer(1, interaction.slice(..));
+            let interaction = draw
+                .interaction_buffer_index
+                .map(|index| {
+                    frame
+                        .buffers
+                        .interaction_buffers
+                        .get(index as usize)
+                        .ok_or(AlignmentGpuRenderError::MissingOverlayBuffer)
+                })
+                .transpose()?;
+            pass.set_pipeline(if interaction.is_some() {
+                &self.interaction_pipeline
             } else {
-                pass.set_pipeline(&self.pipeline);
+                &self.pipeline
+            });
+            // Each range binds its run of the page (and of the interaction flags) at offset
+            // zero, so instance `i` of the draw is the run's `i`th instance in both buffers.
+            for range in draw.ranges.iter() {
+                if range.first.saturating_add(range.count) > page.instance_count {
+                    return Err(AlignmentGpuRenderError::InvalidDrawRange(draw.page));
+                }
+                let instance_stride = size_of::<AlignmentGpuInstance>() as u64;
+                pass.set_vertex_buffer(
+                    0,
+                    page.buffer.slice(
+                        u64::from(range.first) * instance_stride
+                            ..u64::from(range.first + range.count) * instance_stride,
+                    ),
+                );
+                if let Some(interaction) = interaction {
+                    let flag_stride = size_of::<AlignmentGpuInteractionInstance>() as u64;
+                    pass.set_vertex_buffer(
+                        1,
+                        interaction.slice(
+                            u64::from(range.interaction_first) * flag_stride
+                                ..u64::from(range.interaction_first + range.count) * flag_stride,
+                        ),
+                    );
+                }
+                pass.draw(0..6, 0..range.count);
             }
-            pass.draw(0..6, 0..page.instance_count);
         }
         Ok(())
     }
@@ -4164,6 +4404,34 @@ fn interaction_page_instances(
     (instances, active)
 }
 
+/// Interaction flags for the instances of `ranges` (pairs of semantic primitive range and
+/// instance range from [`culled_draw_ranges`]), concatenated in draw order, and the number of
+/// active ones. Only the drawn instances are visited.
+fn interaction_range_instances(
+    page: &AlignmentSemanticPage,
+    ranges: &[(std::ops::Range<u32>, std::ops::Range<u32>)],
+    interaction: &AlignmentInteractionState,
+) -> (Vec<AlignmentGpuInteractionInstance>, usize) {
+    let mut active = 0_usize;
+    let mut instances = Vec::with_capacity(
+        ranges
+            .iter()
+            .map(|(_, instances)| (instances.end - instances.start) as usize)
+            .sum(),
+    );
+    for (primitives, _) in ranges {
+        for primitive in page.primitives()[primitives.start as usize..primitives.end as usize]
+            .iter()
+            .filter(|primitive| !matches!(primitive.component, AlignmentComponent::Label { .. }))
+        {
+            let flags = interaction_flags(interaction.token(primitive.handle));
+            active += usize::from(flags != 0);
+            instances.push(AlignmentGpuInteractionInstance { flags });
+        }
+    }
+    (instances, active)
+}
+
 fn camera_uniform(
     camera: AlignmentCamera,
     screen_size: [f32; 2],
@@ -4647,7 +4915,11 @@ pub enum AlignmentGpuRenderError {
     MissingOverlayBuffer,
     #[error("a pinned GPU alignment page disappeared before render: {0:?}")]
     MissingPinnedPage(AlignmentPageKey),
+    #[error("a GPU alignment draw range lies outside its page: {0:?}")]
+    InvalidDrawRange(AlignmentPageKey),
 }
 
+#[cfg(test)]
+pub(crate) mod culling_tests;
 #[cfg(test)]
 pub(crate) mod tests;

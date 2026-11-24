@@ -1365,6 +1365,7 @@ impl Viewer {
         if !self.display_dirty {
             return;
         }
+        self.alignment_frame_work.record_display_list_rebuild();
         if self.session.synthetic {
             let viewport = self.canvas_geometry().viewport;
             let width = self.session.panels.active().viewport.pixel_width() as f32;

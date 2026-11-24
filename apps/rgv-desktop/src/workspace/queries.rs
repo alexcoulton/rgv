@@ -9,8 +9,8 @@ use crate::workspace::alignments::{
 };
 use crate::workspace::context_lanes::buffered_context_interval;
 use crate::workspace::navigation_transaction::{
-    NavigationPresentationPhase, NavigationQueryTarget, NavigationTargetFingerprint,
-    navigation_target_ready_for_commit,
+    NavigationDueReason, NavigationPresentationPhase, NavigationQueryTarget,
+    NavigationTargetFingerprint, navigation_target_ready_for_commit,
 };
 use crate::{
     AlignmentGpuPublicationRetryGate, Viewer, auxiliary_query_track_ids,
@@ -153,10 +153,7 @@ impl Viewer {
         // whose new horizon becomes ready.
         self.reproject_panel_context_lanes(panel_id);
         if gesture_active {
-            // Alignment cameras are not debounced with source queries. The bounded scene mailbox
-            // replaces unread camera intents per panel, while the UI immediately reprojects the
-            // resident immutable scene under this exact viewport.
-            self.dispatch_alignment_query(panel_id);
+            self.step_alignment_navigation_gesture(panel_id);
         } else {
             let target = self
                 .session
@@ -171,16 +168,38 @@ impl Viewer {
         self.window.request_redraw();
     }
 
+    /// One step of a continuous gesture (wheel, trackpad, pinch, drag) moved `panel_id`.
+    ///
+    /// Inside every alignment lane's prepared scene the step is camera-only: the resident
+    /// immutable scene is recaptured under the new camera and nothing is dispatched; the panel's
+    /// transactions stay queued for the schedule's settled (idle or gesture-end) dispatch.
+    /// Otherwise the camera is dispatched so the source can extend its prepared interval —
+    /// once per frame while input events are being handled, at once elsewhere.
+    fn step_alignment_navigation_gesture(&mut self, panel_id: PanelId) {
+        use rgv_session::alignment::dispatch::{AlignmentGestureStep, alignment_gesture_step};
+        if alignment_gesture_step(self, panel_id) == AlignmentGestureStep::CameraOnly {
+            return;
+        }
+        if self.alignment_frame_work.deferring() {
+            self.alignment_frame_work.owe_dispatch(panel_id);
+        } else {
+            self.dispatch_alignment_query(panel_id);
+        }
+    }
+
     pub(crate) fn finish_navigation_gesture(&mut self, panel_id: PanelId) {
         let now = Instant::now();
-        let target = self
+        let schedule = &mut self
             .session
             .panels
             .panel_mut(panel_id)
-            .navigation_query_schedule
-            .take_immediate(now, true);
+            .navigation_query_schedule;
+        let target = schedule.take_immediate(now, true);
+        let deferred_alignment = schedule.take_due_deferred_alignment(now, true);
         if let Some(target) = target {
             self.dispatch_navigation_query_target(panel_id, target);
+        } else if let Some(target) = deferred_alignment {
+            self.dispatch_deferred_alignment_target(panel_id, target);
         }
         self.resume_alignment_optional_work_for_settled_panels();
         self.window.request_redraw();
@@ -194,12 +213,79 @@ impl Viewer {
             .filter_map(|panel| {
                 panel
                     .navigation_query_schedule
-                    .take_due(now)
+                    .take_due_with_reason(now)
+                    .map(|due| (panel.id, due))
+            })
+            .collect::<Vec<_>>();
+        for (panel_id, due) in due {
+            if due.reason == NavigationDueReason::Cadence
+                && self.navigation_target_is_current(panel_id, due.target)
+                && rgv_session::alignment::dispatch::alignment_viewport_change_is_camera_only(
+                    self, panel_id,
+                )
+            {
+                // A mid-gesture cadence sample inside the prepared scenes: contextual tracks and
+                // reference bases advance, the alignment target waits for the gesture to settle.
+                self.session
+                    .panels
+                    .panel_mut(panel_id)
+                    .navigation_query_schedule
+                    .defer_alignment(due, now);
+                self.dispatch_reference_query(panel_id);
+                self.dispatch_track_query(panel_id);
+            } else {
+                self.dispatch_navigation_query_target(panel_id, due.target);
+            }
+        }
+        let deferred = self
+            .session
+            .panels
+            .iter_mut()
+            .filter_map(|panel| {
+                panel
+                    .navigation_query_schedule
+                    .take_due_deferred_alignment(now, false)
                     .map(|target| (panel.id, target))
             })
             .collect::<Vec<_>>();
-        for (panel_id, target) in due {
-            self.dispatch_navigation_query_target(panel_id, target);
+        for (panel_id, target) in deferred {
+            self.dispatch_deferred_alignment_target(panel_id, target);
+        }
+    }
+
+    /// When the earliest alignment target a camera-only cadence sample deferred becomes due.
+    pub(crate) fn deferred_alignment_dispatch_deadline(&self) -> Option<Instant> {
+        self.session
+            .panels
+            .iter()
+            .filter_map(|panel| panel.navigation_query_schedule.deferred_alignment)
+            .map(|deferred| {
+                deferred.last_input_at
+                    + rgv_session::navigation_transaction::NAVIGATION_QUERY_IDLE_DELAY
+            })
+            .min()
+    }
+
+    fn navigation_target_is_current(
+        &self,
+        panel_id: PanelId,
+        target: NavigationQueryTarget,
+    ) -> bool {
+        self.session.panels.get(panel_id).is_some_and(|panel| {
+            panel.generation_clock.current().get() == target.generation
+                && NavigationTargetFingerprint::from_viewport(panel.viewport) == target.fingerprint
+        })
+    }
+
+    /// The settled dispatch of an alignment target a cadence sample deferred. A stale target
+    /// needs nothing: the newer input that replaced it owns its own dispatch.
+    fn dispatch_deferred_alignment_target(
+        &mut self,
+        panel_id: PanelId,
+        target: NavigationQueryTarget,
+    ) {
+        if self.navigation_target_is_current(panel_id, target) {
+            self.dispatch_alignment_query(panel_id);
         }
     }
 
@@ -208,12 +294,7 @@ impl Viewer {
         panel_id: PanelId,
         target: NavigationQueryTarget,
     ) {
-        let Some(panel) = self.session.panels.get(panel_id) else {
-            return;
-        };
-        if panel.generation_clock.current().get() != target.generation
-            || NavigationTargetFingerprint::from_viewport(panel.viewport) != target.fingerprint
-        {
+        if !self.navigation_target_is_current(panel_id, target) {
             return;
         }
         self.dispatch_alignment_query(panel_id);
@@ -583,18 +664,16 @@ impl Viewer {
                     .projection(id)
                     .is_some_and(|projection| projection.navigation.is_queued())
             });
-            if self
-                .session
-                .panels
-                .panel(id)
-                .navigation_query_schedule
-                .pending
-                .is_some()
-            {
+            let schedule = &self.session.panels.panel(id).navigation_query_schedule;
+            if schedule.pending.is_some() {
                 continue;
             }
+            // A camera-only gesture's alignment target waits for its own settled dispatch.
+            let alignment_deferred = schedule.deferred_alignment.is_some();
             self.session.panels.panel_mut(id).pending_queries.alignment = alignment_pending;
-            self.dispatch_alignment_query(id);
+            if !alignment_deferred {
+                self.dispatch_alignment_query(id);
+            }
             self.dispatch_reference_query(id);
             self.dispatch_track_query(id);
         }

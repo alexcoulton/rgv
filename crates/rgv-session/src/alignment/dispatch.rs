@@ -14,7 +14,8 @@ use crate::session::Session;
 use rgv_alignment_scene::{AlleleSummaryDetail, ReferenceRevision};
 use rgv_core::{GenomicInterval, PanelId, TrackId};
 use rgv_engine::{
-    AlignmentSceneRequestToken, EngineQueueError, LocalBamSourceControl, SourceOwnerId,
+    AlignmentIndividualReadCapability, AlignmentSceneRequestToken, EngineQueueError,
+    LocalBamSourceControl, SourceOwnerId,
 };
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -170,13 +171,196 @@ pub fn request_alignment_scene_camera_update<H: PresentationHost>(
     dispatch_alignment_query(host, panel_id);
 }
 
+/// Main-thread cost of [`dispatch_alignment_query`]: how many dispatches ran (a call with no
+/// queued alignment target returns before counting) and the wall time they took, including the
+/// synchronous scene-frame preparation each dispatch ends with.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AlignmentDispatchTelemetry {
+    /// Dispatches that ran for a queued alignment target.
+    pub dispatches: u64,
+    /// Lanes whose camera/contract the source actor accepted across those dispatches.
+    pub lanes_sent: u64,
+    /// Gesture steps that stayed inside every lane's prepared scene and so moved only the camera:
+    /// no dispatch, no source work (see [`alignment_viewport_change_is_camera_only`]).
+    pub camera_only_steps: u64,
+    /// Total and most recent main-thread wall time spent in dispatch, in microseconds.
+    pub total_micros: u64,
+    pub last_micros: u64,
+}
+
+impl AlignmentDispatchTelemetry {
+    fn record(&mut self, lanes_sent: usize, elapsed: std::time::Duration) {
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.dispatches = self.dispatches.saturating_add(1);
+        self.lanes_sent = self
+            .lanes_sent
+            .saturating_add(u64::try_from(lanes_sent).unwrap_or(u64::MAX));
+        self.total_micros = self.total_micros.saturating_add(micros);
+        self.last_micros = micros;
+    }
+}
+
+/// Fraction of the visible span that must stay prepared on each side of the viewport for a
+/// gesture step to be a camera-only move. Leaving that margin sends the camera to the source so
+/// it can extend the prepared interval before the edge becomes visible.
+const CAMERA_ONLY_MARGIN_DIVISOR: u64 = 8;
+
+/// Whether `panel_id`'s current viewport can be presented by moving the camera over the scenes
+/// its alignment lanes already prepared, with no query dispatch.
+///
+/// True only when every alignment track of the panel is ready and its latest source frame is a
+/// complete, contract-current scene whose prepared interval contains the viewport plus a margin
+/// of an eighth of its span on each side, and when the scene contract the viewport would request
+/// is equivalent to the one the lane already holds (same detail tier, filters, sort anchor,
+/// reference revision, read limit). Anything else (an opening or failed track, an index
+/// overview, a level-of-detail change, a pending or refused individual-read decision, a scene
+/// still loading) needs a dispatch. A camera-only step leaves the panel's transactions queued;
+/// the caller still owes the settled viewport one dispatch.
+pub fn alignment_viewport_change_is_camera_only<H: PresentationHost>(
+    host: &H,
+    panel_id: PanelId,
+) -> bool {
+    let session = host.session();
+    let Some(panel) = session.panels.get(panel_id).map(Panel::state) else {
+        return false;
+    };
+    let viewport = panel.viewport;
+    let resolution = AlignmentSceneResolution::for_viewport(viewport);
+    if session.alignment_tracks.is_empty() || !resolution.requires_alignment_records() {
+        return false;
+    }
+    session.alignment_tracks.iter().all(|track| {
+        if !matches!(track.lifecycle, AlignmentTrackLifecycle::Ready)
+            || track.scene_complete_read_limit != track.config.effective_complete_read_limit()
+            || track.scene_engine.is_none()
+        {
+            return false;
+        }
+        let Some(projection) = track.projection(panel_id) else {
+            return false;
+        };
+        let Some(metadata) = track.scene_metadata.as_ref() else {
+            return false;
+        };
+        let Some((contig, contig_length)) = metadata
+            .dictionary
+            .id_by_name(&panel.contig_name)
+            .and_then(|contig| {
+                metadata
+                    .dictionary
+                    .get(contig)
+                    .map(|entry| (contig, entry.length()))
+            })
+        else {
+            return false;
+        };
+        if projection.index_only_overview
+            || projection.unavailable.is_some()
+            || projection.scene_owner.is_none()
+            || projection.scene_contig != Some(contig)
+            || projection
+                .last_scene_resolution
+                .is_none_or(|previous| resolution.requires_refresh_from(previous))
+        {
+            return false;
+        }
+        let (Some(existing_contract), Some(frame)) = (
+            projection.scene_contract.as_ref(),
+            projection.scene_frame.as_ref(),
+        ) else {
+            return false;
+        };
+        let individual_reads_decided = match frame.individual_reads {
+            AlignmentIndividualReadCapability::Complete { .. } => true,
+            AlignmentIndividualReadCapability::Pending => !frame.camera.has_visible_rows(),
+            AlignmentIndividualReadCapability::Refused { .. } => false,
+        };
+        if !frame.visible_complete()
+            || !frame.reference_requirement.is_ready()
+            || !individual_reads_decided
+        {
+            return false;
+        }
+        let Some(snapshot) = frame.snapshot.as_ref() else {
+            return false;
+        };
+        let Ok(target) = viewport.remapped_contig(contig, contig_length) else {
+            return false;
+        };
+        if !interval_prepared_with_margin(
+            snapshot.prepared_interval(),
+            target.interval(),
+            contig_length,
+        ) {
+            return false;
+        }
+        let contract = alignment_scene_build_contract(
+            &track.config,
+            &track.active_filters,
+            metadata,
+            contig,
+            contig_length,
+            viewport,
+            host.promoted_read_template(track.config.id),
+            session.compatible_alignment_reference_revision(&metadata.dictionary),
+        );
+        alignment_scene_contract_equivalent(existing_contract, &contract)
+    })
+}
+
+/// What one step of a continuous navigation gesture owes the alignment source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlignmentGestureStep {
+    /// The viewport stayed inside every lane's prepared scene: the scene was recaptured under
+    /// the new camera and nothing was dispatched. The queued target still owes the settled
+    /// viewport one dispatch.
+    CameraOnly,
+    /// The step left a prepared scene (or changed what the scene must contain): the caller
+    /// dispatches, at most once per frame.
+    NeedsDispatch,
+}
+
+/// One gesture step of `panel_id`, after the caller moved its viewport and queued its alignment
+/// transactions: a camera-only step recaptures the resident scenes under the new camera (the
+/// host may coalesce that to its next frame) and counts itself; any other step is left for the
+/// caller to dispatch.
+pub fn alignment_gesture_step<H: PresentationHost>(
+    host: &mut H,
+    panel_id: PanelId,
+) -> AlignmentGestureStep {
+    if !alignment_viewport_change_is_camera_only(host, panel_id) {
+        return AlignmentGestureStep::NeedsDispatch;
+    }
+    let telemetry = &mut host.session_mut().alignment_dispatch_telemetry;
+    telemetry.camera_only_steps = telemetry.camera_only_steps.saturating_add(1);
+    host.prepare_alignment_scene_frame();
+    AlignmentGestureStep::CameraOnly
+}
+
+/// Whether `prepared` contains `visible` widened by [`CAMERA_ONLY_MARGIN_DIVISOR`] of its span
+/// on each side (clamped to the contig).
+fn interval_prepared_with_margin(
+    prepared: GenomicInterval,
+    visible: GenomicInterval,
+    contig_length: u64,
+) -> bool {
+    if prepared.contig() != visible.contig() {
+        return false;
+    }
+    let margin = (visible.len() / CAMERA_ONLY_MARGIN_DIVISOR).max(1);
+    let start = visible.start().saturating_sub(margin);
+    let end = visible.end().saturating_add(margin).min(contig_length);
+    prepared.start() <= start && prepared.end() >= end.max(visible.end())
+}
+
 /// Sends the UI's current camera to the unified source actor and changes no pixels itself.
 /// Existing immutable scene pages are captured against this camera immediately by
 /// `prepare_alignment_scene_frame`; source acquisition remains asynchronous and latest-wins.
-#[allow(clippy::too_many_lines)]
+/// Each dispatch that runs is counted, and timed, in the session's
+/// [`AlignmentDispatchTelemetry`].
 pub fn dispatch_alignment_query<H: PresentationHost>(host: &mut H, panel_id: PanelId) {
-    let session = host.session_mut();
-    if !session
+    if !host
+        .session()
         .panels
         .panel(panel_id)
         .state()
@@ -185,6 +369,18 @@ pub fn dispatch_alignment_query<H: PresentationHost>(host: &mut H, panel_id: Pan
     {
         return;
     }
+    let started = Instant::now();
+    let sent = dispatch_queued_alignment_query(host, panel_id);
+    host.session_mut()
+        .alignment_dispatch_telemetry
+        .record(sent, started.elapsed());
+}
+
+/// The body of [`dispatch_alignment_query`] once a target is known to be queued; returns how
+/// many lanes the source actor accepted.
+#[allow(clippy::too_many_lines)]
+fn dispatch_queued_alignment_query<H: PresentationHost>(host: &mut H, panel_id: PanelId) -> usize {
+    let session = host.session_mut();
     if session.alignment_tracks.is_empty() {
         session
             .panels
@@ -192,7 +388,7 @@ pub fn dispatch_alignment_query<H: PresentationHost>(host: &mut H, panel_id: Pan
             .state_mut()
             .pending_queries
             .alignment = false;
-        return;
+        return 0;
     }
     let viewport = session.panels.panel(panel_id).state().viewport;
     let resolution = AlignmentSceneResolution::for_viewport(viewport);
@@ -257,7 +453,7 @@ pub fn dispatch_alignment_query<H: PresentationHost>(host: &mut H, panel_id: Pan
             );
         }
         host.prepare_alignment_scene_frame();
-        return;
+        return 0;
     }
     let contig_name = session.panels.panel(panel_id).state().contig_name.clone();
     let lane_layout = host.panel_lane_layout(panel_id);
@@ -635,6 +831,7 @@ pub fn dispatch_alignment_query<H: PresentationHost>(host: &mut H, panel_id: Pan
     // keeps the latest immutable snapshot and computes its truthful intersection with the
     // live viewport.
     host.prepare_alignment_scene_frame();
+    sent
 }
 
 #[cfg(test)]
@@ -697,6 +894,79 @@ mod tests {
                 .alignment
         );
         assert!(host.calls.is_empty());
+    }
+
+    #[test]
+    fn a_camera_only_step_keeps_an_eighth_of_the_span_prepared_on_each_side() {
+        let interval = |start, end| GenomicInterval::new(ContigId::new(0), start, end).unwrap();
+        let prepared = interval(1_000, 5_000);
+        // A 1,600-base view needs 200 prepared bases beyond each edge.
+        assert!(interval_prepared_with_margin(
+            prepared,
+            interval(1_200, 2_800),
+            1_000_000
+        ));
+        assert!(!interval_prepared_with_margin(
+            prepared,
+            interval(1_199, 2_799),
+            1_000_000
+        ));
+        assert!(interval_prepared_with_margin(
+            prepared,
+            interval(3_200, 4_800),
+            1_000_000
+        ));
+        assert!(!interval_prepared_with_margin(
+            prepared,
+            interval(3_201, 4_801),
+            1_000_000
+        ));
+        // The contig end needs no margin beyond itself.
+        assert!(interval_prepared_with_margin(
+            prepared,
+            interval(3_400, 5_000),
+            5_000
+        ));
+        assert!(!interval_prepared_with_margin(
+            prepared,
+            GenomicInterval::new(ContigId::new(1), 1_200, 2_800).unwrap(),
+            1_000_000
+        ));
+    }
+
+    #[test]
+    fn without_alignment_tracks_no_step_is_camera_only() {
+        let mut host = host();
+        assert!(!alignment_viewport_change_is_camera_only(
+            &host,
+            PanelId::new(1)
+        ));
+        assert_eq!(
+            alignment_gesture_step(&mut host, PanelId::new(1)),
+            AlignmentGestureStep::NeedsDispatch
+        );
+        assert!(host.calls.is_empty(), "nothing was prepared");
+        assert_eq!(
+            host.session.alignment_dispatch_telemetry.camera_only_steps,
+            0
+        );
+    }
+
+    #[test]
+    fn only_a_queued_dispatch_is_counted() {
+        let mut host = host();
+        dispatch_alignment_query(&mut host, PanelId::new(1));
+        assert_eq!(host.session.alignment_dispatch_telemetry.dispatches, 0);
+        host.session
+            .panels
+            .panel_state_mut(PanelId::new(1))
+            .pending_queries
+            .alignment = true;
+        dispatch_alignment_query(&mut host, PanelId::new(1));
+        let telemetry = host.session.alignment_dispatch_telemetry;
+        assert_eq!(telemetry.dispatches, 1);
+        assert_eq!(telemetry.lanes_sent, 0);
+        assert_eq!(telemetry.total_micros, telemetry.last_micros);
     }
 
     #[test]

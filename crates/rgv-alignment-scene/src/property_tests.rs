@@ -3062,3 +3062,317 @@ fn bounded_worlds_keep_summaries_exact_and_extensions_equal_to_clean_builds() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Spatial directory and windowed label projection
+// ---------------------------------------------------------------------------------------------
+
+/// A random camera over `prepared`: zoomed in far enough for base letters, or out to whole
+/// reads; short and tall rows, reads too short for text, fractional pans, and cameras that hang
+/// over the prepared interval's edges.
+fn random_label_camera(
+    rng: &mut XorShift,
+    world: &World,
+    prepared: GenomicInterval,
+    row_count: u32,
+) -> crate::AlignmentCamera {
+    let span = if rng.chance(1, 2) {
+        rng.between(4, 120)
+    } else {
+        rng.between(120, prepared.len() + 400)
+    };
+    let latest = world.contig_length.saturating_sub(span).max(1);
+    let start = rng
+        .between(prepared.start().saturating_sub(span / 2), prepared.end())
+        .min(latest);
+    let end = (start + span).min(world.contig_length).max(start + 1);
+    let width = [60.0, 333.3, 900.0, 1_700.0, 2_600.0][rng.below(5) as usize];
+    let viewport = rgv_core::Viewport::new(interval(start, end), width)
+        .unwrap()
+        .pan_pixels(rng.below(100) as f64 / 37.0, world.contig_length)
+        .unwrap();
+    let row_height = [1.0, 2.5, 6.0, 10.0, 14.0, 14.0, 24.0, 24.0][rng.below(8) as usize];
+    let read_height = (row_height * rng.between(20, 100) as f64 / 100.0).min(row_height);
+    let row_scroll = rng.below(u64::from(row_count) + 2) as f64 + rng.below(100) as f64 / 100.0;
+    crate::AlignmentCamera::from_viewport(
+        viewport,
+        row_scroll,
+        row_height,
+        read_height,
+        crate::CpuClipRect {
+            x: rng.below(50) as f64 + 0.3,
+            y: rng.below(40) as f64 + 0.7,
+            width,
+            height: rng.between(20, 600) as f64 + 0.25,
+        },
+    )
+    .unwrap()
+}
+
+/// Every primitive of `page` in `rows` whose span intersects `window` lies in exactly one of the
+/// returned ranges, which are ascending, disjoint, and hold only primitives of `rows`.
+fn assert_window_ranges_bound(
+    page: &AlignmentSemanticPage,
+    rows: std::ops::Range<u32>,
+    window: std::ops::Range<u64>,
+    context: &str,
+) -> usize {
+    let mut ranges = Vec::new();
+    page.window_primitive_ranges(rows.clone(), window.clone(), &mut ranges);
+    for pair in ranges.windows(2) {
+        assert!(
+            pair[0].end < pair[1].start,
+            "{context}: ranges not ascending and disjoint: {ranges:?}"
+        );
+    }
+    let page_start = page.interval().start();
+    let in_ranges = |index: u32| ranges.iter().any(|range| range.contains(&index));
+    let mut returned = 0;
+    for (index, primitive) in page.primitives().iter().enumerate() {
+        let index = u32::try_from(index).unwrap();
+        let row = page.row_range().start + primitive.row_offset;
+        let reaches = rows.contains(&row)
+            && page_start + primitive.start_offset < window.end
+            && page_start + primitive.end_offset > window.start;
+        if reaches {
+            assert!(
+                in_ranges(index),
+                "{context}: primitive {index} ({primitive:?}) in the window was not returned; \
+                 rows {rows:?} window {window:?} page {:?} rows {:?}: {ranges:?}",
+                page.interval(),
+                page.row_range()
+            );
+        }
+        if in_ranges(index) {
+            returned += 1;
+            assert!(
+                rows.contains(&row),
+                "{context}: primitive {index} of row {row} is outside rows {rows:?}"
+            );
+        }
+    }
+    returned
+}
+
+/// The page spatial directory never misses a primitive of the asked rows that reaches the asked
+/// window, never returns another row's primitive, and returns less than the whole page for a
+/// narrow window.
+#[test]
+fn page_spatial_directory_returns_every_primitive_in_the_window_and_rows() {
+    let (mut queries, mut narrow_queries, mut narrow_returned, mut narrow_total) =
+        (0_u64, 0_u64, 0_usize, 0_usize);
+    for seed in 0..CASES {
+        let world = World::new(seed);
+        let mut rng = XorShift::new(seed ^ 0x5a7a);
+        let bases = reference_bases(&world);
+        drive_steps(
+            &world,
+            layout(ReadStackingMode::Compact, ReadSampling::Complete),
+            OverlappingMatePolicy::CountBoth,
+            &mut |context, target, _, evidence, summaries, atlas| {
+                let presentation = random_presentation(&mut rng);
+                let slice = presentation.reference.map(|_| {
+                    reference_slice(
+                        &bases,
+                        interval(
+                            target.start().saturating_sub(4),
+                            (target.end() + 4).min(world.contig_length),
+                        ),
+                    )
+                });
+                let row_block_rows =
+                    NonZeroU32::new(u32::try_from(rng.between(3, 24)).unwrap()).unwrap();
+                let mut store = AlignmentPresentationStore::new(world.ledger.clone());
+                let candidate = store
+                    .prepare(
+                        evidence,
+                        summaries,
+                        atlas,
+                        presentation,
+                        target,
+                        0..u32::try_from(atlas.row_count()).unwrap(),
+                        world.contig_length,
+                        world.tile_bases,
+                        row_block_rows,
+                        slice.as_ref(),
+                        ReservationKind::Normal,
+                    )
+                    .unwrap_or_else(|error| panic!("{context}: prepare: {error}"));
+                for page in candidate.snapshot().reads().pages() {
+                    let page_rows = page.row_range();
+                    for _ in 0..6 {
+                        let first = rng.between(
+                            u64::from(page_rows.start.saturating_sub(2)),
+                            u64::from(page_rows.end + 1),
+                        );
+                        let rows = u32::try_from(first).unwrap()
+                            ..u32::try_from(first + rng.between(0, 12)).unwrap();
+                        let start = rng.between(
+                            page.interval().start().saturating_sub(300),
+                            page.interval().end() + 50,
+                        );
+                        let narrow = rng.chance(1, 2);
+                        let width = if narrow {
+                            rng.between(1, 6)
+                        } else {
+                            rng.between(1, 900)
+                        };
+                        let returned = assert_window_ranges_bound(
+                            page,
+                            rows.clone(),
+                            start..start + width,
+                            context,
+                        );
+                        queries += 1;
+                        if narrow && rows.end - rows.start == page_rows.end - page_rows.start {
+                            narrow_queries += 1;
+                            narrow_returned += returned;
+                            narrow_total += page.primitives().len();
+                        }
+                    }
+                }
+            },
+        );
+    }
+    eprintln!(
+        "spatial directory: {queries} queries; whole-row narrow windows returned \
+         {narrow_returned} of {narrow_total} primitives over {narrow_queries} queries"
+    );
+    assert!(queries > 0);
+    assert!(
+        narrow_returned * 2 < narrow_total.max(1),
+        "narrow windows returned {narrow_returned} of {narrow_total} primitives"
+    );
+}
+
+/// The windowed label projector chooses exactly the labels the projector that walked every
+/// text-bearing primitive of every visible page chose, on random scenes (every level of detail,
+/// read labels, base letters, modified bases, clips, insertions, splices, pairs) and random
+/// cameras (zoom, pan, row scroll, row and read height, interaction), and never examines more.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn windowed_label_projection_equals_the_unindexed_projection() {
+    let (mut cameras, mut labelled, mut examined_old, mut examined_new) =
+        (0_u64, 0_u64, 0_usize, 0_usize);
+    // Labels drawn, by kind: base letters, insertion chips, clip lengths, read names, others.
+    let mut kinds = [0_usize; 5];
+    for seed in 0..CASES {
+        let world = World::new(seed);
+        let mut rng = XorShift::new(seed ^ 0x1abe1);
+        let bases = reference_bases(&world);
+        for stacking in [ReadStackingMode::Compact, ReadStackingMode::Stable] {
+            drive_steps(
+                &world,
+                layout(stacking, ReadSampling::Complete),
+                OverlappingMatePolicy::CountBoth,
+                &mut |context, target, _, evidence, summaries, atlas| {
+                    let mut presentation = random_presentation(&mut rng);
+                    if rng.chance(1, 2) {
+                        presentation.style.read_labels = AlignmentReadLabelMode::ReadName;
+                    }
+                    let slice = presentation.reference.map(|_| {
+                        reference_slice(
+                            &bases,
+                            interval(
+                                target.start().saturating_sub(4),
+                                (target.end() + 4).min(world.contig_length),
+                            ),
+                        )
+                    });
+                    let row_block_rows =
+                        NonZeroU32::new(u32::try_from(rng.between(3, 24)).unwrap()).unwrap();
+                    let row_count = u32::try_from(atlas.row_count()).unwrap();
+                    let mut store = AlignmentPresentationStore::new(world.ledger.clone());
+                    let candidate = store
+                        .prepare(
+                            evidence,
+                            summaries,
+                            atlas,
+                            presentation,
+                            target,
+                            0..row_count,
+                            world.contig_length,
+                            world.tile_bases,
+                            row_block_rows,
+                            slice.as_ref(),
+                            ReservationKind::Normal,
+                        )
+                        .unwrap_or_else(|error| panic!("{context}: prepare: {error}"));
+                    let scene = candidate.snapshot().reads();
+                    for index in 0..12 {
+                        let camera = random_label_camera(&mut rng, &world, target, row_count);
+                        let interaction = if rng.chance(1, 3) {
+                            let hovered = handle(rng.below(world.records.len() as u64) as usize);
+                            crate::AlignmentInteractionState::new(
+                                Some(hovered),
+                                Some(handle(rng.below(world.records.len() as u64) as usize)),
+                                [hovered],
+                            )
+                        } else {
+                            crate::AlignmentInteractionState::default()
+                        };
+                        let expected = crate::CpuAlignmentProjector::project_labels_unindexed(
+                            scene,
+                            index,
+                            camera,
+                            &interaction,
+                        )
+                        .unwrap();
+                        let actual = crate::CpuAlignmentProjector::project_labels_with_interaction(
+                            scene,
+                            index,
+                            camera,
+                            &interaction,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            actual.labels, expected.labels,
+                            "{context}: camera {index} {camera:?}: labels differ"
+                        );
+                        assert_eq!(actual.coverage, expected.coverage, "{context}");
+                        assert_eq!(
+                            actual.base_labels_projected, expected.base_labels_projected,
+                            "{context}"
+                        );
+                        assert!(actual.anchors_examined <= expected.anchors_examined);
+                        assert!(actual.base_anchors_examined <= expected.base_anchors_examined);
+                        cameras += 1;
+                        labelled += u64::from(!actual.labels.is_empty());
+                        examined_old += expected.anchors_examined;
+                        examined_new += actual.anchors_examined;
+                        for label in actual.labels.iter() {
+                            kinds[match label.component {
+                                crate::AlignmentComponent::Base { .. } => 0,
+                                component if crate::is_insertion_label(component) => 1,
+                                crate::AlignmentComponent::Label {
+                                    kind: crate::AlignmentLabelKind::ClipLength,
+                                    ..
+                                } => 2,
+                                crate::AlignmentComponent::Label {
+                                    kind: crate::AlignmentLabelKind::ReadName,
+                                    ..
+                                } => 3,
+                                _ => 4,
+                            }] += 1;
+                        }
+                    }
+                },
+            );
+        }
+    }
+    eprintln!(
+        "windowed labels: {cameras} cameras, {labelled} with labels; anchors examined \
+         {examined_new} (windowed) vs {examined_old} (every visible page); labels by kind \
+         (bases, insertions, clips, read names, other) {kinds:?}"
+    );
+    assert!(
+        kinds.iter().all(|count| *count > 0),
+        "some label kind was never drawn: {kinds:?}"
+    );
+    // Vacuous unless labels are actually drawn on a fair share of the cameras.
+    assert!(
+        labelled * 10 > cameras,
+        "only {labelled} of {cameras} cameras drew labels"
+    );
+    assert!(examined_new < examined_old);
+}
