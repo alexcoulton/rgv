@@ -27,10 +27,28 @@
         </Directory>
       </Directory>
     </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="RgvStartMenuShortcut" Guid="5E0C8F3A-6B2D-4C61-9F7E-2A4D1B8C3E95">
+        <Shortcut
+            Id="RgvStartMenu"
+            Name="RGV"
+            Description="Rust Genome Viewer"
+            Target="[INSTALLFOLDER]rgv-desktop.exe"
+            WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue
+            Root="HKLM"
+            Key="Software\RGV"
+            Name="StartMenuShortcut"
+            Type="integer"
+            Value="1"
+            KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
     <Feature Id="Main" Title="RGV" Level="1">
       <ComponentRef Id="RgvExecutable" />
       <ComponentRef Id="RgvMcpExecutable" />
       <ComponentRef Id="RgvReleaseMetadata" />
+      <ComponentRef Id="RgvStartMenuShortcut" />
     </Feature>
   </Package>
 </Wix>

@@ -5,8 +5,8 @@ agent control must build and package both `rgv-desktop` and `rgv-mcp` from the s
 pass formatting, strict Clippy, workspace tests, dependency policy checks, the interaction budget,
 and the fixture-matrix audit before packaging.
 
-`packaging/stage_package.py` is the single cross-platform staging authority used by development and
-signed workflows. It refuses a non-empty destination, writes the platform layout, embeds both RGV
+`packaging/stage_package.py` is the single cross-platform staging authority used by the release
+workflow. It refuses a non-empty destination, writes the platform layout, embeds both RGV
 license choices, a locked-graph CycloneDX 1.6 SBOM, third-party license inventory, build provenance,
 and a SHA-256 package manifest, and verifies the result before returning. It uses only the Python
 standard library and offline Cargo metadata after the release binary has built. Run its unit and
@@ -27,36 +27,35 @@ python3 packaging/stage_package.py \
 
 ## Artifacts
 
-- macOS: universal or separate Apple Silicon and Intel `.app` bundles inside a signed and notarized
-  `.dmg`.
-- Windows: a signed x86-64 executable and WiX MSI.
+Releases are unsigned: there is no Apple Developer ID or Windows code-signing certificate.
+
+- macOS: separate Apple Silicon and Intel `.app` bundles, ad-hoc signed, inside a `.dmg`. Ad-hoc
+  signing lets Apple Silicon run the app and makes Gatekeeper offer "Open Anyway" (System
+  Settings → Privacy & Security) instead of reporting it as damaged.
+- Windows: a WiX MSI that installs to Program Files and adds a Start menu shortcut, plus a
+  portable `.zip`. SmartScreen asks once ("More info → Run anyway").
 - Linux: an x86-64 tarball plus AppImage; distribution packages can follow after beta. The release
   workflow pins and verifies the AppImage packaging tool before executing it.
 
 Every platform artifact contains `LICENSE-MIT`, `LICENSE-APACHE`,
 `THIRD_PARTY_LICENSES.txt`, `RGV.cdx.json`, `BUILD-PROVENANCE.json`, and
 `PACKAGE-MANIFEST.sha256`. Platform-named SBOM and provenance copies are also published beside the
-installers, and `SHA256SUMS` plus the GitHub/Sigstore attestation cover the final signed artifacts.
-On macOS the inner manifest deliberately excludes the code-signed Mach-O and `_CodeSignature`
-directory to avoid a signature/hash cycle; the signed DMG checksum and attestation cover them.
+installers, with `SHA256SUMS` covering every published file. On macOS the inner manifest
+deliberately excludes the code-signed Mach-O and `_CodeSignature` directory to avoid a
+signature/hash cycle.
 
-Never publish an unsigned artifact under a stable release tag. CI builds are explicitly development
-artifacts until the signing jobs have access to protected secrets. macOS signing requires a
-Developer ID Application certificate and notarization credentials. Windows signing requires an
-EV/OV code-signing certificate exposed through the protected runner. Signing secrets must never be
-placed in repository variables, logs, session files, or diagnostic bundles.
+## Release workflow
 
-The `Signed release` workflow runs only for semantic-version tags. It fails closed if protected
-Apple or Windows credentials are absent, signs and verifies both platform packages, submits macOS
-disk images to Apple notarization, creates SHA-256 checksums, and emits GitHub/Sigstore build
-provenance attestations. The `release` environment should require maintainer approval.
+`.github/workflows/release.yml` builds every package. Pushing a tag `vX.Y.Z` builds them and
+publishes a GitHub release with installation notes and generated change notes. Running it by
+hand (`gh workflow run release.yml --ref <branch>`, or "Run workflow" on the Actions page) is a dry
+run: the packages are attached to the run as artifacts and nothing is published.
 
 ## Update strategy
 
-RGV uses immutable signed GitHub Releases as its update channel. Until beta telemetry proves that
-automatic replacement and rollback are safe, the application does not self-update: users compare
-the installed version with the latest stable release, verify the platform signature and
-`SHA256SUMS` or `gh attestation verify`, then install explicitly. A future updater must verify the
+RGV uses GitHub Releases as its update channel. Until beta telemetry proves that automatic
+replacement and rollback are safe, the application does not self-update: users compare the
+installed version with the latest release, verify `SHA256SUMS`, then install explicitly. A future updater must verify the
 same signed artifact before replacing anything, preserve the prior binary for rollback, never run
 with elevated privileges outside the installer, and honor an explicit disabled-by-default update
 check setting. Session-schema compatibility is independent of application updates.
@@ -64,8 +63,8 @@ check setting. Session-schema compatibility is independent of application update
 ## Build profiles
 
 `cargo build --release` uses thin LTO, one codegen unit, and strips debug information; it writes
-to `target/release/` and is what the development-artifact workflow stages. The signed-release
-workflow (`.github/workflows/release.yml`) builds with `--profile dist`, which inherits `release`
+to `target/release/`. The release workflow (`.github/workflows/release.yml`) builds with
+`--profile dist`, which inherits `release`
 and switches to fat LTO; its binaries are in `target/dist/`. Both keep `panic = "unwind"`. The
 `dist` profile was added on 20 November 2026 and has not yet been exercised by a tagged release.
 All workflows install the toolchain pinned in `rust-toolchain.toml`.
@@ -82,7 +81,7 @@ All workflows install the toolchain pinned in `rust-toolchain.toml`.
    and opaque alignment selection, prove retained evidence/export stability, save/open in-process,
    background native-window capture through the MCP, and verify that both binaries report a compatible control
    schema and application instance.
-6. Build, sign, notarize where applicable, and install each artifact on a clean machine.
+6. Build each package with a dry run of the release workflow and install it on a clean machine.
 7. Verify that diagnostics remain opt-in and URLs/credentials are redacted.
 8. Publish artifacts and checksums together, then test session migration from the previous release.
 

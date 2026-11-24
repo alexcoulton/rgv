@@ -3,6 +3,6 @@
     <InstallerPlatform>x64</InstallerPlatform>
     <OutputName>RGV-windows-x86_64</OutputName>
     <OutputType>Package</OutputType>
-    <DefineConstants>RgvBinary=$(RgvBinary);RgvPackageRoot=$(RgvPackageRoot);RgvResources=$(RgvResources);RgvVersion=$(RgvVersion)</DefineConstants>
+    <DefineConstants>RgvBinary=$(RgvBinary);RgvMcpBinary=$(RgvMcpBinary);RgvPackageRoot=$(RgvPackageRoot);RgvResources=$(RgvResources);RgvVersion=$(RgvVersion)</DefineConstants>
   </PropertyGroup>
 </Project>
