@@ -5,6 +5,8 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.3 — 2026-11-24
+
 - Hosted genomes work again. igv.org's genome list now serves only the IGV applications, so RGV
   reads the same list from the IGV team's public `igv-data` repository on GitHub (IGV Desktop 3's
   `genomes3.tsv` layout; the older layout is still accepted). GenBank entries, which RGV cannot
