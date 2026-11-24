@@ -830,7 +830,11 @@ fn insertion_i_beam_is_painted_on_the_base_boundary_and_not_over_its_base_cell()
     let bar_end = first_column_at_or_after(bar_right) as u32;
     assert_eq!(bar_end - bar_first, 3, "{bar_first}..{bar_end}");
     for column in bar_first..bar_end {
-        assert_eq!(pixel(column), insertion[..3], "bar column {column}");
+        assert_close(
+            pixel(column),
+            &insertion[..3],
+            format_args!("bar column {column}"),
+        );
     }
     // The serifs: a scanline inside the top serif (0.15 x 11 = 1.65 points thick) and one inside
     // the bottom serif are insertion-coloured across the whole eight-point box.
@@ -851,10 +855,10 @@ fn insertion_i_beam_is_painted_on_the_base_boundary_and_not_over_its_base_cell()
             "{name} serif scanline {row} is not inside the serif"
         );
         for column in first..end {
-            assert_eq!(
+            assert_close(
                 rgb_at(&image, column, row),
-                insertion[..3],
-                "{name} serif column {column}"
+                &insertion[..3],
+                format_args!("{name} serif column {column}"),
             );
         }
         assert_ne!(rgb_at(&image, first - 1, row), insertion[..3]);
@@ -889,7 +893,11 @@ fn insertion_i_beam_is_painted_on_the_base_boundary_and_not_over_its_base_cell()
         end + 1,
         (CLIP.x + 192.0) as u32,
     ] {
-        assert_eq!(pixel(column), read, "base-cell column {column}");
+        assert_close(
+            pixel(column),
+            &read,
+            format_args!("base-cell column {column}"),
+        );
     }
     eprintln!(
         "insertion bar on {}: columns {first}..{end} around boundary {boundary}",
@@ -939,6 +947,18 @@ fn rgb_at(image: &image::RgbaImage, column: u32, row: u32) -> [u8; 3] {
 
 fn close(left: [u8; 3], right: [u8; 3]) -> bool {
     (0..3).all(|channel| left[channel].abs_diff(right[channel]) <= super::CHANNEL_TOLERANCE)
+}
+
+/// Asserts a drawn colour matches `expected` (its first three channels) within the readback
+/// contract's [`super::CHANNEL_TOLERANCE`]: software rasterisers such as Windows' WARP round a
+/// blend one step differently from Metal.
+#[track_caller]
+fn assert_close(actual: [u8; 3], expected: &[u8], context: impl std::fmt::Display) {
+    let expected = [expected[0], expected[1], expected[2]];
+    assert!(
+        close(actual, expected),
+        "{context}: drew {actual:?}, expected {expected:?}"
+    );
 }
 
 /// A forward read's trailing soft clip on the real GPU at 64 points per base: the dark zigzag
@@ -1018,9 +1038,17 @@ fn soft_clip_sawtooth_sits_just_inside_the_arrowhead_on_the_gpu() {
     // The arrowhead is intact: one pixel inside the tip, the middle scanline is the read and
     // the top scanline is cut away; the body before the edge is the read's colour.
     let tip_column = (boundary - 1.0) as u32;
-    assert_eq!(rgb_at(&image, tip_column, 15), body);
-    assert_eq!(rgb_at(&image, tip_column, 10), white);
-    assert_eq!(rgb_at(&image, (edge_left - 20.0) as u32, 15), body);
+    assert_close(rgb_at(&image, tip_column, 15), &body, "arrow tip");
+    assert_close(
+        rgb_at(&image, tip_column, 10),
+        &white,
+        "above the arrow tip",
+    );
+    assert_close(
+        rgb_at(&image, (edge_left - 20.0) as u32, 15),
+        &body,
+        "read body",
+    );
     eprintln!(
         "soft clip sawtooth on {}: edge {edge_left:.2}..{edge_right:.2}, scanline means {mean_columns:?}",
         gpu.description
@@ -1267,7 +1295,7 @@ fn ghost_bases_show_in_empty_space_and_under_a_neighbouring_read_on_the_gpu() {
     // Positions 20 and 21 hold A's fourth and fifth ghosts, but B is drawn over them: its
     // first base matches the reference, so 20 is B's own colour, and its second (`C` against
     // the all-`A` reference) is B's mismatch cell, not the ghost.
-    assert_eq!(rgb_at(&image, cell_centre(20), 15), b);
+    assert_close(rgb_at(&image, cell_centre(20), 15), &b, "position 20");
     let covered = rgb_at(&image, cell_centre(21), 15);
     assert!(
         !close(covered, ghost),

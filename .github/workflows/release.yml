@@ -19,10 +19,6 @@ on:
 permissions:
   contents: read
 
-env:
-  # A tag names the version; a manual run is a development build of the workspace version.
-  RGV_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.1.0' }}
-
 jobs:
   macos:
     strategy:
@@ -36,6 +32,16 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # A tag names the version (and must match the app's); a manual run builds the app's.
+      - name: Resolve the version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' apps/rgv-desktop/Cargo.toml | head -1)"
+          fi
+          echo "RGV_VERSION=$version" >> "$GITHUB_ENV"
       - name: Install pinned Rust toolchain (rust-toolchain.toml)
         shell: bash
         run: rustup show active-toolchain || rustup toolchain install
@@ -67,6 +73,16 @@ jobs:
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@v4
+      # A tag names the version (and must match the app's); a manual run builds the app's.
+      - name: Resolve the version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' apps/rgv-desktop/Cargo.toml | head -1)"
+          fi
+          echo "RGV_VERSION=$version" >> "$GITHUB_ENV"
       - name: Install pinned Rust toolchain (rust-toolchain.toml)
         shell: bash
         run: rustup show active-toolchain || rustup toolchain install
@@ -114,6 +130,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # A tag names the version (and must match the app's); a manual run builds the app's.
+      - name: Resolve the version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' apps/rgv-desktop/Cargo.toml | head -1)"
+          fi
+          echo "RGV_VERSION=$version" >> "$GITHUB_ENV"
       - name: Install pinned Rust toolchain (rust-toolchain.toml)
         shell: bash
         run: rustup show active-toolchain || rustup toolchain install

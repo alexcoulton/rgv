@@ -5,6 +5,8 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.1 — 2026-11-24
+
 - An app icon: a stack of reads with one variant column. It is the macOS app icon, the Windows
   executable, installer and Start menu icon (with version information in the executable), the
   Linux desktop and AppImage icon and the window icon. Sources and the script that renders them

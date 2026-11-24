@@ -2509,9 +2509,15 @@ fn project_sessions_store_inside_sources_relatively_and_resolve_them_on_read() {
     let canonical_reference = reference.canonicalize().unwrap();
     let canonical_outside = outside.path().canonicalize().unwrap();
     let stored = std::fs::read_to_string(&session_path).unwrap();
-    assert!(stored.contains(&format!("data{}reads.bam", std::path::MAIN_SEPARATOR)));
-    assert!(stored.contains(&format!("data{}reference.fa", std::path::MAIN_SEPARATOR)));
-    assert!(stored.contains(&canonical_outside.display().to_string()));
+    // The session is JSON, where a Windows path's backslashes are escaped.
+    let in_json = |text: &str| {
+        let quoted = serde_json::to_string(text).unwrap();
+        quoted[1..quoted.len() - 1].to_owned()
+    };
+    let separator = std::path::MAIN_SEPARATOR;
+    assert!(stored.contains(&in_json(&format!("data{separator}reads.bam"))));
+    assert!(stored.contains(&in_json(&format!("data{separator}reference.fa"))));
+    assert!(stored.contains(&in_json(&canonical_outside.display().to_string())));
 
     let reopened = SessionDocument::read(&session_path).unwrap();
     assert_eq!(
