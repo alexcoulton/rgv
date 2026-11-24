@@ -5,11 +5,16 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.2 — 2026-11-24
+
 - Built-in genes for human (GRCh38, GRCh37, T2T-CHM13) and mouse (GRCm38, GRCm39). The gene
   landmark bundles (gene names for search, one representative transcript per gene, all
   transcripts, cytobands and chromosome aliases; about 51 MB) are in `resources/landmarks` and
   ship inside every package, so a matching reference gets a Genes track and gene-name search with
   nothing to install. Linux packages keep them in `share/rgv/landmarks`.
+- A rewritten README for first-time users: what RGV is, a screenshot, downloads, getting
+  started, controls and supported files. The detailed feature list is now `docs/FEATURES.md`
+  and the developer material `docs/DEVELOPMENT.md`.
 
 ## 0.1.1 — 2026-11-24
 
