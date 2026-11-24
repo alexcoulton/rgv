@@ -37,7 +37,8 @@ impl ApplicationHandler for Application {
             .with_title("RGV — Rust Genome Viewer")
             .with_theme(Some(Theme::Light))
             .with_inner_size(LogicalSize::new(1280.0, 800.0))
-            .with_min_inner_size(LogicalSize::new(640.0, 400.0));
+            .with_min_inner_size(LogicalSize::new(640.0, 400.0))
+            .with_window_icon(window_icon());
         let result = event_loop
             .create_window(attributes)
             .context("failed to create RGV window")
@@ -586,6 +587,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_window_icon_decodes() {
+        assert!(window_icon().is_some());
+    }
+
+    #[test]
     fn redraw_event_does_not_schedule_itself_again() {
         assert!(!should_request_egui_redraw(
             &WindowEvent::RedrawRequested,
@@ -643,4 +649,14 @@ mod tests {
             ModifiersState::SUPER,
         ));
     }
+}
+
+/// RGV's icon for the window's title bar and taskbar entry on Windows and X11. macOS shows the
+/// app bundle's icon and Wayland the desktop entry's, so both ignore it.
+fn window_icon() -> Option<winit::window::Icon> {
+    let image = image::load_from_memory(include_bytes!("../../../packaging/icons/rgv-256.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    winit::window::Icon::from_rgba(image.into_raw(), width, height).ok()
 }

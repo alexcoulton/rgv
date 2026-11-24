@@ -1,3 +1,5 @@
+<p align="center"><img src="packaging/icons/rgv.svg" width="112" alt="RGV logo: a stack of reads with the same red base in one column"></p>
+
 # RGV
 
 RGV is an experimental native desktop genome viewer in Rust. It uses a custom `wgpu` genomic

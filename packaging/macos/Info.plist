@@ -4,6 +4,8 @@
 <dict>
   <key>CFBundleDisplayName</key>
   <string>RGV</string>
+  <key>CFBundleIconFile</key>
+  <string>rgv</string>
   <key>CFBundleExecutable</key>
   <string>rgv-desktop</string>
   <key>CFBundleIdentifier</key>

@@ -7,6 +7,9 @@
       Scope="perMachine">
     <MajorUpgrade DowngradeErrorMessage="A newer version of RGV is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <!-- The icon of the Start menu shortcut and of RGV's entry in Installed apps. -->
+    <Icon Id="RgvIcon" SourceFile="$(sys.SOURCEFILEDIR)..\icons\rgv.ico" />
+    <Property Id="ARPPRODUCTICON" Value="RgvIcon" />
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="RGV">
         <Component Id="RgvExecutable" Guid="B483E788-81B0-46B8-A775-D40703DDA44C">
@@ -35,6 +38,7 @@
             Id="RgvStartMenu"
             Name="RGV"
             Description="Rust Genome Viewer"
+            Icon="RgvIcon"
             Target="[INSTALLFOLDER]rgv-desktop.exe"
             WorkingDirectory="INSTALLFOLDER" />
         <RegistryValue

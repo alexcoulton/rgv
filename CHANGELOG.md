@@ -5,6 +5,11 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+- An app icon: a stack of reads with one variant column. It is the macOS app icon, the Windows
+  executable, installer and Start menu icon (with version information in the executable), the
+  Linux desktop and AppImage icon and the window icon. Sources and the script that renders them
+  are in `packaging/icons`.
+
 - Windows packages (MSI installer and portable zip). Windows builds use the MinGW target
   (`x86_64-pc-windows-gnu`) so they read files through the same HTSlib as macOS and Linux;
   `hts-sys` and `rust-htslib` are vendored with small Windows patches (see `vendor/README.md`).

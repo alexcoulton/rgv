@@ -138,7 +138,8 @@ jobs:
           cp -R dist/stage/RGV-linux-x86_64/share dist/RGV.AppDir/usr/
           cp packaging/linux/AppRun dist/RGV.AppDir/AppRun
           cp packaging/linux/rgv.desktop dist/RGV.AppDir/rgv.desktop
-          cp packaging/linux/rgv.svg dist/RGV.AppDir/rgv.svg
+          cp packaging/icons/rgv.svg dist/RGV.AppDir/rgv.svg
+          cp packaging/icons/rgv-256.png dist/RGV.AppDir/.DirIcon
           chmod +x dist/RGV.AppDir/AppRun
           curl --fail --location https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage --output "$RUNNER_TEMP/appimagetool"
           echo "$APPIMAGETOOL_SHA256  $RUNNER_TEMP/appimagetool" | sha256sum --check

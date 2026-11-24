@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- The macOS app icon: rgv.svg on Apple's icon grid (an 824-point body centred on a
+       1024-point canvas), so it sits at the same size as other apps in the Dock. -->
+  <g transform="translate(100 100) scale(3.21875)">
+  <!-- RGV: a stack of reads in which three carry the same base (red, T) in one column,
+       picked out by a blue band - a variant spotted at a glance. Colours are RGV's own:
+       the T base colour, the interface blue and the light read body. -->
+  <defs>
+    <linearGradient id="rgv-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#13254A"/>
+      <stop offset="1" stop-color="#0A1530"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#rgv-bg)"/>
+  <rect x="134" y="36" width="30" height="184" rx="8" fill="#296BEB" opacity="0.28"/>
+  <rect x="36" y="48" width="150" height="24" rx="12" fill="#C9D6EA"/>
+  <rect x="74" y="86" width="146" height="24" rx="12" fill="#C9D6EA"/>
+  <rect x="36" y="124" width="184" height="24" rx="12" fill="#C9D6EA"/>
+  <rect x="58" y="162" width="128" height="24" rx="12" fill="#C9D6EA"/>
+  <rect x="137" y="48" width="24" height="24" rx="5" fill="#F04747"/>
+  <rect x="137" y="86" width="24" height="24" rx="5" fill="#F04747"/>
+  <rect x="137" y="162" width="24" height="24" rx="5" fill="#F04747"/>
+  </g>
+</svg>

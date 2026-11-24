@@ -52,7 +52,7 @@ def stage_macos(
     plist_path = root / "Contents" / "Info.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_bytes(plistlib.dumps(plist, sort_keys=True))
-    copy(ROOT / "packaging/linux/rgv.svg", resources / "rgv.svg")
+    copy(ROOT / "packaging/icons/rgv.icns", resources / "rgv.icns")
     stage_common(binary, resources, "macos", version, mcp_binary)
     return root
 
@@ -73,7 +73,7 @@ def stage_linux(
         root / "share" / "applications" / "rgv.desktop",
     )
     copy(
-        ROOT / "packaging/linux/rgv.svg",
+        ROOT / "packaging/icons/rgv.svg",
         root / "share" / "icons" / "hicolor" / "scalable" / "apps" / "rgv.svg",
     )
     stage_common(
