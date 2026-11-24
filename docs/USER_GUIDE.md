@@ -394,15 +394,39 @@ members. If parent columns are unavailable, RGV states that it is retaining VCF 
   deterministically and the gutter reports shown, collapsed, and omitted counts.
 - In the read stack an insertion is a purple I-beam on the boundary between two bases: a bar at
   most 3 points wide with short serifs across the top and bottom of the read, never as wide as a
-  base. Below 1 point per base it is a 1-point line, and below 0.1 it is hidden. Where there is
-  room, a purple label sits just beside the I-beam, the read's height tall. It shows the inserted
-  bases for insertions of up to 4 bases (`+T`, `+AG`) and the length for longer ones (`+12`). The
-  label appears for every insertion once base letters are drawn (7 points per base). From 2 points
-  per base it also appears, as a length, for insertions at least “Label events ≥” long. It is
-  dropped where it would cover another read in the row or another label, and on reads shorter than
-  8 points. Insertions hidden by “Show indels ≥” have no label. Base letters under the label are
-  hidden. Clicking the I-beam selects the insertion; the
-  inspector lists its length, position and sequence.
+  base. Below 1 point per base it is a 1-point line, and below 0.1 it is hidden. An insertion at
+  least “Label events ≥” long (default 10) also gets a purple chip stating its length (`+14`, never
+  the bases), from 2 points per base on reads at least 8 points tall. The chip goes just after the
+  I-beam, else just before it, and only where it covers nothing but its own read's plain body: no
+  substitution or modification cell, other I-beam, deletion gap (or its edge), clip edge or ghost
+  base, other read, or other label. Where neither side is free there is no chip; no base letter is
+  ever hidden for one. Shorter insertions are the I-beam alone at every zoom. Clicking the I-beam
+  selects the insertion; the inspector lists its length, position and sequence.
+- **Hovering the read stack.** Rest the pointer on any read event, or on the read itself, and after
+  a quarter of a second a tooltip appears beside the pointer (moving on to another event shows the
+  next one at once):
+  - substitution: `Substitution A>T · chr1:1,234 · base quality 23`, then how many reads here
+    carry that base (`This change: 12 of 40 reads here (30%) · ref A 27 · G 1`);
+  - insertion: its length (with the bases when short), the two bases it lies between, its first 30
+    bases, and how many reads insert there with the most common sequences;
+  - deletion: its length and span, and `Same deletion in 9 of 31 spanning reads (29%)` with the
+    reads deleting the first base;
+  - splice gap: the intron's length and span, and the junction as the Sashimi lane shows it (reads,
+    motif, strand and its source, annotated or novel);
+  - modification call: code, call probability, position (`CpG` when it is one), and the
+    Modifications lane's tally of that site (reverse-strand CpG calls are pooled on the C);
+  - soft clip and its faint bases: length, end, bases, and reads clipped at the same boundary;
+    hard clips, padding, pair connectors (insert size, mate, orientation, proper or discordant) and
+    specialist marks (bisulfite, SMRT kinetics, Ultima, SBX) name the mark, its value and position;
+  - length chips and labels say what they mean; the read itself shows its name, strand, MAPQ and
+    length, and the base under the pointer with the reference base and base quality.
+  Locus counts use the same filters as the coverage and Modifications lanes, so they match them;
+  where a figure is not available it is left out. Small marks such as a zoomed-out insertion line
+  answer to a 6-point-wide hover target. The hovered event is outlined with a soft glow that fades
+  in (about 140 ms) and out (100 ms); its read is tinted. With **Reduce interface motion** (Settings)
+  the outline appears and disappears without fading. Dragging, scrolling, pinching or pressing a key
+  hides the tooltip and highlight until the pointer moves again. Hover never changes the selection,
+  and neither tooltips nor highlights appear in exports.
 - Reference, coverage, Sashimi, aggregate-modification, and read lanes have independent visibility
   controls. Click the eye beside a lane in the track gutter to hide or show it. A hidden lane
   collapses to a compact labelled row with a closed eye, so it can be restored in the same place;

@@ -270,6 +270,17 @@ by one frame (bc5de51), mismatch fill hidden under the following aligned block (
         `minimum_event_label_size` now only gates the zoomed-out (2–7 points per base) length.
         Insertions are drawn as I-beams (capped bar plus serifs), so at extreme zoom the mark can
         no longer be mistaken for a base. Verified by unit, oracle and Metal readback tests.
+- [x] Insertion chips covered substitutions beside the I-beam and hid their letters.
+      — fixed (not yet committed): only insertions ≥ `minimum_event_label_size` get a chip, it is
+        length-only, and it is placed (after, else before, else dropped) only where it covers no
+        event of any read and no other read; no letter is hidden. Read-stack hover tooltips with
+        locus counts and a fading highlight were added at the same time.
+      Hands-on checks still to do live: tooltip delay and warm hand-over between events; highlight
+      stays on its event while scrolling with the wheel (it should vanish, then return on the next
+      pointer move); idle CPU returns to zero once a fade ends (Activity Monitor, pointer at rest on
+      an event for 10 s); Reduce interface motion removes the fade; tooltip counts against the
+      coverage and Modifications lanes' inspectors at the same base on an ONT CpG locus; hover cost
+      on an ONT long-read page (no lag moving across a 100 kb read at base zoom).
 
 ## Wave 4 — product reach
 

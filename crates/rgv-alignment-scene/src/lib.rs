@@ -15,6 +15,7 @@ mod depth_pyramid;
 mod evidence;
 mod filter_summary;
 mod fingerprint;
+mod hover;
 mod identity;
 mod interaction;
 mod junction_annotation;
@@ -94,6 +95,10 @@ pub use evidence::{
 };
 pub use filter_summary::{ExactFilterSummaryError, ExactFilterSummaryKey, ExactFilterSummaryTile};
 pub use fingerprint::ContractFingerprint;
+pub use hover::{
+    AlignmentHoverProbe, AlignmentHoverTarget, HOVER_MINIMUM_TARGET_WIDTH, hover_box,
+    hover_captured_scene, hover_outline, is_hover_event,
+};
 pub use identity::AlignmentHandle;
 pub use interaction::{AlignmentInteractionState, AlignmentInteractionToken};
 pub use junction_annotation::{

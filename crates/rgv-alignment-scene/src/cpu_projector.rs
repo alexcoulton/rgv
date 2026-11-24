@@ -152,11 +152,23 @@ impl AlignmentCamera {
         start..end.max(start)
     }
 
+    /// Pane y of the top of the read drawn in canonical atlas `row` (unclipped), and the drawn
+    /// read height (at least one point): the vertical extent every read-height shape shares.
+    #[must_use]
+    pub fn read_extent(self, row: u32) -> (f64, f64) {
+        (
+            self.clip.y
+                + (f64::from(row) - self.row_scroll) * self.row_height
+                + (self.row_height - self.read_height) * 0.5,
+            self.read_height.max(MINIMUM_PRIMITIVE_EXTENT),
+        )
+    }
+
     fn x_for_position(self, position: u64) -> f64 {
         self.clip.x + self.viewport.pixel_at_genomic(position)
     }
 
-    fn position_for_x(self, x: f64) -> Option<u64> {
+    pub(crate) fn position_for_x(self, x: f64) -> Option<u64> {
         if x < self.clip.x || x >= self.clip.x + self.clip.width {
             return None;
         }
@@ -167,7 +179,7 @@ impl AlignmentCamera {
         ))
     }
 
-    fn row_for_y(self, y: f64) -> Option<u32> {
+    pub(crate) fn row_for_y(self, y: f64) -> Option<u32> {
         if y < self.clip.y || y >= self.clip.y + self.clip.height {
             return None;
         }
@@ -579,11 +591,11 @@ impl CpuAlignmentProjector {
                 }
             }
         }
-        let mut read_bodies = ReadBodiesByRow::new();
+        let mut occupancy = RowOccupancy::default();
         for primitive in &primitives {
-            add_read_body(&mut read_bodies, primitive);
+            occupancy.add(primitive);
         }
-        reconcile_labels(&mut primitives, labels.into_values(), camera, &read_bodies);
+        reconcile_labels(&mut primitives, labels.into_values(), camera, &occupancy);
         // Paint order, as on the GPU: clip ghosts lie beneath the rest of their row, and boundary
         // marks (point markers, clip edges) overhang the neighbouring cells, so they follow it.
         primitives.sort_by(|left, right| {
@@ -723,6 +735,13 @@ impl CpuAlignmentProjector {
                                 obscured: false,
                                 ..
                             }
+                    ) && !matches!(
+                        // A short insertion never has a chip (see `place_insertion_label`).
+                        primitive.component,
+                        AlignmentComponent::Label {
+                            kind: AlignmentLabelKind::ShortInsertion,
+                            ..
+                        }
                     )
                 }) {
                     if base_glyph_cannot_fit(primitive, points_per_base) {
@@ -758,19 +777,44 @@ impl CpuAlignmentProjector {
                     }
                 }
             }
-            // Read bodies are consulted only by labels placed beside a read: insertion chips
-            // and clip lengths.
-            let mut read_bodies = ReadBodiesByRow::new();
-            if fragments.values().any(|fragment| {
-                is_insertion_label(fragment.component)
-                    || matches!(fragment.geometry, AlignmentGeometryToken::ClipEdge(_))
-            }) {
-                for (page_index, page) in visible_text_pages.iter().enumerate() {
-                    for primitive in
-                        windowed(page_index).filter(|primitive| is_read_body(primitive.component))
+            // What occupies a row is consulted only by labels placed beside a read (insertion
+            // chips and clip lengths), and only in the rows that hold one.
+            let beside_read_rows = fragments
+                .values()
+                .filter(|fragment| {
+                    is_insertion_label(fragment.component)
+                        || matches!(fragment.geometry, AlignmentGeometryToken::ClipEdge(_))
+                })
+                .map(|fragment| fragment.row)
+                .collect::<std::collections::HashSet<_>>();
+            let mut occupancy = RowOccupancy::default();
+            if !beside_read_rows.is_empty() {
+                // Read bodies and events, including modification and other specialist cells,
+                // which live on overlay pages of their own.
+                let mut occupant_ranges = Vec::new();
+                for page in occupancy_pages(scene, covered_interval, covered_rows.clone()) {
+                    occupant_ranges.clear();
+                    page.window_primitive_ranges(
+                        covered_rows.clone(),
+                        window.clone(),
+                        &mut occupant_ranges,
+                    );
+                    for primitive in occupant_ranges
+                        .iter()
+                        .flat_map(|range| {
+                            &page.primitives()[range.start as usize..range.end as usize]
+                        })
+                        .copied()
+                        .filter(|primitive| {
+                            is_read_body(primitive.component)
+                                || is_chip_obstacle(primitive.component)
+                        })
                     {
                         let global_row =
                             page.row_range().start.saturating_add(primitive.row_offset);
+                        if !beside_read_rows.contains(&global_row) {
+                            continue;
+                        }
                         if let Some(projected) = project_primitive(
                             primitive,
                             page.interval().start(),
@@ -779,13 +823,13 @@ impl CpuAlignmentProjector {
                             None,
                             AlignmentInteractionToken::default(),
                         ) {
-                            add_read_body(&mut read_bodies, &projected);
+                            occupancy.add(&projected);
                         }
                     }
                 }
             }
             labels.reserve_exact(fragments.len());
-            reconcile_labels(&mut labels, fragments.into_values(), camera, &read_bodies);
+            reconcile_labels(&mut labels, fragments.into_values(), camera, &occupancy);
         }
         drop(ranges);
         let base_labels_projected = labels
@@ -884,15 +928,12 @@ impl CpuAlignmentProjector {
             HashMap::<(AlignmentHandle, AlignmentComponent), CpuProjectedPrimitive>::with_capacity(
                 maximum_labels,
             );
-        let mut read_bodies = ReadBodiesByRow::new();
+        let mut occupancy = RowOccupancy::default();
         if covered_interval.is_some() {
-            for page in &visible_text_pages {
-                for primitive in page
-                    .primitives()
-                    .iter()
-                    .copied()
-                    .filter(|primitive| is_read_body(primitive.component))
-                {
+            for page in occupancy_pages(scene, covered_interval, covered_rows.clone()) {
+                for primitive in page.primitives().iter().copied().filter(|primitive| {
+                    is_read_body(primitive.component) || is_chip_obstacle(primitive.component)
+                }) {
                     let global_row = page.row_range().start.saturating_add(primitive.row_offset);
                     if global_row < covered_rows.start || global_row >= covered_rows.end {
                         continue;
@@ -905,7 +946,7 @@ impl CpuAlignmentProjector {
                         None,
                         AlignmentInteractionToken::default(),
                     ) {
-                        add_read_body(&mut read_bodies, &projected);
+                        occupancy.add(&projected);
                     }
                 }
             }
@@ -956,7 +997,7 @@ impl CpuAlignmentProjector {
             }
         }
         let mut labels = Vec::with_capacity(maximum_labels);
-        reconcile_labels(&mut labels, fragments.into_values(), camera, &read_bodies);
+        reconcile_labels(&mut labels, fragments.into_values(), camera, &occupancy);
         let base_labels_projected = labels
             .iter()
             .filter(|label| matches!(label.component, AlignmentComponent::Base { .. }))
@@ -1092,54 +1133,98 @@ fn pick_captured_scene(
             .max(position.saturating_add(1)),
     )
     .ok()?;
-    scene
-        .visible_pages(search_interval, row..row.saturating_add(1))
-        .into_iter()
-        .flat_map(|page| {
-            page.pick_candidates(row, position, marker_start..marker_end)
-                .filter(|primitive| {
-                    !matches!(primitive.component, AlignmentComponent::Label { .. })
-                })
-                .filter_map(|primitive| {
-                    project_primitive(
-                        primitive,
-                        page.interval().start(),
-                        row,
-                        camera,
-                        match primitive.component {
-                            AlignmentComponent::Label { id, .. } => page.label_arc(id),
-                            _ => None,
-                        },
-                        AlignmentInteractionToken::default(),
-                    )
-                })
-        })
-        .filter(|primitive| primitive.contains(x, y))
-        // Boundary marks paint over their row and clip ghosts beneath it (see the semantic page
-        // order), so the paint layer decides here too.
-        .max_by_key(|primitive| {
-            (
-                crate::semantic_page::primitive_paint_layer(
-                    primitive.component,
-                    primitive.geometry,
-                ),
-                primitive.draw_order,
-                primitive.component,
-                primitive.handle,
-            )
-        })
-        .map(|primitive| AlignmentHit {
-            track,
-            scene_revision: scene.revision(),
-            handle: primitive.handle,
-            component: primitive.component,
-        })
+    // The page spatial index narrows the row to primitives intersecting the search window; the
+    // candidate rule (the base under the pointer, or a boundary mark within reach) is applied
+    // exactly as before.
+    let window = marker_start.min(position)..marker_end.max(position.saturating_add(1));
+    let mut best: Option<CpuProjectedPrimitive> = None;
+    for_each_row_window_primitive(
+        scene,
+        search_interval,
+        row,
+        window,
+        |page_start, primitive| {
+            if matches!(primitive.component, AlignmentComponent::Label { .. }) {
+                return;
+            }
+            let start = page_start.saturating_add(primitive.start_offset);
+            let end = page_start.saturating_add(primitive.end_offset);
+            let candidate = (start <= position && position < end)
+                || (primitive.geometry.is_boundary_mark()
+                    && start < marker_end
+                    && marker_start < end);
+            if !candidate {
+                return;
+            }
+            let Some(projected) = project_primitive(
+                primitive,
+                page_start,
+                row,
+                camera,
+                None,
+                AlignmentInteractionToken::default(),
+            ) else {
+                return;
+            };
+            // Boundary marks paint over their row and clip ghosts beneath it (see the semantic page
+            // order), so the paint layer decides here too.
+            if projected.contains(x, y)
+                && best
+                    .as_ref()
+                    .is_none_or(|best| pick_rank(&projected) > pick_rank(best))
+            {
+                best = Some(projected);
+            }
+        },
+    );
+    best.map(|primitive| AlignmentHit {
+        track,
+        scene_revision: scene.revision(),
+        handle: primitive.handle,
+        component: primitive.component,
+    })
+}
+
+/// Paint order of a picked primitive, topmost greatest.
+fn pick_rank(primitive: &CpuProjectedPrimitive) -> (u8, u32, AlignmentComponent, AlignmentHandle) {
+    (
+        crate::semantic_page::primitive_paint_layer(primitive.component, primitive.geometry),
+        primitive.draw_order,
+        primitive.component,
+        primitive.handle,
+    )
+}
+
+/// Calls `visit` with the page start and every primitive of canonical `row` whose genomic span
+/// intersects `window`, on the visible pages of `interval`, through each page's spatial index:
+/// the cost is a few binary searches per page plus the primitives near the window, never the
+/// rest of a (possibly very long) row. Primitives may be visited that lie just outside the
+/// window; callers project and test each one.
+pub(crate) fn for_each_row_window_primitive(
+    scene: &AlignmentPresentationScene,
+    interval: GenomicInterval,
+    row: u32,
+    window: Range<u64>,
+    mut visit: impl FnMut(u64, AlignmentSemanticPrimitive),
+) {
+    let rows = row..row.saturating_add(1);
+    let mut ranges = Vec::new();
+    for page in scene.visible_pages(interval, rows.clone()) {
+        ranges.clear();
+        page.window_primitive_ranges(rows.clone(), window.clone(), &mut ranges);
+        let page_start = page.interval().start();
+        for range in &ranges {
+            for primitive in &page.primitives()[range.start as usize..range.end as usize] {
+                visit(page_start, *primitive);
+            }
+        }
+    }
 }
 
 /// Smallest extent, in points, any projected alignment shape may have along either axis. One
 /// point is at least one physical pixel at every window scale factor. Keep in lockstep with
 /// `project_instance` in `rgv-render`'s `alignment_scene.wgsl`.
-const MINIMUM_PRIMITIVE_EXTENT: f64 = 1.0;
+pub(crate) const MINIMUM_PRIMITIVE_EXTENT: f64 = 1.0;
 
 /// Fixed part, in points, of the margin [`AlignmentCamera::projection_window`] adds beyond the
 /// clip on each side. Twice the widest point marker; the read-height part covers arrowheads.
@@ -1169,7 +1254,8 @@ pub const INSERTION_SERIF_THICKNESS_FRACTION: f64 = 0.15;
 pub const INSERTION_SERIF_MINIMUM_THICKNESS: f64 = 1.0;
 pub const INSERTION_SERIF_MAXIMUM_THICKNESS: f64 = 2.0;
 /// The widest an I-beam ever is: the widest bar plus both serifs.
-const POINT_MARKER_MAXIMUM_WIDTH: f64 = INSERTION_BAR_MAXIMUM_WIDTH + 2.0 * INSERTION_SERIF_WIDTH;
+pub(crate) const POINT_MARKER_MAXIMUM_WIDTH: f64 =
+    INSERTION_BAR_MAXIMUM_WIDTH + 2.0 * INSERTION_SERIF_WIDTH;
 
 /// Horizontal extent `(left, width)` of a point marker whose one-base span projects to
 /// `cell_left..cell_right`, under a camera of `points_per_base`: centred on the cell's start
@@ -1251,7 +1337,7 @@ impl CpuInsertionMark {
 /// soft clip's sawtooth is half a base wide within [2, 6] points; a hard clip's bar is two.
 const SOFT_CLIP_EDGE_BASE_FRACTION: f64 = 0.5;
 const SOFT_CLIP_EDGE_MINIMUM_WIDTH: f64 = 2.0;
-const SOFT_CLIP_EDGE_MAXIMUM_WIDTH: f64 = 6.0;
+pub(crate) const SOFT_CLIP_EDGE_MAXIMUM_WIDTH: f64 = 6.0;
 const HARD_CLIP_EDGE_WIDTH: f64 = 2.0;
 /// Stroke of the sawtooth, measured across the stroke, and the target height of one tooth.
 const CLIP_EDGE_STROKE: f64 = 1.5;
@@ -1340,7 +1426,7 @@ pub fn clip_edge_covers(
     (from_boundary - centre).abs() <= half_stroke
 }
 
-fn project_primitive(
+pub(crate) fn project_primitive(
     primitive: AlignmentSemanticPrimitive,
     page_start: u64,
     global_row: u32,
@@ -1542,12 +1628,13 @@ fn merge_label_fragments(existing: &mut CpuProjectedPrimitive, fragment: &CpuPro
 /// * a clip has no on-screen extent, so its length shows only from this many points per base,
 ///   and only when the text fits in the width its `length` unseen bases would occupy at the
 ///   current zoom (`length x points per base`);
-/// * an insertion is labelled beside its I-beam; see [`insertion_label_text`] for the text and
-///   `place_insertion_label` for when and where it is shown.
+/// * an insertion at least `minimum_event_label_size` long has a length chip beside its
+///   I-beam; see `place_insertion_label` for when and where it is shown.
 pub const EVENT_LABEL_MINIMUM_POINTS_PER_BASE: f64 = 2.0;
 
-/// Insertions of at most this many bases are labelled with the inserted bases themselves (`+T`,
-/// `+AG`); longer ones with their length (`+12`).
+/// Insertion label anchors of at most this many bases carry the inserted bases themselves
+/// (`+T`, `+AG`), longer ones their length (`+12`). A chip always shows the length (see
+/// `place_insertion_label`).
 pub const INSERTION_LABEL_MAXIMUM_BASES: u32 = 4;
 /// Reads drawn shorter than this many points carry no insertion label: its chip could not hold
 /// the smallest text.
@@ -1596,40 +1683,36 @@ fn label_text_width(text: &str, height: f64) -> f64 {
         + LABEL_HORIZONTAL_PADDING * 2.0
 }
 
-/// Places an insertion's label (a [`AlignmentLabelKind::InsertionLength`] or
-/// [`AlignmentLabelKind::ShortInsertion`] label whose one-point box is centred on the
-/// insertion's boundary) as a chip the read's height tall, just beside the I-beam: after it,
-/// or before it when that side has no room. The rules depend only on the zoom and the read
-/// height:
+/// Places an insertion's label (a label whose one-point box is centred on the insertion's
+/// boundary) as a chip the read's height tall, just beside the I-beam: after it, or before it
+/// when that side has no room. Only an insertion at least `minimum_event_label_size` long
+/// ([`AlignmentLabelKind::InsertionLength`]) has a chip, and only from
+/// [`EVENT_LABEL_MINIMUM_POINTS_PER_BASE`] on reads at least [`INSERTION_LABEL_MINIMUM_HEIGHT`]
+/// points tall; it always states the length (`+14`, never the bases). A shorter insertion
+/// ([`AlignmentLabelKind::ShortInsertion`]) is its I-beam alone at every zoom; hovering it
+/// tells the rest.
 ///
-/// * from the base-letter width ([`CLIP_GHOST_MINIMUM_POINTS_PER_BASE`] points per base) every
-///   insertion is labelled, with its bases or its length (see [`insertion_label_text`]);
-/// * from [`EVENT_LABEL_MINIMUM_POINTS_PER_BASE`] only insertions at least
-///   `minimum_event_label_size` long ([`AlignmentLabelKind::InsertionLength`]) are, and only
-///   with their length (`+2`, never `+AG`);
-/// * never coarser than that, nor on reads under [`INSERTION_LABEL_MINIMUM_HEIGHT`] points.
-///
-/// A chip that would leave the pane or cover another read of the same row is dropped rather
-/// than moved further; collisions with other labels are resolved by the caller's sweep.
+/// A side has room only when the chip stays in the pane and covers nothing but the plain body
+/// of its own read: no other read, and no event of any read (substitution and modification
+/// cells, other I-beams, deletion gaps and their edges, clip edges and ghosts; see
+/// [`RowOccupancy::blocks_chip`]). With neither side free the chip is dropped, never moved
+/// further, and nothing else is hidden for it. Collisions with other labels are resolved by the
+/// caller's sweep.
 fn place_insertion_label(
     mut label: CpuProjectedPrimitive,
     kind: AlignmentLabelKind,
     points_per_base: f64,
     clip: CpuClipRect,
-    read_bodies: &ReadBodiesByRow,
+    occupancy: &RowOccupancy,
 ) -> Option<CpuProjectedPrimitive> {
-    if points_per_base < EVENT_LABEL_MINIMUM_POINTS_PER_BASE
+    if kind != AlignmentLabelKind::InsertionLength
+        || points_per_base < EVENT_LABEL_MINIMUM_POINTS_PER_BASE
         || label.height < INSERTION_LABEL_MINIMUM_HEIGHT
     {
         return None;
     }
-    if points_per_base < MINIMUM_BASE_GLYPH_WIDTH {
-        if kind != AlignmentLabelKind::InsertionLength {
-            return None;
-        }
-        if let Some(length) = label.text.as_deref().and_then(insertion_length_only) {
-            label.text = Some(Arc::from(length));
-        }
+    if let Some(length) = label.text.as_deref().and_then(insertion_length_only) {
+        label.text = Some(Arc::from(length));
     }
     let text_width = label_text_width(label.text.as_deref()?, label.height);
     let boundary = label.x + label.width * 0.5;
@@ -1640,11 +1723,7 @@ fn place_insertion_label(
         let right = left + text_width;
         left >= clip.x
             && right <= clip_right
-            && !read_bodies.get(&label.row).is_some_and(|bodies| {
-                bodies.iter().any(|&(start, end, handle)| {
-                    handle != label.handle && start < right && end > left
-                })
-            })
+            && !occupancy.blocks_chip(label.row, label.handle, left, right)
     };
     let after = boundary + reach + INSERTION_LABEL_GAP;
     let before = boundary - reach - INSERTION_LABEL_GAP - text_width;
@@ -1695,9 +1774,76 @@ fn point_event_label_length(text: &str) -> f64 {
     digits.parse::<u32>().map_or(1.0, f64::from).max(1.0)
 }
 
-/// Horizontal extents of read bodies per row, so a clip length placed outside its read can be
-/// refused when it would sit on a different read packed into the same row.
-type ReadBodiesByRow = HashMap<u32, Vec<(f64, f64, AlignmentHandle)>>;
+/// What occupies each row of the pane, for labels placed beside a read. A clip length or an
+/// insertion chip must not sit on another read's body packed into the same row; an insertion
+/// chip must also cover no event on any read (see [`is_chip_obstacle`]).
+#[derive(Debug, Default)]
+struct RowOccupancy {
+    rows: HashMap<u32, Vec<RowOccupant>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RowOccupant {
+    left: f64,
+    right: f64,
+    handle: AlignmentHandle,
+    body: bool,
+    event: bool,
+}
+
+/// Slack, in points, below which two extents that merely touch are not said to overlap.
+const OCCUPANCY_TOLERANCE: f64 = 1.0e-6;
+
+impl RowOccupancy {
+    fn add(&mut self, primitive: &CpuProjectedPrimitive) {
+        let body = is_read_body(primitive.component);
+        let event = is_chip_obstacle(primitive.component);
+        if body || event {
+            self.rows
+                .entry(primitive.row)
+                .or_default()
+                .push(RowOccupant {
+                    left: primitive.x,
+                    right: primitive.x + primitive.width,
+                    handle: primitive.handle,
+                    body,
+                    event,
+                });
+        }
+    }
+
+    /// Whether `left..right` of `row` lies on the body of a read other than `handle`.
+    fn covers_another_read(
+        &self,
+        row: u32,
+        handle: AlignmentHandle,
+        left: f64,
+        right: f64,
+    ) -> bool {
+        self.rows.get(&row).is_some_and(|occupants| {
+            occupants.iter().any(|occupant| {
+                occupant.body
+                    && occupant.handle != handle
+                    && occupant.left < right - OCCUPANCY_TOLERANCE
+                    && occupant.right > left + OCCUPANCY_TOLERANCE
+            })
+        })
+    }
+
+    /// Whether an insertion chip of `handle` over `left..right` of `row` would hide anything:
+    /// another read's body, or an event of any read, including the edges of its extent (each
+    /// event is kept [`INSERTION_LABEL_GAP`] clear).
+    fn blocks_chip(&self, row: u32, handle: AlignmentHandle, left: f64, right: f64) -> bool {
+        self.covers_another_read(row, handle, left, right)
+            || self.rows.get(&row).is_some_and(|occupants| {
+                occupants.iter().any(|occupant| {
+                    occupant.event
+                        && occupant.left - INSERTION_LABEL_GAP < right - OCCUPANCY_TOLERANCE
+                        && occupant.right + INSERTION_LABEL_GAP > left + OCCUPANCY_TOLERANCE
+                })
+            })
+    }
+}
 
 fn is_read_body(component: AlignmentComponent) -> bool {
     matches!(
@@ -1710,21 +1856,47 @@ fn is_read_body(component: AlignmentComponent) -> bool {
     )
 }
 
-fn add_read_body(bodies: &mut ReadBodiesByRow, primitive: &CpuProjectedPrimitive) {
-    if is_read_body(primitive.component) {
-        bodies.entry(primitive.row).or_default().push((
-            primitive.x,
-            primitive.x + primitive.width,
-            primitive.handle,
-        ));
-    }
+/// Everything drawn on (or beside) a read that an insertion chip must not cover: base and
+/// substitution cells, modification and other specialist cells, I-beams and hairlines, deletion
+/// and skip gaps, clip edges and ghost bases. Only the plain read body (and pair connectors,
+/// drawn between mates) may lie under a chip.
+fn is_chip_obstacle(component: AlignmentComponent) -> bool {
+    !matches!(
+        component,
+        AlignmentComponent::ReadSpan
+            | AlignmentComponent::AlignedSegment { .. }
+            | AlignmentComponent::DirectionTerminal
+            | AlignmentComponent::PairConnector { .. }
+            | AlignmentComponent::Label { .. }
+    )
+}
+
+/// The pages whose primitives can occupy a row beside a label: read geometry and specialist
+/// overlays (modification cells and the like), never label pages.
+fn occupancy_pages(
+    scene: &AlignmentPresentationScene,
+    covered_interval: Option<GenomicInterval>,
+    covered_rows: Range<u32>,
+) -> Vec<&Arc<crate::AlignmentSemanticPage>> {
+    covered_interval.map_or_else(Vec::new, |interval| {
+        scene
+            .visible_pages(interval, covered_rows)
+            .into_iter()
+            .filter(|page| {
+                matches!(
+                    page.key().family(),
+                    AlignmentPageFamily::ReadGeometry | AlignmentPageFamily::SpecialistOverlay
+                )
+            })
+            .collect()
+    })
 }
 
 fn reconcile_labels(
     primitives: &mut Vec<CpuProjectedPrimitive>,
     labels: impl Iterator<Item = CpuProjectedPrimitive>,
     camera: AlignmentCamera,
-    read_bodies: &ReadBodiesByRow,
+    occupancy: &RowOccupancy,
 ) {
     const MIN_TEXT_HEIGHT: f64 = LABEL_MINIMUM_TEXT_HEIGHT;
     const COLLISION_GAP: f64 = 2.0;
@@ -1738,7 +1910,7 @@ fn reconcile_labels(
             if let AlignmentComponent::Label { kind, .. } = label.component
                 && is_insertion_label(label.component)
             {
-                return place_insertion_label(label, kind, points_per_base, clip, read_bodies);
+                return place_insertion_label(label, kind, points_per_base, clip, occupancy);
             }
             let text = label.text.as_deref()?;
             if matches!(
@@ -1800,13 +1972,7 @@ fn reconcile_labels(
                 if left < clip.x || left + text_width > clip_right {
                     return None;
                 }
-                let right = left + text_width;
-                let on_another_read = read_bodies.get(&label.row).is_some_and(|bodies| {
-                    bodies.iter().any(|&(start, end, handle)| {
-                        handle != label.handle && start < right && end > left
-                    })
-                });
-                if on_another_read {
+                if occupancy.covers_another_read(label.row, label.handle, left, left + text_width) {
                     return None;
                 }
                 label.x = left;
@@ -1830,9 +1996,9 @@ fn reconcile_labels(
 
     // A sweep line keeps only accepted labels whose horizontal bounds can still collide.
     // The active set is therefore bounded by current screen geometry, not a record-count cap.
+    // Base letters are not part of the sweep: an insertion chip is only ever placed where it
+    // covers no cell (see `place_insertion_label`), so no letter is hidden for one.
     let mut active = Vec::<CpuProjectedPrimitive>::new();
-    // Accepted insertion chips per row, as horizontal extents.
-    let mut chips = HashMap::<u32, Vec<(f64, f64)>>::new();
     for candidate in candidates {
         active.retain(|accepted| accepted.x + accepted.width + COLLISION_GAP > candidate.x);
         let collides = active.iter().any(|accepted| {
@@ -1840,27 +2006,10 @@ fn reconcile_labels(
                 && candidate.y < accepted.y + accepted.height + COLLISION_GAP
         });
         if !collides {
-            if is_insertion_label(candidate.component) {
-                chips
-                    .entry(candidate.row)
-                    .or_default()
-                    .push((candidate.x, candidate.x + candidate.width));
-            }
             active.push(candidate.clone());
             primitives.push(candidate);
         }
     }
-
-    // An insertion's chip covers the cells beside its I-beam, so a base letter of its row whose
-    // glyph would overlap the chip is not drawn (it would otherwise paint over the chip).
-    base_labels.retain(|letter| {
-        let centre = letter.x + letter.width * 0.5;
-        let half_glyph = letter.height * LABEL_GLYPH_ASPECT_RATIO * 0.5;
-        !chips.get(&letter.row).is_some_and(|row| {
-            row.iter()
-                .any(|&(left, right)| centre - half_glyph < right && centre + half_glyph > left)
-        })
-    });
     primitives.append(&mut base_labels);
 }
 
@@ -2320,6 +2469,200 @@ mod tests {
         assert_eq!(INSERTION_LABEL_MAXIMUM_BASES, 4);
         assert_eq!(insertion_length_only("+AG").as_deref(), Some("+2"));
         assert_eq!(insertion_length_only("+12"), None);
+    }
+
+    /// A projected primitive of `component` over `left..right` of row 0.
+    fn occupant(
+        component: AlignmentComponent,
+        left: f64,
+        right: f64,
+        position: u64,
+    ) -> CpuProjectedPrimitive {
+        let mut semantic = primitive(0, 1, AlignmentGeometryToken::Rectangle);
+        semantic.component = component;
+        semantic.handle = AlignmentHandle::new(semantic.handle.source_revision(), {
+            AlignmentSourcePosition::bam_virtual_offset(position)
+        });
+        CpuProjectedPrimitive {
+            x: left,
+            y: 20.0,
+            width: right - left,
+            height: 11.0,
+            shape: CpuPrimitiveShape::BaseCell,
+            geometry: AlignmentGeometryToken::Rectangle,
+            handle: semantic.handle,
+            component,
+            style: semantic.style,
+            interaction: AlignmentInteractionToken::default(),
+            draw_order: 0,
+            text: None,
+            row: 0,
+            arrow: None,
+            insertion_mark: None,
+        }
+    }
+
+    /// The chip rules at the level of one label: only an insertion at least the minimum event
+    /// label size has a chip, it states its length, and each side is refused by any event of any
+    /// kind under it or within a point of it (modification cells and clip ghosts included) and by
+    /// another read's body, but not by its own read's plain body.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn insertion_chips_avoid_every_kind_of_event() {
+        // 20 points per base: the I-beam reaches four points either side of its boundary at
+        // x = 100, and `+14` is 22.48 points wide, so after spans 105..127.48 and before
+        // 72.52..95.
+        let points_per_base = 20.0;
+        let clip = CpuClipRect {
+            x: 10.0,
+            y: 20.0,
+            width: 1_000.0,
+            height: 50.0,
+        };
+        let own = 100;
+        let label = |kind: AlignmentLabelKind| {
+            let mut label = occupant(
+                AlignmentComponent::Label {
+                    kind,
+                    id: crate::ContractFingerprint::new(1),
+                },
+                99.5,
+                100.5,
+                own,
+            );
+            label.shape = CpuPrimitiveShape::TextLabel;
+            label.text = Some(Arc::from("+ACGTACGTACGTAC"));
+            label
+        };
+        let place = |occupants: &[CpuProjectedPrimitive]| {
+            let mut occupancy = RowOccupancy::default();
+            for occupant in occupants {
+                occupancy.add(occupant);
+            }
+            place_insertion_label(
+                label(AlignmentLabelKind::InsertionLength),
+                AlignmentLabelKind::InsertionLength,
+                points_per_base,
+                clip,
+                &occupancy,
+            )
+            .map(|chip| (chip.x, chip.x + chip.width, chip.text))
+        };
+        let (left, _, text) = place(&[]).expect("an empty row has room after the I-beam");
+        assert!((left - 105.0).abs() < 1.0e-9, "{left}");
+        assert_eq!(text.as_deref(), Some("+14"));
+        // A short insertion has no chip, whatever room there is.
+        assert!(
+            place_insertion_label(
+                label(AlignmentLabelKind::ShortInsertion),
+                AlignmentLabelKind::ShortInsertion,
+                points_per_base,
+                clip,
+                &RowOccupancy::default(),
+            )
+            .is_none()
+        );
+
+        let substitution = AlignmentComponent::Base {
+            cigar_index: 0,
+            read_index: 3,
+            base: b'C',
+            quality: Some(30),
+            classification: rgv_model::AlignedBaseClassification::Substitution,
+        };
+        let events = [
+            substitution,
+            AlignmentComponent::ModifiedBase {
+                read_index: 3,
+                canonical_base: b'C',
+                code: rgv_model::ModificationCode::Letter(b'm'),
+                probability: Some(240),
+                state: crate::ModificationState::Modified,
+                color_by_type: true,
+            },
+            AlignmentComponent::Deletion { cigar_index: 2 },
+            AlignmentComponent::ReferenceSkip { cigar_index: 2 },
+            AlignmentComponent::Insertion {
+                cigar_index: 4,
+                read_start: 9,
+                length: 1,
+            },
+            AlignmentComponent::SoftClip {
+                cigar_index: 0,
+                read_start: 0,
+                length: 5,
+            },
+            AlignmentComponent::HardClip {
+                cigar_index: 0,
+                length: 5,
+            },
+            AlignmentComponent::ClipGhostBase {
+                cigar_index: 0,
+                read_index: 1,
+                base: b'a',
+                obscured: false,
+            },
+        ];
+        let body = AlignmentComponent::AlignedSegment {
+            cigar_index: 0,
+            operation: crate::AlignmentOperation::Match,
+        };
+        for event in events {
+            // On the read's own body, an event after the I-beam sends the chip before it...
+            let after_event = occupant(event, 110.0, 112.0, own);
+            let (_, right, _) = place(&[occupant(body, 0.0, 1_000.0, own), after_event.clone()])
+                .unwrap_or_else(|| panic!("{event:?}: before has room"));
+            assert!((right - 95.0).abs() < 1.0e-9, "{event:?}: {right}");
+            // ...and with another before it there is no chip.
+            assert_eq!(
+                place(&[after_event.clone(), occupant(event, 80.0, 82.0, own)]),
+                None,
+                "{event:?}"
+            );
+            // An event of another read counts as well.
+            assert!(
+                place(&[occupant(event, 110.0, 112.0, own + 1)])
+                    .is_some_and(|(_, right, _)| (right - 95.0).abs() < 1.0e-9),
+                "{event:?}"
+            );
+            // Its edges are kept a point clear: half a point short of the chip still rules the
+            // side out, a point and a half does not.
+            assert!(
+                place(&[occupant(event, 127.98, 130.0, own)])
+                    .is_some_and(|(_, right, _)| (right - 95.0).abs() < 1.0e-9),
+                "{event:?}"
+            );
+            assert!(
+                place(&[occupant(event, 128.98, 130.0, own)])
+                    .is_some_and(|(left, _, _)| (left - 105.0).abs() < 1.0e-9),
+                "{event:?}"
+            );
+        }
+        // Another read's body rules a side out; the own read's does not.
+        assert!(
+            place(&[occupant(body, 120.0, 400.0, own + 1)])
+                .is_some_and(|(_, right, _)| (right - 95.0).abs() < 1.0e-9)
+        );
+        assert!(
+            place(&[occupant(body, 120.0, 400.0, own)])
+                .is_some_and(|(left, _, _)| (left - 105.0).abs() < 1.0e-9)
+        );
+        // Off the pane on both sides: dropped.
+        assert_eq!(
+            place_insertion_label(
+                label(AlignmentLabelKind::InsertionLength),
+                AlignmentLabelKind::InsertionLength,
+                points_per_base,
+                CpuClipRect {
+                    x: 90.0,
+                    y: 20.0,
+                    width: 30.0,
+                    height: 50.0,
+                },
+                &RowOccupancy::default(),
+            ),
+            None
+        );
     }
 
     #[test]

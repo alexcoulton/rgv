@@ -6,6 +6,7 @@ pub(crate) mod inspector_controller;
 pub(crate) mod model;
 pub(crate) mod navigation;
 pub(crate) mod read;
+pub(crate) mod read_hover_facts;
 pub(crate) mod rna;
 pub(crate) mod selection;
 pub(crate) mod variant;

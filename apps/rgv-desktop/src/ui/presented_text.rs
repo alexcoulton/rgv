@@ -84,11 +84,13 @@ impl PresentedTextPainter {
 
     /// Lays out `texts` centred on their anchors, in monospace, clipped to `clip`, exactly as
     /// [`crate::ui::paint_genomic_text`] would inside the pass, over `backdrops` (label chips,
-    /// already in their final colour).
+    /// already in their final colour), and `overlays` (the read-hover highlight) over the text.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn paint(
         &mut self,
         backdrops: &[RectPrimitive],
         texts: &[TextPrimitive],
+        overlays: Vec<ClippedShape>,
         clip: Rect,
         pixels_per_point: f32,
         fonts: PresentedTextFonts<impl FnOnce() -> FontDefinitions>,
@@ -144,6 +146,7 @@ impl PresentedTextPainter {
                     shape: Shape::galley(rect.min, galley, color),
                 })
             }));
+            shapes.extend(overlays);
             shapes
         };
         let texture_delta = atlas_fonts.font_image_delta();
@@ -252,9 +255,15 @@ mod tests {
     fn text_is_drawn_from_its_own_atlas_uploaded_in_the_same_frame() {
         let mut painter = PresentedTextPainter::default();
         let clip = Rect::from_min_max(pos2(0.0, 0.0), pos2(400.0, 300.0));
-        let first = painter.paint(&[], &[text("A", 20.0, 30.0)], clip, 2.0, fonts(), |_| {
-            Color32::BLACK
-        });
+        let first = painter.paint(
+            &[],
+            &[text("A", 20.0, 30.0)],
+            Vec::new(),
+            clip,
+            2.0,
+            fonts(),
+            |_| Color32::BLACK,
+        );
         let delta = first
             .texture_delta
             .expect("a new atlas is uploaded in full");
@@ -278,18 +287,32 @@ mod tests {
             font_size: 9.37,
             ..text("7", 50.0, 60.0)
         };
-        let second = painter.paint(&[], &[resized], clip, 2.0, fonts(), |_| Color32::BLACK);
-        assert!(second.texture_delta.is_some());
-        // Nothing new: nothing to upload.
-        let third = painter.paint(&[], &[text("A", 80.0, 30.0)], clip, 2.0, fonts(), |_| {
+        let second = painter.paint(&[], &[resized], Vec::new(), clip, 2.0, fonts(), |_| {
             Color32::BLACK
         });
+        assert!(second.texture_delta.is_some());
+        // Nothing new: nothing to upload.
+        let third = painter.paint(
+            &[],
+            &[text("A", 80.0, 30.0)],
+            Vec::new(),
+            clip,
+            2.0,
+            fonts(),
+            |_| Color32::BLACK,
+        );
         assert!(third.texture_delta.is_none());
 
         painter.reset();
-        let after_reset = painter.paint(&[], &[text("A", 20.0, 30.0)], clip, 2.0, fonts(), |_| {
-            Color32::BLACK
-        });
+        let after_reset = painter.paint(
+            &[],
+            &[text("A", 20.0, 30.0)],
+            Vec::new(),
+            clip,
+            2.0,
+            fonts(),
+            |_| Color32::BLACK,
+        );
         assert!(
             after_reset
                 .texture_delta
@@ -315,6 +338,7 @@ mod tests {
         let frame = painter.paint(
             &[backdrop],
             &[text("+T", 108.0, 25.5)],
+            Vec::new(),
             clip,
             2.0,
             fonts(),

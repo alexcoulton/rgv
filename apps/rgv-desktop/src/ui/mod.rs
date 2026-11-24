@@ -9,6 +9,7 @@ mod menu;
 pub(crate) mod modification_legend;
 mod navigation;
 pub(crate) mod presented_text;
+pub(crate) mod read_hover;
 pub(crate) mod shell;
 mod status;
 pub(crate) mod system_dialogs;

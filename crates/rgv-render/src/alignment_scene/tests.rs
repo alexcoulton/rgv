@@ -4972,8 +4972,9 @@ fn clip_edges_use_their_own_colour_and_ghosts_their_reads() {
 }
 
 /// An insertion's label is a chip just after its I-beam (one point clear of the serifs), the
-/// read's height tall, stating the two inserted bases (`+AC`, from the fixture's `SEQ`). It was
-/// a bare length centred on the bar, which hid under it.
+/// read's height tall, stating the insertion's length (`+2`). It was a bare length centred on
+/// the bar, which hid under it, and then stated the two inserted bases (`+AC`); a chip now never
+/// shows bases (hovering the I-beam does).
 #[test]
 fn insertion_labels_sit_just_after_the_i_beam() {
     let ledger = boundary_ledger();
@@ -4987,7 +4988,7 @@ fn insertion_labels_sit_just_after_the_i_beam() {
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(labels.len(), 1, "{:?}", frame.labels);
-        assert_eq!(labels[0].text.as_deref(), Some("+AC"));
+        assert_eq!(labels[0].text.as_deref(), Some("+2"));
         labels[0].clone()
     };
     let camera = boundary_camera(21, 25, 448.0);

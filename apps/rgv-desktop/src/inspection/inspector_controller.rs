@@ -1225,10 +1225,7 @@ fn coverage_insertion_fields(
     threshold: Option<f64>,
     locus: impl Fn(u64) -> String,
 ) -> Vec<(String, String)> {
-    use crate::inspection::coverage_insertions::{
-        inserted_bases_after, inserted_sequences_text, insertion_support_text,
-        tally_inserted_sequences,
-    };
+    use crate::inspection::coverage_insertions::{inserted_sequences_text, insertion_support_text};
     let mut fields = Vec::new();
     for anchor in [position.checked_sub(1), Some(position)]
         .into_iter()
@@ -1246,22 +1243,7 @@ fn coverage_insertion_fields(
             format!("Insertions after {}", locus(anchor)),
             insertion_support_text(bin.alleles.insertion, covering, threshold),
         ));
-        let sequences =
-            GenomicInterval::new(scene.prepared_interval().contig(), anchor, anchor + 1)
-                .ok()
-                .and_then(|interval| scene.reads().evidence().select(interval).ok())
-                .map(|selection| {
-                    let inserted = (0..selection.len()).filter_map(|index| {
-                        let record = selection.record_view(index)?;
-                        let bases = match selection.sequence(index) {
-                            Some(rgv_model::SequenceView::Present { bases, .. }) => bases,
-                            _ => &[][..],
-                        };
-                        inserted_bases_after(record.start(), record.cigar(), bases, anchor)
-                    });
-                    tally_inserted_sequences(inserted)
-                })
-                .unwrap_or_default();
+        let sequences = crate::inspection::read_hover_facts::inserted_sequences_at(scene, anchor);
         fields.push((
             "Inserted sequences".to_owned(),
             inserted_sequences_text(&sequences),

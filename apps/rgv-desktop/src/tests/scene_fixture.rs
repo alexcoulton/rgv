@@ -36,7 +36,6 @@ fn source_revision() -> AlignmentSourceRevision {
 }
 
 fn exact_authority(ledger: &AllocationLedger) -> (Arc<EvidenceRoot>, Arc<ExactSummaryRoot>) {
-    let interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
     let record = AlignmentRecord {
         contig: ContigId::new(0),
         start: 10,
@@ -76,13 +75,25 @@ fn exact_authority(ledger: &AllocationLedger) -> (Arc<EvidenceRoot>, Arc<ExactSu
             },
         ],
     };
+    exact_authority_of(ledger, &[record])
+}
+
+/// Evidence and exact summaries (alleles with counts, modifications) of `records` over `0..100`.
+#[allow(clippy::too_many_lines)]
+fn exact_authority_of(
+    ledger: &AllocationLedger,
+    records: &[AlignmentRecord],
+) -> (Arc<EvidenceRoot>, Arc<ExactSummaryRoot>) {
+    let interval = GenomicInterval::new(ContigId::new(0), 0, 100).unwrap();
     let mut decoded = AlignmentBatch::default();
-    decoded
-        .push_with_source_position(
-            &record,
-            AlignmentSourcePosition::bam_virtual_offset((5 << 16) | 1),
-        )
-        .unwrap();
+    for (ordinal, record) in records.iter().enumerate() {
+        decoded
+            .push_with_source_position(
+                record,
+                AlignmentSourcePosition::bam_virtual_offset((5 << 16) | (ordinal as u64 + 1)),
+            )
+            .unwrap();
+    }
     let payload_contract = PayloadContract::new_all_auxiliary(
         CapabilityRequirement::Required,
         CapabilityRequirement::Required,
@@ -139,8 +150,8 @@ fn exact_authority(ledger: &AllocationLedger) -> (Arc<EvidenceRoot>, Arc<ExactSu
         RECORD_CONTRACT,
         interval,
         FilteredRecordProvenance {
-            records_seen: 1,
-            eligible_records: 1,
+            records_seen: records.len() as u64,
+            eligible_records: records.len() as u64,
             ..FilteredRecordProvenance::default()
         },
     )
@@ -260,10 +271,38 @@ pub(crate) fn alignment_scene_snapshot_on(ledger: &AllocationLedger) -> Arc<Alig
     let ledger = ledger.clone();
     let (evidence, summaries) = exact_authority(&ledger);
     let interval = summaries.prepared_interval();
+    snapshot_of(
+        &ledger,
+        &evidence,
+        summaries,
+        &vec![b'A'; interval.len() as usize],
+    )
+}
+
+/// A scene of `records` over `0..100` with the given reference bases, its summaries counting
+/// alleles and modifications exactly as a live scene does.
+pub(crate) fn alignment_scene_snapshot_of(
+    ledger: &AllocationLedger,
+    records: &[AlignmentRecord],
+    reference: &[u8],
+) -> Arc<AlignmentSceneSnapshot> {
+    let (evidence, summaries) = exact_authority_of(ledger, records);
+    snapshot_of(ledger, &evidence, summaries, reference)
+}
+
+#[allow(clippy::too_many_lines)]
+fn snapshot_of(
+    ledger: &AllocationLedger,
+    evidence: &Arc<EvidenceRoot>,
+    summaries: Arc<ExactSummaryRoot>,
+    reference: &[u8],
+) -> Arc<AlignmentSceneSnapshot> {
+    let ledger = ledger.clone();
+    let interval = summaries.prepared_interval();
     let reference_revision = ReferenceRevision::new(RevisionFingerprint::new(30, 31));
     let reference = ReferenceSlice {
         interval,
-        bases: vec![b'A'; interval.len() as usize],
+        bases: reference.to_vec(),
     };
     let layout = LayoutContract {
         stacking: ReadStackingMode::Compact,
@@ -279,7 +318,7 @@ pub(crate) fn alignment_scene_snapshot_on(ledger: &AllocationLedger) -> Arc<Alig
     };
     let atlas = AlignmentRowAtlas::build(
         RowAtlasRevision::new(RevisionFingerprint::new(20, 21)),
-        &evidence,
+        evidence,
         interval,
         layout,
         &ledger,
@@ -310,7 +349,7 @@ pub(crate) fn alignment_scene_snapshot_on(ledger: &AllocationLedger) -> Arc<Alig
             AlignmentPageFamily::ReadGeometry,
             GeometryLod::Span,
         ),
-        &evidence,
+        evidence,
         &atlas,
         presentation,
         100,
@@ -321,13 +360,14 @@ pub(crate) fn alignment_scene_snapshot_on(ledger: &AllocationLedger) -> Arc<Alig
     )
     .unwrap();
     let revision = SceneRevision::new(RevisionFingerprint::new(22, 23));
+    let rows = 0..u32::try_from(atlas.row_count()).unwrap().max(1);
     let reads = AlignmentPresentationScene::new(
         revision,
-        Arc::clone(&evidence),
+        Arc::clone(evidence),
         atlas,
         presentation,
         interval,
-        0..1,
+        rows,
         vec![read_page],
         &ledger,
         ReservationKind::Normal,

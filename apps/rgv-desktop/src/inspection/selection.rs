@@ -1455,6 +1455,48 @@ impl Viewer {
     }
 
     pub(crate) fn alignment_scene_hit_at_cursor(&self, panel_id: PanelId) -> Option<AlignmentHit> {
+        self.probe_presented_read_lanes_at_cursor(panel_id, |lane, x, y| {
+            CpuAlignmentProjector::pick_panel_lane(lane, x, y)
+                .ok()
+                .flatten()
+        })
+    }
+
+    /// The read event (or read) the pointer hovers in `panel_id`: the same presented lanes and
+    /// captured cameras as [`Self::alignment_scene_hit_at_cursor`], with hover's enlarged target
+    /// for small marks; see `rgv_alignment_scene::hover`.
+    ///
+    /// A label drawn over the reads (an insertion chip, an event length) is hovered as itself.
+    /// Also returns the base under the pointer, for the read's own tooltip.
+    pub(crate) fn alignment_scene_hover_at_cursor(
+        &self,
+        panel_id: PanelId,
+    ) -> Option<(rgv_alignment_scene::AlignmentHoverTarget, Option<u64>)> {
+        self.probe_presented_read_lanes_at_cursor(panel_id, |lane, x, y| {
+            if let Some((label, _)) = self.presented_label_at(panel_id, x, y)
+                && label.hit.track == lane.track_id
+            {
+                return Some((label, None));
+            }
+            let target = CpuAlignmentProjector::hover_panel_lane(lane, x, y).target?;
+            let position = lane.read_camera.map(|camera| {
+                camera
+                    .viewport()
+                    .genomic_at_pixel(x - camera.clip().x)
+                    .floor()
+                    .max(0.0) as u64
+            });
+            Some((target, position))
+        })
+    }
+
+    /// Runs `probe` at the pointer on each read lane of the presented frame of `panel_id` whose
+    /// native read authority is current and whose clip holds the pointer; the first answer wins.
+    fn probe_presented_read_lanes_at_cursor<T>(
+        &self,
+        panel_id: PanelId,
+        probe: impl Fn(&rgv_alignment_scene::AlignmentPanelLaneFrame, f64, f64) -> Option<T>,
+    ) -> Option<T> {
         let scale = self.window.scale_factor().max(f64::EPSILON);
         let x = self.cursor.x / scale;
         let y = self.cursor.y / scale;
@@ -1471,37 +1513,30 @@ impl Viewer {
         {
             return None;
         }
-        frame
-            .lanes
-            .iter()
-            .filter_map(|lane| {
-                lane.read_camera?;
-                let scene = lane.snapshot.as_ref()?.reads();
-                let source = bundle.lane_authorities.iter().find(|authority| {
-                    authority.panel_id == panel_id
-                        && authority.track_id == lane.track_id
-                        && authority.target_revision == bundle.target_revision
-                        && authority.source_camera == lane.preparation_camera
-                })?;
-                let authority = bundle.read_authorities.iter().find(|authority| {
-                    authority.panel_id == panel_id
-                        && authority.track_id == lane.track_id
-                        && authority.target_revision == bundle.target_revision
-                        && authority.source_request_token == source.source_request_token
-                        && authority.desired_request_token == source.desired_request_token
-                        && authority.source_camera == lane.preparation_camera
-                        && authority.scene_revision == scene.revision()
-                })?;
-                let clip = authority.clip;
-                if x < clip.x || x >= clip.x + clip.width || y < clip.y || y >= clip.y + clip.height
-                {
-                    return None;
-                }
-                CpuAlignmentProjector::pick_panel_lane(lane, x, y)
-                    .ok()
-                    .flatten()
-            })
-            .next()
+        frame.lanes.iter().find_map(|lane| {
+            lane.read_camera?;
+            let scene = lane.snapshot.as_ref()?.reads();
+            let source = bundle.lane_authorities.iter().find(|authority| {
+                authority.panel_id == panel_id
+                    && authority.track_id == lane.track_id
+                    && authority.target_revision == bundle.target_revision
+                    && authority.source_camera == lane.preparation_camera
+            })?;
+            let authority = bundle.read_authorities.iter().find(|authority| {
+                authority.panel_id == panel_id
+                    && authority.track_id == lane.track_id
+                    && authority.target_revision == bundle.target_revision
+                    && authority.source_request_token == source.source_request_token
+                    && authority.desired_request_token == source.desired_request_token
+                    && authority.source_camera == lane.preparation_camera
+                    && authority.scene_revision == scene.revision()
+            })?;
+            let clip = authority.clip;
+            if x < clip.x || x >= clip.x + clip.width || y < clip.y || y >= clip.y + clip.height {
+                return None;
+            }
+            probe(lane, x, y)
+        })
     }
 
     pub(crate) fn select_visible_read(&mut self, forward: bool) {

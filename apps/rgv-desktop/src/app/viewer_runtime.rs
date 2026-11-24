@@ -983,6 +983,8 @@ impl Viewer {
             presented_text_painter: crate::ui::presented_text::PresentedTextPainter::default(),
             sashimi_presentations: std::collections::HashMap::new(),
             sashimi_hover_annotation: None,
+            read_hover: crate::ui::read_hover::ReadHoverAnimator::default(),
+            read_hover_tooltip: std::cell::RefCell::default(),
             workspace_layout,
             genomic_canvas_layer_id: None,
             pane_divider_rect: None,

@@ -7,6 +7,10 @@
 //! the egui pass, after it, after a camera-only capture or not), so they never carry this text.
 //! Instead it is assembled from the bundle the GPU pass is about to draw, at paint time; see
 //! `Viewer::submit_ui_frame`. Exports read it the same way.
+//!
+//! The read-hover highlight is laid out here too, from the same bundle and cameras (it is never
+//! exported), and hovering a label (an insertion chip, an event length) is hit-tested against the
+//! labels of the presented frame.
 
 use crate::{AlignmentGpuFrameBundle, Viewer, alignment_gpu_bundle_is_current};
 use rgv_alignment_scene::{AlignmentComponent, CpuProjectedPrimitive, is_insertion_label};
@@ -277,6 +281,172 @@ impl Viewer {
         backdrops
     }
 
+    /// The presented label frame (and its read authority's clip) of `track_id` in `panel_id`,
+    /// when it shows scene `scene_revision`.
+    fn presented_read_label_frame(
+        bundle: &AlignmentGpuFrameBundle,
+        panel_id: PanelId,
+        track_id: rgv_core::TrackId,
+        scene_revision: rgv_alignment_scene::SceneRevision,
+    ) -> Option<(
+        &rgv_alignment_scene::CpuAlignmentLabelFrame,
+        rgv_alignment_scene::CpuClipRect,
+    )> {
+        let frame = bundle.reads.as_ref()?;
+        bundle
+            .read_authorities
+            .iter()
+            .zip(frame.label_frames())
+            .find(|(authority, labels)| {
+                authority.panel_id == panel_id
+                    && authority.track_id == track_id
+                    && authority.scene_revision == scene_revision
+                    && labels.scene_revision == scene_revision
+            })
+            .map(|(authority, labels)| (labels, authority.clip))
+    }
+
+    /// The label of the presented frame drawn at `(x, y)` in `panel_id` that hovering explains
+    /// (insertion chips, event lengths, read names and tags; base letters are their cells), as a
+    /// hover target with its text.
+    pub(crate) fn presented_label_at(
+        &self,
+        panel_id: PanelId,
+        x: f64,
+        y: f64,
+    ) -> Option<(
+        rgv_alignment_scene::AlignmentHoverTarget,
+        std::sync::Arc<str>,
+    )> {
+        let bundle = self.drawable_alignment_gpu_bundle()?;
+        let frame = bundle.reads.as_ref()?;
+        bundle
+            .read_authorities
+            .iter()
+            .zip(frame.label_frames())
+            .filter(|(authority, labels)| {
+                authority.panel_id == panel_id
+                    && labels.scene_revision == authority.scene_revision
+                    && authority.clip.contains(x, y)
+            })
+            .find_map(|(authority, labels)| {
+                let label = labels.labels.iter().rev().find(|label| {
+                    matches!(label.component, AlignmentComponent::Label { .. })
+                        && x >= label.x
+                        && x < label.x + label.width
+                        && y >= label.y
+                        && y < label.y + label.height
+                })?;
+                Some((
+                    rgv_alignment_scene::AlignmentHoverTarget {
+                        hit: rgv_alignment_scene::AlignmentHit {
+                            track: authority.track_id,
+                            scene_revision: authority.scene_revision,
+                            handle: label.handle,
+                            component: label.component,
+                        },
+                        primitive: rgv_alignment_scene::AlignmentSemanticPrimitive {
+                            start_offset: 0,
+                            end_offset: 0,
+                            row_offset: label.row,
+                            handle: label.handle,
+                            component: label.component,
+                            geometry: label.geometry,
+                            style: label.style,
+                            draw_order: label.draw_order,
+                        },
+                    },
+                    std::sync::Arc::clone(label.text.as_ref()?),
+                ))
+            })
+    }
+
+    /// The text of the hovered label `target` in the presented frame of `panel_id`.
+    pub(crate) fn presented_label_text(
+        &self,
+        panel_id: PanelId,
+        target: &rgv_alignment_scene::AlignmentHoverTarget,
+    ) -> Option<std::sync::Arc<str>> {
+        let bundle = self.drawable_alignment_gpu_bundle()?;
+        let (labels, _) = Self::presented_read_label_frame(
+            bundle,
+            panel_id,
+            target.hit.track,
+            target.hit.scene_revision,
+        )?;
+        labels
+            .labels
+            .iter()
+            .find(|label| {
+                label.handle == target.hit.handle && label.component == target.hit.component
+            })
+            .and_then(|label| label.text.clone())
+    }
+
+    /// The highlight of every hovered target at `now`, laid out through the camera of the label
+    /// frame the GPU pass draws with it, so it moves with the reads exactly as their text does.
+    /// Empty during a gesture (the hover is suspended then anyway).
+    pub(crate) fn presented_read_hover_highlights(
+        &self,
+        now: std::time::Instant,
+        genomic: egui::Rect,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let Some(bundle) = self.drawable_alignment_gpu_bundle() else {
+            return Vec::new();
+        };
+        if self.dragging {
+            return Vec::new();
+        }
+        let reduced_motion = self.session.settings.reduced_motion;
+        let glow = crate::theme::adapt(egui::Color32::from_rgba_unmultiplied(255, 176, 0, 150));
+        let ring = crate::theme::adapt(egui::Color32::from_gray(20));
+        let mut shapes = Vec::new();
+        for (hover, alpha) in self.read_hover.highlights(now, reduced_motion) {
+            if !self
+                .session
+                .panels
+                .get(hover.panel)
+                .is_some_and(|panel| panel.navigation_presentation.is_interactive())
+            {
+                continue;
+            }
+            let target = hover.target;
+            let Some((labels, clip)) = Self::presented_read_label_frame(
+                bundle,
+                hover.panel,
+                target.hit.track,
+                target.hit.scene_revision,
+            ) else {
+                continue;
+            };
+            let camera = labels.camera;
+            let projected = if matches!(target.hit.component, AlignmentComponent::Label { .. }) {
+                labels
+                    .labels
+                    .iter()
+                    .find(|label| {
+                        label.handle == target.hit.handle && label.component == target.hit.component
+                    })
+                    .cloned()
+            } else {
+                target.project(camera)
+            };
+            let Some(projected) = projected else {
+                continue;
+            };
+            let outline = rgv_alignment_scene::hover_outline(&projected, camera, 1.0);
+            let clip = egui::Rect::from_min_size(
+                egui::pos2(clip.x as f32, clip.y as f32),
+                egui::vec2(clip.width as f32, clip.height as f32),
+            )
+            .intersect(genomic);
+            shapes.extend(crate::ui::read_hover::highlight_shapes(
+                &outline, alpha, clip, glow, ring,
+            ));
+        }
+        shapes
+    }
+
     /// Lays out every panel's read-level text from the bundle the GPU pass draws this frame and
     /// splices it into `paint_jobs` at the slot the workspace canvas recorded, uploading any new
     /// glyphs first. Must run after the frame's last alignment capture and before
@@ -288,6 +458,8 @@ impl Viewer {
     ) {
         let texts = self.presented_alignment_label_texts(|_| true);
         let backdrops = self.presented_alignment_label_backdrops(|_| true);
+        let genomic = self.workspace_layout.canvas_geometry().genomic;
+        let highlights = self.presented_read_hover_highlights(std::time::Instant::now(), genomic);
         let context = self.egui_context.clone();
         let (options, tessellation) = (
             context.fonts(|fonts| *fonts.options()),
@@ -296,7 +468,8 @@ impl Viewer {
         let frame = self.presented_text_painter.paint(
             &backdrops,
             &texts,
-            self.workspace_layout.canvas_geometry().genomic,
+            highlights,
+            genomic,
             pixels_per_point,
             crate::ui::presented_text::PresentedTextFonts {
                 options,

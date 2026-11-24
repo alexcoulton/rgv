@@ -3376,3 +3376,92 @@ fn windowed_label_projection_equals_the_unindexed_projection() {
     );
     assert!(examined_new < examined_old);
 }
+
+/// Hovering through the page spatial index answers exactly as examining every primitive of the
+/// pointer's row on every visible page does, on random scenes and cameras (zoom, pan, row
+/// scroll, row and read height), at random pointer positions, and never examines more.
+#[test]
+fn indexed_hover_equals_the_unindexed_hover() {
+    let (mut probes, mut hits, mut events, mut examined_old, mut examined_new) =
+        (0_u64, 0_u64, 0_u64, 0_usize, 0_usize);
+    for seed in 0..CASES {
+        let world = World::new(seed);
+        let mut rng = XorShift::new(seed ^ 0x4040);
+        let bases = reference_bases(&world);
+        drive_steps(
+            &world,
+            layout(ReadStackingMode::Compact, ReadSampling::Complete),
+            OverlappingMatePolicy::CountBoth,
+            &mut |context, target, _, evidence, summaries, atlas| {
+                let presentation = random_presentation(&mut rng);
+                let slice = presentation.reference.map(|_| {
+                    reference_slice(
+                        &bases,
+                        interval(
+                            target.start().saturating_sub(4),
+                            (target.end() + 4).min(world.contig_length),
+                        ),
+                    )
+                });
+                let row_count = u32::try_from(atlas.row_count()).unwrap();
+                let mut store = AlignmentPresentationStore::new(world.ledger.clone());
+                let candidate = store
+                    .prepare(
+                        evidence,
+                        summaries,
+                        atlas,
+                        presentation,
+                        target,
+                        0..row_count,
+                        world.contig_length,
+                        world.tile_bases,
+                        NonZeroU32::new(u32::try_from(rng.between(3, 24)).unwrap()).unwrap(),
+                        slice.as_ref(),
+                        ReservationKind::Normal,
+                    )
+                    .unwrap_or_else(|error| panic!("{context}: prepare: {error}"));
+                let scene = candidate.snapshot().reads();
+                for _ in 0..6 {
+                    let camera = random_label_camera(&mut rng, &world, target, row_count);
+                    let clip = camera.clip();
+                    for _ in 0..16 {
+                        let x = clip.x + rng.below(10_000) as f64 / 10_000.0 * clip.width;
+                        let y = clip.y + rng.below(10_000) as f64 / 10_000.0 * clip.height;
+                        let track = rgv_core::TrackId::new(1);
+                        let covered = Some(scene.prepared_interval());
+                        let rows = scene.prepared_rows();
+                        let actual = crate::hover_captured_scene(
+                            scene,
+                            track,
+                            camera,
+                            covered,
+                            rows.clone(),
+                            x,
+                            y,
+                        );
+                        let expected =
+                            crate::hover::hover_unindexed(scene, track, camera, covered, rows, x, y);
+                        assert_eq!(
+                            actual.target, expected.target,
+                            "{context}: {camera:?} at ({x}, {y})"
+                        );
+                        assert!(actual.candidates_examined <= expected.candidates_examined);
+                        probes += 1;
+                        hits += u64::from(actual.target.is_some());
+                        events += u64::from(actual.target.is_some_and(|target| target.is_event()));
+                        examined_old += expected.candidates_examined;
+                        examined_new += actual.candidates_examined;
+                    }
+                }
+            },
+        );
+    }
+    eprintln!(
+        "hover: {probes} probes, {hits} on a read, {events} on an event; primitives examined \
+         {examined_new} (indexed) vs {examined_old} (whole row)"
+    );
+    // Vacuous unless the pointer lands on reads and on events often enough.
+    assert!(hits * 20 > probes, "only {hits} of {probes} probes hit a read");
+    assert!(events > 0, "no probe hit an event");
+    assert!(examined_new < examined_old);
+}

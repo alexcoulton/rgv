@@ -30,6 +30,7 @@ mod canvas;
 mod commit;
 mod menus;
 mod prepare;
+mod read_hover_overlay;
 mod read_notices;
 mod sashimi_overlays;
 mod shell_dialogs;

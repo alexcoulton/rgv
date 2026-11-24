@@ -147,6 +147,8 @@ impl ApplicationHandler for Application {
                 if event.state == ElementState::Pressed && !egui_response.consumed =>
             {
                 Viewer::mark_native_input_handled(&mut recording_observation);
+                // Keys navigate the view: like a scroll, they hide the read hover.
+                viewer.suspend_read_hover();
                 viewer.keyboard_input(&event.logical_key);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
@@ -168,6 +170,7 @@ impl ApplicationHandler for Application {
                 viewer.cursor_moved(position, egui_response.consumed);
             }
             WindowEvent::CursorLeft { .. } => {
+                viewer.set_read_hover(None, None);
                 // Read hover may sit in any panel, so leaving the window clears every panel's.
                 let focused = viewer.session.panels.active().id;
                 if !crate::ui::interaction::retarget_alignment_hover(
@@ -200,6 +203,7 @@ impl ApplicationHandler for Application {
             }
             WindowEvent::Focused(false) => {
                 Viewer::mark_native_input_handled(&mut recording_observation);
+                viewer.suspend_read_hover();
                 viewer.finish_overview_capture();
                 viewer.finish_vertical_scrollbar_drag();
                 let was_canvas_dragging = viewer.dragging;
@@ -332,6 +336,8 @@ impl ApplicationHandler for Application {
                 if let Some(panel_id) = viewer.panel_at_cursor() {
                     viewer.activate_view_panel(panel_id);
                 }
+                // Scrolling is a gesture: the read hover hides until the pointer moves again.
+                viewer.suspend_read_hover();
                 let navigated = viewer.apply_scroll(delta);
                 // The event that ends a trackpad scroll usually carries a zero delta, so the
                 // gesture is settled for any scroll that ends over the canvas.
@@ -353,6 +359,7 @@ impl ApplicationHandler for Application {
                 if let Some(panel_id) = viewer.panel_at_cursor() {
                     viewer.activate_view_panel(panel_id);
                 }
+                viewer.suspend_read_hover();
                 viewer.apply_pinch(delta);
                 if matches!(
                     phase,

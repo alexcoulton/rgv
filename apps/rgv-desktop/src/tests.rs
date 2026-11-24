@@ -5,7 +5,7 @@ mod display;
 #[path = "tests/inspection.rs"]
 mod inspection;
 #[path = "tests/scene_fixture.rs"]
-mod scene_fixture;
+pub(crate) mod scene_fixture;
 #[path = "tests/semantic_retirement.rs"]
 mod semantic_retirement;
 #[path = "tests/sources.rs"]

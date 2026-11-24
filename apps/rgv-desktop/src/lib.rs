@@ -1327,6 +1327,10 @@ struct Viewer {
     /// Lays out read-level text from the presented alignment bundle after the egui pass, into
     /// its own atlas texture in `egui_renderer`.
     presented_text_painter: ui::presented_text::PresentedTextPainter,
+    /// Read-stack hover: the hovered event or read, its highlight fade and tooltip delay.
+    read_hover: ui::read_hover::ReadHoverAnimator,
+    /// The hovered target's tooltip lines and its read's record, built once per target.
+    read_hover_tooltip: std::cell::RefCell<ui::read_hover::ReadHoverTooltipCache>,
     /// Annotation status line of the hovered junction's tooltip, keyed by that junction.
     sashimi_hover_annotation: Option<((TrackId, u64, u64), Option<String>)>,
     /// Resolved Sashimi presentation of each captured `(panel, track)` lane.

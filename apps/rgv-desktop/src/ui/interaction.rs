@@ -63,6 +63,26 @@ const fn undo_shortcut_command(shift: bool) -> UiCommand {
     }
 }
 
+/// Each panel's hovered read (track and record), ignoring which of its events is hovered.
+fn hovered_reads(
+    panels: &PanelWorkspace,
+) -> Vec<(
+    PanelId,
+    Option<(TrackId, rgv_alignment_scene::AlignmentHandle)>,
+)> {
+    panels
+        .iter()
+        .map(|panel| {
+            (
+                panel.id,
+                panel
+                    .hovered_alignment_hit
+                    .map(|hit| (hit.track, hit.handle)),
+            )
+        })
+        .collect()
+}
+
 /// Moves the single read hover to `hover_panel`, clearing it everywhere else, and returns the
 /// panels whose hover changed. The hover panel need not be the focused one.
 pub(crate) fn retarget_alignment_hover(
@@ -129,13 +149,41 @@ impl Viewer {
         // shows the previous camera: a hit test would name the read that was under the pointer
         // before the move, and retargeting would capture again for every event. Hover resumes
         // with the next pointer movement after the frame.
+        if self.dragging {
+            // A drag is a gesture: hover highlights and tooltips are hidden until it ends.
+            self.suspend_read_hover();
+        }
         let hover_changed = if self.alignment_frame_work.prepare_owed() {
             Vec::new()
         } else {
-            let hovered_scene = hover_allowed
-                .then(|| self.alignment_scene_hit_at_cursor(hover_panel))
+            let hovered = hover_allowed
+                .then(|| self.alignment_scene_hover_at_cursor(hover_panel))
                 .flatten();
-            retarget_alignment_hover(&mut self.session.panels, hover_panel, hovered_scene)
+            let before = hovered_reads(&self.session.panels);
+            let changed = retarget_alignment_hover(
+                &mut self.session.panels,
+                hover_panel,
+                hovered.map(|(target, _)| target.hit),
+            );
+            if !self.dragging {
+                self.set_read_hover(
+                    hovered.map(|(target, _)| crate::ui::read_hover::ReadHover {
+                        panel: hover_panel,
+                        target,
+                    }),
+                    hovered.and_then(|(_, position)| position),
+                );
+            }
+            // The interaction flags the GPU draws are per read: moving between the events of one
+            // read changes no flag, so it needs no new capture.
+            let after = hovered_reads(&self.session.panels);
+            changed
+                .into_iter()
+                .filter(|panel_id| {
+                    before.iter().find(|(id, _)| id == panel_id)
+                        != after.iter().find(|(id, _)| id == panel_id)
+                })
+                .collect::<Vec<_>>()
         };
         if !hover_changed.is_empty() {
             for panel_id in hover_changed {

@@ -586,11 +586,12 @@ pub enum SpecialistUnavailableReason {
 pub enum AlignmentLabelKind {
     ReadName,
     AuxiliaryTag([u8; 2]),
-    /// An insertion's label (`+T`, `+AG` or `+12`; see `insertion_label_text`) for an insertion
-    /// at least `minimum_event_label_size` long: shown, as its length, from
-    /// `EVENT_LABEL_MINIMUM_POINTS_PER_BASE` where it has room.
+    /// An insertion's label (see `insertion_label_text`) for an insertion at least
+    /// `minimum_event_label_size` long: shown as a length chip (`+12`) from
+    /// `EVENT_LABEL_MINIMUM_POINTS_PER_BASE` where it covers nothing but its own read's body.
     InsertionLength,
-    /// The same label for a shorter insertion: shown only at base-letter detail.
+    /// The same label for a shorter insertion: never shown; its I-beam stands alone and
+    /// hovering it shows the bases.
     ShortInsertion,
     DeletionLength,
     SkipLength,
@@ -2706,9 +2707,9 @@ fn emit_record_primitives(
                     );
                     draw_order = draw_order.saturating_add(1);
                 }
-                // Every insertion drawn is labelled; one shorter than the minimum event label
-                // size only at base-letter detail (see `place_insertion_label`). Its bases come
-                // from the record's own SEQ.
+                // Every insertion drawn carries a label anchor. Only one at least the minimum
+                // event label size is ever shown, as a length chip (see `place_insertion_label`);
+                // the text keeps the record's own SEQ bases for short ones.
                 if emit_labels && operation.len >= style_contract.minimum_indel_size {
                     let inserted = match sequence {
                         Some(SequenceView::Present { bases, .. }) => {
@@ -4370,6 +4371,16 @@ mod tests {
         records: &[AlignmentRecord],
         layout: crate::LayoutContract,
     ) -> (Arc<EvidenceRoot>, Arc<AlignmentRowAtlas>) {
+        evidence_and_atlas_over(ledger, records, layout, 300)
+    }
+
+    /// [`evidence_and_atlas_for_records`] on a contig `contig_length` bases long.
+    fn evidence_and_atlas_over(
+        ledger: &AllocationLedger,
+        records: &[AlignmentRecord],
+        layout: crate::LayoutContract,
+        contig_length: u64,
+    ) -> (Arc<EvidenceRoot>, Arc<AlignmentRowAtlas>) {
         let mut decoded = AlignmentBatch::default();
         for (ordinal, record) in records.iter().enumerate() {
             decoded
@@ -4433,7 +4444,7 @@ mod tests {
             EvidenceChunk::new_with_payload(core, core_allocation, overlap_allocation, payload)
                 .unwrap(),
         );
-        let coverage_interval = GenomicInterval::new(ContigId::new(0), 0, 300).unwrap();
+        let coverage_interval = GenomicInterval::new(ContigId::new(0), 0, contig_length).unwrap();
         let coverage = CompleteCoverage::new(
             source_revision(),
             RECORD_CONTRACT,
@@ -4533,6 +4544,30 @@ mod tests {
         style: crate::AlignmentStyleContract,
         family: AlignmentPageFamily,
     ) -> Arc<AlignmentSemanticPage> {
+        page_tiled(
+            ledger,
+            evidence,
+            atlas,
+            (tile_coordinate, 100, 300),
+            lod,
+            reference,
+            style,
+            family,
+        )
+    }
+
+    /// [`page_with_style`] for tile `(coordinate, tile bases, contig length)`.
+    #[allow(clippy::too_many_arguments)]
+    fn page_tiled(
+        ledger: &AllocationLedger,
+        evidence: &Arc<EvidenceRoot>,
+        atlas: &Arc<AlignmentRowAtlas>,
+        (tile_coordinate, tile_bases, contig_length): (u64, u64, u64),
+        lod: GeometryLod,
+        reference: Option<&ReferenceSlice>,
+        style: crate::AlignmentStyleContract,
+        family: AlignmentPageFamily,
+    ) -> Arc<AlignmentSemanticPage> {
         let presentation = PresentationContract {
             geometry_lod: lod,
             style,
@@ -4549,7 +4584,7 @@ mod tests {
             CanonicalGenomicTile::new(
                 ContigId::new(0),
                 tile_coordinate,
-                NonZeroU64::new(100).unwrap(),
+                NonZeroU64::new(tile_bases).unwrap(),
             ),
             CanonicalRowBlock::new(0, NonZeroU32::new(16).unwrap()),
             family,
@@ -4560,7 +4595,7 @@ mod tests {
             evidence,
             atlas,
             presentation,
-            300,
+            contig_length,
             reference,
             ledger,
             ReservationKind::Normal,
@@ -6683,10 +6718,23 @@ mod tests {
         lod: GeometryLod,
         style: crate::AlignmentStyleContract,
     ) -> Arc<crate::AlignmentPresentationScene> {
-        let (evidence, atlas) = evidence_and_atlas_for_records(ledger, records, layout_contract());
+        scene_over(ledger, records, lod, style, (300, 100))
+    }
+
+    /// [`scene_for_records`] over a contig of `contig_length` bases cut into pages of
+    /// `tile_bases`.
+    fn scene_over(
+        ledger: &AllocationLedger,
+        records: &[AlignmentRecord],
+        lod: GeometryLod,
+        style: crate::AlignmentStyleContract,
+        (contig_length, tile_bases): (u64, u64),
+    ) -> Arc<crate::AlignmentPresentationScene> {
+        let (evidence, atlas) =
+            evidence_and_atlas_over(ledger, records, layout_contract(), contig_length);
         let reference = ReferenceSlice {
-            interval: GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
-            bases: vec![b'A'; 300],
+            interval: GenomicInterval::new(ContigId::new(0), 0, contig_length).unwrap(),
+            bases: vec![b'A'; usize::try_from(contig_length).unwrap()],
         };
         let reference = (lod == GeometryLod::Base).then_some(&reference);
         let presentation = PresentationContract {
@@ -6697,10 +6745,17 @@ mod tests {
             annotation: None,
         };
         let mut pages = Vec::new();
-        for tile in 0..3 {
+        for tile in 0..contig_length.div_ceil(tile_bases) {
             for family in presentation.required_page_families() {
-                pages.push(page_with_style(
-                    ledger, &evidence, &atlas, tile, lod, reference, style, family,
+                pages.push(page_tiled(
+                    ledger,
+                    &evidence,
+                    &atlas,
+                    (tile, tile_bases, contig_length),
+                    lod,
+                    reference,
+                    style,
+                    family,
                 ));
             }
         }
@@ -6710,7 +6765,7 @@ mod tests {
             evidence,
             atlas,
             presentation,
-            GenomicInterval::new(ContigId::new(0), 0, 300).unwrap(),
+            GenomicInterval::new(ContigId::new(0), 0, contig_length).unwrap(),
             rows,
             pages,
             ledger,
@@ -8009,7 +8064,7 @@ mod tests {
     /// text to fit inside their on-screen extent; clips need at least two points per base and
     /// the text to fit in the width their bases would take. An insertion's label (here `+2`, at
     /// least `minimum_event_label_size` long) is a chip beside its I-beam from two points per
-    /// base wherever the chip has room (it used to need its bases' width too).
+    /// base wherever the chip covers no other event.
     #[test]
     fn event_length_labels_are_hidden_until_the_text_fits() {
         let ledger = AllocationLedger::new(16 << 20, 0);
@@ -8054,9 +8109,10 @@ mod tests {
         assert_eq!(visible(0.25), [false, false, false, true]);
         // Below two points per base no point event is labelled, even a long one.
         assert_eq!(visible(1.9), [false, false, false, true]);
-        // 2.1: "5" fits in five clipped bases (10.5 points) and the insertion's chip has room;
-        // "3" does not fit in the 6.3-point deletion.
-        assert_eq!(visible(2.1), [true, true, false, true]);
+        // 2.1: "5" fits in five clipped bases (10.5 points); "3" does not fit in the 6.3-point
+        // deletion. The insertion's chip has no room: after the I-beam it would end within a
+        // point of the deletion's gap, before it on the clip's cut edge.
+        assert_eq!(visible(2.1), [true, false, false, true]);
         // 4: the deletion is 12 points long.
         assert_eq!(visible(4.0), [true, true, true, true]);
         // 6: everything fits.
@@ -8111,15 +8167,16 @@ mod tests {
         .unwrap()
     }
 
-    /// The user's case, `79M1I21M`, in miniature: an insertion shorter than the minimum event
-    /// label size (the session default, 10) is labelled with its base (`+T`, from the read's
-    /// SEQ) once base letters are drawn; a 12-base one with its length (`+12`), which also shows
-    /// zoomed out to two points per base. The label is a chip the read's height tall, one point
-    /// after the I-beam (whose bar and serifs reach four points either side at 20 points per
-    /// base). Reads under eight points tall carry none.
+    /// The user's case, `79M1I21M`, in miniature. An insertion shorter than the minimum event
+    /// label size (the session default, 10) has no chip at any zoom, only its I-beam; a 12-base
+    /// one has a chip stating its length (`+12`) from two points per base, the read's height
+    /// tall, one point after the I-beam (whose bar and serifs reach four points either side at
+    /// 20 points per base). Reads under eight points tall carry none. Changed deliberately: short
+    /// insertions used to show their bases (`+T`, `+ACG`) once base letters were drawn, and a
+    /// chip never shows bases now, even with the minimum at one.
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn insertion_labels_follow_the_zoom_and_minimum_size_rules() {
+    fn insertion_chips_are_for_long_insertions_only_and_state_their_length() {
         let ledger = AllocationLedger::new(16 << 20, 0);
         let mut one = vec![b'A'; 21];
         one[10] = b't';
@@ -8144,7 +8201,7 @@ mod tests {
                     (CigarOpKind::Insertion, 12),
                     (CigarOpKind::Match, 10),
                 ],
-                &[b'C'; 32],
+                &[b'A'; 32],
             ),
             record(
                 b"three",
@@ -8163,14 +8220,14 @@ mod tests {
             ..crate::AlignmentStyleContract::default()
         };
         let scene = scene_for_records(&ledger, &records, GeometryLod::Base, style);
-        let texts = |camera| {
-            insertion_labels(&scene, camera)
+        let texts = |scene: &Arc<crate::AlignmentPresentationScene>, camera| {
+            insertion_labels(scene, camera)
                 .into_iter()
                 .map(|label| label.0)
                 .collect::<Vec<_>>()
         };
 
-        // 20 points per base: base letters are drawn, so every insertion is labelled.
+        // 20 points per base, base letters drawn: still only the long insertion has a chip.
         let detailed = clip_camera(90, 130, 800.0);
         let labels = insertion_labels(&scene, detailed);
         assert_eq!(
@@ -8178,117 +8235,167 @@ mod tests {
                 .iter()
                 .map(|label| label.0.as_str())
                 .collect::<Vec<_>>(),
-            ["+12", "+ACG", "+T"]
+            ["+12"]
         );
         let boundary = pane_x(detailed, 110);
-        for (text, left, width, row, y, height) in &labels {
-            assert!(
-                (left - (boundary + 4.0 + 1.0)).abs() < 1.0e-9,
-                "{text}: {left}"
-            );
-            let glyphs = text.chars().count() as f64;
-            assert!(
-                (width - (glyphs * 11.0 * 0.56 + 4.0)).abs() < 1.0e-9,
-                "{text}"
-            );
-            // Exactly over its read: the row's top plus the 1.5-point margin, 11 points tall.
-            assert!(
-                (y - (f64::from(*row) * 14.0 + 1.5)).abs() < 1.0e-9,
-                "{text}"
-            );
-            assert!((height - 11.0).abs() < 1.0e-9, "{text}");
-        }
-        // Just under the base-letter width (6.9) and down to two points per base only the
-        // insertion at least ten bases long is labelled, and only by its length.
-        assert_eq!(texts(clip_camera(0, 200, 1_380.0)), ["+12"]);
-        assert_eq!(texts(clip_camera(0, 200, 400.0)), ["+12"]);
+        let (text, left, width, row, y, height) = &labels[0];
+        assert!((left - (boundary + 4.0 + 1.0)).abs() < 1.0e-9, "{text}: {left}");
+        assert!((width - (3.0 * 11.0 * 0.56 + 4.0)).abs() < 1.0e-9, "{text}");
+        // Exactly over its read: the row's top plus the 1.5-point margin, 11 points tall.
+        assert!((y - (f64::from(*row) * 14.0 + 1.5)).abs() < 1.0e-9, "{text}");
+        assert!((height - 11.0).abs() < 1.0e-9, "{text}");
+        // 112 points per base: no short insertion is labelled however far one zooms in.
+        assert_eq!(texts(&scene, clip_camera(105, 115, 1_120.0)), ["+12"]);
+        // Just under the base-letter width (6.9) and down to two points per base the same.
+        assert_eq!(texts(&scene, clip_camera(0, 200, 1_380.0)), ["+12"]);
+        assert_eq!(texts(&scene, clip_camera(0, 200, 400.0)), ["+12"]);
         // Below two points per base nothing is.
-        assert!(texts(clip_camera(0, 200, 380.0)).is_empty());
+        assert!(texts(&scene, clip_camera(0, 200, 380.0)).is_empty());
         // Seven-point reads cannot hold the chip, even at 20 points per base.
         assert!(insertion_labels(&scene, read_height_camera(90, 130, 800.0, 7.0)).is_empty());
         assert_eq!(
             insertion_labels(&scene, read_height_camera(90, 130, 800.0, 8.0)).len(),
-            3
+            1
         );
 
-        // With the minimum at one, a short insertion is labelled zoomed out too, by its length.
-        let every = scene_for_records(
-            &ledger,
-            &records,
-            GeometryLod::Base,
-            crate::AlignmentStyleContract {
-                minimum_event_label_size: 1,
-                ..crate::AlignmentStyleContract::default()
-            },
-        );
-        let zoomed_out = insertion_labels(&every, clip_camera(0, 200, 800.0));
-        assert_eq!(
-            zoomed_out
-                .iter()
-                .map(|label| label.0.as_str())
-                .collect::<Vec<_>>(),
-            ["+1", "+12", "+3"]
-        );
+        // With the minimum at one every insertion has a chip, zoomed out or in, and every chip
+        // states the length: `+1` and `+3`, never `+T` or `+ACG`.
+        let every_style = crate::AlignmentStyleContract {
+            minimum_event_label_size: 1,
+            ..crate::AlignmentStyleContract::default()
+        };
+        let every = scene_for_records(&ledger, &records, GeometryLod::Base, every_style);
+        assert_eq!(texts(&every, clip_camera(0, 200, 800.0)), ["+1", "+12", "+3"]);
+        assert_eq!(texts(&every, detailed), ["+1", "+12", "+3"]);
 
-        // An insertion hidden by the minimum indel size has no I-beam, so no label either.
+        // An insertion hidden by the minimum indel size has no I-beam, so no chip either.
         let fewer = scene_for_records(
             &ledger,
             &records,
             GeometryLod::Base,
             crate::AlignmentStyleContract {
                 minimum_indel_size: 2,
-                ..style
+                ..every_style
             },
         );
-        assert_eq!(
-            insertion_labels(&fewer, detailed)
-                .into_iter()
-                .map(|label| label.0)
-                .collect::<Vec<_>>(),
-            ["+12", "+ACG"]
-        );
+        assert_eq!(texts(&fewer, detailed), ["+12", "+3"]);
     }
 
-    /// A chip goes after its I-beam, or before it when after would cover another read packed
-    /// into the same row, and is dropped when both sides would; it never covers another chip
-    /// (the second of two insertions a base apart loses its label) and the base letters it
-    /// covers are not drawn over it.
+    /// A chip covers nothing but its own read's plain body. It goes after its I-beam, else
+    /// before it, else nowhere: a substitution cell, a deletion gap, a clip's cut edge or ghost
+    /// bases, another insertion's I-beam, or another read packed into the row on a side rules
+    /// that side out. No base letter is ever hidden for a chip. Changed deliberately: a chip
+    /// used to cover the cells beside its I-beam and hide their letters.
     #[test]
-    fn insertion_labels_avoid_other_reads_other_labels_and_hide_covered_letters() {
+    #[allow(clippy::too_many_lines)]
+    fn insertion_chips_cover_no_event_and_hide_no_letter() {
         let ledger = AllocationLedger::new(16 << 20, 0);
-        // At 7 points per base the I-beam reaches 3.5 points either side, and `+ACGT` is
-        // 5 x 11 x 0.56 + 4 = 34.8 points wide: 5.6 bases after the gap.
-        let short = record(
-            b"short",
-            110,
-            112,
-            &[
-                (CigarOpKind::Match, 1),
-                (CigarOpKind::Insertion, 4),
-                (CigarOpKind::Match, 1),
-            ],
-            b"AACGTA",
-        );
-        let before = record(b"before", 100, 107, &[(CigarOpKind::Match, 7)], &[b'A'; 7]);
-        let after = record(b"after", 115, 130, &[(CigarOpKind::Match, 15)], &[b'A'; 15]);
         let style = crate::AlignmentStyleContract::default();
+        // Seven points per base: the I-beam reaches 3.5 points either side of its boundary and
+        // `+12` is 3 x 11 x 0.56 + 4 = 22.48 points wide, so a chip after the insertion at 110
+        // spans 110.64..113.85 and one before it 106.15..109.36 (in bases).
         let camera = clip_camera(90, 150, 420.0);
-        let boundary = pane_x(camera, 111);
-        let chip = |records: &[AlignmentRecord]| {
+        let boundary = pane_x(camera, 110);
+        let after = boundary + 3.5 + 1.0;
+        let before_right = boundary - 3.5 - 1.0;
+        let chips = |records: &[AlignmentRecord], camera| {
             let scene = scene_for_records(&ledger, records, GeometryLod::Base, style);
-            let labels = insertion_labels(&scene, camera);
-            assert!(labels.len() <= 1, "{labels:?}");
-            labels.first().map(|label| (label.1, label.1 + label.2))
+            insertion_labels(&scene, camera)
+                .into_iter()
+                .map(|label| (label.0, label.1, label.1 + label.2))
+                .collect::<Vec<_>>()
         };
-        let (left, _) =
-            chip(std::slice::from_ref(&short)).expect("alone, the chip goes after the I-beam");
-        assert!((left - (boundary + 3.5 + 1.0)).abs() < 1.0e-9, "{left}");
-        let (_, right) = chip(&[short.clone(), after.clone()])
-            .expect("with a read after it, the chip goes before the I-beam");
-        assert!((right - (boundary - 3.5 - 1.0)).abs() < 1.0e-9, "{right}");
-        assert_eq!(chip(&[before, short, after]), None);
+        let letters = |records: &[AlignmentRecord]| {
+            let scene = scene_for_records(&ledger, records, GeometryLod::Base, style);
+            crate::CpuAlignmentProjector::project_labels(&scene, 0, camera)
+                .unwrap()
+                .labels
+                .iter()
+                .filter(|label| matches!(label.component, AlignmentComponent::Base { .. }))
+                .map(|label| ((label.x - 10.0) / 7.0 + 90.0).round() as u64)
+                .collect::<Vec<_>>()
+        };
+        // `10M 12I 20M` from 100, every aligned base `A` (the reference) unless replaced.
+        let read = |mismatches: &[(usize, u8)]| {
+            let mut sequence = vec![b'A'; 42];
+            for &(index, base) in mismatches {
+                sequence[index] = base;
+            }
+            record(
+                b"read",
+                100,
+                130,
+                &[
+                    (CigarOpKind::Match, 10),
+                    (CigarOpKind::Insertion, 12),
+                    (CigarOpKind::Match, 20),
+                ],
+                &sequence,
+            )
+        };
 
-        // Two insertions a base apart: the second chip would cover the first.
+        let placed = chips(&[read(&[])], camera);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert_eq!(placed[0].0, "+12");
+        assert!((placed[0].1 - after).abs() < 1.0e-9, "{placed:?}");
+
+        // A substitution at 111 (read index 10 + 12 + 1) is under the chip's place after the
+        // I-beam: the chip goes before it, and the substitution keeps its letter.
+        let substituted = read(&[(23, b'C')]);
+        let placed = chips(std::slice::from_ref(&substituted), camera);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert!((placed[0].2 - before_right).abs() < 1.0e-9, "{placed:?}");
+        assert_eq!(letters(&[substituted]), [111]);
+        // With a substitution at 108 too, neither side has room: no chip, both letters drawn.
+        let boxed_in = read(&[(8, b'G'), (23, b'C')]);
+        assert!(chips(std::slice::from_ref(&boxed_in), camera).is_empty());
+        assert_eq!(letters(&[boxed_in]), [108, 111]);
+
+        // A deletion at 112..114, inside the chip's place after the I-beam: before.
+        let deleted = record(
+            b"deleted",
+            100,
+            132,
+            &[
+                (CigarOpKind::Match, 10),
+                (CigarOpKind::Insertion, 12),
+                (CigarOpKind::Match, 2),
+                (CigarOpKind::Deletion, 2),
+                (CigarOpKind::Match, 18),
+            ],
+            &[b'A'; 42],
+        );
+        let placed = chips(&[deleted], camera);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert!((placed[0].2 - before_right).abs() < 1.0e-9, "{placed:?}");
+
+        // A read soft-clipped at 107: its cut edge and ghost bases rule out the place before.
+        let clipped = |mismatch: Option<usize>| {
+            let mut sequence = vec![b'A'; 40];
+            if let Some(index) = mismatch {
+                sequence[index] = b'C';
+            }
+            record(
+                b"clipped",
+                107,
+                130,
+                &[
+                    (CigarOpKind::SoftClip, 5),
+                    (CigarOpKind::Match, 3),
+                    (CigarOpKind::Insertion, 12),
+                    (CigarOpKind::Match, 20),
+                ],
+                &sequence,
+            )
+        };
+        let placed = chips(&[clipped(None)], camera);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert!((placed[0].1 - after).abs() < 1.0e-9, "{placed:?}");
+        // ...and with a substitution at 111 as well (read index 5 + 3 + 12 + 1), no chip.
+        assert!(chips(&[clipped(Some(21))], camera).is_empty());
+
+        // Two insertions a base apart: the first chip would cover the second I-beam, so it goes
+        // before its own; the second goes after. Both are shown (one used to be dropped).
         let twice = record(
             b"twice",
             100,
@@ -8302,23 +8409,48 @@ mod tests {
             ],
             b"AAAAATAGAAAAAAAAAAAAA",
         );
-        let scene = scene_for_records(&ledger, &[twice], GeometryLod::Base, style);
-        let labels = insertion_labels(&scene, camera);
-        assert_eq!(labels.len(), 1, "{labels:?}");
-        assert_eq!(labels[0].0, "+T");
+        let placed = chips(&[twice], camera);
+        assert_eq!(placed.len(), 2, "{placed:?}");
+        assert!(placed.iter().all(|chip| chip.0 == "+1"), "{placed:?}");
+        let mut extents = placed.iter().map(|chip| (chip.1, chip.2)).collect::<Vec<_>>();
+        extents.sort_by(|left, right| left.0.total_cmp(&right.0));
+        assert!((extents[0].1 - (pane_x(camera, 105) - 4.5)).abs() < 1.0e-9, "{extents:?}");
+        assert!((extents[1].0 - (pane_x(camera, 106) + 4.5)).abs() < 1.0e-9, "{extents:?}");
 
-        // Every base lettered: the chip after the insertion at 110 covers the letter of base
-        // 110 (centred 10 points in at 20 points per base), not those of 109 or 111.
+        // Other reads of the row, at 2.1 points per base (`+12` is 10.7 bases wide): a read
+        // after the short one rules out after, one before it rules out before.
+        let coarse = clip_camera(90, 150, 126.0);
+        let short = record(
+            b"short",
+            110,
+            112,
+            &[
+                (CigarOpKind::Match, 1),
+                (CigarOpKind::Insertion, 12),
+                (CigarOpKind::Match, 1),
+            ],
+            &[b'A'; 14],
+        );
+        let preceding = record(b"preceding", 100, 107, &[(CigarOpKind::Match, 7)], &[b'A'; 7]);
+        let following = record(b"following", 115, 130, &[(CigarOpKind::Match, 15)], &[b'A'; 15]);
+        let short_boundary = pane_x(coarse, 111);
+        let placed = chips(&[short.clone(), following.clone()], coarse);
+        assert_eq!(placed.len(), 1, "{placed:?}");
+        assert!((placed[0].2 - (short_boundary - 4.5)).abs() < 1.0e-9, "{placed:?}");
+        assert!(chips(&[preceding, short, following], coarse).is_empty());
+
+        // Every base lettered: every cell beside the I-beam is a base cell, so there is no chip
+        // and every letter is drawn, including 110's (which a chip used to hide).
         let one = record(
             b"one",
             100,
             120,
             &[
                 (CigarOpKind::Match, 10),
-                (CigarOpKind::Insertion, 1),
+                (CigarOpKind::Insertion, 12),
                 (CigarOpKind::Match, 10),
             ],
-            &[b'A'; 21],
+            &[b'A'; 32],
         );
         let scene = scene_for_records(
             &ledger,
@@ -8337,12 +8469,311 @@ mod tests {
             .filter(|label| matches!(label.component, AlignmentComponent::Base { .. }))
             .map(|label| ((label.x - 10.0) / 20.0 + 90.0).round() as u64)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(insertion_labels(&scene, camera).len(), 1);
-        assert!(
-            lettered.contains(&109) && lettered.contains(&111),
-            "{lettered:?}"
+        assert!(insertion_labels(&scene, camera).is_empty());
+        assert_eq!(lettered, (100..120).collect());
+    }
+
+    /// The component hovered at `(x, y)` under `camera`, by the indexed hover (checked against
+    /// the unindexed reference).
+    fn hovered(
+        scene: &Arc<crate::AlignmentPresentationScene>,
+        camera: crate::AlignmentCamera,
+        x: f64,
+        y: f64,
+    ) -> Option<AlignmentComponent> {
+        let probe = |hover: fn(
+            &crate::AlignmentPresentationScene,
+            rgv_core::TrackId,
+            crate::AlignmentCamera,
+            Option<GenomicInterval>,
+            std::ops::Range<u32>,
+            f64,
+            f64,
+        ) -> crate::AlignmentHoverProbe| {
+            hover(
+                scene,
+                rgv_core::TrackId::new(1),
+                camera,
+                Some(scene.prepared_interval()),
+                scene.prepared_rows(),
+                x,
+                y,
+            )
+        };
+        let indexed = probe(crate::hover_captured_scene);
+        assert_eq!(indexed.target, probe(crate::hover::hover_unindexed).target, "{x}, {y}");
+        indexed.target.map(|target| target.hit.component)
+    }
+
+    /// Hovering finds each kind of read event on the exact shape the frame draws: a
+    /// substitution cell, an insertion's I-beam (bar or serif), a deletion's gap at the read's
+    /// full height, a soft clip's cut edge and ghost bases, a modification cell; elsewhere on
+    /// the read, the read itself.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn hover_finds_every_kind_of_event_on_its_drawn_shape() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        // `3S 5M 2I 3M 2D 6M` from 150 (ghost bases at 147..150, in the same page): aligned
+        // 150..155 and 155..158, the insertion on the 155 boundary, the deletion over 158..160,
+        // then 160..166; a substitution at 152.
+        let mut sequence = vec![b'A'; 19];
+        sequence[3 + 2] = b'C';
+        let events = record(
+            b"events",
+            150,
+            166,
+            &[
+                (CigarOpKind::SoftClip, 3),
+                (CigarOpKind::Match, 5),
+                (CigarOpKind::Insertion, 2),
+                (CigarOpKind::Match, 3),
+                (CigarOpKind::Deletion, 2),
+                (CigarOpKind::Match, 6),
+            ],
+            &sequence,
         );
-        assert!(!lettered.contains(&110), "{lettered:?}");
+        let scene = scene_for_records(
+            &ledger,
+            &[events],
+            GeometryLod::Base,
+            crate::AlignmentStyleContract::default(),
+        );
+        // 20 points per base; row 0's read spans y 1.5..12.5.
+        let camera = clip_camera(140, 180, 800.0);
+        let (top, middle) = (2.0, 7.0);
+        let at = |x: f64, y: f64| hovered(&scene, camera, x, y);
+        assert!(
+            matches!(
+                at(pane_x(camera, 152) + 10.0, middle),
+                Some(AlignmentComponent::Base {
+                    classification: rgv_model::AlignedBaseClassification::Substitution,
+                    ..
+                })
+            ),
+            "{:?}",
+            at(pane_x(camera, 152) + 10.0, middle)
+        );
+        let insertion = |component: Option<AlignmentComponent>| {
+            matches!(
+                component,
+                Some(AlignmentComponent::Insertion { length: 2, .. })
+            )
+        };
+        let boundary = pane_x(camera, 155);
+        // The bar, a serif beyond the bar, and beside the three-point bar within the six-point
+        // hover band; just beyond the band, between the serifs, is the read.
+        assert!(insertion(at(boundary, middle)));
+        assert!(insertion(at(boundary + 3.5, top)));
+        assert!(insertion(at(boundary + 2.8, middle)));
+        assert!(insertion(at(boundary - 2.8, middle)));
+        let beside = at(boundary + 3.2, middle);
+        assert!(beside.is_some_and(|component| !crate::is_hover_event(component)), "{beside:?}");
+        // The highlight follows the I-beam's bar and serifs, a point clear of them.
+        let target = crate::hover_captured_scene(
+            &scene,
+            rgv_core::TrackId::new(1),
+            camera,
+            Some(scene.prepared_interval()),
+            scene.prepared_rows(),
+            boundary,
+            middle,
+        )
+        .target
+        .unwrap();
+        let mark = target.project(camera).unwrap();
+        let outline = crate::hover_outline(&mark, camera, 1.0);
+        assert_eq!(outline.len(), 12, "{outline:?}");
+        let (left, right) = outline
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, r), [x, _]| (l.min(*x), r.max(*x)));
+        assert!((left - (boundary - 5.0)).abs() < 1.0e-9 && (right - (boundary + 5.0)).abs() < 1.0e-9);
+        // The inner corner beside the three-point bar, under the 1.65-point top serif.
+        assert!(
+            outline.iter().any(|[x, y]| (x - (boundary + 2.5)).abs() < 1.0e-9
+                && (y - (1.5 + 1.65 + 1.0)).abs() < 1.0e-9),
+            "{outline:?}"
+        );
+        // The deletion's gap, above its line as well as on it.
+        for y in [top, middle] {
+            assert!(
+                matches!(
+                    at(pane_x(camera, 159), y),
+                    Some(AlignmentComponent::Deletion { .. })
+                ),
+                "{y}"
+            );
+        }
+        // The soft clip's sawtooth starts on the boundary, and its ghost bases lie beyond it.
+        assert!(matches!(
+            at(pane_x(camera, 150) + 0.75, top - 0.4),
+            Some(AlignmentComponent::SoftClip { length: 3, .. })
+        ));
+        let ghost = at(pane_x(camera, 148) + 10.0, middle);
+        assert!(
+            matches!(ghost, Some(AlignmentComponent::ClipGhostBase { .. })),
+            "{ghost:?}"
+        );
+        let body = at(pane_x(camera, 163) + 10.0, middle);
+        assert!(body.is_some_and(|component| !crate::is_hover_event(component)), "{body:?}");
+        // Between rows, and beyond the read, nothing.
+        assert_eq!(at(pane_x(camera, 163), 13.5), None);
+        assert_eq!(at(pane_x(camera, 175), middle), None);
+
+        // A modification call (one `C+m` on the read's first C, at 101) at read detail.
+        let modified = modified_read(
+            b"modified",
+            100,
+            &[(CigarOpKind::Match, 6)],
+            0,
+            "C+m,0;",
+            vec![230],
+            None,
+        );
+        let scene = scene_for_records(
+            &ledger,
+            &[modified],
+            GeometryLod::Read,
+            crate::AlignmentStyleContract::default(),
+        );
+        let camera = clip_camera(90, 130, 800.0);
+        assert!(matches!(
+            hovered(&scene, camera, pane_x(camera, 101) + 10.0, middle),
+            Some(AlignmentComponent::ModifiedBase {
+                probability: Some(230),
+                ..
+            })
+        ));
+    }
+
+    /// Zoomed out, an insertion is a one-point hairline: it answers to a six-point band centred
+    /// on it, over the read beneath, without changing what is drawn.
+    #[test]
+    fn hover_gives_tiny_marks_a_six_point_target() {
+        let ledger = AllocationLedger::new(16 << 20, 0);
+        let lone = record(
+            b"lone",
+            100,
+            130,
+            &[
+                (CigarOpKind::Match, 10),
+                (CigarOpKind::Insertion, 1),
+                (CigarOpKind::Match, 20),
+            ],
+            &[b'A'; 31],
+        );
+        let scene = scene_for_records(
+            &ledger,
+            &[lone],
+            GeometryLod::Read,
+            crate::AlignmentStyleContract::default(),
+        );
+        // 0.4 points per base: the I-beam is a one-point hairline centred on 110's edge.
+        let camera = clip_camera(0, 300, 120.0);
+        let boundary = pane_x(camera, 110);
+        let frame = crate::CpuAlignmentProjector::project(&scene, 0, camera).unwrap();
+        let hairline = frame
+            .primitives
+            .iter()
+            .find(|primitive| matches!(primitive.component, AlignmentComponent::Insertion { .. }))
+            .unwrap();
+        assert_eq!(hairline.shape, crate::CpuPrimitiveShape::BoundaryHairline);
+        assert!((hairline.width - 1.0).abs() < 1.0e-9);
+        for dx in [-2.9, -1.0, 0.0, 1.5, 2.9] {
+            assert!(
+                matches!(
+                    hovered(&scene, camera, boundary + dx, 7.0),
+                    Some(AlignmentComponent::Insertion { .. })
+                ),
+                "{dx}"
+            );
+        }
+        for dx in [-3.2, 3.2] {
+            let component = hovered(&scene, camera, boundary + dx, 7.0);
+            assert!(
+                component.is_some_and(|component| !crate::is_hover_event(component)),
+                "{dx}: {component:?}"
+            );
+        }
+        // The enlarged target is for hovering only: a click beside the hairline is the read.
+        let hit = crate::CpuAlignmentProjector::pick(
+            &scene,
+            rgv_core::TrackId::new(1),
+            &frame,
+            boundary + 2.0,
+            7.0,
+        )
+        .unwrap()
+        .map(|hit| hit.component);
+        assert!(hit.is_some_and(|component| !crate::is_hover_event(component)), "{hit:?}");
+    }
+
+    /// On an ONT-like page (one 200 kb read of substitutions: some 200,000 primitives in one
+    /// row) hovering examines only the primitives near the pointer, through the page's spatial
+    /// index, and answers exactly as examining the whole row does.
+    #[test]
+    fn hover_cost_follows_the_pointer_not_the_row() {
+        let ledger = AllocationLedger::new(1 << 30, 0);
+        let length = 200_000_u64;
+        let long = record(
+            b"long",
+            0,
+            length,
+            &[(CigarOpKind::Match, u32::try_from(length).unwrap())],
+            &vec![b'C'; usize::try_from(length).unwrap()],
+        );
+        let scene = scene_over(
+            &ledger,
+            &[long],
+            GeometryLod::Base,
+            crate::AlignmentStyleContract::default(),
+            (length, length),
+        );
+        let row_primitives = scene
+            .visible_pages(scene.prepared_interval(), 0..1)
+            .iter()
+            .map(|page| page.primitives().len())
+            .sum::<usize>();
+        assert!(row_primitives > 200_000, "{row_primitives}");
+        // 20 points per base, and one.
+        for camera in [
+            clip_camera(100_000, 100_050, 1_000.0),
+            clip_camera(90_000, 91_000, 1_000.0),
+        ] {
+            for x in [10.0, 333.3, 777.7, 1_009.0] {
+                let probe = crate::hover_captured_scene(
+                    &scene,
+                    rgv_core::TrackId::new(1),
+                    camera,
+                    Some(scene.prepared_interval()),
+                    scene.prepared_rows(),
+                    x,
+                    7.0,
+                );
+                let reference = crate::hover::hover_unindexed(
+                    &scene,
+                    rgv_core::TrackId::new(1),
+                    camera,
+                    Some(scene.prepared_interval()),
+                    scene.prepared_rows(),
+                    x,
+                    7.0,
+                );
+                assert_eq!(probe.target, reference.target, "{x}");
+                assert!(
+                    matches!(
+                        probe.target.map(|target| target.hit.component),
+                        Some(AlignmentComponent::Base { .. })
+                    ),
+                    "{x}: {probe:?}"
+                );
+                assert!(reference.candidates_examined > 200_000);
+                assert!(
+                    probe.candidates_examined <= 128,
+                    "{x}: {} candidates",
+                    probe.candidates_examined
+                );
+            }
+        }
     }
 
     /// SCENE-9. Pins the in-memory size of one semantic primitive and of its parts, so a field
