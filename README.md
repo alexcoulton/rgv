@@ -1,323 +1,143 @@
 <p align="center"><img src="packaging/icons/rgv.svg" width="112" alt="RGV logo: a stack of reads with the same red base in one column"></p>
 
-# RGV
+<h1 align="center">RGV</h1>
 
-RGV is an experimental native desktop genome viewer in Rust. It uses a custom `wgpu` genomic
-canvas, `egui` application chrome, and a bounded off-thread `rust-htslib` alignment engine.
+<p align="center">
+A fast, free genome browser for looking at sequencing data on your own computer.<br>
+Open a BAM file and see every read, base and splice junction, instantly.
+</p>
 
-The current native prototype supports:
+<p align="center">
+<a href="https://github.com/alexcoulton/rgv/releases/latest"><b>Download</b></a> ·
+<a href="docs/USER_GUIDE.md">User guide</a> ·
+<a href="docs/FEATURES.md">All features</a> ·
+<a href="https://github.com/alexcoulton/rgv/issues">Report a problem</a>
+</p>
 
-- A native macOS, Linux, and Windows application shell.
-- An IGV-like light desktop layout with application menus, compact locus navigation, assembly and
-  contig selectors, locus history, chromosome context, adaptive coordinate ruler, fixed track-label
-  gutter, contextual track controls, integrated scrollbar, and compact status bar.
-- Cursor-centred zooming, drag panning, and clipped vertical scrolling across stacked tracks.
-- Indexed local BAM queries with a four-thread decompression pool, plus local CRAM and HTTP/S
-  BAM/CRAM through the same alignment scene. CRAM needs its reference FASTA loaded. Remote and
-  CRAM alignments have automated coverage but have not yet had hands-on desktop testing on this
-  branch.
-- Standalone indexed FASTA genomes with FASTA-backed contig navigation, an independent pinned
-  reference track, and bounded off-thread sequence fetching; the same FASTA also configures CRAM.
-- All CIGAR operations, secondary/supplementary reads, arbitrary auxiliary fields, and missing
-  sequence/quality states in the normalized alignment model.
-- Two read-display modes per alignment track. **Downsampled** (the default for new tracks) shows
-  at most 100 reads per 50-base window, chosen by a stable hash of the read name so the subset
-  does not change while panning; the track label states how many reads are shown. **Complete**
-  presents every eligible read or asks the user to zoom in or raise the limit. Coverage, alleles,
-  junctions, and modification summaries always count every eligible read in both modes.
-- Transactional pan/zoom previews retain orientation while coalesced exact queries settle, then
-  switch atomically without fading; preview pixels are never exposed as current evidence.
-- CPU read packing and instanced GPU rendering for coverage and CIGAR geometry.
-- Generation-based cancellation so stale queries never replace a newer viewport.
-- Reference bases, quality-aware mismatches, mate links, `MM`/`ML` overlays, picking, and a read
-  inspector.
-- Persisted CG/CHG/CHH/HCG/GCH/WCG bisulfite modes with both-strand reference interpretation,
-  first-of-pair body colours, protected/converted marks at read and base detail, bounded rendering,
-  a copyable legend, and per-read conversion summaries.
-- Persisted PacBio SMRT kinetic modes for subread/CLR `ip` and `pw` arrays and CCS
-  `fi`/`ri`/`fp`/`rp` arrays. Forward/reverse molecule-strand selection follows alignment
-  orientation, per-base colouring uses a documented bounded scale, and missing or malformed arrays
-  leave reads visible with explicit gutter and inspector status.
-- A persisted Ultima flow-indel mode for signed `tp` direction arrays, `t0` deletion qualities,
-  base qualities, and read-group `mc` limits. Insertions and deletions retain their ordinary shape
-  while a bounded, position-and-colour confidence mark shows Q0–Q42; the inspector exposes exact
-  quality, direction, source, homopolymer base, and unavailable reasons.
-- A persisted, explicit SBX evidence mode. Insertions are purple, dark grey, or light grey for
-  concordant, partly discordant, or fully discordant base-quality evidence; configurable simplex
-  tails can be highlighted, hidden, or left unchanged. Thresholds, fallback state, omitted marks,
-  and per-read evidence summaries remain visible rather than inferring the sequencing technology.
-- MAPQ/flag/tag filtering plus strand, MAPQ, `RG`, `HP`, and arbitrary SAM-tag colour/group modes.
-- Local BED/BED12, GFF3, GTF, genePred/refFlat, narrowPeak/broadPeak, PSL, GWAS/PLINK
-  association summaries, indexed
-  bigGenePred/bigNarrowPeak, indexed VCF/BCF, BigWig, TDF, bedGraph, WIG, generic BigBed,
-  BEDPE/interact, multi-sample SEG/CBS copy-number, and cancer Mutation Annotation Format tracks.
-- Bounded background annotation indexing and locus-bar autocomplete for feature names, gene names,
-  aliases, IDs, and transcript IDs, with exact matches preferred and ambiguous choices shown.
-- HTTP/S BAM, reference-dependent CRAM, FASTA, VCF/BCF, BigWig, TDF, and BigBed access. BAM, CRAM,
-  CRAI, and FASTA/FAI use the observable pure-Rust range reader with a bounded disk cache, request
-  coalescing, validator checks, safe redirects, retries, cooperative cancellation, and redacted
-  authentication objects.
-- Track ordering, visibility, and height controls; native file dialogs and drag-and-drop.
-- Versioned JSON sessions, partial IGV XML-session import, and deterministic PNG export.
-- A 512 MiB bounded cache hierarchy, stable directional prefetch, incremental GPU uploads, and
-  observable cache/upload metrics.
-- One authoritative columnar alignment batch with packed name, CIGAR, sequence, quality, and
-  auxiliary-tag arenas; tags are decoded selectively and full records only on inspection.
-- Persistent recent files/loci, configurable cache preferences, keyboard command search, and
-  diagnostics that remain disabled unless explicitly enabled.
+![RGV showing RNA-seq reads over the GAPDH gene: coverage, splice-junction arcs with read counts, the gene model and the spliced reads below](docs/images/rgv-gapdh.png)
 
-The current execution roadmap is in
-[plans/RGV_IGV_PARITY_ROADMAP.md](plans/RGV_IGV_PARITY_ROADMAP.md); the complete planning index is
-[plans/README.md](plans/README.md).
-See [the user guide](docs/USER_GUIDE.md), [format support matrix](docs/FORMAT_SUPPORT.md),
-[session compatibility policy](docs/SESSION_COMPATIBILITY.md), [portable genome configuration](docs/GENOME_CONFIGURATION.md), and
-[validation guide](docs/VALIDATION.md) for operational details. To attach an agent to a visible,
-explicitly controlled window, see [the MCP setup and tool guide](docs/MCP.md). The complete deterministic manual
-fixture index is [validation/manual-suite/README.md](validation/manual-suite/README.md), with the
-full testing procedure in
-[validation/manual-suite/TEST_INSTRUCTIONS.md](validation/manual-suite/TEST_INSTRUCTIONS.md).
-For recorded replay and generated native interaction stress testing on macOS, see
-[the interaction-stress guide](docs/INTERACTION_STRESS.md).
-Historical review material is grouped under [`audits/`](audits/), and resolved defect write-ups
-under [`issues/`](issues/).
+## What is RGV?
 
-## Run the desktop viewer
+RGV (Rust Genome Viewer) is a desktop app for exploring aligned sequencing data: the reads in a
+BAM or CRAM file, laid out against the reference genome. If you have used
+[IGV](https://igv.org), it will feel familiar. RGV is written in Rust and draws on the GPU, so it
+stays smooth when you pan and zoom through deep coverage or long reads.
 
-Run the synthetic GPU workload:
+It is for anyone who needs to look at reads: checking a variant call, seeing how a gene is
+spliced, looking at methylation on long reads, or just making sure an alignment looks right.
 
-```sh
-cargo run -p rgv-desktop
-```
+> **RGV is early software.** It works well day to day, but expect rough edges and things that
+> change between versions. If something looks wrong, please
+> [open an issue](https://github.com/alexcoulton/rgv/issues).
 
-Open an indexed BAM at an IGV-style one-based locus:
+## What you can do with it
 
-```sh
-cargo run --release -p rgv-desktop -- \
-  --bam sample.bam \
-  --locus chr1:1000001-1100000
-```
+- **See your reads.** Coverage, every read with its mismatches, insertions, deletions and clipped
+  ends, and paired reads joined to their mates.
+- **Check variants.** Hover over any base or event to see what it is and how many reads at that
+  position share it. Click a read for its full details.
+- **Explore splicing.** RNA-seq reads show their splice junctions as arcs with read counts
+  (a sashimi plot), coloured by strand.
+- **Look at long reads and methylation.** Nanopore and PacBio reads, with base modifications
+  such as 5mC drawn on each read and summarised in their own track.
+- **Add annotations.** Genes, peaks, variants (VCF), signal tracks (BigWig, bedGraph) and more,
+  and jump to a gene by typing its name.
+- **Open files from the web.** Indexed files on an HTTP or HTTPS server are read on demand, a
+  piece at a time.
+- **Save your work.** Sessions remember your files, tracks and view. IGV session files can be
+  imported.
 
-Open an indexed FASTA without an alignment:
+## Download and install
 
-```sh
-cargo run --release -p rgv-desktop -- \
-  --reference reference.fa \
-  --genome-name hg38 \
-  --locus chr6:1000001-1010000
-```
+Get the latest version from the [releases page](https://github.com/alexcoulton/rgv/releases/latest).
+RGV is free and runs on macOS, Windows and Linux.
 
-The FASTA requires an adjacent `.fai`. It can also be opened with **Genomes → Open FASTA** or by
-dropping it onto the window. At base detail its sequence is fetched independently of BAM/CRAM and
-the reference track remains pinned above the vertically scrollable tracks.
+| Your computer | Download | Then |
+|---|---|---|
+| **Mac with Apple silicon** (M1 or later) | `RGV-macos-arm64.dmg` | Open it and drag RGV into Applications. |
+| **Mac with an Intel processor** | `RGV-macos-x86_64.dmg` | Open it and drag RGV into Applications. |
+| **Windows 10 or 11** | `RGV-windows-x86_64.msi` | Run the installer. RGV appears in the Start menu. A portable `.zip` is also available. |
+| **Linux** | `RGV-linux-x86_64.AppImage` | Make it executable (`chmod +x RGV-linux-x86_64.AppImage`) and run it. A `.tar.gz` is also available. |
 
-A portable genome bundle can additionally define exact contig aliases, cytobands, and default
-annotations:
+**The first time you open RGV**, your computer may warn you about it. RGV is not yet signed with
+an Apple or Microsoft developer certificate, so the system cannot vouch for it. This happens once:
 
-```sh
-cargo run --release -p rgv-desktop -- \
-  --genome-config genomes/hg38/genome.rgvgenome \
-  --locus 6:1000001-1010000
-```
+- **macOS** says it cannot verify the developer. Open **System Settings → Privacy & Security**,
+  scroll down and click **Open Anyway**.
+- **Windows** shows "Windows protected your PC". Click **More info**, then **Run anyway**.
 
-The desktop **File → Open URL** dialog opens remote BAM/CRAM, FASTA, indexed VCF/BCF, BigWig, TDF,
-BigBed, bigGenePred, and bigNarrowPeak sources, including custom alignment/reference indexes and an
-optional CRAM reference. The same `--bam` argument accepts an HTTP/S BAM or CRAM URL. Remote BAM tries both conventional
-`.bai` and `.csi` forms; remote CRAM tries both conventional `.crai` forms.
-`--remote-index-url` supplies a nonconventional BAI, CSI, or CRAI URL, while
-`--remote-reference-index-url` does the same for a remote FASTA's FAI. Set
-`RGV_REMOTE_BEARER_TOKEN` in the launch environment when remote BAM/CRAM/FASTA objects require
-bearer authentication; credentials are never stored. Indexed auxiliary URLs may use signed source
-URLs, while remote VCF/BCF requires its conventional adjacent index. Add any number of auxiliary
-tracks:
+## Getting started
+
+1. **Open your reads.** Choose **File → Open BAM/CRAM…** or drag a `.bam` file onto the window.
+   It needs its index (`.bam.bai` or `.csi`) next to it.
+2. **Add the reference genome.** Choose **Genomes → Open FASTA…** and pick the FASTA your reads
+   were aligned to (it needs a `.fai` index next to it). This lets RGV show reference bases and
+   mismatches. A CRAM file always needs its reference.
+3. **Go somewhere.** Type a position such as `chr7:55,019,017-55,211,628` in the **Locus** box and
+   press Enter. Once a gene annotation is loaded, a gene name such as `EGFR` works too.
+4. **Add more tracks.** **Tracks → Add track…** (or drag files onto the window) adds genes,
+   variants, peaks and signal tracks.
+
+### Moving around
+
+| To | Do this |
+|---|---|
+| Pan left and right | Drag the view |
+| Zoom in and out | Scroll, or pinch on a trackpad (zooms around the pointer) |
+| Scroll through the reads | Scroll over the track names, use the scrollbar, or hold Shift and scroll |
+| See what something is | Hover over it |
+| See a read's full details | Click it (details appear in the Properties panel) |
+| Change a track's settings | Right-click its name, or click the settings button beside it |
+| Go back and forward | Alt + Left / Alt + Right |
+| Find any command | Ctrl + K (⌘K on a Mac) |
+| Open settings | Ctrl + , (⌘, on a Mac) |
+
+### Files RGV can open
+
+| Kind of data | Formats |
+|---|---|
+| Aligned reads | BAM, CRAM, SAM |
+| Reference genome | FASTA (with `.fai`), 2bit |
+| Genes and features | GTF, GFF3, BED, BigBed, genePred, refFlat, PSL |
+| Variants | VCF and BCF (indexed) |
+| Signal | BigWig, bedGraph, WIG, TDF |
+| Peaks | narrowPeak, broadPeak |
+| Other | BEDPE and interact (loops), SEG (copy number), MAF (mutations), GWAS summaries |
+
+Large text files (BED, GFF and so on) open fastest when compressed with `bgzip` and indexed with
+`tabix`. The [format support matrix](docs/FORMAT_SUPPORT.md) has the details.
+
+### From the command line
+
+RGV can also be started from a terminal, which is handy for scripts. On macOS the program is
+inside the app: `/Applications/RGV.app/Contents/MacOS/rgv-desktop`.
 
 ```sh
-cargo run --release -p rgv-desktop -- \
-  --bam sample.bam \
-  --reference reference.fa \
-  --genome-name hg38 \
-  --cytobands hg38.cytoband.tsv \
-  --bed targets.bed \
-  --gff genes.gff3 \
-  --gene-pred transcripts.genePred \
-  --ref-flat refseq.refFlat \
-  --narrow-peak binding.narrowPeak \
-  --broad-peak broad-binding.broadPeak \
-  --psl target-alignments.psl \
-  --gwas study.assoc.gz \
-  --big-gene-pred transcripts.bb \
-  --big-narrow-peak binding.bb \
-  --vcf calls.vcf.gz \
-  --bigwig coverage.bw \
-  --tdf archived-signal.tdf \
-  --bedgraph signal.bedgraph \
-  --bedpe loops.bedpe \
-  --seg cohort.seg \
-  --maf somatic.maf \
-  --locus chr1:1000001-1100000
+rgv-desktop --bam sample.bam --reference genome.fa --locus chr1:1000001-1100000
+rgv-desktop --bam sample.bam --gff genes.gff3 --vcf calls.vcf.gz
+rgv-desktop --session my-analysis.rgv.json
 ```
 
-Open a saved RGV session or import an IGV XML session:
+Run `rgv-desktop --help` for every option. The [user guide](docs/USER_GUIDE.md) covers sessions,
+image export, batch automation and the rest.
 
-```sh
-cargo run --release -p rgv-desktop -- --session analysis.rgv.json
-cargo run --release -p rgv-desktop -- --import-igv analysis.xml
-```
+## Known limitations
 
-For CRAM, supply its reference FASTA:
+- **Hosted genomes do not work yet.** The **Genomes → Hosted genomes** menu reads IGV's genome
+  list, but IGV's servers now serve only IGV itself. For now, open a reference FASTA (step 2
+  above) and a gene annotation file.
+- **Gene names in the Locus box** need a gene annotation (such as a GTF) to be loaded first.
+- **Remote files** are newly supported and have had less real-world use than local files.
 
-```sh
-cargo run --release -p rgv-desktop -- \
-  --bam sample.cram \
-  --reference reference.fa \
-  --locus chr1:1000001-1100000
-```
+## Learn more
 
-Drag to pan and use the mouse wheel or trackpad to zoom around the pointer. Scroll over the track
-gutter, use the right-edge scrollbar, or hold Shift while scrolling to move vertically. Right-click
-a track label for settings and press Alt+Left/Right for locus history. Use `Escape` to exit.
-Application menus open alignments and tracks, save sessions, export PNG images, and clear the
-decoded-alignment cache. `Ctrl/Cmd+K` opens command search, `Ctrl/Cmd+D` toggles diagnostics, and
-`Ctrl/Cmd+,` opens settings. `Ctrl/Cmd+W` asks for confirmation; press it again to exit.
-
-### Ready-made manual-review workspaces
-
-Generate, mechanically qualify, and list the complete focused manual suite with:
-
-```sh
-cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- generate
-cargo run --release -p rgv-validation-runner --bin rgv-manual-fixture-check -- \
-  verify --require-complete
-cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- qualify
-cargo run --release -p rgv-validation-runner --bin rgv-manual-fixtures -- list
-```
-
-This supplies 17 ready-to-open projects for MF-01 through MF-14, 15 plain-language scenario cards,
-three MF-15 automation batches, exact truth, deliberate failures, portable relocation, and an
-ephemeral loopback remote-source lab. `cargo run` builds changed binaries automatically; a separate
-`cargo build` is optional. Fixture readiness does not mean that the manual cards or real-data and
-platform qualification have passed.
-
-After building the release executable, open the deterministic manual-test project directly:
-
-```sh
-target/release/rgv-desktop --session benchmark-data/demo-tracks/rgv-demo-project.json
-```
-
-The project combines the checked-in variant BAM and FASTA with 19 annotation, variant,
-quantitative, interaction, copy-number, mutation, and indexed track examples at
-`chrVariants:8501-16000`. Its checksum manifest is
-`benchmark-data/demo-tracks/manifest.json`.
-
-Open the companion alignment project separately:
-
-```sh
-target/release/rgv-desktop \
-  --session benchmark-data/demo-tracks/rgv-alignment-review-project.json
-```
-
-Its four panels cover paired reads, RNA junctions, long/supplementary/modified/specialist reads,
-and the 70,000-operation CIGAR truth. Its six-item Review queue also links the deep-coverage and
-structural-pair loci. Regenerate and mechanically verify both projects through RGV's production
-readers with:
-
-```sh
-cargo run --release -p rgv-validation-runner --bin rgv-demo-corpus
-```
-
-See [the manual qualification guide](validation/MANUAL_QUALIFICATION.md) for the short starting
-sequence and the later representative-data checklist.
-
-## Run the alignment benchmark
-
-```sh
-cargo run --release -p rgv-alignment-bench -- generate
-cargo run --release -p rgv-alignment-bench -- run --iterations 5
-```
-
-The deterministic BAM, indexes, variant truth, and reference under `benchmark-data/` are checked in
-so tests and the manual-review projects work immediately. Regenerate them with the commands above
-when changing the declared truth corpus.
-
-For visual testing of alignment events, generate the compact variant truth set:
-
-```sh
-cargo run --release -p rgv-alignment-bench -- generate-variants
-target/release/rgv-desktop \
-  --bam benchmark-data/variants.bam \
-  --reference benchmark-data/variants.fa \
-  --locus chrVariants:9941-10080
-```
-
-Every read is named for its intentional event. The base-scale locus above contains SNVs and 1/6 bp
-insertions plus 1/12 bp deletions. Use `chrVariants:9401-12600` to review 100/1,000 bp insertions
-and 500/2,000 bp deletions. For Ultima truth, select **Ultima flow indels** and open
-`chrVariants:13991-15120`; its three reads cover directional `tp` insertion Q40, read-group `mc`
-deletion Q0, and single-base `t0` deletion Q35. The generator writes an indexed BAM and indexed
-FASTA.
-
-## Run the interaction benchmark
-
-No matched RGV-versus-IGV comparison has been run; see the status section at the top of
-[benchmarks/IGV_COMPARISON.md](benchmarks/IGV_COMPARISON.md). The benchmark below is headless and
-is a regression gate, not a comparison with IGV.
-
-The interaction benchmark measures indexed query, coverage/sampling, read packing, and display-list
-construction as one pipeline:
-
-```sh
-cargo run --release -p rgv-interaction-bench -- \
-  benchmark-data/mixed.bam \
-  --locus chr1:900001-920000 \
-  --iterations 10 \
-  --maximum-p95-ms 16.7 \
-  --maximum-first-useful-ms 250 \
-  --output benchmark-results/interaction-latest.json
-```
-
-The deterministic WAN range gate injects latency and one transient failure while enforcing exact
-request and response-byte budgets:
-
-```sh
-cargo run --release -p rgv-remote-range-bench -- \
-  --output benchmark-results/remote-range-latest.json
-```
-
-## Quality gates
-
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --locked
-```
-
-The toolchain is pinned in `rust-toolchain.toml`; `./test.rgv.sh` runs the formatting, Clippy and
-test steps in one go. `.github/workflows/ci.yml` runs a plain build-and-test job and a separate
-formatting/Clippy job on macOS, Linux, and Windows (without `--all-features`/`--all-targets`).
-CI is not yet a passing baseline: the 2026-11-20 review
-([audits/COMPREHENSIVE_REVIEW_2026-11-20.md](audits/COMPREHENSIVE_REVIEW_2026-11-20.md), OPS-1
-and OPS-2) found that no CI run had succeeded and that Windows had not compiled.
-
-A plain `cargo build` or `cargo test` at the repository root skips `rgv-alignment-bench`, the
-only crate that pulls the benchmark-only alignment backends; pass `--workspace` or
-`-p rgv-alignment-bench` to include it.
-
-## Current limitations
-
-- Local CRAM and HTTP/S BAM/CRAM alignments open through the unified alignment scene but are
-  newly connected: a superseded remote request is not yet cancelled mid-transfer.
-- Hosted genomes (Genomes → Hosted genomes, or `--genome hg38`) read IGV's genome list and
-  genome JSON files, including `.2bit` references. This has automated coverage but has not yet
-  been exercised against the live hosting or tested hands-on.
-
-- Unindexed text BED/GFF/GTF, genePred/refFlat, and peak inputs are loaded into bounded
-  in-memory indexes (2,000,000 rows). Compress large files with `bgzip` and index them with
-  `tabix`; RGV then reads them on demand with no row limit. BigBed, bigGenePred, and bigNarrowPeak stay indexed and on-demand; explicit
-  name search without a BigBed extra index performs a bounded background scan.
-- Release signing requires the platform credentials described in
-  [docs/RELEASING.md](docs/RELEASING.md).
+- [User guide](docs/USER_GUIDE.md): everything RGV can do and how to use it
+- [Feature reference](docs/FEATURES.md): the complete, detailed list of features
+- [Format support](docs/FORMAT_SUPPORT.md): what each file format supports
+- [Developing RGV](docs/DEVELOPMENT.md): building from source, tests and benchmarks
+- [Changelog](CHANGELOG.md): what changed in each version
 
 ## License
 
-RGV is available under either the [MIT license](LICENSE-MIT) or the
-[Apache License 2.0](LICENSE-APACHE), at your option. Release packages also carry the locked
-third-party license inventory and full license/attribution texts used by their dependencies.
+RGV is free and open source, available under either the [MIT license](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option.
