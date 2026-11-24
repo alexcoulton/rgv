@@ -5,6 +5,8 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+## 0.1.4 — 2026-11-24
+
 - Gene tracks from UCSC's RefSeq bigGenePred files (the hosted T2T/hs1 genome's gene track)
   show one transcript per gene again: those files repeat each transcript's accession as its gene
   name, which no longer counts as a gene id, so transcripts group by gene symbol (BRCA1 shows as
