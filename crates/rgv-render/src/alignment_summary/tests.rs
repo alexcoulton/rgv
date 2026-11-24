@@ -1188,6 +1188,55 @@ fn a_scene_has_modification_calls_only_when_its_reads_carry_tags() {
     assert!(!scene.summaries().has_modification_calls());
 }
 
+/// Every modification page must fit the capacity planned for it, including pages with no
+/// calls: the packer's per-level range table was once left out of the plan, so a page without
+/// calls was planned at 0 bytes, charged 192, and the whole presentation was refused.
+#[test]
+fn modification_pages_fit_their_planned_capacity_with_and_without_calls() {
+    let ledger = AllocationLedger::new_with_transient_budget(64 << 20, 8 << 20, 16 << 20);
+    let mut tagless = cpg_record(b"tagless", "C+m?,0;", vec![255]);
+    tagless.auxiliary_fields.clear();
+    let scenes = [
+        methylation_snapshot(&ledger),
+        test_snapshot_from_authority(
+            &ledger,
+            None,
+            exact_authority_with_records(&ledger, NonZeroU64::new(64).unwrap(), 0, &[tagless]),
+            None,
+        ),
+    ];
+    let mut empty_pages = 0;
+    let mut pages_with_calls = 0;
+    for scene in &scenes {
+        for page in scene
+            .summary_pages()
+            .iter()
+            .filter(|page| page.key().family() == SummaryPageFamily::Modifications)
+        {
+            let packed = PackedAlignmentSummaryPage::from_request(
+                AlignmentSummaryGpuPageRequest::modifications(page),
+            )
+            .unwrap();
+            let charged = packed_buffer_capacity(&packed).unwrap() + packed.range_index_bytes();
+            let planned = summary_page_maximum_retained_bytes(&OwnedSummaryPageRequest {
+                key: AlignmentSummaryGpuPageKey::modifications(page).unwrap(),
+                page: Arc::clone(page),
+                companion_depth: None,
+                junction_presentation: None,
+            })
+            .unwrap();
+            assert!(charged <= planned, "charged {charged} > planned {planned}");
+            if page.primitives().is_empty() {
+                empty_pages += 1;
+            } else {
+                pages_with_calls += 1;
+            }
+        }
+    }
+    assert!(empty_pages > 0, "the case that failed live must be covered");
+    assert!(pages_with_calls > 0);
+}
+
 /// A lane projection case: camera, weighted, hidden codes, shown code, and the plotted
 /// `(code, fraction)` of each bar left to right.
 type LaneCase = (

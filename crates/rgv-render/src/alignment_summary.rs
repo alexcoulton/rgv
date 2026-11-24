@@ -4933,8 +4933,15 @@ fn summary_page_maximum_retained_bytes(
                 .min(u32::BITS as usize)
                 .checked_mul(size_of::<ModificationCode>())
                 .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?;
+            // The packer always allocates one instance-range entry per bin level, even for a
+            // page with no calls, and that table is charged to the page.
+            let levels = rgv_alignment_scene::MODIFICATION_LANE_BIN_LEVELS
+                .len()
+                .checked_mul(size_of::<AlignmentSummaryModificationLevel>())
+                .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)?;
             buffer
                 .checked_add(dictionary)
+                .and_then(|bytes| bytes.checked_add(levels))
                 .ok_or(AlignmentSummaryGpuReplacementError::CapacityOverflow)
         }
         SummaryPageFamily::Junctions => {
