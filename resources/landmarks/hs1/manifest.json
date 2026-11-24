@@ -1,0 +1,295 @@
+{
+  "bundle": {
+    "assembly": {
+      "compatible_dictionary_sha256": [],
+      "compatible_ids": [
+        "CHM13v2.0",
+        "hs1"
+      ],
+      "contigs": [
+        {
+          "length": 248387328,
+          "md5": null,
+          "name": "chr1",
+          "primary": true
+        },
+        {
+          "length": 242696752,
+          "md5": null,
+          "name": "chr2",
+          "primary": true
+        },
+        {
+          "length": 201105948,
+          "md5": null,
+          "name": "chr3",
+          "primary": true
+        },
+        {
+          "length": 193574945,
+          "md5": null,
+          "name": "chr4",
+          "primary": true
+        },
+        {
+          "length": 182045439,
+          "md5": null,
+          "name": "chr5",
+          "primary": true
+        },
+        {
+          "length": 172126628,
+          "md5": null,
+          "name": "chr6",
+          "primary": true
+        },
+        {
+          "length": 160567428,
+          "md5": null,
+          "name": "chr7",
+          "primary": true
+        },
+        {
+          "length": 154259566,
+          "md5": null,
+          "name": "chrX",
+          "primary": true
+        },
+        {
+          "length": 150617247,
+          "md5": null,
+          "name": "chr9",
+          "primary": true
+        },
+        {
+          "length": 146259331,
+          "md5": null,
+          "name": "chr8",
+          "primary": true
+        },
+        {
+          "length": 135127769,
+          "md5": null,
+          "name": "chr11",
+          "primary": true
+        },
+        {
+          "length": 134758134,
+          "md5": null,
+          "name": "chr10",
+          "primary": true
+        },
+        {
+          "length": 133324548,
+          "md5": null,
+          "name": "chr12",
+          "primary": true
+        },
+        {
+          "length": 113566686,
+          "md5": null,
+          "name": "chr13",
+          "primary": true
+        },
+        {
+          "length": 101161492,
+          "md5": null,
+          "name": "chr14",
+          "primary": true
+        },
+        {
+          "length": 99753195,
+          "md5": null,
+          "name": "chr15",
+          "primary": true
+        },
+        {
+          "length": 96330374,
+          "md5": null,
+          "name": "chr16",
+          "primary": true
+        },
+        {
+          "length": 84276897,
+          "md5": null,
+          "name": "chr17",
+          "primary": true
+        },
+        {
+          "length": 80542538,
+          "md5": null,
+          "name": "chr18",
+          "primary": true
+        },
+        {
+          "length": 66210255,
+          "md5": null,
+          "name": "chr20",
+          "primary": true
+        },
+        {
+          "length": 62460029,
+          "md5": null,
+          "name": "chrY",
+          "primary": true
+        },
+        {
+          "length": 61707364,
+          "md5": null,
+          "name": "chr19",
+          "primary": true
+        },
+        {
+          "length": 51324926,
+          "md5": null,
+          "name": "chr22",
+          "primary": true
+        },
+        {
+          "length": 45090682,
+          "md5": null,
+          "name": "chr21",
+          "primary": true
+        },
+        {
+          "length": 16569,
+          "md5": null,
+          "name": "chrM",
+          "primary": true
+        }
+      ],
+      "dictionary_sha256": "acd8997731252a8315286f89ac12a4f03d6cf84f2848189bba41463386cf9be7",
+      "display_name": "T2T CHM13 v2.0 / hs1",
+      "primary_contig_count": 25,
+      "stable_id": "T2T-CHM13v2.0"
+    },
+    "assets": [
+      {
+        "bytes": 375,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Copied and validated as an ordered contig dictionary.",
+        "format": "chrom_sizes_tsv",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "hs1/chrom.sizes",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "chromosome_sizes",
+        "sha256": "acd8997731252a8315286f89ac12a4f03d6cf84f2848189bba41463386cf9be7",
+        "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/hs1.chrom.sizes.txt",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1"
+      },
+      {
+        "bytes": 1036,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Normalized to one alias<TAB>canonical pair per row; conflicts rejected.",
+        "format": "alias_tsv",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "hs1/aliases.normalized.tsv",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "contig_aliases",
+        "sha256": "a0908a3cab17560d0567745ddaf80d0a7d19ce8f73f475d831b815c015b61c10",
+        "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/hs1.chromAlias.txt",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1"
+      },
+      {
+        "bytes": 30753,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Decoded from BigBed and coordinate/stain validated as UCSC cytoband text.",
+        "format": "ucsc_cytoband",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "hs1/cytobands.txt",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "cytobands",
+        "sha256": "09c7fa3ca3e222ebaabbecedc3086aa2543999824c0966f96b0c3f31c1126ea2",
+        "source_url": "https://hgdownload.soe.ucsc.edu/gbdb/hs1/cytoBandMapped/cytoBandMapped.bb",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1"
+      },
+      {
+        "bytes": 13437806,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Copied as the indexed optional all-transcript source; BigBed signature validated.",
+        "format": "big_gene_pred",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "hs1/transcripts.bigGenePred",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "detailed_transcripts",
+        "sha256": "1523cbc7fe6a581419951a15d6c894a26aa988c32df84fe959f0adedf3848c55",
+        "source_url": "https://hgdownload.soe.ucsc.edu/gbdb/hs1/ncbiRefSeq/ncbiRefSeq.bb",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1"
+      },
+      {
+        "bytes": 883094,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Derived deterministically from the representative records; one row per gene, whose stable gene ID is the RefSeq gene symbol.",
+        "format": "rgv_gene_names_v1_gzip",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "hs1/names.rgv.tsv.gz",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "gene_search",
+        "sha256": "05c437e68395326a7876f35b1c892a4f9906577257c2150a7a6a997a4675e6af",
+        "source_url": "https://hgdownload.soe.ucsc.edu/gbdb/hs1/ncbiRefSeq/ncbiRefSeq.bb",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1"
+      },
+      {
+        "bytes": 1167,
+        "citation": "See NOTICE.md",
+        "derivation": "Generated bundle-level attribution and release-gate notice.",
+        "format": "markdown",
+        "license": "Multiple source-specific terms; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "hs1/NOTICE.md",
+        "required_notice": "NOTICE.md must accompany redistribution.",
+        "role": "notice",
+        "sha256": "bb0779edbf7255abd027e7ae76c60d418db89c8976e35d86ff2737359096e976",
+        "source_url": "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json/hs1.json",
+        "upstream_project": "RGV landmark curation with IGV/NCBI/UCSC/MANE/GENCODE sources",
+        "upstream_version": "1.1-rgv1"
+      },
+      {
+        "bytes": 3193872,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Selected exactly one model for every gene: one representative transcript per gene symbol of IGV's default RefSeq All track: no preferred transcript set, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and accession.",
+        "format": "gene_pred_ext_gzip",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "hs1/genes.representative.genePred.gz",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "representative_genes",
+        "sha256": "be92b6539ae97d7451e08bd769da31e31418d75d2be1c020bcf55b751f499730",
+        "source_url": "https://hgdownload.soe.ucsc.edu/gbdb/hs1/ncbiRefSeq/ncbiRefSeq.bb",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1"
+      }
+    ],
+    "display_name": "Human (T2T CHM13-v2.0/hs1)",
+    "id": "hs1",
+    "provider": "NCBI RefSeq",
+    "release": "NCBI RefSeq All snapshot used by IGV hs1",
+    "selection_policy": "one representative transcript per gene symbol of IGV's default RefSeq All track: no preferred transcript set, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and accession",
+    "version": "1.1-rgv1"
+  },
+  "counts": {
+    "exons": 2117078,
+    "genes": 41566,
+    "off_reference_transcripts_excluded": 0,
+    "source_transcripts": 178178,
+    "transcripts": 178178
+  },
+  "distribution_status": "local_qualification_only_pending_release_review",
+  "reference": {
+    "downloaded": false,
+    "note": "Reference sequence is deliberately not part of the lightweight landmark bundle.",
+    "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/hs1.2bit"
+  },
+  "schema_version": 1,
+  "source_configuration": "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json/hs1.json"
+}

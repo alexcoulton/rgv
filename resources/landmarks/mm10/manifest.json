@@ -1,0 +1,541 @@
+{
+  "bundle": {
+    "assembly": {
+      "compatible_dictionary_sha256": [],
+      "compatible_ids": [
+        "GRCm38",
+        "mm10"
+      ],
+      "contigs": [
+        {
+          "length": 195471971,
+          "md5": null,
+          "name": "chr1",
+          "primary": true
+        },
+        {
+          "length": 182113224,
+          "md5": null,
+          "name": "chr2",
+          "primary": true
+        },
+        {
+          "length": 171031299,
+          "md5": null,
+          "name": "chrX",
+          "primary": true
+        },
+        {
+          "length": 160039680,
+          "md5": null,
+          "name": "chr3",
+          "primary": true
+        },
+        {
+          "length": 156508116,
+          "md5": null,
+          "name": "chr4",
+          "primary": true
+        },
+        {
+          "length": 151834684,
+          "md5": null,
+          "name": "chr5",
+          "primary": true
+        },
+        {
+          "length": 149736546,
+          "md5": null,
+          "name": "chr6",
+          "primary": true
+        },
+        {
+          "length": 145441459,
+          "md5": null,
+          "name": "chr7",
+          "primary": true
+        },
+        {
+          "length": 130694993,
+          "md5": null,
+          "name": "chr10",
+          "primary": true
+        },
+        {
+          "length": 129401213,
+          "md5": null,
+          "name": "chr8",
+          "primary": true
+        },
+        {
+          "length": 124902244,
+          "md5": null,
+          "name": "chr14",
+          "primary": true
+        },
+        {
+          "length": 124595110,
+          "md5": null,
+          "name": "chr9",
+          "primary": true
+        },
+        {
+          "length": 122082543,
+          "md5": null,
+          "name": "chr11",
+          "primary": true
+        },
+        {
+          "length": 120421639,
+          "md5": null,
+          "name": "chr13",
+          "primary": true
+        },
+        {
+          "length": 120129022,
+          "md5": null,
+          "name": "chr12",
+          "primary": true
+        },
+        {
+          "length": 104043685,
+          "md5": null,
+          "name": "chr15",
+          "primary": true
+        },
+        {
+          "length": 98207768,
+          "md5": null,
+          "name": "chr16",
+          "primary": true
+        },
+        {
+          "length": 94987271,
+          "md5": null,
+          "name": "chr17",
+          "primary": true
+        },
+        {
+          "length": 91744698,
+          "md5": null,
+          "name": "chrY",
+          "primary": true
+        },
+        {
+          "length": 90702639,
+          "md5": null,
+          "name": "chr18",
+          "primary": true
+        },
+        {
+          "length": 61431566,
+          "md5": null,
+          "name": "chr19",
+          "primary": true
+        },
+        {
+          "length": 953012,
+          "md5": null,
+          "name": "chr5_JH584299_random",
+          "primary": false
+        },
+        {
+          "length": 336933,
+          "md5": null,
+          "name": "chrX_GL456233_random",
+          "primary": false
+        },
+        {
+          "length": 259875,
+          "md5": null,
+          "name": "chrY_JH584301_random",
+          "primary": false
+        },
+        {
+          "length": 241735,
+          "md5": null,
+          "name": "chr1_GL456211_random",
+          "primary": false
+        },
+        {
+          "length": 227966,
+          "md5": null,
+          "name": "chr4_GL456350_random",
+          "primary": false
+        },
+        {
+          "length": 207968,
+          "md5": null,
+          "name": "chr4_JH584293_random",
+          "primary": false
+        },
+        {
+          "length": 206961,
+          "md5": null,
+          "name": "chr1_GL456221_random",
+          "primary": false
+        },
+        {
+          "length": 205776,
+          "md5": null,
+          "name": "chr5_JH584297_random",
+          "primary": false
+        },
+        {
+          "length": 199368,
+          "md5": null,
+          "name": "chr5_JH584296_random",
+          "primary": false
+        },
+        {
+          "length": 195993,
+          "md5": null,
+          "name": "chr5_GL456354_random",
+          "primary": false
+        },
+        {
+          "length": 191905,
+          "md5": null,
+          "name": "chr4_JH584294_random",
+          "primary": false
+        },
+        {
+          "length": 184189,
+          "md5": null,
+          "name": "chr5_JH584298_random",
+          "primary": false
+        },
+        {
+          "length": 182347,
+          "md5": null,
+          "name": "chrY_JH584300_random",
+          "primary": false
+        },
+        {
+          "length": 175968,
+          "md5": null,
+          "name": "chr7_GL456219_random",
+          "primary": false
+        },
+        {
+          "length": 169725,
+          "md5": null,
+          "name": "chr1_GL456210_random",
+          "primary": false
+        },
+        {
+          "length": 158099,
+          "md5": null,
+          "name": "chrY_JH584303_random",
+          "primary": false
+        },
+        {
+          "length": 155838,
+          "md5": null,
+          "name": "chrY_JH584302_random",
+          "primary": false
+        },
+        {
+          "length": 153618,
+          "md5": null,
+          "name": "chr1_GL456212_random",
+          "primary": false
+        },
+        {
+          "length": 114452,
+          "md5": null,
+          "name": "chrUn_JH584304",
+          "primary": false
+        },
+        {
+          "length": 72385,
+          "md5": null,
+          "name": "chrUn_GL456379",
+          "primary": false
+        },
+        {
+          "length": 66673,
+          "md5": null,
+          "name": "chr4_GL456216_random",
+          "primary": false
+        },
+        {
+          "length": 55711,
+          "md5": null,
+          "name": "chrUn_GL456393",
+          "primary": false
+        },
+        {
+          "length": 47073,
+          "md5": null,
+          "name": "chrUn_GL456366",
+          "primary": false
+        },
+        {
+          "length": 42057,
+          "md5": null,
+          "name": "chrUn_GL456367",
+          "primary": false
+        },
+        {
+          "length": 40056,
+          "md5": null,
+          "name": "chrUn_GL456239",
+          "primary": false
+        },
+        {
+          "length": 39340,
+          "md5": null,
+          "name": "chr1_GL456213_random",
+          "primary": false
+        },
+        {
+          "length": 38659,
+          "md5": null,
+          "name": "chrUn_GL456383",
+          "primary": false
+        },
+        {
+          "length": 35240,
+          "md5": null,
+          "name": "chrUn_GL456385",
+          "primary": false
+        },
+        {
+          "length": 31704,
+          "md5": null,
+          "name": "chrUn_GL456360",
+          "primary": false
+        },
+        {
+          "length": 31602,
+          "md5": null,
+          "name": "chrUn_GL456378",
+          "primary": false
+        },
+        {
+          "length": 28772,
+          "md5": null,
+          "name": "chrUn_GL456389",
+          "primary": false
+        },
+        {
+          "length": 28664,
+          "md5": null,
+          "name": "chrUn_GL456372",
+          "primary": false
+        },
+        {
+          "length": 26764,
+          "md5": null,
+          "name": "chrUn_GL456370",
+          "primary": false
+        },
+        {
+          "length": 25871,
+          "md5": null,
+          "name": "chrUn_GL456381",
+          "primary": false
+        },
+        {
+          "length": 24685,
+          "md5": null,
+          "name": "chrUn_GL456387",
+          "primary": false
+        },
+        {
+          "length": 24668,
+          "md5": null,
+          "name": "chrUn_GL456390",
+          "primary": false
+        },
+        {
+          "length": 24323,
+          "md5": null,
+          "name": "chrUn_GL456394",
+          "primary": false
+        },
+        {
+          "length": 23629,
+          "md5": null,
+          "name": "chrUn_GL456392",
+          "primary": false
+        },
+        {
+          "length": 23158,
+          "md5": null,
+          "name": "chrUn_GL456382",
+          "primary": false
+        },
+        {
+          "length": 22974,
+          "md5": null,
+          "name": "chrUn_GL456359",
+          "primary": false
+        },
+        {
+          "length": 21240,
+          "md5": null,
+          "name": "chrUn_GL456396",
+          "primary": false
+        },
+        {
+          "length": 20208,
+          "md5": null,
+          "name": "chrUn_GL456368",
+          "primary": false
+        },
+        {
+          "length": 16299,
+          "md5": null,
+          "name": "chrM",
+          "primary": true
+        },
+        {
+          "length": 14945,
+          "md5": null,
+          "name": "chr4_JH584292_random",
+          "primary": false
+        },
+        {
+          "length": 1976,
+          "md5": null,
+          "name": "chr4_JH584295_random",
+          "primary": false
+        }
+      ],
+      "dictionary_sha256": "55463d59f400b2c8260d100f4b521800ee773fa9711fe3f6dad9c7887db2574f",
+      "display_name": "GRCm38 / mm10",
+      "primary_contig_count": 22,
+      "stable_id": "GRCm38.p6"
+    },
+    "assets": [
+      {
+        "bytes": 1405,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Copied and validated as an ordered contig dictionary.",
+        "format": "chrom_sizes_tsv",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "mm10/chrom.sizes",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "chromosome_sizes",
+        "sha256": "55463d59f400b2c8260d100f4b521800ee773fa9711fe3f6dad9c7887db2574f",
+        "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.chrom.sizes",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "IGV curated snapshot"
+      },
+      {
+        "bytes": 921,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Normalized to one alias<TAB>canonical pair per row; conflicts rejected.",
+        "format": "alias_tsv",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "mm10/aliases.normalized.tsv",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "contig_aliases",
+        "sha256": "763fc592c1cf219ad3b80be64098712a9e97721b8a6a3397b5cd4e8084b8bdc6",
+        "source_url": "https://hgdownload.soe.ucsc.edu/hubs/GCF/000/001/635/GCF_000001635.26/GCF_000001635.26.chromAlias.txt",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "IGV curated snapshot"
+      },
+      {
+        "bytes": 13790,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Decompressed and coordinate/stain validated as UCSC cytoband text.",
+        "format": "ucsc_cytoband",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "mm10/cytobands.txt",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "cytobands",
+        "sha256": "0e3fa5a47318569b4582ee04ec9658ba769cc9de8dd26c4b211be97ce810e980",
+        "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/cytoBand.txt.gz",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "IGV curated snapshot"
+      },
+      {
+        "bytes": 5585058,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Copied as the optional all-transcript source; coordinates validated during curation.",
+        "format": "gene_pred_ext_gzip",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "mm10/transcripts.genePred.gz",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "detailed_transcripts",
+        "sha256": "8f3aace6f00adc4a83103d5f88ebefda7d3fbf1d1982aec976548e5ed607c1d9",
+        "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/ncbiRefSeq.txt.gz",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "IGV curated snapshot"
+      },
+      {
+        "bytes": 803273,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Derived deterministically from the representative records.",
+        "format": "rgv_gene_names_v1_gzip",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "mm10/names.rgv.tsv.gz",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "gene_search",
+        "sha256": "edef2d5b4fa0364e1a0966f6464ec49387986341986cda0d342b7e19c069ae8c",
+        "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/ncbiRefSeq.txt.gz",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "IGV curated snapshot"
+      },
+      {
+        "bytes": 1170,
+        "citation": "See NOTICE.md",
+        "derivation": "Generated bundle-level attribution and release-gate notice.",
+        "format": "markdown",
+        "license": "Multiple source-specific terms; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "mm10/NOTICE.md",
+        "required_notice": "NOTICE.md must accompany redistribution.",
+        "role": "notice",
+        "sha256": "c3cb279b16f4f8eb3ed5d7274b237617b387e3816b1bd627a5304eedbb37979f",
+        "source_url": "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json/mm10.json",
+        "upstream_project": "RGV landmark curation with IGV/NCBI/UCSC/MANE/GENCODE sources",
+        "upstream_version": "1.0-rgv1"
+      },
+      {
+        "bytes": 2995545,
+        "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+        "derivation": "Selected exactly one model per stable gene: MANE Select first, then NM/NR/XM/XR, coding length, spliced length, genomic span, and stable accession.",
+        "format": "gene_pred_ext_gzip",
+        "license": "Source-specific; see NOTICE.md",
+        "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+        "path": "mm10/genes.representative.genePred.gz",
+        "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing.",
+        "role": "representative_genes",
+        "sha256": "e0296fc2c34ebf318e7d182ceb7b1d993b0b3070b8562345a9b60c2e6eb09269",
+        "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/ncbiRefSeq.txt.gz",
+        "upstream_project": "IGV data repository and named upstream provider",
+        "upstream_version": "IGV curated snapshot"
+      }
+    ],
+    "display_name": "Mouse (GRCm38/mm10)",
+    "id": "mm10",
+    "provider": "NCBI RefSeq",
+    "release": "IGV curated snapshot",
+    "selection_policy": "one representative transcript per gene: MANE Select first, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and stable accession",
+    "version": "1.0-rgv1"
+  },
+  "counts": {
+    "exons": 1353526,
+    "genes": 38779,
+    "off_reference_transcripts_excluded": 4219,
+    "source_transcripts": 123667,
+    "transcripts": 119448
+  },
+  "distribution_status": "local_qualification_only_pending_release_review",
+  "reference": {
+    "downloaded": false,
+    "note": "Reference sequence is deliberately not part of the lightweight landmark bundle.",
+    "source_url": "https://igv.org/genomes/data/mm10/mm10.fa"
+  },
+  "schema_version": 1,
+  "source_configuration": "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json/mm10.json"
+}

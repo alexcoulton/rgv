@@ -1,0 +1,4850 @@
+{
+  "schema_version": 1,
+  "bundles": [
+    {
+      "id": "hg38",
+      "version": "1.1-rgv1",
+      "display_name": "Human (GRCh38/hg38)",
+      "provider": "NCBI RefSeq (MANE Select preferred)",
+      "release": "IGV RefSeq All snapshot; MANE 1.0 preference",
+      "selection_policy": "one representative transcript per gene symbol of IGV's default Refseq All track: MANE Select transcripts from https://igv.org/genomes/data/hg38/mane.1.0.bb first, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and accession",
+      "assembly": {
+        "stable_id": "GRCh38.no_alt_analysis_set",
+        "display_name": "GRCh38",
+        "compatible_ids": [
+          "GRCh38",
+          "GRCh38.p14",
+          "hg38"
+        ],
+        "primary_contig_count": 25,
+        "dictionary_sha256": "e1d9152418038457a959e949d99c9caf7ae3e4f87cfbb4ffe7d8b9a54ba1202b",
+        "compatible_dictionary_sha256": [
+          "36bda445209ba362bb534c9acf5f453f1adeacd3707586a346257f8f69a53fae"
+        ],
+        "contigs": [
+          {
+            "name": "chr1",
+            "length": 248956422,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr2",
+            "length": 242193529,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr3",
+            "length": 198295559,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr4",
+            "length": 190214555,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr5",
+            "length": 181538259,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr6",
+            "length": 170805979,
+            "md5": "5691468a67c7e7a7b5f2a3a683792c29",
+            "primary": true
+          },
+          {
+            "name": "chr7",
+            "length": 159345973,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrX",
+            "length": 156040895,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr8",
+            "length": 145138636,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr9",
+            "length": 138394717,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr11",
+            "length": 135086622,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr10",
+            "length": 133797422,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr12",
+            "length": 133275309,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr13",
+            "length": 114364328,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr14",
+            "length": 107043718,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr15",
+            "length": 101991189,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr16",
+            "length": 90338345,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr17",
+            "length": 83257441,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr18",
+            "length": 80373285,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr20",
+            "length": 64444167,
+            "md5": "b18e6c531b0bd70e949a7fc20859cb01",
+            "primary": true
+          },
+          {
+            "name": "chr19",
+            "length": 58617616,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrY",
+            "length": 57227415,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr22",
+            "length": 50818468,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr21",
+            "length": 46709983,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr15_KI270905v1_alt",
+            "length": 5161414,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_GL000256v2_alt",
+            "length": 4929269,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_GL000254v2_alt",
+            "length": 4827813,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_GL000251v2_alt",
+            "length": 4795265,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_GL000253v2_alt",
+            "length": 4677643,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_GL000250v2_alt",
+            "length": 4672374,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_GL000255v2_alt",
+            "length": 4606388,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_GL000252v2_alt",
+            "length": 4604811,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270857v1_alt",
+            "length": 2877074,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr16_KI270853v1_alt",
+            "length": 2659700,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr16_KI270728v1_random",
+            "length": 1872759,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_GL000258v2_alt",
+            "length": 1821992,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_GL339449v2_alt",
+            "length": 1612928,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_KI270847v1_alt",
+            "length": 1511111,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270908v1_alt",
+            "length": 1423190,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_KI270846v1_alt",
+            "length": 1351393,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_KI270897v1_alt",
+            "length": 1144418,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_KI270803v1_alt",
+            "length": 1111570,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL949749v2_alt",
+            "length": 1091841,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270938v1_alt",
+            "length": 1066800,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL949750v2_alt",
+            "length": 1066390,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL949748v2_alt",
+            "length": 1064304,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL949751v2_alt",
+            "length": 1002683,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL949746v1_alt",
+            "length": 987716,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL949752v1_alt",
+            "length": 987100,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270821v1_alt",
+            "length": 985506,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270763v1_alt",
+            "length": 911658,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_KI270801v1_alt",
+            "length": 870480,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL949753v2_alt",
+            "length": 796479,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL949747v2_alt",
+            "length": 729520,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270822v1_alt",
+            "length": 624492,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_GL000257v2_alt",
+            "length": 586476,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_KI270904v1_alt",
+            "length": 572349,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_KI270925v1_alt",
+            "length": 555799,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr15_KI270852v1_alt",
+            "length": 478999,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr15_KI270727v1_random",
+            "length": 448248,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_KI270823v1_alt",
+            "length": 439082,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr15_KI270850v1_alt",
+            "length": 430880,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270759v1_alt",
+            "length": 425601,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_GL877876v1_alt",
+            "length": 408271,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270442v1",
+            "length": 392061,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270862v1_alt",
+            "length": 391357,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr15_GL383555v2_alt",
+            "length": 388773,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL383573v1_alt",
+            "length": 385657,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_KI270896v1_alt",
+            "length": 378547,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_GL383528v1_alt",
+            "length": 376187,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_GL383563v3_alt",
+            "length": 375691,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270810v1_alt",
+            "length": 374415,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL383520v2_alt",
+            "length": 366580,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270762v1_alt",
+            "length": 354444,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr15_KI270848v1_alt",
+            "length": 327382,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270909v1_alt",
+            "length": 325800,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_KI270844v1_alt",
+            "length": 322166,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270900v1_alt",
+            "length": 318687,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr10_GL383546v1_alt",
+            "length": 309802,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr13_KI270838v1_alt",
+            "length": 306913,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270816v1_alt",
+            "length": 305841,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270879v1_alt",
+            "length": 304135,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270813v1_alt",
+            "length": 300230,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270831v1_alt",
+            "length": 296895,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr15_GL383554v1_alt",
+            "length": 296527,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270811v1_alt",
+            "length": 292436,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_GL383567v1_alt",
+            "length": 289831,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrX_KI270880v1_alt",
+            "length": 284869,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270812v1_alt",
+            "length": 282736,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270921v1_alt",
+            "length": 282224,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270729v1_random",
+            "length": 280839,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_JH159146v1_alt",
+            "length": 278131,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrX_KI270913v1_alt",
+            "length": 274009,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_KI270798v1_alt",
+            "length": 271782,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_KI270808v1_alt",
+            "length": 271455,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270876v1_alt",
+            "length": 263666,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr15_KI270851v1_alt",
+            "length": 263054,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270875v1_alt",
+            "length": 259914,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270766v1_alt",
+            "length": 256271,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270882v1_alt",
+            "length": 248807,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270778v1_alt",
+            "length": 248252,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr15_KI270849v1_alt",
+            "length": 244917,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_KI270786v1_alt",
+            "length": 244096,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_KI270835v1_alt",
+            "length": 238139,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270858v1_alt",
+            "length": 235827,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270867v1_alt",
+            "length": 233762,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr16_KI270855v1_alt",
+            "length": 232857,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270926v1_alt",
+            "length": 229282,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_GL949742v1_alt",
+            "length": 226852,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270780v1_alt",
+            "length": 224108,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_GL383565v1_alt",
+            "length": 223995,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270774v1_alt",
+            "length": 223625,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_KI270790v1_alt",
+            "length": 220246,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270927v1_alt",
+            "length": 218612,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270932v1_alt",
+            "length": 215732,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270903v1_alt",
+            "length": 214625,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270894v1_alt",
+            "length": 214158,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_GL000225v1_random",
+            "length": 211173,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270743v1",
+            "length": 210658,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270832v1_alt",
+            "length": 210133,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_KI270805v1_alt",
+            "length": 209988,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_GL000008v2_random",
+            "length": 209709,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_KI270809v1_alt",
+            "length": 209586,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270887v1_alt",
+            "length": 209512,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_KI270789v1_alt",
+            "length": 205944,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270779v1_alt",
+            "length": 205312,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270914v1_alt",
+            "length": 205194,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270886v1_alt",
+            "length": 204239,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270829v1_alt",
+            "length": 204059,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_GL000009v2_random",
+            "length": 201709,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr21_GL383579v2_alt",
+            "length": 201197,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_JH159136v1_alt",
+            "length": 200998,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270930v1_alt",
+            "length": 200773,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270747v1",
+            "length": 198735,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_GL383571v1_alt",
+            "length": 198278,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270920v1_alt",
+            "length": 198005,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_KI270797v1_alt",
+            "length": 197536,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270935v1_alt",
+            "length": 197351,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270861v1_alt",
+            "length": 196688,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr15_KI270906v1_alt",
+            "length": 196384,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_KI270791v1_alt",
+            "length": 195710,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_KI270722v1_random",
+            "length": 194050,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr16_GL383556v1_alt",
+            "length": 192462,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr13_KI270840v1_alt",
+            "length": 191684,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_GL000194v1_random",
+            "length": 191469,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_JH159137v1_alt",
+            "length": 191409,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270917v1_alt",
+            "length": 190932,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_KI270899v1_alt",
+            "length": 190869,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270923v1_alt",
+            "length": 189352,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr10_KI270825v1_alt",
+            "length": 188315,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL383576v1_alt",
+            "length": 188024,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270922v1_alt",
+            "length": 187935,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270742v1",
+            "length": 186739,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270878v1_alt",
+            "length": 186262,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270929v1_alt",
+            "length": 186203,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270826v1_alt",
+            "length": 186169,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_KB021644v2_alt",
+            "length": 185823,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_GL000205v2_random",
+            "length": 185591,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270765v1_alt",
+            "length": 185285,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270916v1_alt",
+            "length": 184516,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270890v1_alt",
+            "length": 184499,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270784v1_alt",
+            "length": 184404,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_GL383551v1_alt",
+            "length": 184319,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr20_KI270870v1_alt",
+            "length": 183433,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL000195v1",
+            "length": 182896,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL383518v1_alt",
+            "length": 182439,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270736v1_random",
+            "length": 181920,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr10_KI270824v1_alt",
+            "length": 181496,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_KI270845v1_alt",
+            "length": 180703,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_GL383526v1_alt",
+            "length": 180671,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr13_KI270839v1_alt",
+            "length": 180306,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270733v1_random",
+            "length": 179772,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL000224v1",
+            "length": 179693,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr10_GL383545v1_alt",
+            "length": 179254,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL000219v1",
+            "length": 179198,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_KI270792v1_alt",
+            "length": 179043,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270860v1_alt",
+            "length": 178921,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL000209v2_alt",
+            "length": 177381,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270830v1_alt",
+            "length": 177092,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_KI270719v1_random",
+            "length": 176845,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL000216v2",
+            "length": 176608,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270928v1_alt",
+            "length": 176103,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270712v1_random",
+            "length": 176043,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_KI270800v1_alt",
+            "length": 175808,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270706v1_random",
+            "length": 175055,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270776v1_alt",
+            "length": 174166,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_KI270912v1_alt",
+            "length": 174061,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270777v1_alt",
+            "length": 173649,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_GL383531v1_alt",
+            "length": 173459,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_JH636055v2_alt",
+            "length": 173151,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_KI270725v1_random",
+            "length": 172810,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_KI270796v1_alt",
+            "length": 172708,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_GL383541v1_alt",
+            "length": 171286,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270885v1_alt",
+            "length": 171027,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270919v1_alt",
+            "length": 170701,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270889v1_alt",
+            "length": 170698,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270891v1_alt",
+            "length": 170680,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270915v1_alt",
+            "length": 170665,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270933v1_alt",
+            "length": 170537,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270883v1_alt",
+            "length": 170399,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL383575v2_alt",
+            "length": 170222,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270931v1_alt",
+            "length": 170148,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_GL383550v2_alt",
+            "length": 169178,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr13_KI270841v1_alt",
+            "length": 169134,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270744v1",
+            "length": 168472,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_KI270863v1_alt",
+            "length": 167999,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_GL383569v1_alt",
+            "length": 167950,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_GL877875v1_alt",
+            "length": 167313,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr21_KI270874v1_alt",
+            "length": 166743,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270924v1_alt",
+            "length": 166540,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270761v1_alt",
+            "length": 165834,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270937v1_alt",
+            "length": 165607,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270734v1_random",
+            "length": 165050,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_GL383570v1_alt",
+            "length": 164789,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_KI270794v1_alt",
+            "length": 164558,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_GL383527v1_alt",
+            "length": 164536,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL000213v1",
+            "length": 164239,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270936v1_alt",
+            "length": 164170,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270934v1_alt",
+            "length": 163458,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_GL383539v1_alt",
+            "length": 162988,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270895v1_alt",
+            "length": 162896,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_GL383582v2_alt",
+            "length": 162811,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270782v1_alt",
+            "length": 162429,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270892v1_alt",
+            "length": 162212,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL000220v1",
+            "length": 161802,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270767v1_alt",
+            "length": 161578,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270715v1_random",
+            "length": 161471,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270893v1_alt",
+            "length": 161218,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL000218v1",
+            "length": 161147,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_GL383572v1_alt",
+            "length": 159547,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270817v1_alt",
+            "length": 158983,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_KI270788v1_alt",
+            "length": 158965,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270749v1",
+            "length": 158759,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_KI270806v1_alt",
+            "length": 158166,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_KI270804v1_alt",
+            "length": 157952,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_KI270911v1_alt",
+            "length": 157710,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270741v1",
+            "length": 157432,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270910v1_alt",
+            "length": 157099,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270884v1_alt",
+            "length": 157053,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_GL383574v1_alt",
+            "length": 155864,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270888v1_alt",
+            "length": 155532,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_GL000221v1_random",
+            "length": 155397,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_GL383547v1_alt",
+            "length": 154407,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270716v1_random",
+            "length": 153799,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_GL383553v2_alt",
+            "length": 152874,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_KI270799v1_alt",
+            "length": 152148,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270731v1_random",
+            "length": 150754,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270751v1",
+            "length": 150742,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270750v1",
+            "length": 148850,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270818v1_alt",
+            "length": 145606,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrX_KI270881v1_alt",
+            "length": 144206,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr21_KI270873v1_alt",
+            "length": 143900,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_GL383521v1_alt",
+            "length": 143390,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270814v1_alt",
+            "length": 141812,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_GL383552v1_alt",
+            "length": 138655,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270519v1",
+            "length": 138126,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270775v1_alt",
+            "length": 138019,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270907v1_alt",
+            "length": 137721,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL000214v1",
+            "length": 137718,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270901v1_alt",
+            "length": 136959,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270770v1_alt",
+            "length": 136240,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr16_KI270854v1_alt",
+            "length": 134193,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270819v1_alt",
+            "length": 133535,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_GL383564v2_alt",
+            "length": 133151,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270772v1_alt",
+            "length": 133041,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270815v1_alt",
+            "length": 132244,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_KI270795v1_alt",
+            "length": 131892,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_KI270898v1_alt",
+            "length": 130957,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr20_GL383577v2_alt",
+            "length": 128386,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270708v1_random",
+            "length": 127682,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_KI270807v1_alt",
+            "length": 126434,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_KI270793v1_alt",
+            "length": 126136,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_GL383533v1_alt",
+            "length": 124736,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_GL383522v1_alt",
+            "length": 123821,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270918v1_alt",
+            "length": 123111,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_GL383549v1_alt",
+            "length": 120804,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270769v1_alt",
+            "length": 120616,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_KI270785v1_alt",
+            "length": 119912,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_KI270834v1_alt",
+            "length": 119498,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_GL383534v2_alt",
+            "length": 119183,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr20_KI270869v1_alt",
+            "length": 118774,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr21_GL383581v2_alt",
+            "length": 116689,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270781v1_alt",
+            "length": 113034,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270730v1_random",
+            "length": 112551,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270438v1",
+            "length": 112505,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_KI270787v1_alt",
+            "length": 111943,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_KI270864v1_alt",
+            "length": 111737,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270771v1_alt",
+            "length": 110395,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL383519v1_alt",
+            "length": 110268,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270768v1_alt",
+            "length": 110099,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270760v1_alt",
+            "length": 109528,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr3_KI270783v1_alt",
+            "length": 109187,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_KI270859v1_alt",
+            "length": 108763,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270902v1_alt",
+            "length": 106711,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_GL383568v1_alt",
+            "length": 104552,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270737v1_random",
+            "length": 103838,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr13_KI270843v1_alt",
+            "length": 103832,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270877v1_alt",
+            "length": 101331,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_GL383530v1_alt",
+            "length": 101241,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270721v1_random",
+            "length": 100316,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270738v1_random",
+            "length": 99375,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_GL383583v2_alt",
+            "length": 96924,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_GL582966v2_alt",
+            "length": 96131,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270748v1",
+            "length": 93321,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270435v1",
+            "length": 92983,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_GL000208v1_random",
+            "length": 92689,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270538v1",
+            "length": 91309,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_GL383566v1_alt",
+            "length": 90219,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr16_GL383557v1_alt",
+            "length": 89672,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_JH159148v1_alt",
+            "length": 88070,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_GL383532v1_alt",
+            "length": 82728,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr21_KI270872v1_alt",
+            "length": 82692,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270756v1",
+            "length": 79590,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_KI270758v1_alt",
+            "length": 76752,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_KI270833v1_alt",
+            "length": 76061,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_KI270802v1_alt",
+            "length": 75005,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr21_GL383580v2_alt",
+            "length": 74653,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KB663609v1_alt",
+            "length": 74013,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270739v1_random",
+            "length": 73985,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_GL383540v1_alt",
+            "length": 71551,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270757v1",
+            "length": 71251,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr2_KI270773v1_alt",
+            "length": 70887,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_JH159147v1_alt",
+            "length": 70345,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_KI270827v1_alt",
+            "length": 67707,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270709v1_random",
+            "length": 66860,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270746v1",
+            "length": 66486,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr16_KI270856v1_alt",
+            "length": 63982,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr21_GL383578v2_alt",
+            "length": 63917,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270753v1",
+            "length": 62944,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270868v1_alt",
+            "length": 61734,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_GL383542v1_alt",
+            "length": 60032,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr20_KI270871v1_alt",
+            "length": 58661,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_KI270836v1_alt",
+            "length": 56134,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270865v1_alt",
+            "length": 52969,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270764v1_alt",
+            "length": 50258,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270589v1",
+            "length": 44474,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_KI270726v1_random",
+            "length": 43739,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_KI270866v1_alt",
+            "length": 43156,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270735v1_random",
+            "length": 42811,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270711v1_random",
+            "length": 42210,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270745v1",
+            "length": 41891,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270714v1_random",
+            "length": 41717,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr22_KI270732v1_random",
+            "length": 41543,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270713v1_random",
+            "length": 40745,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270754v1",
+            "length": 40191,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270710v1_random",
+            "length": 40176,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr12_KI270837v1_alt",
+            "length": 40090,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_KI270717v1_random",
+            "length": 40062,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_KI270724v1_random",
+            "length": 39555,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_KI270720v1_random",
+            "length": 39050,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr14_KI270723v1_random",
+            "length": 38115,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_KI270718v1_random",
+            "length": 38054,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270317v1",
+            "length": 37690,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr13_KI270842v1_alt",
+            "length": 37287,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrY_KI270740v1_random",
+            "length": 37240,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270755v1",
+            "length": 36723,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_KI270820v1_alt",
+            "length": 36640,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_KI270707v1_random",
+            "length": 32032,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270579v1",
+            "length": 31033,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270752v1",
+            "length": 27745,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270512v1",
+            "length": 22689,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270322v1",
+            "length": 21476,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrM",
+            "length": 16569,
+            "md5": "c68f52674c9fb33aef52dcf399755519",
+            "primary": true
+          },
+          {
+            "name": "chrUn_GL000226v1",
+            "length": 15008,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270311v1",
+            "length": 12399,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270366v1",
+            "length": 8320,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270511v1",
+            "length": 8127,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270448v1",
+            "length": 7992,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270521v1",
+            "length": 7642,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270581v1",
+            "length": 7046,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270582v1",
+            "length": 6504,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270515v1",
+            "length": 6361,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270588v1",
+            "length": 6158,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270591v1",
+            "length": 5796,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270522v1",
+            "length": 5674,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270507v1",
+            "length": 5353,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270590v1",
+            "length": 4685,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270584v1",
+            "length": 4513,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270320v1",
+            "length": 4416,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270382v1",
+            "length": 4215,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270468v1",
+            "length": 4055,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270467v1",
+            "length": 3920,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270362v1",
+            "length": 3530,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270517v1",
+            "length": 3253,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270593v1",
+            "length": 3041,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270528v1",
+            "length": 2983,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270587v1",
+            "length": 2969,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270364v1",
+            "length": 2855,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270371v1",
+            "length": 2805,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270333v1",
+            "length": 2699,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270374v1",
+            "length": 2656,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270411v1",
+            "length": 2646,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270414v1",
+            "length": 2489,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270510v1",
+            "length": 2415,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270390v1",
+            "length": 2387,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270375v1",
+            "length": 2378,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270420v1",
+            "length": 2321,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270509v1",
+            "length": 2318,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270315v1",
+            "length": 2276,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270302v1",
+            "length": 2274,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270518v1",
+            "length": 2186,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270530v1",
+            "length": 2168,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270304v1",
+            "length": 2165,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270418v1",
+            "length": 2145,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270424v1",
+            "length": 2140,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270417v1",
+            "length": 2043,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270508v1",
+            "length": 1951,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270303v1",
+            "length": 1942,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270381v1",
+            "length": 1930,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270529v1",
+            "length": 1899,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270425v1",
+            "length": 1884,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270396v1",
+            "length": 1880,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270363v1",
+            "length": 1803,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270386v1",
+            "length": 1788,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270465v1",
+            "length": 1774,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270383v1",
+            "length": 1750,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270384v1",
+            "length": 1658,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270330v1",
+            "length": 1652,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270372v1",
+            "length": 1650,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270548v1",
+            "length": 1599,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270580v1",
+            "length": 1553,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270387v1",
+            "length": 1537,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270391v1",
+            "length": 1484,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270305v1",
+            "length": 1472,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270373v1",
+            "length": 1451,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270422v1",
+            "length": 1445,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270316v1",
+            "length": 1444,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270338v1",
+            "length": 1428,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270340v1",
+            "length": 1428,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270583v1",
+            "length": 1400,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270334v1",
+            "length": 1368,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270429v1",
+            "length": 1361,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270393v1",
+            "length": 1308,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270516v1",
+            "length": 1300,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270389v1",
+            "length": 1298,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270466v1",
+            "length": 1233,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270388v1",
+            "length": 1216,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270544v1",
+            "length": 1202,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270310v1",
+            "length": 1201,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270412v1",
+            "length": 1179,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270395v1",
+            "length": 1143,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270376v1",
+            "length": 1136,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270337v1",
+            "length": 1121,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270335v1",
+            "length": 1048,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270378v1",
+            "length": 1048,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270379v1",
+            "length": 1045,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270329v1",
+            "length": 1040,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270419v1",
+            "length": 1029,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270336v1",
+            "length": 1026,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270312v1",
+            "length": 998,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270539v1",
+            "length": 993,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270385v1",
+            "length": 990,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270423v1",
+            "length": 981,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270392v1",
+            "length": 971,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_KI270394v1",
+            "length": 970,
+            "md5": null,
+            "primary": false
+          }
+        ]
+      },
+      "assets": [
+        {
+          "role": "chromosome_sizes",
+          "path": "hg38/chrom.sizes",
+          "format": "chrom_sizes_tsv",
+          "bytes": 11672,
+          "sha256": "e1d9152418038457a959e949d99c9caf7ae3e4f87cfbb4ffe7d8b9a54ba1202b",
+          "source_url": "https://igv.org/genomes/data/hg38/hg38.chrom.sizes",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; MANE 1.0 preference",
+          "derivation": "Copied and validated as an ordered contig dictionary.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "contig_aliases",
+          "path": "hg38/aliases.normalized.tsv",
+          "format": "alias_tsv",
+          "bytes": 44637,
+          "sha256": "f9a59d2d9ae6057672a92998cc67910f3fd2cb0a12f0c5f9ebd5116ab3774514",
+          "source_url": "https://igv.org/genomes/data/hg38/hg38_alias.tab",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; MANE 1.0 preference",
+          "derivation": "Normalized to one alias<TAB>canonical pair per row; conflicts rejected.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "cytobands",
+          "path": "hg38/cytobands.txt",
+          "format": "ucsc_cytoband",
+          "bytes": 45503,
+          "sha256": "a3752f83f56e95dd18504f39401daf247bef43711f82d65cc21cee2838b60f3e",
+          "source_url": "https://igv.org/genomes/data/hg38/cytoBandIdeo.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; MANE 1.0 preference",
+          "derivation": "Decompressed and coordinate/stain validated as UCSC cytoband text.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "detailed_transcripts",
+          "path": "hg38/transcripts.genePred.gz",
+          "format": "gene_pred_ext_gzip",
+          "bytes": 7301143,
+          "sha256": "abcb962a816dbdaa44787f07fe98676fca88bbbd55377d15e40a69c726414582",
+          "source_url": "https://igv.org/genomes/data/hg38/ncbiRefSeq.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; MANE 1.0 preference",
+          "derivation": "Copied as the optional all-transcript source; coordinates validated during curation.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "gene_search",
+          "path": "hg38/names.rgv.tsv.gz",
+          "format": "rgv_gene_names_v1_gzip",
+          "bytes": 1104272,
+          "sha256": "34d8e95e9350a5097531206b4123a714aca56437e820c6dd9842159f644464d1",
+          "source_url": "https://igv.org/genomes/data/hg38/ncbiRefSeq.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; MANE 1.0 preference",
+          "derivation": "Derived deterministically from the representative records; one row per gene, whose stable gene ID is the Ensembl gene of the gene's MANE Select record, otherwise the RefSeq gene symbol.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "notice",
+          "path": "hg38/NOTICE.md",
+          "format": "markdown",
+          "bytes": 1170,
+          "sha256": "e2035767a552991811218e3b424889739e66b6ecdb40c087e65ab28eab5722eb",
+          "source_url": "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json/hg38.json",
+          "upstream_project": "RGV landmark curation with IGV/NCBI/UCSC/MANE/GENCODE sources",
+          "upstream_version": "1.1-rgv1",
+          "derivation": "Generated bundle-level attribution and release-gate notice.",
+          "citation": "See NOTICE.md",
+          "license": "Multiple source-specific terms; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "NOTICE.md must accompany redistribution."
+        },
+        {
+          "role": "representative_genes",
+          "path": "hg38/genes.representative.genePred.gz",
+          "format": "gene_pred_ext_gzip",
+          "bytes": 3213325,
+          "sha256": "cac694dc0ab9562ef87aaa1a3d35ba947392cf57ff440646f6effed10c72a003",
+          "source_url": "https://igv.org/genomes/data/hg38/ncbiRefSeq.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; MANE 1.0 preference",
+          "derivation": "Selected exactly one model for every gene: one representative transcript per gene symbol of IGV's default Refseq All track: MANE Select transcripts from https://igv.org/genomes/data/hg38/mane.1.0.bb first, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and accession.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        }
+      ]
+    },
+    {
+      "id": "hg19",
+      "version": "1.1-rgv1",
+      "display_name": "Human (GRCh37/hg19)",
+      "provider": "NCBI RefSeq",
+      "release": "IGV RefSeq All snapshot; RefSeq Select preference",
+      "selection_policy": "one representative transcript per gene symbol of IGV's default Refseq All track: RefSeq Select transcripts from https://igv.org/genomes/data/hg19/ncbiRefSeqSelect.bb first, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and accession",
+      "assembly": {
+        "stable_id": "GRCh37.p13",
+        "display_name": "GRCh37 / hg19",
+        "compatible_ids": [
+          "GRCh37",
+          "hg19"
+        ],
+        "primary_contig_count": 25,
+        "dictionary_sha256": "b404927655a4aada254ea94ad4da0c8901ed0737e67a0dcabedf673354b1f505",
+        "compatible_dictionary_sha256": [
+          "d74373ee19d2e0f8378f17ea869b31f242189d381b2e04be48f6fbd76fb7028b"
+        ],
+        "contigs": [
+          {
+            "name": "chr1",
+            "length": 249250621,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr2",
+            "length": 243199373,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr3",
+            "length": 198022430,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr4",
+            "length": 191154276,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr5",
+            "length": 180915260,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr6",
+            "length": 171115067,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr7",
+            "length": 159138663,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrX",
+            "length": 155270560,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr8",
+            "length": 146364022,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr9",
+            "length": 141213431,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr10",
+            "length": 135534747,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr11",
+            "length": 135006516,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr12",
+            "length": 133851895,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr13",
+            "length": 115169878,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr14",
+            "length": 107349540,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr15",
+            "length": 102531392,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr16",
+            "length": 90354753,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr17",
+            "length": 81195210,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr18",
+            "length": 78077248,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr20",
+            "length": 63025520,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrY",
+            "length": 59373566,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr19",
+            "length": 59128983,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr22",
+            "length": 51304566,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr21",
+            "length": 48129895,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr6_ssto_hap7",
+            "length": 4928567,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_mcf_hap5",
+            "length": 4833398,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_cox_hap2",
+            "length": 4795371,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_mann_hap4",
+            "length": 4683263,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_apd_hap1",
+            "length": 4622290,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_qbl_hap6",
+            "length": 4611984,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr6_dbb_hap3",
+            "length": 4610396,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_ctg5_hap1",
+            "length": 1680828,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_ctg9_hap1",
+            "length": 590426,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_gl000192_random",
+            "length": 547496,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000225",
+            "length": 211173,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_gl000194_random",
+            "length": 191469,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_gl000193_random",
+            "length": 189789,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_gl000200_random",
+            "length": 187035,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000222",
+            "length": 186861,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000212",
+            "length": 186858,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_gl000195_random",
+            "length": 182896,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000223",
+            "length": 180455,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000224",
+            "length": 179693,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000219",
+            "length": 179198,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_gl000205_random",
+            "length": 174588,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000215",
+            "length": 172545,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000216",
+            "length": 172294,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000217",
+            "length": 172149,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_gl000199_random",
+            "length": 169874,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000211",
+            "length": 166566,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000213",
+            "length": 164239,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000220",
+            "length": 161802,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000218",
+            "length": 161147,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_gl000209_random",
+            "length": 159169,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000221",
+            "length": 155397,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000214",
+            "length": 137718,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000228",
+            "length": 129120,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000227",
+            "length": 128374,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_gl000191_random",
+            "length": 106433,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr19_gl000208_random",
+            "length": 92689,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_gl000198_random",
+            "length": 90085,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_gl000204_random",
+            "length": 81310,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000233",
+            "length": 45941,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000237",
+            "length": 45867,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000230",
+            "length": 43691,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000242",
+            "length": 43523,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000243",
+            "length": 43341,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000241",
+            "length": 42152,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000236",
+            "length": 41934,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000240",
+            "length": 41933,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_gl000206_random",
+            "length": 41001,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000232",
+            "length": 40652,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000234",
+            "length": 40531,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr11_gl000202_random",
+            "length": 40103,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000238",
+            "length": 39939,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000244",
+            "length": 39929,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000248",
+            "length": 39786,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_gl000196_random",
+            "length": 38914,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000249",
+            "length": 38502,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000246",
+            "length": 38154,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr17_gl000203_random",
+            "length": 37498,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr8_gl000197_random",
+            "length": 37175,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000245",
+            "length": 36651,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000247",
+            "length": 36422,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr9_gl000201_random",
+            "length": 36148,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000235",
+            "length": 34474,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000239",
+            "length": 33824,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr21_gl000210_random",
+            "length": 27682,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000231",
+            "length": 27386,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_gl000229",
+            "length": 19913,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrM",
+            "length": 16571,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrUn_gl000226",
+            "length": 15008,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr18_gl000207_random",
+            "length": 4262,
+            "md5": null,
+            "primary": false
+          }
+        ]
+      },
+      "assets": [
+        {
+          "role": "chromosome_sizes",
+          "path": "hg19/chrom.sizes",
+          "format": "chrom_sizes_tsv",
+          "bytes": 1971,
+          "sha256": "b404927655a4aada254ea94ad4da0c8901ed0737e67a0dcabedf673354b1f505",
+          "source_url": "https://igv.org/genomes/data/hg19/hg19.chrom.sizes",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; RefSeq Select preference",
+          "derivation": "Copied and validated as an ordered contig dictionary.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "contig_aliases",
+          "path": "hg19/aliases.normalized.tsv",
+          "format": "alias_tsv",
+          "bytes": 8100,
+          "sha256": "64d2ecfd0efadf39c6c7f59d2b132fdcc94a9509cd8c8fa63fa2146598bee62a",
+          "source_url": "https://igv.org/genomes/data/hg19/hg19_alias.tab",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; RefSeq Select preference",
+          "derivation": "Normalized to one alias<TAB>canonical pair per row; conflicts rejected.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "cytobands",
+          "path": "hg19/cytobands.txt",
+          "format": "ucsc_cytoband",
+          "bytes": 30754,
+          "sha256": "c296fe7d73eafae12569ef7b57c2876c2181f70a79e476c00fb4611ababb2439",
+          "source_url": "https://igv.org/genomes/data/hg19/cytoBand.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; RefSeq Select preference",
+          "derivation": "Decompressed and coordinate/stain validated as UCSC cytoband text.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "detailed_transcripts",
+          "path": "hg19/transcripts.genePred.gz",
+          "format": "gene_pred_ext_gzip",
+          "bytes": 4607905,
+          "sha256": "25d7be987073d8ecadb042da87837bfc469e432ec044353a5f28c8e9fa893238",
+          "source_url": "https://igv.org/genomes/data/hg19/ncbiRefSeq.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; RefSeq Select preference",
+          "derivation": "Copied as the optional all-transcript source; coordinates validated during curation.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "gene_search",
+          "path": "hg19/names.rgv.tsv.gz",
+          "format": "rgv_gene_names_v1_gzip",
+          "bytes": 659947,
+          "sha256": "9dcb1da57c09756bb01cd47390e7466aa667b3ec6c1db5b376baa4ac70944f51",
+          "source_url": "https://igv.org/genomes/data/hg19/ncbiRefSeq.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; RefSeq Select preference",
+          "derivation": "Derived deterministically from the representative records; one row per gene, whose stable gene ID is the RefSeq gene symbol.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "notice",
+          "path": "hg19/NOTICE.md",
+          "format": "markdown",
+          "bytes": 1170,
+          "sha256": "fb395b72cae048318a726755b0fec8616dc3cba31cffa11406297e184b974430",
+          "source_url": "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json/hg19.json",
+          "upstream_project": "RGV landmark curation with IGV/NCBI/UCSC/MANE/GENCODE sources",
+          "upstream_version": "1.1-rgv1",
+          "derivation": "Generated bundle-level attribution and release-gate notice.",
+          "citation": "See NOTICE.md",
+          "license": "Multiple source-specific terms; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "NOTICE.md must accompany redistribution."
+        },
+        {
+          "role": "representative_genes",
+          "path": "hg19/genes.representative.genePred.gz",
+          "format": "gene_pred_ext_gzip",
+          "bytes": 2656031,
+          "sha256": "956c2f4d0a2cb13c096018718dc621835bc8480c4a3160053dd4b5837dc733ca",
+          "source_url": "https://igv.org/genomes/data/hg19/ncbiRefSeq.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV RefSeq All snapshot; RefSeq Select preference",
+          "derivation": "Selected exactly one model for every gene: one representative transcript per gene symbol of IGV's default Refseq All track: RefSeq Select transcripts from https://igv.org/genomes/data/hg19/ncbiRefSeqSelect.bb first, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and accession.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        }
+      ]
+    },
+    {
+      "id": "mm10",
+      "version": "1.0-rgv1",
+      "display_name": "Mouse (GRCm38/mm10)",
+      "provider": "NCBI RefSeq",
+      "release": "IGV curated snapshot",
+      "selection_policy": "one representative transcript per gene: MANE Select first, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and stable accession",
+      "assembly": {
+        "stable_id": "GRCm38.p6",
+        "display_name": "GRCm38 / mm10",
+        "compatible_ids": [
+          "GRCm38",
+          "mm10"
+        ],
+        "primary_contig_count": 22,
+        "dictionary_sha256": "55463d59f400b2c8260d100f4b521800ee773fa9711fe3f6dad9c7887db2574f",
+        "compatible_dictionary_sha256": [],
+        "contigs": [
+          {
+            "name": "chr1",
+            "length": 195471971,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr2",
+            "length": 182113224,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrX",
+            "length": 171031299,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr3",
+            "length": 160039680,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr4",
+            "length": 156508116,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr5",
+            "length": 151834684,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr6",
+            "length": 149736546,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr7",
+            "length": 145441459,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr10",
+            "length": 130694993,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr8",
+            "length": 129401213,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr14",
+            "length": 124902244,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr9",
+            "length": 124595110,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr11",
+            "length": 122082543,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr13",
+            "length": 120421639,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr12",
+            "length": 120129022,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr15",
+            "length": 104043685,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr16",
+            "length": 98207768,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr17",
+            "length": 94987271,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrY",
+            "length": 91744698,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr18",
+            "length": 90702639,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr19",
+            "length": 61431566,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr5_JH584299_random",
+            "length": 953012,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrX_GL456233_random",
+            "length": 336933,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrY_JH584301_random",
+            "length": 259875,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456211_random",
+            "length": 241735,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_GL456350_random",
+            "length": 227966,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_JH584293_random",
+            "length": 207968,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456221_random",
+            "length": 206961,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_JH584297_random",
+            "length": 205776,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_JH584296_random",
+            "length": 199368,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_GL456354_random",
+            "length": 195993,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_JH584294_random",
+            "length": 191905,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_JH584298_random",
+            "length": 184189,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrY_JH584300_random",
+            "length": 182347,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_GL456219_random",
+            "length": 175968,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456210_random",
+            "length": 169725,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrY_JH584303_random",
+            "length": 158099,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrY_JH584302_random",
+            "length": 155838,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456212_random",
+            "length": 153618,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_JH584304",
+            "length": 114452,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456379",
+            "length": 72385,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_GL456216_random",
+            "length": 66673,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456393",
+            "length": 55711,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456366",
+            "length": 47073,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456367",
+            "length": 42057,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456239",
+            "length": 40056,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456213_random",
+            "length": 39340,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456383",
+            "length": 38659,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456385",
+            "length": 35240,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456360",
+            "length": 31704,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456378",
+            "length": 31602,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456389",
+            "length": 28772,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456372",
+            "length": 28664,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456370",
+            "length": 26764,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456381",
+            "length": 25871,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456387",
+            "length": 24685,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456390",
+            "length": 24668,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456394",
+            "length": 24323,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456392",
+            "length": 23629,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456382",
+            "length": 23158,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456359",
+            "length": 22974,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456396",
+            "length": 21240,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456368",
+            "length": 20208,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrM",
+            "length": 16299,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr4_JH584292_random",
+            "length": 14945,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_JH584295_random",
+            "length": 1976,
+            "md5": null,
+            "primary": false
+          }
+        ]
+      },
+      "assets": [
+        {
+          "role": "chromosome_sizes",
+          "path": "mm10/chrom.sizes",
+          "format": "chrom_sizes_tsv",
+          "bytes": 1405,
+          "sha256": "55463d59f400b2c8260d100f4b521800ee773fa9711fe3f6dad9c7887db2574f",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/bigZips/mm10.chrom.sizes",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Copied and validated as an ordered contig dictionary.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "contig_aliases",
+          "path": "mm10/aliases.normalized.tsv",
+          "format": "alias_tsv",
+          "bytes": 921,
+          "sha256": "763fc592c1cf219ad3b80be64098712a9e97721b8a6a3397b5cd4e8084b8bdc6",
+          "source_url": "https://hgdownload.soe.ucsc.edu/hubs/GCF/000/001/635/GCF_000001635.26/GCF_000001635.26.chromAlias.txt",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Normalized to one alias<TAB>canonical pair per row; conflicts rejected.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "cytobands",
+          "path": "mm10/cytobands.txt",
+          "format": "ucsc_cytoband",
+          "bytes": 13790,
+          "sha256": "0e3fa5a47318569b4582ee04ec9658ba769cc9de8dd26c4b211be97ce810e980",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/cytoBand.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Decompressed and coordinate/stain validated as UCSC cytoband text.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "detailed_transcripts",
+          "path": "mm10/transcripts.genePred.gz",
+          "format": "gene_pred_ext_gzip",
+          "bytes": 5585058,
+          "sha256": "8f3aace6f00adc4a83103d5f88ebefda7d3fbf1d1982aec976548e5ed607c1d9",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/ncbiRefSeq.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Copied as the optional all-transcript source; coordinates validated during curation.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "gene_search",
+          "path": "mm10/names.rgv.tsv.gz",
+          "format": "rgv_gene_names_v1_gzip",
+          "bytes": 803273,
+          "sha256": "edef2d5b4fa0364e1a0966f6464ec49387986341986cda0d342b7e19c069ae8c",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/ncbiRefSeq.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Derived deterministically from the representative records.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "notice",
+          "path": "mm10/NOTICE.md",
+          "format": "markdown",
+          "bytes": 1170,
+          "sha256": "c3cb279b16f4f8eb3ed5d7274b237617b387e3816b1bd627a5304eedbb37979f",
+          "source_url": "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json/mm10.json",
+          "upstream_project": "RGV landmark curation with IGV/NCBI/UCSC/MANE/GENCODE sources",
+          "upstream_version": "1.0-rgv1",
+          "derivation": "Generated bundle-level attribution and release-gate notice.",
+          "citation": "See NOTICE.md",
+          "license": "Multiple source-specific terms; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "NOTICE.md must accompany redistribution."
+        },
+        {
+          "role": "representative_genes",
+          "path": "mm10/genes.representative.genePred.gz",
+          "format": "gene_pred_ext_gzip",
+          "bytes": 2995545,
+          "sha256": "e0296fc2c34ebf318e7d182ceb7b1d993b0b3070b8562345a9b60c2e6eb09269",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm10/database/ncbiRefSeq.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Selected exactly one model per stable gene: MANE Select first, then NM/NR/XM/XR, coding length, spliced length, genomic span, and stable accession.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        }
+      ]
+    },
+    {
+      "id": "mm39",
+      "version": "1.0-rgv1",
+      "display_name": "Mouse (GRCm39/mm39)",
+      "provider": "NCBI RefSeq",
+      "release": "IGV curated snapshot",
+      "selection_policy": "one representative transcript per gene: MANE Select first, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and stable accession",
+      "assembly": {
+        "stable_id": "GRCm39",
+        "display_name": "GRCm39 / mm39",
+        "compatible_ids": [
+          "GRCm39",
+          "mm39"
+        ],
+        "primary_contig_count": 22,
+        "dictionary_sha256": "acd0edeab2409fe5e112444846dd89c4f8873df1f8ee4ca616aed6cf75be2a05",
+        "compatible_dictionary_sha256": [],
+        "contigs": [
+          {
+            "name": "chr1",
+            "length": 195154279,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr2",
+            "length": 181755017,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrX",
+            "length": 169476592,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr3",
+            "length": 159745316,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr4",
+            "length": 156860686,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr5",
+            "length": 151758149,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr6",
+            "length": 149588044,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr7",
+            "length": 144995196,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr10",
+            "length": 130530862,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr8",
+            "length": 130127694,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr14",
+            "length": 125139656,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr9",
+            "length": 124359700,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr11",
+            "length": 121973369,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr13",
+            "length": 120883175,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr12",
+            "length": 120092757,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr15",
+            "length": 104073951,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr16",
+            "length": 98008968,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr17",
+            "length": 95294699,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrY",
+            "length": 91455967,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr18",
+            "length": 90720763,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr19",
+            "length": 61420004,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr5_JH584299v1_random",
+            "length": 953012,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrX_GL456233v2_random",
+            "length": 559103,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrY_JH584301v1_random",
+            "length": 259875,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456211v1_random",
+            "length": 241735,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456221v1_random",
+            "length": 206961,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_JH584297v1_random",
+            "length": 205776,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_JH584296v1_random",
+            "length": 199368,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_GL456354v1_random",
+            "length": 195993,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr5_JH584298v1_random",
+            "length": 184189,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrY_JH584300v1_random",
+            "length": 182347,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr7_GL456219v1_random",
+            "length": 175968,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456210v1_random",
+            "length": 169725,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrY_JH584303v1_random",
+            "length": 158099,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrY_JH584302v1_random",
+            "length": 155838,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456212v1_random",
+            "length": 153618,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_JH584304v1",
+            "length": 114452,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456379v1",
+            "length": 72385,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456366v1",
+            "length": 47073,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456367v1",
+            "length": 42057,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr1_GL456239v1_random",
+            "length": 40056,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456383v1",
+            "length": 38659,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456385v1",
+            "length": 35240,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456360v1",
+            "length": 31704,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456378v1",
+            "length": 31602,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_MU069435v1",
+            "length": 31129,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456389v1",
+            "length": 28772,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456372v1",
+            "length": 28664,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456370v1",
+            "length": 26764,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456381v1",
+            "length": 25871,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456387v1",
+            "length": 24685,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456390v1",
+            "length": 24668,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456394v1",
+            "length": 24323,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456392v1",
+            "length": 23629,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456382v1",
+            "length": 23158,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456359v1",
+            "length": 22974,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456396v1",
+            "length": 21240,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrUn_GL456368v1",
+            "length": 20208,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chrM",
+            "length": 16299,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr1_MU069434v1_random",
+            "length": 8412,
+            "md5": null,
+            "primary": false
+          },
+          {
+            "name": "chr4_JH584295v1_random",
+            "length": 1976,
+            "md5": null,
+            "primary": false
+          }
+        ]
+      },
+      "assets": [
+        {
+          "role": "chromosome_sizes",
+          "path": "mm39/chrom.sizes",
+          "format": "chrom_sizes_tsv",
+          "bytes": 1350,
+          "sha256": "acd0edeab2409fe5e112444846dd89c4f8873df1f8ee4ca616aed6cf75be2a05",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.chrom.sizes",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Copied and validated as an ordered contig dictionary.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "contig_aliases",
+          "path": "mm39/aliases.normalized.tsv",
+          "format": "alias_tsv",
+          "bytes": 4737,
+          "sha256": "8a13eec94b921ed583111c5e0d1254f1a0654389d0162de0a3cae249e5f8d87f",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm39/bigZips/mm39.chromAlias.txt",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Normalized to one alias<TAB>canonical pair per row; conflicts rejected.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "cytobands",
+          "path": "mm39/cytobands.txt",
+          "format": "ucsc_cytoband",
+          "bytes": 3608,
+          "sha256": "fe9a608de871d261f3b3a51e7d9fc0c86e9b1dac4241a7dbe040cff96874cdec",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm39/database/cytoBandIdeo.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Decompressed and coordinate/stain validated as UCSC cytoband text.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "detailed_transcripts",
+          "path": "mm39/transcripts.genePred.gz",
+          "format": "gene_pred_ext_gzip",
+          "bytes": 3387847,
+          "sha256": "9844a21ce07f4ab26c1ec0fedb73023c6b0572634268f6c2350bd278741a662f",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm39/database/ncbiRefSeqCurated.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Copied as the optional all-transcript source; coordinates validated during curation.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "gene_search",
+          "path": "mm39/names.rgv.tsv.gz",
+          "format": "rgv_gene_names_v1_gzip",
+          "bytes": 567893,
+          "sha256": "195cee5beb275c8408cf63a6e59c2d19874a9308260b46606a7fc9ec9dad0d90",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm39/database/ncbiRefSeqCurated.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Derived deterministically from the representative records.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "notice",
+          "path": "mm39/NOTICE.md",
+          "format": "markdown",
+          "bytes": 1170,
+          "sha256": "775dea143ac978e229c446b7d6a84659d5efd2ef46cf32c916de901a5c770228",
+          "source_url": "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json/mm39.json",
+          "upstream_project": "RGV landmark curation with IGV/NCBI/UCSC/MANE/GENCODE sources",
+          "upstream_version": "1.0-rgv1",
+          "derivation": "Generated bundle-level attribution and release-gate notice.",
+          "citation": "See NOTICE.md",
+          "license": "Multiple source-specific terms; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "NOTICE.md must accompany redistribution."
+        },
+        {
+          "role": "representative_genes",
+          "path": "mm39/genes.representative.genePred.gz",
+          "format": "gene_pred_ext_gzip",
+          "bytes": 2495597,
+          "sha256": "eb6755c4337f2a9e0faf55b84c58022243c713711df66faf4dd8c97b9b260883",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/mm39/database/ncbiRefSeqCurated.txt.gz",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "IGV curated snapshot",
+          "derivation": "Selected exactly one model per stable gene: MANE Select first, then NM/NR/XM/XR, coding length, spliced length, genomic span, and stable accession.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        }
+      ]
+    },
+    {
+      "id": "hs1",
+      "version": "1.1-rgv1",
+      "display_name": "Human (T2T CHM13-v2.0/hs1)",
+      "provider": "NCBI RefSeq",
+      "release": "NCBI RefSeq All snapshot used by IGV hs1",
+      "selection_policy": "one representative transcript per gene symbol of IGV's default RefSeq All track: no preferred transcript set, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and accession",
+      "assembly": {
+        "stable_id": "T2T-CHM13v2.0",
+        "display_name": "T2T CHM13 v2.0 / hs1",
+        "compatible_ids": [
+          "CHM13v2.0",
+          "hs1"
+        ],
+        "primary_contig_count": 25,
+        "dictionary_sha256": "acd8997731252a8315286f89ac12a4f03d6cf84f2848189bba41463386cf9be7",
+        "compatible_dictionary_sha256": [],
+        "contigs": [
+          {
+            "name": "chr1",
+            "length": 248387328,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr2",
+            "length": 242696752,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr3",
+            "length": 201105948,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr4",
+            "length": 193574945,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr5",
+            "length": 182045439,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr6",
+            "length": 172126628,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr7",
+            "length": 160567428,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrX",
+            "length": 154259566,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr9",
+            "length": 150617247,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr8",
+            "length": 146259331,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr11",
+            "length": 135127769,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr10",
+            "length": 134758134,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr12",
+            "length": 133324548,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr13",
+            "length": 113566686,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr14",
+            "length": 101161492,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr15",
+            "length": 99753195,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr16",
+            "length": 96330374,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr17",
+            "length": 84276897,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr18",
+            "length": 80542538,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr20",
+            "length": 66210255,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrY",
+            "length": 62460029,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr19",
+            "length": 61707364,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr22",
+            "length": 51324926,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chr21",
+            "length": 45090682,
+            "md5": null,
+            "primary": true
+          },
+          {
+            "name": "chrM",
+            "length": 16569,
+            "md5": null,
+            "primary": true
+          }
+        ]
+      },
+      "assets": [
+        {
+          "role": "chromosome_sizes",
+          "path": "hs1/chrom.sizes",
+          "format": "chrom_sizes_tsv",
+          "bytes": 375,
+          "sha256": "acd8997731252a8315286f89ac12a4f03d6cf84f2848189bba41463386cf9be7",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/hs1.chrom.sizes.txt",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1",
+          "derivation": "Copied and validated as an ordered contig dictionary.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "contig_aliases",
+          "path": "hs1/aliases.normalized.tsv",
+          "format": "alias_tsv",
+          "bytes": 1036,
+          "sha256": "a0908a3cab17560d0567745ddaf80d0a7d19ce8f73f475d831b815c015b61c10",
+          "source_url": "https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/hs1.chromAlias.txt",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1",
+          "derivation": "Normalized to one alias<TAB>canonical pair per row; conflicts rejected.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "cytobands",
+          "path": "hs1/cytobands.txt",
+          "format": "ucsc_cytoband",
+          "bytes": 30753,
+          "sha256": "09c7fa3ca3e222ebaabbecedc3086aa2543999824c0966f96b0c3f31c1126ea2",
+          "source_url": "https://hgdownload.soe.ucsc.edu/gbdb/hs1/cytoBandMapped/cytoBandMapped.bb",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1",
+          "derivation": "Decoded from BigBed and coordinate/stain validated as UCSC cytoband text.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "detailed_transcripts",
+          "path": "hs1/transcripts.bigGenePred",
+          "format": "big_gene_pred",
+          "bytes": 13437806,
+          "sha256": "1523cbc7fe6a581419951a15d6c894a26aa988c32df84fe959f0adedf3848c55",
+          "source_url": "https://hgdownload.soe.ucsc.edu/gbdb/hs1/ncbiRefSeq/ncbiRefSeq.bb",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1",
+          "derivation": "Copied as the indexed optional all-transcript source; BigBed signature validated.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "gene_search",
+          "path": "hs1/names.rgv.tsv.gz",
+          "format": "rgv_gene_names_v1_gzip",
+          "bytes": 883094,
+          "sha256": "05c437e68395326a7876f35b1c892a4f9906577257c2150a7a6a997a4675e6af",
+          "source_url": "https://hgdownload.soe.ucsc.edu/gbdb/hs1/ncbiRefSeq/ncbiRefSeq.bb",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1",
+          "derivation": "Derived deterministically from the representative records; one row per gene, whose stable gene ID is the RefSeq gene symbol.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        },
+        {
+          "role": "notice",
+          "path": "hs1/NOTICE.md",
+          "format": "markdown",
+          "bytes": 1167,
+          "sha256": "bb0779edbf7255abd027e7ae76c60d418db89c8976e35d86ff2737359096e976",
+          "source_url": "https://raw.githubusercontent.com/igvteam/igv-data/main/genomes/json/hs1.json",
+          "upstream_project": "RGV landmark curation with IGV/NCBI/UCSC/MANE/GENCODE sources",
+          "upstream_version": "1.1-rgv1",
+          "derivation": "Generated bundle-level attribution and release-gate notice.",
+          "citation": "See NOTICE.md",
+          "license": "Multiple source-specific terms; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "NOTICE.md must accompany redistribution."
+        },
+        {
+          "role": "representative_genes",
+          "path": "hs1/genes.representative.genePred.gz",
+          "format": "gene_pred_ext_gzip",
+          "bytes": 3193872,
+          "sha256": "be92b6539ae97d7451e08bd769da31e31418d75d2be1c020bcf55b751f499730",
+          "source_url": "https://hgdownload.soe.ucsc.edu/gbdb/hs1/ncbiRefSeq/ncbiRefSeq.bb",
+          "upstream_project": "IGV data repository and named upstream provider",
+          "upstream_version": "NCBI RefSeq All snapshot used by IGV hs1",
+          "derivation": "Selected exactly one model for every gene: one representative transcript per gene symbol of IGV's default RefSeq All track: no preferred transcript set, then NM, NR, XM, XR; then coding length, spliced length, genomic span, and accession.",
+          "citation": "Robinson et al., Integrative Genomics Viewer; source-specific citations in NOTICE.md",
+          "license": "Source-specific; see NOTICE.md",
+          "license_url": "https://github.com/igvteam/igv-data/blob/main/LICENSE",
+          "required_notice": "Retain bundle NOTICE.md and source URLs when redistributing."
+        }
+      ]
+    }
+  ]
+}

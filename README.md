@@ -40,8 +40,9 @@ spliced, looking at methylation on long reads, or just making sure an alignment 
   (a sashimi plot), coloured by strand.
 - **Look at long reads and methylation.** Nanopore and PacBio reads, with base modifications
   such as 5mC drawn on each read and summarised in their own track.
-- **Add annotations.** Genes, peaks, variants (VCF), signal tracks (BigWig, bedGraph) and more,
-  and jump to a gene by typing its name.
+- **Find genes.** Human and mouse genes are built in: type a gene name to jump straight to it.
+- **Add annotations.** Peaks, variants (VCF), signal tracks (BigWig, bedGraph), your own gene
+  annotations and more.
 - **Open files from the web.** Indexed files on an HTTP or HTTPS server are read on demand, a
   piece at a time.
 - **Save your work.** Sessions remember your files, tracks and view. IGV session files can be
@@ -73,8 +74,12 @@ an Apple or Microsoft developer certificate, so the system cannot vouch for it. 
 2. **Add the reference genome.** Choose **Genomes → Open FASTA…** and pick the FASTA your reads
    were aligned to (it needs a `.fai` index next to it). This lets RGV show reference bases and
    mismatches. A CRAM file always needs its reference.
-3. **Go somewhere.** Type a position such as `chr7:55,019,017-55,211,628` in the **Locus** box and
-   press Enter. Once a gene annotation is loaded, a gene name such as `EGFR` works too.
+
+   For human (GRCh38/hg38, GRCh37/hg19, T2T-CHM13) and mouse (GRCm38/mm10, GRCm39/mm39)
+   references, RGV recognises the genome and adds a **Genes** track and chromosome bands
+   automatically. Nothing to download.
+3. **Go somewhere.** Type a gene name such as `EGFR`, or a position such as
+   `chr7:55,019,017-55,211,628`, in the **Locus** box and press Enter.
 4. **Add more tracks.** **Tracks → Add track…** (or drag files onto the window) adds genes,
    variants, peaks and signal tracks.
 
@@ -125,8 +130,9 @@ image export, batch automation and the rest.
 
 - **Hosted genomes do not work yet.** The **Genomes → Hosted genomes** menu reads IGV's genome
   list, but IGV's servers now serve only IGV itself. For now, open a reference FASTA (step 2
-  above) and a gene annotation file.
-- **Gene names in the Locus box** need a gene annotation (such as a GTF) to be loaded first.
+  above).
+- **Other genomes** (anything besides the human and mouse builds above) have no built-in genes:
+  add a gene annotation file such as a GTF to see genes and search them by name.
 - **Remote files** are newly supported and have had less real-world use than local files.
 
 ## Learn more

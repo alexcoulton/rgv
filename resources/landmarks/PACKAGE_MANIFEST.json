@@ -1,0 +1,221 @@
+{
+  "bundles": [
+    "hg38",
+    "hg19",
+    "mm10",
+    "mm39",
+    "hs1"
+  ],
+  "catalogue_schema_version": 1,
+  "distribution_status": "local_qualification_only_pending_release_review",
+  "files": [
+    {
+      "bytes": 141927,
+      "path": "catalog.json",
+      "sha256": "a6361175bbb359c7033062d33f43e6422f8cd3d4474878c32375c6de7994beb0"
+    },
+    {
+      "bytes": 1170,
+      "path": "hg19/NOTICE.md",
+      "sha256": "fb395b72cae048318a726755b0fec8616dc3cba31cffa11406297e184b974430"
+    },
+    {
+      "bytes": 8100,
+      "path": "hg19/aliases.normalized.tsv",
+      "sha256": "64d2ecfd0efadf39c6c7f59d2b132fdcc94a9509cd8c8fa63fa2146598bee62a"
+    },
+    {
+      "bytes": 1971,
+      "path": "hg19/chrom.sizes",
+      "sha256": "b404927655a4aada254ea94ad4da0c8901ed0737e67a0dcabedf673354b1f505"
+    },
+    {
+      "bytes": 30754,
+      "path": "hg19/cytobands.txt",
+      "sha256": "c296fe7d73eafae12569ef7b57c2876c2181f70a79e476c00fb4611ababb2439"
+    },
+    {
+      "bytes": 2656031,
+      "path": "hg19/genes.representative.genePred.gz",
+      "sha256": "956c2f4d0a2cb13c096018718dc621835bc8480c4a3160053dd4b5837dc733ca"
+    },
+    {
+      "bytes": 20583,
+      "path": "hg19/manifest.json",
+      "sha256": "d85bc821742fb53116398b9ca18c21ab209cfb05e37f86a3be4454295f9d47de"
+    },
+    {
+      "bytes": 659947,
+      "path": "hg19/names.rgv.tsv.gz",
+      "sha256": "9dcb1da57c09756bb01cd47390e7466aa667b3ec6c1db5b376baa4ac70944f51"
+    },
+    {
+      "bytes": 4607905,
+      "path": "hg19/transcripts.genePred.gz",
+      "sha256": "25d7be987073d8ecadb042da87837bfc469e432ec044353a5f28c8e9fa893238"
+    },
+    {
+      "bytes": 1170,
+      "path": "hg38/NOTICE.md",
+      "sha256": "e2035767a552991811218e3b424889739e66b6ecdb40c087e65ab28eab5722eb"
+    },
+    {
+      "bytes": 44637,
+      "path": "hg38/aliases.normalized.tsv",
+      "sha256": "f9a59d2d9ae6057672a92998cc67910f3fd2cb0a12f0c5f9ebd5116ab3774514"
+    },
+    {
+      "bytes": 11672,
+      "path": "hg38/chrom.sizes",
+      "sha256": "e1d9152418038457a959e949d99c9caf7ae3e4f87cfbb4ffe7d8b9a54ba1202b"
+    },
+    {
+      "bytes": 45503,
+      "path": "hg38/cytobands.txt",
+      "sha256": "a3752f83f56e95dd18504f39401daf247bef43711f82d65cc21cee2838b60f3e"
+    },
+    {
+      "bytes": 3213325,
+      "path": "hg38/genes.representative.genePred.gz",
+      "sha256": "cac694dc0ab9562ef87aaa1a3d35ba947392cf57ff440646f6effed10c72a003"
+    },
+    {
+      "bytes": 71351,
+      "path": "hg38/manifest.json",
+      "sha256": "b71ab596d502b35123fb077b4b7212ca46aa4002731c9d1a82af51d01d0dfd47"
+    },
+    {
+      "bytes": 1104272,
+      "path": "hg38/names.rgv.tsv.gz",
+      "sha256": "34d8e95e9350a5097531206b4123a714aca56437e820c6dd9842159f644464d1"
+    },
+    {
+      "bytes": 7301143,
+      "path": "hg38/transcripts.genePred.gz",
+      "sha256": "abcb962a816dbdaa44787f07fe98676fca88bbbd55377d15e40a69c726414582"
+    },
+    {
+      "bytes": 1167,
+      "path": "hs1/NOTICE.md",
+      "sha256": "bb0779edbf7255abd027e7ae76c60d418db89c8976e35d86ff2737359096e976"
+    },
+    {
+      "bytes": 1036,
+      "path": "hs1/aliases.normalized.tsv",
+      "sha256": "a0908a3cab17560d0567745ddaf80d0a7d19ce8f73f475d831b815c015b61c10"
+    },
+    {
+      "bytes": 375,
+      "path": "hs1/chrom.sizes",
+      "sha256": "acd8997731252a8315286f89ac12a4f03d6cf84f2848189bba41463386cf9be7"
+    },
+    {
+      "bytes": 30753,
+      "path": "hs1/cytobands.txt",
+      "sha256": "09c7fa3ca3e222ebaabbecedc3086aa2543999824c0966f96b0c3f31c1126ea2"
+    },
+    {
+      "bytes": 3193872,
+      "path": "hs1/genes.representative.genePred.gz",
+      "sha256": "be92b6539ae97d7451e08bd769da31e31418d75d2be1c020bcf55b751f499730"
+    },
+    {
+      "bytes": 11104,
+      "path": "hs1/manifest.json",
+      "sha256": "04ebe828426ee7a090ffe68a8d1db8c1b70dcf1ebf8b355417750c9a0237ab57"
+    },
+    {
+      "bytes": 883094,
+      "path": "hs1/names.rgv.tsv.gz",
+      "sha256": "05c437e68395326a7876f35b1c892a4f9906577257c2150a7a6a997a4675e6af"
+    },
+    {
+      "bytes": 13437806,
+      "path": "hs1/transcripts.bigGenePred",
+      "sha256": "1523cbc7fe6a581419951a15d6c894a26aa988c32df84fe959f0adedf3848c55"
+    },
+    {
+      "bytes": 1170,
+      "path": "mm10/NOTICE.md",
+      "sha256": "c3cb279b16f4f8eb3ed5d7274b237617b387e3816b1bd627a5304eedbb37979f"
+    },
+    {
+      "bytes": 921,
+      "path": "mm10/aliases.normalized.tsv",
+      "sha256": "763fc592c1cf219ad3b80be64098712a9e97721b8a6a3397b5cd4e8084b8bdc6"
+    },
+    {
+      "bytes": 1405,
+      "path": "mm10/chrom.sizes",
+      "sha256": "55463d59f400b2c8260d100f4b521800ee773fa9711fe3f6dad9c7887db2574f"
+    },
+    {
+      "bytes": 13790,
+      "path": "mm10/cytobands.txt",
+      "sha256": "0e3fa5a47318569b4582ee04ec9658ba769cc9de8dd26c4b211be97ce810e980"
+    },
+    {
+      "bytes": 2995545,
+      "path": "mm10/genes.representative.genePred.gz",
+      "sha256": "e0296fc2c34ebf318e7d182ceb7b1d993b0b3070b8562345a9b60c2e6eb09269"
+    },
+    {
+      "bytes": 16452,
+      "path": "mm10/manifest.json",
+      "sha256": "e0d787ec76afdc826b1d264ad2161b20229558303943eeffc66d9c0c0cdeed58"
+    },
+    {
+      "bytes": 803273,
+      "path": "mm10/names.rgv.tsv.gz",
+      "sha256": "edef2d5b4fa0364e1a0966f6464ec49387986341986cda0d342b7e19c069ae8c"
+    },
+    {
+      "bytes": 5585058,
+      "path": "mm10/transcripts.genePred.gz",
+      "sha256": "8f3aace6f00adc4a83103d5f88ebefda7d3fbf1d1982aec976548e5ed607c1d9"
+    },
+    {
+      "bytes": 1170,
+      "path": "mm39/NOTICE.md",
+      "sha256": "775dea143ac978e229c446b7d6a84659d5efd2ef46cf32c916de901a5c770228"
+    },
+    {
+      "bytes": 4737,
+      "path": "mm39/aliases.normalized.tsv",
+      "sha256": "8a13eec94b921ed583111c5e0d1254f1a0654389d0162de0a3cae249e5f8d87f"
+    },
+    {
+      "bytes": 1350,
+      "path": "mm39/chrom.sizes",
+      "sha256": "acd0edeab2409fe5e112444846dd89c4f8873df1f8ee4ca616aed6cf75be2a05"
+    },
+    {
+      "bytes": 3608,
+      "path": "mm39/cytobands.txt",
+      "sha256": "fe9a608de871d261f3b3a51e7d9fc0c86e9b1dac4241a7dbe040cff96874cdec"
+    },
+    {
+      "bytes": 2495597,
+      "path": "mm39/genes.representative.genePred.gz",
+      "sha256": "eb6755c4337f2a9e0faf55b84c58022243c713711df66faf4dd8c97b9b260883"
+    },
+    {
+      "bytes": 15846,
+      "path": "mm39/manifest.json",
+      "sha256": "dc7dc65ec19c331c9647742451dd5ee7da467aac4e6b849c9328d87e4a877af2"
+    },
+    {
+      "bytes": 567893,
+      "path": "mm39/names.rgv.tsv.gz",
+      "sha256": "195cee5beb275c8408cf63a6e59c2d19874a9308260b46606a7fc9ec9dad0d90"
+    },
+    {
+      "bytes": 3387847,
+      "path": "mm39/transcripts.genePred.gz",
+      "sha256": "9844a21ce07f4ab26c1ec0fedb73023c6b0572634268f6c2350bd278741a662f"
+    }
+  ],
+  "package": "complete",
+  "schema_version": 1,
+  "total_bytes": 53376330
+}

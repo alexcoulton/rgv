@@ -117,7 +117,16 @@ locations that holds `catalog.json` (a folder whose `igv/` subfolder holds it, s
    the default for every launch;
 5. the development and packaged locations: `benchmark-data/large-public-alignments/landmarks/igv`
    and `resources/landmarks` relative to the working directory, then `landmarks`,
-   `resources/landmarks` and `../Resources/landmarks` beside the executable.
+   `resources/landmarks`, `../Resources/landmarks` (inside the macOS app) and
+   `../share/rgv/landmarks` (a Linux install or AppImage) beside the executable.
+
+The repository carries the complete package in `resources/landmarks` (about 51 MB: every bundle's
+compact context plus its detailed transcripts), and every release package ships it in the
+location above for its platform, so a matching reference needs nothing installed. It was staged
+with `tools/landmarks/stage_resources.py --include-detail --allow-pending-review` from the
+bundles described here; restage it the same way after rebuilding them. Its
+`PACKAGE_MANIFEST.json` still records the distribution-review gate as pending, and each bundle's
+`NOTICE.md` lists the upstream providers whose attribution must travel with it.
 
 For example, with the catalogue on an external drive:
 

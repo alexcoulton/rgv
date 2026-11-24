@@ -5,6 +5,12 @@ versions follow Semantic Versioning.
 
 ## Unreleased
 
+- Built-in genes for human (GRCh38, GRCh37, T2T-CHM13) and mouse (GRCm38, GRCm39). The gene
+  landmark bundles (gene names for search, one representative transcript per gene, all
+  transcripts, cytobands and chromosome aliases; about 51 MB) are in `resources/landmarks` and
+  ship inside every package, so a matching reference gets a Genes track and gene-name search with
+  nothing to install. Linux packages keep them in `share/rgv/landmarks`.
+
 ## 0.1.1 — 2026-11-24
 
 - An app icon: a stack of reads with one variant column. It is the macOS app icon, the Windows

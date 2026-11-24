@@ -26,6 +26,14 @@ def copy(source: Path, destination: Path, *, executable: bool = False) -> None:
         destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def copy_landmarks(destination: Path) -> None:
+    """The built-in gene landmarks (resources/landmarks), where RGV looks beside its executable."""
+    source = ROOT / "resources" / "landmarks"
+    if not (source / "catalog.json").is_file():
+        raise ValueError(f"landmark resources are missing from {source}")
+    shutil.copytree(source, destination)
+
+
 def require_empty(destination: Path) -> None:
     if destination.exists() and any(destination.iterdir()):
         raise ValueError(f"staging destination is not empty: {destination}")
@@ -53,6 +61,7 @@ def stage_macos(
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_bytes(plistlib.dumps(plist, sort_keys=True))
     copy(ROOT / "packaging/icons/rgv.icns", resources / "rgv.icns")
+    copy_landmarks(resources / "landmarks")
     stage_common(binary, resources, "macos", version, mcp_binary)
     return root
 
@@ -76,6 +85,7 @@ def stage_linux(
         ROOT / "packaging/icons/rgv.svg",
         root / "share" / "icons" / "hicolor" / "scalable" / "apps" / "rgv.svg",
     )
+    copy_landmarks(root / "share" / "rgv" / "landmarks")
     stage_common(
         binary,
         root / "share" / "doc" / "rgv",
@@ -97,6 +107,7 @@ def stage_windows(
     copy(binary, root / "rgv-desktop.exe", executable=True)
     if mcp_binary is not None:
         copy(mcp_binary, root / "rgv-mcp.exe", executable=True)
+    copy_landmarks(root / "landmarks")
     stage_common(binary, root / "licenses", f"windows-{architecture}", version, mcp_binary)
     return root
 

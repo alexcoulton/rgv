@@ -15,6 +15,19 @@ import release_metadata  # noqa: E402
 import stage_package  # noqa: E402
 
 
+def app_version() -> str:
+    """The version of rgv-desktop, which packages must carry."""
+    manifest = PACKAGING.parent / "apps" / "rgv-desktop" / "Cargo.toml"
+    return next(
+        line.split('"')[1]
+        for line in manifest.read_text(encoding="utf-8").splitlines()
+        if line.startswith("version = ")
+    )
+
+
+VERSION = app_version()
+
+
 class PackagingTests(unittest.TestCase):
     def test_reachable_dependency_graph_excludes_unrelated_packages(self) -> None:
         metadata = {
@@ -43,13 +56,18 @@ class PackagingTests(unittest.TestCase):
             destination = directory / "dist"
             destination.mkdir()
             root = stage_package.stage_macos(
-                binary, destination, "0.1.0", "42", mcp_binary
+                binary, destination, VERSION, "42", mcp_binary
             )
             stage_package.write_manifest(root)
             stage_package.verify_manifest(root)
 
             plist = plistlib.loads((root / "Contents" / "Info.plist").read_bytes())
-            self.assertEqual(plist["CFBundleShortVersionString"], "0.1.0")
+            self.assertEqual(plist["CFBundleShortVersionString"], VERSION)
+            self.assertEqual(plist["CFBundleIconFile"], "rgv")
+            self.assertTrue((root / "Contents" / "Resources" / "rgv.icns").is_file())
+            self.assertTrue(
+                (root / "Contents" / "Resources" / "landmarks" / "catalog.json").is_file()
+            )
             self.assertEqual(plist["CFBundleVersion"], "42")
             self.assertTrue((root / "Contents" / "MacOS" / "rgv-mcp").is_file())
             resources = root / "Contents" / "Resources"
@@ -78,7 +96,7 @@ class PackagingTests(unittest.TestCase):
             mcp_binary = directory / "rgv-mcp"
             mcp_binary.write_bytes(b"test mcp executable")
             linux_root = stage_package.stage_linux(
-                binary, directory / "linux", "x86_64", "0.1.0", mcp_binary
+                binary, directory / "linux", "x86_64", VERSION, mcp_binary
             )
             stage_package.write_manifest(linux_root)
             stage_package.verify_manifest(linux_root)
@@ -88,14 +106,16 @@ class PackagingTests(unittest.TestCase):
             release_metadata.check(linux_resources)
             desktop = (linux_root / "share" / "applications" / "rgv.desktop").read_text()
             self.assertEqual(next(line for line in desktop.splitlines() if line.startswith("Exec=")), "Exec=rgv-desktop")
+            self.assertTrue((linux_root / "share" / "rgv" / "landmarks" / "catalog.json").is_file())
 
             windows_root = stage_package.stage_windows(
-                binary, directory / "windows", "x86_64", "0.1.0", mcp_binary
+                binary, directory / "windows", "x86_64", VERSION, mcp_binary
             )
             stage_package.write_manifest(windows_root)
             stage_package.verify_manifest(windows_root)
             self.assertTrue((windows_root / "rgv-desktop.exe").is_file())
             self.assertTrue((windows_root / "rgv-mcp.exe").is_file())
+            self.assertTrue((windows_root / "landmarks" / "catalog.json").is_file())
             release_metadata.check(windows_root / "licenses")
 
 

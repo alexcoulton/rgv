@@ -622,7 +622,10 @@ pub(super) fn landmark_root_candidates(
             [
                 directory.join("landmarks"),
                 directory.join("resources/landmarks"),
+                // Inside the macOS app bundle (Contents/MacOS/../Resources).
                 directory.join("../Resources/landmarks"),
+                // A Linux install or AppImage (bin/../share/rgv).
+                directory.join("../share/rgv/landmarks"),
             ]
             .into_iter()
             .map(|path| candidate(LandmarkRootSource::Bundled, path)),
@@ -1127,9 +1130,16 @@ mod tests {
             all[3].path,
             PathBuf::from("benchmark-data/large-public-alignments/landmarks/igv")
         );
+        let bundled_beside_the_executable = all[all.len() - 2..]
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect::<Vec<_>>();
         assert_eq!(
-            all.last().unwrap().path,
-            Path::new("/app/bin/../Resources/landmarks")
+            bundled_beside_the_executable,
+            [
+                PathBuf::from("/app/bin/../Resources/landmarks"),
+                PathBuf::from("/app/bin/../share/rgv/landmarks"),
+            ]
         );
 
         // The command line is authoritative; empty values are not locations.

@@ -55,6 +55,8 @@
       <ComponentRef Id="RgvMcpExecutable" />
       <ComponentRef Id="RgvReleaseMetadata" />
       <ComponentRef Id="RgvStartMenuShortcut" />
+      <!-- The built-in gene landmarks, beside the executable where RGV looks for them. -->
+      <Files Directory="INSTALLFOLDER" Subdirectory="landmarks" Include="$(var.RgvPackageRoot)\landmarks\**" />
     </Feature>
   </Package>
 </Wix>
