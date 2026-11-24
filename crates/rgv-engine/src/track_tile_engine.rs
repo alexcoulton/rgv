@@ -2605,11 +2605,21 @@ mod tests {
         let generation = engine.request_view(aliased).unwrap();
         let missing_generation = engine.request_view(view(8, 0.0, 1_000.0, 1.0)).unwrap();
         let mut pending = BTreeSet::from([generation, missing_generation]);
+        // Track 8's open failure may arrive after its view settles: wait for both.
+        let mut failure_reported = false;
         let events = wait_for(&engine, |event| {
-            if let TrackTileEngineEvent::ViewSettled { generation, .. } = event {
-                pending.remove(generation);
+            match event {
+                TrackTileEngineEvent::ViewSettled { generation, .. } => {
+                    pending.remove(generation);
+                }
+                TrackTileEngineEvent::TrackOpenFailed { track, .. }
+                    if *track == TrackId::new(8) =>
+                {
+                    failure_reported = true;
+                }
+                _ => {}
             }
-            pending.is_empty()
+            pending.is_empty() && failure_reported
         });
         assert!(events.contains(&TrackTileEngineEvent::TrackOpened {
             track: TrackId::new(7)
@@ -2961,11 +2971,21 @@ mod tests {
         let generation = tiles.request_view(aliased).unwrap();
         let unknown = tiles.request_view(view(8, 0.0, 1_000.0, 1.0)).unwrap();
         let mut pending = BTreeSet::from([generation, unknown]);
+        // Track 8's open failure may arrive after its view settles: wait for both.
+        let mut failure_reported = false;
         let events = wait_for(&tiles, |event| {
-            if let TrackTileEngineEvent::ViewSettled { generation, .. } = event {
-                pending.remove(generation);
+            match event {
+                TrackTileEngineEvent::ViewSettled { generation, .. } => {
+                    pending.remove(generation);
+                }
+                TrackTileEngineEvent::TrackOpenFailed { track, .. }
+                    if *track == TrackId::new(8) =>
+                {
+                    failure_reported = true;
+                }
+                _ => {}
             }
-            pending.is_empty()
+            pending.is_empty() && failure_reported
         });
         assert!(events.contains(&TrackTileEngineEvent::TrackOpened {
             track: TrackId::new(7)
