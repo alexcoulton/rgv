@@ -40,6 +40,9 @@ jobs:
         shell: bash
         run: rustup show active-toolchain || rustup toolchain install
       - run: cargo build --locked --profile dist -p rgv-desktop -p rgv-mcp
+      # Staging lists the whole locked dependency graph offline for the SBOM; fetch every
+      # package, not only those this build compiled.
+      - run: cargo fetch --locked
       - name: Build ad-hoc signed app and disk image
         env:
           RGV_ARCH: ${{ matrix.architecture }}
@@ -68,6 +71,9 @@ jobs:
         shell: bash
         run: rustup show active-toolchain || rustup toolchain install
       - run: cargo build --locked --profile dist -p rgv-desktop -p rgv-mcp
+      # Staging lists the whole locked dependency graph offline for the SBOM; fetch every
+      # package, not only those this build compiled.
+      - run: cargo fetch --locked
       - name: Build MSI installer and portable zip
         shell: pwsh
         run: |
@@ -100,6 +106,9 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - run: sudo apt-get update && sudo apt-get install --yes libfontconfig1-dev libxkbcommon-dev libwayland-dev
       - run: cargo build --locked --profile dist -p rgv-desktop -p rgv-mcp
+      # Staging lists the whole locked dependency graph offline for the SBOM; fetch every
+      # package, not only those this build compiled.
+      - run: cargo fetch --locked
       - name: Package tarball
         run: |
           python3 packaging/stage_package.py --platform linux --architecture x86_64 --version "${RGV_VERSION#v}" --build-number "$GITHUB_RUN_NUMBER" --binary target/dist/rgv-desktop --mcp-binary target/dist/rgv-mcp --destination dist/stage
