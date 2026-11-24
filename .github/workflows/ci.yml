@@ -35,7 +35,7 @@ jobs:
         if: runner.os == 'Windows'
         uses: ./.github/actions/windows-mingw
       - run: cargo build --workspace ${{ runner.os == 'Windows' && '--exclude rgv-alignment-bench' || '' }} --locked
-      - run: cargo test --workspace ${{ runner.os == 'Windows' && '--exclude rgv-alignment-bench' || '' }} --locked
+      - run: cargo test --workspace ${{ runner.os == 'Windows' && '--exclude rgv-alignment-bench' || '' }} --locked --no-fail-fast
       - name: Test package staging, SBOM, provenance, and manifests
         run: python -m unittest discover -s packaging/tests -v
 
